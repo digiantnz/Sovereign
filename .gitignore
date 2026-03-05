@@ -1,0 +1,19 @@
+# Secrets — never commit
+secrets/
+*.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Credentials and tokens
+*credentials*
+*token*
+*secret*
+
+# Runtime / ephemeral
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
