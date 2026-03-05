@@ -1225,3 +1225,55 @@ GitHub operations are wired into the execution engine under devops_agent scope w
 ### Second Commit
 - Pushed `docs/as-built.md` to digiantnz/Sovereign via Sovereign's GitHubAdapter (push_file)
 - Commit identity: Sovereign <rex@digiant.nz>
+
+---
+
+## Security Incident — Brave API Key Exposure (2026-03-05)
+
+### What Was Exposed
+- **Secret:** `BRAVE_API_KEY` — Brave Search API key (prefix `BSA...`)
+- **Source:** Written verbatim into `as-built.md` during Phase 2/browser setup documentation
+- **Committed:** Sovereign's second commit to `digiantnz/Sovereign`, pushed 2026-03-05 ~05:56 UTC
+- **Detected by:** GitGuardian automated secret scanning
+- **Severity:** Medium (key was already dead-letter — Brave free tier discontinued early 2026; returns 401/402)
+
+### Timeline
+| Time | Event |
+|------|-------|
+| 2026-03-05 05:56 UTC | as-built.md pushed to GitHub containing live key value |
+| 2026-03-05 (session) | GitGuardian alert received by Director |
+| 2026-03-05 (session) | Director revoked the key at Brave |
+| 2026-03-05 (session) | Key redacted to `<REVOKED>` in RAID as-built.md |
+| 2026-03-05 (session) | `git filter-branch` rewrote all 3 commits — key purged from entire history |
+| 2026-03-05 (session) | `refs/original/` stale refs expired and pruned |
+| 2026-03-05 (session) | Force-pushed clean chain to GitHub (old tip `aeeebf3` → new tip `9fd0085`) |
+
+### Root Cause
+`as-built.md` was treated as a narrative documentation file and written with literal secret values during infrastructure setup. No pre-commit scanning was in place. The sanitization step applied to `governance.json` was not applied to `as-built.md`.
+
+### Remediation
+1. Key revoked (Director)
+2. Git history rewritten — key absent from all reachable commits
+3. RAID `as-built.md` updated — key replaced with `<REVOKED>`
+
+### Prevention Added
+1. **GitHubAdapter pre-push scanner** (`execution/adapters/github.py` — `_scan_for_secrets()`):
+   - Runs on every `push_file()` call before any bytes leave the system
+   - Patterns: `API_KEY=`, `TOKEN=`, `PASSWORD=`, `SECRET=`, `PRIVATE KEY`, `Bearer`, `sk-`, `ghp_`, `ghs_`, `BSA` (Brave), RFC1918 IPs
+   - Blocked path patterns: `secrets/`, `.env`, `.key`, `.pem`, `.p12`
+   - Match blocks push and returns `SECRET_SCAN_BLOCKED` error — no bypass
+   - Violations logged (match position only — secret value never logged)
+
+2. **`.gitignore`** added to `digiantnz/Sovereign` (commit `6318f0d`):
+   - Blocks: `secrets/`, `*.env`, `.env.*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`, `*credentials*`, `*token*`, `*secret*`
+
+3. **`hooks/pre-commit`** added to `digiantnz/Sovereign` (commit `9af84b9`):
+   - Shell script; install with `cp hooks/pre-commit .git/hooks/pre-commit && chmod +x`
+   - Same pattern set as GitHubAdapter scanner — applies to any git-based contributor
+
+### Invariants Going Forward
+- `as-built.md` and all documentation must never contain literal secret values
+- Secret references in docs must use `<REDACTED>`, `<env:VAR_NAME>`, or `<REVOKED>`
+- Every push via GitHubAdapter is scanned before transmission — no exceptions
+- governance.json sanitization (already in place) + new universal pre-push scanner = two-layer protection
+
