@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Sovereign pre-commit hook — secret scanner
+# Blocks commits containing API keys, tokens, passwords, private keys.
+# Install: cp hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -e
+
+PATTERNS=(
+  '[A-Z_]*API[_]KEY[[:space:]]*=[[:space:]]*[^[:space:]]{8,}'
+  '[A-Z_]*TOKEN[[:space:]]*=[[:space:]]*[^[:space:]]{8,}'
+  '[A-Z_]*PASSWORD[[:space:]]*=[[:space:]]*[^[:space:]]{4,}'
+  '[A-Z_]*SECRET[[:space:]]*=[[:space:]]*[a-f0-9]{16,}'
+  '-----BEGIN .{1,30}PRIVATE KEY-----'
+  'Bearer[[:space:]]+[A-Za-z0-9._~+/-]{20,}'
+  'sk-[A-Za-z0-9]{20,}'
+  'ghp_[A-Za-z0-9]{30,}'
+  'ghs_[A-Za-z0-9]{30,}'
+  'BSA[A-Za-z0-9_-]{10,}'
+)
+
+BLOCKED_PATHS=(
+  'secrets/'
+  '\.env'
+  '\.key$'
+  '\.pem$'
+)
+
+FAIL=0
+
+# Check staged file paths
+while IFS= read -r file; do
+  for pat in "${BLOCKED_PATHS[@]}"; do
+    if echo "$file" | grep -qE "$pat"; then
+      echo "BLOCKED: $file matches blocked path pattern ($pat)"
+      FAIL=1
+    fi
+  done
+done < <(git diff --cached --name-only)
+
+# Check staged file contents
+while IFS= read -r file; do
+  [ -f "$file" ] || continue
+  for pat in "${PATTERNS[@]}"; do
+    if git diff --cached -- "$file" | grep -qE "$pat"; then
+      echo "BLOCKED: $file contains secret pattern ($pat)"
+      FAIL=1
+    fi
+  done
+done < <(git diff --cached --name-only)
+
+if [ "$FAIL" -ne 0 ]; then
+  echo ""
+  echo "Commit blocked by Sovereign pre-commit secret scanner."
+  echo "Remove secrets before committing. Never commit credentials."
+  exit 1
+fi
+
+exit 0
