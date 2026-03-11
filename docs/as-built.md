@@ -1939,3 +1939,41 @@ Rex was fabricating success responses when adapters failed or were never called.
 
 ### Validation
 - Build: success; health: ok; soul_guardian: active
+
+
+## Qdrant Memory / Live Adapter Source Confusion Bug Fix (2026-03-11)
+
+### Problem
+Qdrant memory results (from PASS 4.5 cross-reference) were being presented to the
+Director as if they were live adapter results (emails, files, calendar events). The
+translator LLM had no way to distinguish stored knowledge from a real live query.
+
+### Root cause
+1. No source tag on any adapter result — the LLM saw `{"messages":[...]}` and didn't know if
+   it came from IMAP live or from Qdrant memory
+2. PASS 4.5 memory_context entries had no `_result_source` field
+3. `translate_for_director()` prompt had no instruction about source provenance
+4. No `_live_result_empty` flag — when live adapter returned nothing, the LLM could
+   silently substitute Qdrant memory as if it were the live result
+
+### Fixes applied
+- **`execution/engine.py`**: Added `_DOMAIN_SOURCE` map (domain→source tag)
+- **`execution/engine.py`**: Renamed `_dispatch` → `_dispatch_inner`; new `_dispatch` wrapper
+  stamps `_result_source` on every result (broker_live, webdav_live, caldav_live, imap_live,
+  smtp_live, browser_live, github_live, wallet_live, qdrant_memory, etc.)
+- **`execution/engine.py`** PASS 4.5: each Qdrant memory hit stamped with
+  `_result_source: "qdrant_memory"`; added `_live_result_empty: true` flag when live adapter
+  returned empty items/content
+- **`cognition/prompts.py`** `translate_for_director()`: SOURCE RULE added to prompt —
+  tells LLM what each source tag means, that qdrant_memory is stored memory NOT live data,
+  and that if `_live_result_empty=true` it MUST say "no results" before any memory context;
+  memory_context section label now explicitly states "NOT a live query result";
+  `_result_source` always stamped into `r_summary` so LLM sees it
+
+### Containers changed
+- `sovereign-core` rebuilt
+
+### Validation
+- `docker_ps` result carries `_result_source: "broker_live"` ✓
+- `webdav list` result carries `_result_source: "webdav_live"` ✓
+- Health check: ok, soul_guardian: active ✓
