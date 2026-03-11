@@ -11,6 +11,8 @@
       "memory_search": true,
       "security_read": true,
       "browser_search": true,
+      "browser_fetch": true,
+      "github_read": true,
       "requires_confirmation": false,
       "requires_double_confirmation": false,
       "allowed_actions": [
@@ -23,12 +25,31 @@
         "memory_write",
         "memory_search",
         "mail_fetch_unread",
+        "mail_search",
         "calendar_read",
         "system_status",
         "security_check_updates",
         "security_read",
-        "browser_search"
-      ]
+        "browser_search",
+        "browser_fetch",
+        "github_read",
+        "wallet_config_read",
+        "wallet_read_config",
+        "wallet_get_btc_xpub",
+        "inspect_container",
+        "get_compose",
+        "host_file_read",
+        "get_hardware",
+        "list_processes",
+        "list_tasks",
+        "file_navigate",
+        "skill_search",
+        "skill_review",
+        "skill_audit"
+      ],
+      "wallet_read": true,
+      "wallet_btc_xpub": true,
+      "skill_read": true
     },
     "MID": {
       "docker_read": true,
@@ -46,7 +67,14 @@
       "caldav_read": true,
       "calendar_write": true,
       "ollama_query": true,
+      "memory_write": true,
       "memory_promote": true,
+      "github_push_doc": true,
+      "webdav_mkdir": true,
+      "wallet_read": true,
+      "wallet_sign": true,
+      "task_schedule": true,
+      "skill_load": true,
       "requires_confirmation": true,
       "requires_double_confirmation": false,
       "allowed_actions": [
@@ -57,8 +85,19 @@
         "mail_send",
         "mail_move",
         "calendar_create",
+        "task_create",
         "memory_write",
-        "memory_promote"
+        "memory_promote",
+        "github_push_doc",
+        "folder_create",
+        "wallet_get_address",
+        "wallet_sign_message",
+        "wallet_get_proposals",
+        "schedule_task",
+        "pause_task",
+        "cancel_task",
+        "skill_load",
+        "skill_unload"
       ]
     },
     "HIGH": {
@@ -83,6 +122,8 @@
       "calendar_write": true,
       "calendar_delete": true,
       "ollama_query": true,
+      "github_push_soul": true,
+      "wallet_propose": true,
       "requires_confirmation": true,
       "requires_double_confirmation": true,
       "allowed_actions": [
@@ -92,9 +133,13 @@
         "docker_remove",
         "file_delete",
         "calendar_delete",
+        "task_delete",
         "mail_delete",
         "backup_restore",
-        "governance_reload"
+        "governance_reload",
+        "github_push_soul",
+        "github_push_security",
+        "wallet_propose_safe_tx"
       ]
     }
   },
@@ -127,9 +172,48 @@
       "specialists_immutable": true
     }
   },
+  "github": {
+    "repo": "digiantnz/Sovereign",
+    "identity_name": "Sovereign",
+    "identity_email": "rex@digiant.nz",
+    "token_source": "GITHUB_PAT env var (secrets/github.env)",
+    "token_owner": "Sovereign GitHubAdapter \u2014 not CC",
+    "tier_policy": {
+      "LOW": [
+        "github_read"
+      ],
+      "MID": [
+        "github_push_doc"
+      ],
+      "HIGH": [
+        "github_push_soul",
+        "github_push_security"
+      ]
+    },
+    "prohibited": [
+      "pat_modification",
+      "repo_creation",
+      "repo_visibility_change",
+      "branch_deletion",
+      "force_push"
+    ],
+    "protected_paths": [
+      "soul/Sovereign-soul.md",
+      "governance/governance.json"
+    ],
+    "note": "Protected path pushes require HIGH tier + double confirmation + explicit Director acknowledgement"
+  },
+  "intent_tiers": {
+    "skill_search": "LOW",
+    "skill_review": "LOW",
+    "skill_audit": "LOW",
+    "skill_load": "MID",
+    "skill_unload": "MID",
+    "skill_install": "MID"
+  },
   "meta": {
-    "version": "1.5",
-    "description": "Sovereign governance policy \u2014 Phase 0\u20134 + typed memory + weighted retrieval + prospective briefing",
+    "version": "1.12",
+    "description": "Sovereign governance policy \u2014 Phase 0\u20134 + typed memory + weighted retrieval + prospective briefing + browser_fetch + VTODO task support + BTC Zpub export + broker examination API + generalised task scheduler + skills domain governance",
     "raid_path": "<RAID_PATH>",
     "reasoning_authority": "sovereign-core",
     "director_interface": "translator",
