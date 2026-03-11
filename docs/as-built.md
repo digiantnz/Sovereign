@@ -1914,3 +1914,28 @@ Paste the descriptor into Specter Desktop when adding Rex as signer on the 2-of-
 ### Containers changed
 - `sovereign-core` rebuilt (governance engine wallet domain + get_btc_xpub)
 
+
+
+## Fabrication Bug Fix — Adapter Result Integrity (2026-03-11)
+
+### Problem
+Rex was fabricating success responses when adapters failed or were never called. Three root causes:
+1. `_safe_translate()` only caught `error` key and `status=="error"` — missed `unconfigured`, `partial`, `success=False`
+2. PASS 5 called `ceo_memory_decision()` LLM BEFORE computing `_execution_confirmed` — LLM never saw authoritative confirmation state
+3. `_execution_confirmed` required an HTTP status code — non-HTTP adapters (SMTP, IMAP, wallet) always got `False` even on success
+4. `webdav.delete()` and `webdav.mkdir()` omitted `http_status` from success return dicts
+5. No iron rule in prompts forbidding the LLM from translating failure as success
+
+### Fixes applied
+- **`adapters/webdav.py`**: `delete()` and `mkdir()` now include `http_status: r.status_code` in success return
+- **`execution/engine.py`** `_safe_translate()`: expanded failure detection to include `status in ("error","unconfigured","partial")` and `success is False`
+- **`execution/engine.py`** PASS 5: `_execution_confirmed` computed BEFORE `ceo_memory_decision()` call; stamped onto `execution_result["execution_confirmed"]` so LLM sees authoritative value
+- **`execution/engine.py`** `_execution_confirmed` logic: if `http_status` is `None` (non-HTTP adapter), trusts `status=="ok"` or `success=True` instead of requiring HTTP 2xx
+- **`cognition/prompts.py`** `translate_for_director()`: added IRON RULE — if `is_failure` (error/unconfigured/partial/success=False/execution_confirmed=False), LLM is explicitly instructed to report failure, not invent success. If not failure, second iron rule: only report success when `execution_confirmed=true`
+- **`cognition/prompts.py`** `memory_decision()`: added IRON RULE — if `execution_confirmed=false` or error present, must not set `outcome="positive"` or store a completion
+
+### Containers changed
+- `sovereign-core` rebuilt
+
+### Validation
+- Build: success; health: ok; soul_guardian: active
