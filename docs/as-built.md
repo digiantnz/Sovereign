@@ -1977,3 +1977,104 @@ translator LLM had no way to distinguish stored knowledge from a real live query
 - `docker_ps` result carries `_result_source: "broker_live"` ✓
 - `webdav list` result carries `_result_source: "webdav_live"` ✓
 - Health check: ok, soul_guardian: active ✓
+
+
+## Broker Examination API (2026-03-11)
+
+Rex now has read-only examination capability across the full host system via new
+broker endpoints. All are LOW tier, all read-only, none execute state-changing commands.
+
+### New broker endpoints (GET, all trust=low)
+| Endpoint | Purpose |
+|---|---|
+| `/system/containers` | Full `docker ps -a` with networks, mounts, all fields |
+| `/system/logs/:container` | Last N lines of container logs (tail query param, default 100) |
+| `/system/inspect/:container` | Full docker inspect — env secrets auto-redacted |
+| `/system/compose` | Current `/docker/sovereign/compose.yml` content |
+| `/fs/read?path=` | Read any file or list any directory on host filesystem (5 MB limit) |
+| `/system/hardware` | GPU (nvidia-smi via ollama exec), disk (df -h), RAM (/proc/meminfo), CPU (/proc/cpuinfo) |
+| `/system/processes` | ps aux (container-scoped — isolated PID namespace) |
+
+### Infrastructure changes
+- `compose.yml`: added `- /:/hostfs:ro` bind mount to docker-broker (host root read-only)
+- `docker-policy.yaml`: all 7 new endpoints added to `low` trust allow list
+- `governance.json` v1.10: new allowed_actions for LOW tier:
+  `inspect_container`, `get_compose`, `host_file_read`, `get_hardware`, `list_processes`
+
+### sovereign-core changes
+- `adapters/broker.py`: 6 new async methods wired to new broker endpoints
+- `execution/engine.py`: 5 new intents + dispatch cases in docker domain
+- `cognition/prompts.py`: new intents added to devops_agent section + routing rules
+
+### Security notes
+- `/system/inspect/:container` auto-redacts env vars matching PASSWORD|SECRET|TOKEN|KEY|PAT|PASS
+- `/fs/read` validates path stays within `/hostfs` (traversal blocked at broker)
+- `/fs/read` returns 5 MB size limit; binary files return note instead of raw bytes
+- Only sovereign-core can reach the broker (ai_net isolation enforced by Docker)
+- All results stamped `_result_source: "broker_live"` by the dispatch wrapper
+
+### Validated
+- `/docker/sovereign/core/app/` readable via /query ✓ (source: broker_live)
+- `/home/sovereign/docs/` readable via /query ✓ (source: broker_live)
+- Hardware: RTX 3060 Ti 7/8192 MB VRAM, 31183 MB RAM, AMD Ryzen 9 9900X 24-core, 467 GB disk
+- Inspect secret redaction confirmed: WEBDAV_PASS, METAMASK_PASSWORD → `<REDACTED>` ✓
+- Health: ok, soul_guardian: active ✓
+
+
+## Phase 6.6 — Skill System Gap Fixes (2026-03-11)
+
+### Overview
+Three gaps identified in the skill lifecycle audit were fixed. No changes to the existing 4-layer security pipeline (escalation keywords → scanner → LLM → certification check) — that is correct and intact.
+
+### Gap 1 — Conversational skill install flow
+**Problem**: Rex failed when asked to "install a skill" conversationally because `load()` requires a `review_result` from a prior `skill_review` call, and Rex had no memory of the mandatory sequence.
+
+**Fix**:
+- Added `qdrant.seed_skill_install_procedure()` — writes a procedural memory entry to the PROCEDURAL collection at startup (`human_confirmed=True`, idempotent). Entry encodes the 3-step sequence: skill_search → skill_review → skill_load (only with confirmed review_result and Director explicit confirmation).
+- Added `skill_install` composite intent in execution/engine.py `_dispatch_inner` (domain=skills, op=install): runs search, reviews top candidate, returns `requires_confirmation` with full `review_result` to Director; on confirmed=True calls `lifecycle.load()`.
+- Added `skill_install` to INTENT_ACTION_MAP and `_quick_classify()` keyword detection (checked before `skill_search` to capture "install a skill for X" patterns).
+- Validated: Rex retrieves procedural memory and outlines 3-step sequence when asked to install a skill ✓
+
+### Gap 2 — Skills domain in governance.json
+**Problem**: Tier policy for skill operations was hardcoded in `INTENT_TIER_MAP` in execution/engine.py. No `skills` domain existed in governance.json or governance/engine.py — governance engine could not independently validate skill operations.
+
+**Fix**:
+- Added `"skill_read": true` to LOW tier, `"skill_load": true` to MID tier in governance.json
+- Added `skill_search`, `skill_review`, `skill_audit` to LOW `allowed_actions`; `skill_load`, `skill_unload` to MID `allowed_actions`
+- Added `"intent_tiers"` top-level section to governance.json mapping skill_search/skill_review/skill_audit → LOW, skill_load/skill_unload/skill_install → MID
+- Added `elif domain == 'skills':` handler to governance/engine.py
+- Added `GovernanceEngine.get_intent_tier(intent)` method — reads from `intent_tiers` section
+- Replaced hardcoded `INTENT_TIER_MAP.get(intent)` with `self.gov.get_intent_tier(intent) or INTENT_TIER_MAP.get(intent)` in handle_chat
+- Removed hardcoded skill tier entries from INTENT_TIER_MAP (now governed by governance.json)
+- governance.json bumped to v1.12
+
+**Validated**:
+- skills/search at LOW tier: passes governance ✓
+- skill_load with name="skill_load" at LOW tier: rejected ("Action 'skill_load' not in allowed_actions for tier LOW") ✓
+- skill_load at MID tier: `{"requires_confirmation": True}` ✓
+
+### Gap 3 — ClawhHub live HTTP dependency removed
+**Problem**: `skills/lifecycle.py search()` made direct HTTP calls to `https://topclawhubskills.com/api/search` — an external dependency that bypassed the SearXNG routing all other web requests use.
+
+**Fix**:
+- Removed `CLAWHUB_API_BASE` and `CLAWHUB_TIMEOUT` constants
+- Replaced `search()` with SearXNG-primary implementation:
+  - Primary: `browser.search("sovereign skill <query> SKILL.md site:github.com")` via a2a-browser → SearXNG
+  - Parses GitHub URLs from results via `_github_url_to_raw()` helper
+  - Fetches raw SKILL.md directly from `raw.githubusercontent.com` via httpx
+  - Fallback: general web search if GitHub search yields nothing
+- Added `_github_url_to_raw(url)` — converts `github.com/<user>/<repo>/blob/<branch>/<path>` to `raw.githubusercontent.com` URL
+- Added `_fetch_raw_url(url)` — async httpx fetch for raw GitHub content
+- `_fetch_skill_md()` and `_search_fallback()` methods removed (replaced by new flow)
+- No direct calls to `topclawhubskills.com` remain in the codebase
+
+### Containers changed
+- sovereign-core: rebuilt with all three fixes
+
+### Config changes
+- governance.json: v1.10 → v1.12 (skill_read LOW flag, skill_load MID flag, intent_tiers section, skill ops in allowed_actions)
+
+### Signed off
+- Health: ok, soul_guardian: active ✓
+- Startup log: "Qdrant: skill install sequence procedural entry seeded" ✓
+- Governance signed on startup: 36c022869576604c ✓
