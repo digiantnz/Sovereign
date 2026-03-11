@@ -1887,3 +1887,30 @@ Pre-push scanner also updated (`execution/adapters/github.py`):
 
 Containers rebuilt: sovereign-core. Health check: ok.
 
+
+## Wallet xpub — First Export (2026-03-11)
+
+### Root cause of governance failure
+`wallet` domain was missing from GovernanceEngine domain/operation switch in
+`core/app/governance/engine.py`. The `allowed_actions` check passed but the domain
+handler fell through to `raise ValueError`. Added wallet domain block:
+- `read` → `wallet_read: true`
+- `sign` → `wallet_sign: true`
+- `propose` → `wallet_propose: true`
+
+### BTC Xpub Exported
+First successful call to `wallet_get_btc_xpub()`. Results written to
+`/home/sovereign/governance/wallet-config.json` under `btc.*`.
+
+| Field | Value |
+|---|---|
+| Derivation | m/48'/0'/0'/2' |
+| Fingerprint | cf99ab1f |
+| Xpub | xpub6E5wfFfuApjU5zYtgriMLahdgdeVC1eU9GYtrbE3BgvrazPiF7dURgQ8zvAu3f6ytRcSFwDPBgxoCzPLnPDP29Ps9zd5hJ2Z8Dh5tsXuikT |
+| Specter descriptor | [cf99ab1f/48'/0'/0'/2']xpub6E5wfFfuApjU5zYtgriMLahdgdeVC1eU9GYtrbE3BgvrazPiF7dURgQ8zvAu3f6ytRcSFwDPBgxoCzPLnPDP29Ps9zd5hJ2Z8Dh5tsXuikT |
+
+Paste the descriptor into Specter Desktop when adding Rex as signer on the 2-of-3 P2WSH wallet.
+
+### Containers changed
+- `sovereign-core` rebuilt (governance engine wallet domain + get_btc_xpub)
+
