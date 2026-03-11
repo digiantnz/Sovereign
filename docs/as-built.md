@@ -1277,3 +1277,589 @@ GitHub operations are wired into the execution engine under devops_agent scope w
 - Every push via GitHubAdapter is scanned before transmission — no exceptions
 - governance.json sanitization (already in place) + new universal pre-push scanner = two-layer protection
 
+
+
+## a2a-browser node04 Fix + Timeout Bump (2026-03-05)
+
+### Changes
+- **Port binding fix**: `BIND_ADDRESS` changed from `172.16.201.4` to `0.0.0.0` on node04 — Docker's docker-proxy was silently failing to bind to the specific VLAN IP (HostConfig.PortBindings populated but NetworkSettings.Ports empty). Binding to all interfaces; VLAN exposure controlled by upstream routing.
+- **Enrichment model**: Reverted from qwen2:0.5b (too small — was echoing prompt instructions verbatim) back to phi3:mini (~2.3GB, 4GB GPU, some CPU spill but correct output).
+- **Enrichment timeout**: `a2a-browser/app/enrichment/ollama.py` `_TIMEOUT` 45s → 180s (covers phi3:mini with CPU offload ~117s observed).
+- **Sovereign-core browser adapter**: `core/app/execution/adapters/browser.py` `_TIMEOUT` 120s → 200s (must exceed enrichment timeout).
+
+### Validation
+- First cold request: ~117s (phi3:mini warm-up + CPU spill). Subsequent: consistent ~117s.
+- Sovereign synthesis field populated correctly. No placeholder-echo observed.
+- Pending: HP z440 8GB GPU arriving to replace node04's 4GB card — at that point phi3:mini will run fully in VRAM and enrichment time will drop significantly.
+
+### Invariants
+- sovereign-core browser adapter timeout must always exceed a2a-browser enrichment timeout
+- When new GPU lands: re-evaluate model upgrade and tighten timeouts
+
+
+---
+
+## Phase 6 — Sovereign Skill System (2026-03-08)
+
+### Overview
+Implemented a Sovereign-native skill system allowing structured capability protocols to be
+loaded into specialist system prompts at runtime, with cryptographic integrity enforcement
+and full audit logging.
+
+### Containers Changed
+- **sovereign-core**: rebuilt with new `skills/` module; `cognition/engine.py` updated
+
+### New Files (NVMe — runtime code)
+| Path | Purpose |
+|---|---|
+| `core/app/skills/__init__.py` | Module init |
+| `core/app/skills/loader.py` | SkillLoader class + `scan_all_skills()` startup helper |
+
+### Config Changes
+- `compose.yml`: added `/home/sovereign/skills:/home/sovereign/skills:ro` volume mount to sovereign-core
+- `core/app/main.py`: `scan_all_skills(ledger)` called in lifespan; result stored in `app.state.skill_summary`
+- `core/app/cognition/engine.py`: `specialist_reason()` now instantiates `SkillLoader` per call and injects active skills into specialist persona before LLM call
+
+### New Directories / Files (RAID — durable)
+| Path | Purpose |
+|---|---|
+| `/home/sovereign/skills/` | Skill root — mounted :ro into sovereign-core |
+| `/home/sovereign/skills/deep-research/SKILL.md` | Research protocol for research_agent |
+| `/home/sovereign/skills/security-audit/SKILL.md` | CVSS-lite threat assessment for security_agent |
+| `/home/sovereign/skills/session-wrap-up/SKILL.md` | End-of-session closure for all 5 specialists |
+| `/home/sovereign/skills/memory-curate/SKILL.md` | working→sovereign promotion gates for memory_agent |
+| `/home/sovereign/security/skill-checksums.json` | Whole-file SHA256 reference hashes (written by SkillLoader on first boot) |
+
+### Integrity Model
+- `sovereign.checksum` in each SKILL.md frontmatter = SHA256 of the body (text after `---`)
+- `skill-checksums.json` = whole-file SHA256 reference for drift detection
+- SkillLoader validates both on every load; mismatch → refuse + `skill_checksum_mismatch` / `skill_drift` audit event
+- Bootstrap mode: if no reference file exists, SkillLoader creates it on first load and logs a `skill_loaded` event per skill enrolled
+
+### Validation Results
+```
+sovereign-core startup log:
+  SkillLoader: bootstrap mode — creating skill reference checksums
+  SkillLoader: loaded 'deep-research' v1.0 for research_agent (tier=LOW)
+  SkillLoader: loaded 'session-wrap-up' v1.0 for research_agent (tier=MID)
+  SkillLoader: loaded 'session-wrap-up' v1.0 for devops_agent (tier=MID)
+  SkillLoader: loaded 'session-wrap-up' v1.0 for business_agent (tier=MID)
+  SkillLoader: loaded 'memory-curate' v1.0 for memory_agent (tier=LOW)
+  SkillLoader: loaded 'session-wrap-up' v1.0 for memory_agent (tier=MID)
+  SkillLoader: loaded 'security-audit' v1.0 for security_agent (tier=LOW)
+  SkillLoader: loaded 'session-wrap-up' v1.0 for security_agent (tier=MID)
+  SkillLoader startup scan: 8 skill(s) loaded across 5 specialist(s)
+  Application startup complete.
+
+/health: {"status":"ok","soul_checksum":"5f61b00...","soul_guardian":"active"}
+skill-checksums.json: 4 entries written to /home/sovereign/security/
+Dry-run checksum validation: all 4 SKILL.md bodies verified OK before rebuild
+```
+
+### Signed-Off Invariants
+- Skills dir is mounted `:ro` — sovereign-core cannot modify skill files at runtime
+- Body checksum + whole-file reference = two independent integrity gates
+- Adapter dep check ensures skills don't activate when their required adapter is offline
+- All skill load events (success, mismatch, drift, missing deps) flow through AuditLedger
+- SkillLoader never raises — exceptions are caught and logged; specialist always gets at least base persona
+- OpenClaw translation: no runtime dependency; adapter mapping is documentation only
+- Adding a new skill: write SKILL.md, compute `sha256sum` of body, insert into frontmatter — SkillLoader enrolls on next startup
+
+
+
+---
+
+## Phase 6.5a — Skill Lifecycle Manager (2026-03-08)
+
+### Overview
+Built a complete four-operation skill lifecycle manager enabling Rex to discover, evaluate,
+install, and audit skills from the ClawhHub community registry — all gated through the
+existing security and governance pipeline, with no OpenClaw runtime dependency.
+
+### New Files (NVMe — runtime code)
+| Path | Purpose |
+|---|---|
+| `core/app/skills/lifecycle.py` | SkillLifecycleManager: SEARCH/REVIEW/LOAD/AUDIT |
+
+### New Metadata Files (RAID — durable)
+| Path | Purpose |
+|---|---|
+| `/home/sovereign/security/skill-metadata.json` | Per-skill install metadata (loaded_at, last_accessed, clawhub provenance) |
+| `/home/sovereign/security/skill-watchlist.json` | Durable soul-guardian watchlist for dynamically installed skills |
+
+### Code Changes
+- `core/app/execution/engine.py`: `skills` domain added to `INTENT_ACTION_MAP`, `INTENT_TIER_MAP`, and `_dispatch()`; `_get_lifecycle()` lazy factory; `set_guardian()` injector; `skill_search`/`skill_audit` deterministic `_quick_classify` fast-paths
+- `core/app/cognition/prompts.py`: `skill_search`, `skill_review`, `skill_load`, `skill_audit` intents added to devops_agent block and routing rules
+- `core/app/main.py`: skill watchlist read at startup, merged into SoulGuardian protected_files before guardian instantiation; `set_guardian()` called post-lifespan
+
+### Operations
+- **SEARCH** (LOW): queries `https://topclawhubskills.com/api/search`; certified_only=True default; httpx primary; A2ABrowserAdapter SearXNG fallback; fetches SKILL.md content for top 3 certified candidates
+- **REVIEW** (LOW): escalation keyword scan → SecurityScanner → LLM `security_evaluate()` → `{"decision": "block|review|approve", ...}`; non-certified always "review"; escalation on memory/governance/soul/identity keywords
+- **LOAD** (MID, confirmed required): synthesises sovereign: frontmatter; computes body SHA256; writes SKILL.md; updates skill-checksums.json + skill-metadata.json + skill-watchlist.json; registers with guardian at runtime and durably; triggers config change notifier
+- **AUDIT** (LOW): compares whole-file hash vs skill-checksums.json reference; drift = HIGH tier incident logged to ledger
+
+### Validation
+- Build: clean, no errors
+- Startup: healthy — 8 skill loads, SoulGuardian active, governance snapshot signed
+- /health: ok
+
+### Invariants
+- certified_only=True is the default; non-certified requires explicit Director override to reach review
+- LOAD gate: review_result must be present; "block" verdict unconditionally refuses write
+- Lifecycle manager never raises to caller — all exceptions logged; graceful degradation
+- soul-guardian watchlist is durable: skills survive restarts and remain monitored
+
+---
+
+## Phase 6.5b — Config Change Notification Policy (2026-03-08)
+
+### Overview
+Cross-cutting policy that fires after any confirmed write to sensitive configuration files.
+Sends Telegram notification to Director summarising what changed and why, and appends a
+CEO-readable narrative entry to as-built.md. Audit ledger receives technical detail.
+
+### New Files (NVMe — runtime code)
+| Path | Purpose |
+|---|---|
+| `core/app/config_policy/__init__.py` | Module init |
+| `core/app/config_policy/notifier.py` | `notify_config_change()` + `config_write()` + `is_in_scope()` |
+
+### Integration Points
+- `skills/lifecycle.py` LOAD: calls `notify_config_change()` after successful skill write
+- `execution/engine.py` skills dispatch: threads `proposed_by` and `reason` into LOAD call
+- Future adapters: `config_write()` helper gates, writes, and notifies for any RAID config file
+
+### Files in Scope
+| Pattern | Policy Tier |
+|---|---|
+| governance.json | ANY |
+| sovereign-soul.md | HIGH |
+| /home/sovereign/security/*.yaml | MID |
+| /home/sovereign/personas/* | MID |
+| /home/sovereign/skills/* | MID |
+| skill-checksums.json | HIGH |
+
+### Notification Format
+- **Telegram**: tier icon + label + timestamp + plain-English narrative + proposed_by + reason + tier
+- **as-built.md**: narrative section (what changed, who, why, tier) — no raw diffs, no checksums
+- **Audit ledger**: technical detail (file hash prefix, checksum prefix, clawhub_slug, review_decision)
+
+### Design Decisions
+- Notifier fires POST-write (Director already confirmed before write — no pre-write gate here)
+- `config_write()` helper for direct RAID writes includes its own pre-write confirmation gate
+- WebDAV writes (to Nextcloud) are not intercepted — they write to WEBDAV_BASE, not RAID paths
+- Telegram credentials absent: notification skipped gracefully; write still succeeds
+
+### Validation
+- Build: clean, no errors
+- Startup: healthy
+
+### Invariants
+- Notification is best-effort: Telegram/as-built failure never blocks the write or returns an error
+- Technical detail (checksums, file hashes) must never appear in as-built.md — only the audit ledger
+- `is_in_scope(path)` is the canonical check; all future RAID file writes should call it
+
+
+
+---
+
+### CalDAV Bug Fixes — 2026-03-08
+
+#### Changes Made
+
+**1. CalDAV path construction fix (`core/app/adapters/caldav.py`)**
+
+Previous behaviour: `create_event` and `delete_event` built the target URL as
+`{CALDAV_BASE}/{calendar_label}/{uid}.ics` using the LLM-supplied calendar name directly as a
+slug, without verifying it against Nextcloud's actual calendar collections.
+
+Fix: Added `_discover_calendar(client, name)` method. It issues a PROPFIND to
+`/remote.php/dav/calendars/digiant/` with `Depth: 1`, parses the `<d:response>` blocks,
+and returns the absolute URL of the matching calendar collection (exact slug → exact display name
+→ partial match → first available as fallback). Both `create_event` and `delete_event` call this
+before any PUT/DELETE. If discovery returns no result the adapter returns an explicit error dict.
+
+Validated calendars discovered from Nextcloud: `personal` (Personal), `contact_birthdays`,
+`inbox`, `outbox`, `trashbin`.
+
+Test: `create_event(calendar="personal", ...)` → PROPFIND discovery → PUT to
+`http://nextcloud/remote.php/dav/calendars/digiant/personal/{uid}.ics` → HTTP 201 Created. ✓
+
+**2. HTTP status code truthfulness (`core/app/adapters/caldav.py`, `core/app/execution/engine.py`)**
+
+Previous behaviour:
+- Adapters called `raise_for_status()`, then returned `{"status": "ok", ...}`. If the exception
+  was caught by the execution engine it produced `{"status": "error", "message": ..., "http_status": ...}`
+  (key `"message"`, not `"error"`). `_safe_translate`'s hard fallback only checked `result.get("error")`
+  so error results fell through to `ceo_translate`. The LLM could hallucinate a success message.
+
+Fix:
+- `caldav.py`: Removed all `raise_for_status()` calls. All methods now check `r.status_code`
+  directly and return `{"status": "error", "error": ..., "http_status": ...}` for non-2xx. The
+  HTTP status code is always included in every return path.
+- `execution/engine.py` PASS 4 exception catch: changed `"message"` key to `"error"` for
+  consistency with the new adapter error shape.
+- `execution/engine.py` `_safe_translate`: added a deterministic error guard at the top that
+  triggers on `result.get("error")` OR `result.get("status") == "error"`. When triggered, returns
+  a hard-coded failure message including the real HTTP status code — without ever calling
+  `ceo_translate`. This enforces the invariant: Sovereign never tells the Director an action
+  succeeded without a confirmed 2xx HTTP response.
+
+#### Invariants Signed Off
+- CalDAV PROPFIND discovery runs before every PUT/DELETE — slugs are never assumed
+- All CalDAV adapter methods return the actual `http_status` in every code path
+- `_safe_translate` never passes error results to `ceo_translate`; error messages are deterministic
+- Any non-2xx from Nextcloud CalDAV surfaces as an explicit failure message to the Director
+
+#### Containers Changed
+- `sovereign-core` — rebuilt and restarted; health check OK
+
+#### Validation
+- `list_calendars` → HTTP 207, correct slug list returned ✓
+- `create_event(calendar="personal")` → PROPFIND discovery → PUT 201 Created ✓
+- `_discover_calendar("personal")` → exact slug match ✓
+- `_discover_calendar("Personal")` → case-insensitive display name match ✓
+- `_discover_calendar("nonexistent_xyz")` → first-available fallback ✓
+- Error guard test cases: HTTP 409, HTTP 404, no-code error → deterministic FAIL messages ✓
+- Success (HTTP 201) → guard passes through to ceo_translate ✓
+
+
+---
+
+### CalDAV Three-Bug Fix — 2026-03-08 (second pass)
+
+#### Bug 1 — Raw HTTP transparency (`core/app/adapters/caldav.py`)
+
+**Problem:** `_discover_calendar()` returned `str | None` — discarding the PROPFIND HTTP status
+and response body when returning `None`. `create_event` / `delete_event` returned synthesised
+error strings without the raw response body from the PUT/DELETE call. The cognition layer had
+no visibility into what actually happened on the wire.
+
+**Fix:** `_discover_calendar()` now always returns a full dict:
+```
+{
+  "url": str | None,
+  "propfind_http_status": int,
+  "propfind_response_body": str,   # raw XML ≤3000 chars
+  "calendars_found": [{"slug", "display_name", "url"}]
+}
+```
+All methods (`create_event`, `delete_event`, `list_calendars`) now include in every return path:
+- `http_calls_made`: explicit list of every HTTP call attempted (or not attempted)
+- `http_status`: real status code from PUT/DELETE (None if call was not made)
+- `response_body`: raw response body from PUT/DELETE
+- `propfind_http_status`: real PROPFIND status
+
+If a call was not made, the returned dict says so with a literal `"PUT not attempted"` or
+`"DELETE not attempted"` in the error message. No synthesised success or failure text.
+
+#### Bug 2 — CalDAV PUT path via PROPFIND discovery (`core/app/adapters/caldav.py`)
+
+**Problem:** Previous implementations could short-circuit PROPFIND discovery silently.
+
+**Fix (confirms and hardens prior fix):** `create_event` and `delete_event` always:
+1. Call `_discover_calendar()` → PROPFIND to `/remote.php/dav/calendars/digiant/` (Depth:1)
+2. Only proceed if a real calendar URL is returned
+3. PUT/DELETE to `{discovered_url}/{uid}.ics` — never a guessed slug
+
+If PROPFIND returns non-207/200, the error dict includes the raw PROPFIND status + body and
+states which call was not made. The full `http_calls_made` list is always present.
+
+Validated calendar slugs on this instance: `personal`, `contact_birthdays`, `inbox`,
+`outbox`, `trashbin`.
+
+#### Bug 3 — Prospective memory confirmation gate (`core/app/execution/engine.py`)
+
+**Problem:** PASS 5 (`ceo_memory_decision`) ran after execution without any deterministic check
+on whether the HTTP call succeeded. The LLM could store a prospective entry marked "completed"
+after a failed `create_event`, or leave an entry with no `execution_confirmed` flag at all.
+A prospective entry with no HTTP confirmation was indistinguishable from one that had been
+executed successfully.
+
+**Fix:** Added deterministic `execution_confirmed` stamping in PASS 5 for mutating intents.
+Mutating intents: `create_event`, `write_file`, `send_email`, `delete_file`, `delete_email`,
+`restart_container`, `create_folder`.
+
+When `mem_type == "prospective"` and `intent in _MUTATING_INTENTS`:
+- `execution_confirmed = (status == "ok" and 200 ≤ http_status < 300)` — computed from
+  the real adapter return value, never from the LLM
+- If `execution_confirmed` is `False`: `outcome` is overridden to `"unconfirmed"` regardless
+  of what the LLM's memory decision contains
+- `execution_confirmed: True` is set only when the adapter returned a real 2xx
+
+Non-mutating intents (query, web_search, etc.) and non-prospective collections are unaffected.
+
+#### Validation
+- PROPFIND discovery: HTTP 207, 5 slugs discovered ✓
+- `create_event("personal")` → PROPFIND 207 + PUT 201, `http_calls_made` lists both ✓
+- `delete_event("personal")` → PROPFIND 207 + DELETE 204, `http_calls_made` lists both ✓
+- `create_event` with bad PROPFIND → explicit "PUT not attempted" with raw PROPFIND status ✓
+- Bug 3 gate: 201 → `execution_confirmed: True` ✓; 409/None → `execution_confirmed: False, outcome: unconfirmed` ✓
+- Non-mutating intents → no `execution_confirmed` field in extra_meta ✓
+- Episodic collection → no `execution_confirmed` field ✓
+- Build clean, health check OK ✓
+
+#### Containers Changed
+- `sovereign-core` — rebuilt and restarted
+
+---
+
+## 2026-03-09 — CalDAV VTODO Support + IMAP Archive Fix + Nextcloud Volume Migration
+
+### Changes Made
+
+#### 1 — CalDAV adapter: VTODO task support (`core/app/adapters/caldav.py`)
+
+Added `create_task(calendar, uid, summary, due, start, description, status)`:
+- Same PROPFIND discovery flow as `create_event` — PROPFIND to
+  `/remote.php/dav/calendars/digiant/` (Depth:1) to discover the tasks calendar slug
+- Builds a valid VTODO ICS (DTSTAMP, optional DTSTART, optional DUE, SUMMARY,
+  DESCRIPTION, STATUS) and PUTs to `{discovered_url}/{uid}.ics`
+- Same no-fabrication invariant as `create_event`: if PROPFIND fails or no matching
+  calendar found, returns explicit "PUT not attempted" with raw PROPFIND status+body
+- `http_calls_made`, `http_status`, `propfind_http_status`, `response_body` always present
+
+Added `delete_task(calendar, uid)`:
+- Delegates directly to `delete_event` — DELETE flow is identical at the HTTP level
+
+#### 2 — Execution engine: new intents (`core/app/execution/engine.py`)
+
+Added to `INTENT_ACTION_MAP`:
+- `create_task` → `{domain: caldav, operation: write, name: task_create}`
+- `delete_task` → `{domain: caldav, operation: delete, name: task_delete}`
+
+Added to `INTENT_TIER_MAP`:
+- `create_task`: MID (requires_confirmation)
+- `delete_task`: HIGH (requires_double_confirmation)
+
+Added dispatch handlers for `task_create` and `task_delete` in the caldav block.
+Default calendar for task creation: `"tasks"` (PROPFIND discovery finds the correct slug).
+
+Added `create_task` and `delete_task` to `_MUTATING_INTENTS` — prospective memory
+confirmation gate now applies to task operations (execution_confirmed stamped from real
+HTTP status, never from LLM assertion).
+
+#### 3 — Governance policy: v1.7 → v1.8 (`/home/sovereign/governance/governance.json`)
+
+- Added `"task_create"` to MID tier `allowed_actions`
+- Added `"task_delete"` to HIGH tier `allowed_actions`
+- Version bumped from 1.7 to 1.8
+
+#### 4 — IMAP adapter: archive discovery fix (`core/app/adapters/imap.py`)
+
+Removed Gmail-specific entries from `_find_archive` candidates:
+- Removed: `"all mail"`, `"[gmail]/all mail"`
+- Retained: `"archive"`, `"archives"`, `"inbox.archive"`, `"saved messages"`
+- Rationale: accounts are on digiant.co.nz, digiant.nz, e.email — no Gmail
+
+#### 5 — Nextcloud volume migration (host filesystem change)
+
+All Nextcloud named Docker volumes migrated from overlay2 to RAID5 bind mounts:
+
+| Old named volume | New bind mount |
+|---|---|
+| `sovereign_nc_db` | `/home/nextcloud/db` |
+| `sovereign_nc_html` | `/home/nextcloud/html` |
+| `sovereign_nc_data` | `/home/nextcloud/data` |
+| `sovereign_nc_config` | `/home/nextcloud/config` |
+| `sovereign_nc_apps` | `/home/nextcloud/apps` |
+| `sovereign_nc_themes` | `/home/nextcloud/themes` |
+| `sovereign_redis_data` | `/home/nextcloud/redis` |
+
+Procedure:
+1. Stopped `nextcloud-rp → nextcloud → db → redis` cleanly
+2. Created `/home/nextcloud/` directory tree via Docker helper container
+3. Copied each volume with `cp -a` to preserve ownership (www-data 33:33, mysql 999:999)
+4. Verified: file counts matched exactly; size delta <100KB (filesystem block rounding)
+5. Updated `compose.yml` — removed named volume declarations, replaced with bind mounts
+6. Brought stack back up: db+redis first, waited for healthy, then nextcloud, then nginx-rp
+7. Confirmed `/status.php` returns `installed:true, maintenance:false, needsDbUpgrade:false`
+8. Removed all 7 `sovereign_nc_*` named volumes
+
+#### Validation
+- `governance.json` v1.8: `task_create` at MID OK, `task_delete` at HIGH OK ✓
+- `task_create` correctly rejected at LOW tier ✓
+- CalDAV `create_task` VTODO ICS: DTSTAMP/DTSTART/DUE/SUMMARY/DESCRIPTION/STATUS present ✓
+- No-fabrication guard: "PUT not attempted" present in `create_task` path ✓
+- `delete_task` delegates to `delete_event` ✓
+- IMAP: no Gmail entries in `_find_archive` ✓
+- Nextcloud: all containers healthy post-migration, `/status.php` HTTP 200 ✓
+- `sovereign-core` rebuilt and healthy: `{"status":"ok","soul_guardian":"active"}` ✓
+
+#### Containers Changed
+- `sovereign-core` — rebuilt and restarted
+- `nextcloud`, `nc-db`, `nc-redis`, `nextcloud-rp` — restarted with bind mounts
+
+---
+
+## Sovereign Wallet — W1 + W2 + Config (2026-03-10)
+
+### Summary
+Built the complete Sovereign wallet stack across two phases, plus governance config and documentation.
+
+### Phase W1 — Key generation + storage
+
+**New container: `sov-wallet`**
+- Base: `ghcr.io/browserless/chrome:latest`
+- Networks: `ai_net` (CDP port 9222, wallet API port 3001) + `browser_net` (Safe API internet egress)
+- Chrome profile bind mount: `/docker/sovereign/wallet/profile/` (NVMe)
+- MetaMask extension: `/docker/sovereign/wallet/extensions/metamask/` (ro)
+- Express wallet API: `POST /wallet/init`, `GET /signer`, `/safe/nonce`, `/safe/propose`, `/safe/pending`
+
+**New code: `core/app/execution/adapters/wallet.py`**
+- `WalletAdapter.initialize()`: BIP-39 keygen via `eth_account`, HKDF+AES-256-GCM seed encryption → `wallet-seed.enc` (RAID, 600), GPG backup → `wallet-seed.gpg` (Director key), MetaMask import via sov-wallet API (non-fatal), `wallet-state.json` written, wallet-config.json Rex address auto-updated, signed Telegram notification, audit ledger `wallet_keygen` event with full sig + canonical payload
+- `SigningAdapter.encrypt_seed()` / `decrypt_seed()`: HKDF-SHA256(sovereign.key raw bytes, info=`b"sovereign-wallet-seed-v1"`) → 32-byte AES-256-GCM key; key zeroed after every use; format: 12-byte nonce || ciphertext+GCM-tag
+- `WalletAdapter.build_proposal()`: signs canonical proposal dict, returns formatted message + sig_prefix
+- `WalletAdapter.verify_sig()`: scans audit JSONL by sig prefix, re-verifies Ed25519 sig
+
+**Key material (RAID `/home/sovereign/keys/`)**
+- `wallet-seed.enc` — encrypted mnemonic (written on first boot)
+- `wallet-seed.gpg` — GPG backup to Director key `matt@digiant.co.nz`
+- `wallet-state.json` — Ethereum address + derivation path (perms 600)
+- `director.gpg.pub` — Director's OpenPGP public key
+
+**sovereign.key as Docker secret**
+- Added `secrets.sovereign_key` (file: `/home/sovereign/keys/sovereign.key`) to compose.yml
+- Mounted at `/run/secrets/sovereign_key` in sovereign-core; `SOVEREIGN_KEY_PATH` env var updated
+
+**Gateway: `/verify` command**
+- `CommandHandler("verify", handle_verify)` added to gateway/main.py
+- Calls `/wallet/verify?prefix=<sig>` on sovereign-core → `WalletAdapter.verify_sig()` → confirmed/failed
+
+**`core/app/main.py`**: WalletAdapter initialized in lifespan; `/wallet/verify` GET route added
+
+### Phase W2 — Playwright CDP control
+
+**`WalletControlAdapter`** (appended to wallet.py):
+- Connects to sov-wallet Chrome via `playwright.chromium.connect_over_cdp(http://sov-wallet:9222)`
+- `get_address()` — reads wallet-state.json (MID tier, audit logged)
+- `sign_message(message)` — personal_sign via MetaMask popup automation (MID tier)
+- `propose_safe_transaction(to, value, data, purpose)` — EIP-712 SafeTx, eth_signTypedData_v4, Safe Transaction Service submission via sov-wallet proxy (HIGH tier, double confirmation)
+- `get_pending_proposals()` — Safe Transaction Service REST via sov-wallet proxy (MID tier)
+- All operations: signed audit ledger entry; full MetaMask signatures in ledger only
+
+**engine.py additions**: 5 wallet intents in INTENT_ACTION_MAP + INTENT_TIER_MAP; `WalletControlAdapter` instantiated in `__init__`; wallet domain dispatch in `_dispatch`
+
+### Governance config
+
+**`/home/sovereign/governance/wallet-config.json`** (new, RAID):
+- Safe: `0x50BF8f009ECC10DB65262c65d729152e989A9323`, 2-of-3 (Rex + Ledger + Mobile)
+- ETH nodes: `172.16.201.15:8545` (primary), `172.16.201.2:8545` (secondary), `.15:5052` (beacon)
+- BTC: Bitcoin Knots `172.16.201.5:8332`, Specter `172.16.201.5:25441`, path `m/48'/0'/0'/2'`
+- ETH/BTC node connections NOT active — config stored for future use
+- Mounted `:rw` in sovereign-core (specific file override on :ro governance dir)
+
+**`main.py`**: `wallet_config_snapshot` signed alongside `governance_snapshot` on every startup
+
+**`governance.json`**: `wallet_read_config` + `wallet_config_read` added to LOW tier; `wallet_get_address`, `wallet_sign_message`, `wallet_get_proposals` added to MID; `wallet_propose_safe_tx` added to HIGH
+
+**`secrets/wallet.env`**: METAMASK_PASSWORD, SAFE_ADDRESS, CHAIN_ID, SOV_WALLET_CDP_URL, ETH_RPC_PRIMARY/SECONDARY, ETH_BEACON_API, BTC_RPC_URL/USER/PASS, SPECTER_URL/PASSWORD
+
+### Documentation
+- `/home/sovereign/docs/sovereign-safe-setup.md` — Safe ceremony, owner structure, proposal flow, /verify, recovery, BTC Specter cross-ref
+- `/home/sovereign/docs/sovereign-wallet-keygen.md` — written at runtime by WalletAdapter on first boot
+
+### Signed Invariants
+- sovereign.key never logged, never in LLM context, never transmitted
+- Seed phrase zeroed in memory after every use (best-effort Python del)
+- HKDF-derived AES key never written to disk, zeroed after every encrypt/decrypt
+- Full MetaMask signatures in audit ledger only; Director-facing messages show 8-char prefix
+- Safe proposals are off-chain only — nothing executes without co-owner signatures
+- wallet-config.json changes detected by governance snapshot signing on every restart
+- MetaMask import non-fatal: address generated + telegraphed even if sov-wallet unavailable
+
+### Containers Changed
+- `sovereign-core` — needs rebuild: eth-account, python-gnupg, playwright added; WalletAdapter + WalletControlAdapter; wallet_config_snapshot signing; /wallet/verify route
+- `gateway` — needs rebuild: /verify CommandHandler added
+- `sov-wallet` — new container (first build pending MetaMask extension placement)
+
+### Pending
+- MetaMask extension at `/docker/sovereign/wallet/extensions/metamask/` (not yet downloaded)
+- Rex ETH address: pending sovereign-core first boot → arrives via Telegram
+- BTC xpub: `get_btc_xpub()` method not yet built (needs `embit` library)
+- Specter PSBT signing adapter: not yet built
+- ETH/BTC node active connections: not yet enabled
+
+
+---
+
+## Wallet Refactor — MetaMask Dropped, BTC Zpub Added (2026-03-11)
+
+### Driver
+MetaMask/Playwright approach was abandoned — importing a mnemonic into a browser extension
+inside a container adds complexity, attack surface, and a brittle Playwright automation layer.
+Sovereign signs ETH transactions directly via `eth_account` (EIP-712), which is simpler,
+faster, and keeps the private key derivation fully deterministic and auditable.
+BTC Zpub export for Specter multisig was also built in the same session.
+
+### sov-wallet Simplification
+
+**Before:** `ghcr.io/browserless/chrome:latest` — full Chrome + Puppeteer + MetaMask extension.
+CDP endpoint exposed on port 9222. WalletControlAdapter connected via Playwright CDP.
+
+**After:** `node:18-alpine` — thin Express.js Safe Transaction Service proxy only.
+No Chrome, no MetaMask, no CDP. Only endpoints: `/safe/nonce`, `/safe/propose`,
+`/safe/pending`, `/health`.
+
+#### Containers Changed
+- `sov-wallet` — Dockerfile rebuilt from `node:18-alpine`; wallet-api.js stripped to pure proxy
+- `sovereign-core` — rebuilt (dead MetaMask code removed, `embit` added, `get_btc_xpub` added)
+
+#### compose.yml Cleanup
+- Removed stale `SOV_WALLET_CDP_URL=http://sov-wallet:9222` from sovereign-core environment
+- Removed `extensions/metamask` bind mount from sov-wallet (no Chrome to load it)
+- Removed `wallet/profile` bind mount from sov-wallet (no Chrome profile needed)
+- Updated comment: "Safe proxy API accessible on ai_net only (port 3001)"
+
+### WalletAdapter.initialize() — MetaMask code removed
+- Removed `_import_to_metamask()` method (dead — sov-wallet no longer has `/wallet/init`)
+- Removed `METAMASK_PASSWORD` env var reference from initialize()
+- Removed `metamask_import` field from `wallet-state.json` schema
+- Updated keygen Telegram message to reference BTC Zpub export step
+
+### WalletControlAdapter — Direct eth_account Signing
+- No change to signing logic (was already rewritten to use `eth_account` directly in last session)
+- Added `get_btc_xpub()` — new LOW tier method (see below)
+- Added `_notify_telegram()` — mirrors WalletAdapter helper; used by get_btc_xpub
+
+### get_btc_xpub() — BTC Zpub Ceremony
+
+**Method:** `WalletControlAdapter.get_btc_xpub()` in `core/app/execution/adapters/wallet.py`
+
+**What it does:**
+1. Decrypts `wallet-seed.enc` via `SigningAdapter.decrypt_seed()`
+2. Derives BIP-32 root key from BIP-39 seed bytes (`embit.bip32.HDKey.from_seed`)
+3. Derives child at `m/48'/0'/0'/2'` (BIP-48 P2WSH multisig path)
+4. Serialises as Zpub (SLIP-132 version `0x02AA7ED3`) via `embit.networks.NETWORKS["main"]["Zpub"]`
+5. Writes Zpub to `/home/sovereign/governance/wallet-config.json` at `btc.rex_zpub` + `btc.rex_zpub_path`
+6. Logs `wallet_btc_xpub` event to audit ledger
+7. Sends Telegram notification with Zpub and Specter import instructions
+8. Zeros mnemonic from memory (best-effort `del` + `gc.collect()`)
+
+**Tier:** LOW — Zpub is public key material; grants no signing authority.
+**Library:** `embit` (added to `core/app/requirements.txt`)
+
+#### Governance Changes
+- `governance.json` v1.8 → v1.9
+- Added `wallet_get_btc_xpub` to LOW tier `allowed_actions`
+- Added `wallet_btc_xpub: true` to LOW tier capabilities
+
+#### Engine Changes
+- `INTENT_ACTION_MAP`: added `wallet_get_btc_xpub` → `{domain: wallet, operation: read, name: wallet_get_btc_xpub}`
+- `INTENT_TIER_MAP`: added `wallet_get_btc_xpub` → `LOW`
+- `_dispatch` wallet block: added `wallet_get_btc_xpub` → `wallet_control.get_btc_xpub()`
+
+### Validation
+- Build: clean, no errors ✓
+- `GET /health` → `{"status":"ok","soul_checksum":"5f61b008...","soul_guardian":"active"}` ✓
+- `wallet_get_btc_xpub` at LOW tier passes governance ✓ (pending live test on initialized wallet)
+
+### Signed-off Invariants
+- sov-wallet is now a stateless thin proxy — no secrets, no browser, no extension
+- ETH signing is fully in-process via `eth_account`; no external browser automation
+- Seed is decrypted, used, and zeroed within the same call — never persisted in memory longer than needed
+- Zpub is public key material; derivation does not expose the private key or mnemonic
+- `wallet-state.json` no longer contains `metamask_import` field
+- governance.json v1.9: `wallet_get_btc_xpub` at LOW ✓
+- `embit` in requirements.txt ✓
+
