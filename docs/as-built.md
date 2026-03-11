@@ -1863,3 +1863,27 @@ No Chrome, no MetaMask, no CDP. Only endpoints: `/safe/nonce`, `/safe/propose`,
 - governance.json v1.9: `wallet_get_btc_xpub` at LOW ✓
 - `embit` in requirements.txt ✓
 
+
+## get_btc_xpub correction — xpub not Zpub (2026-03-11)
+
+Specter Desktop expects standard `xpub` version bytes (BIP-32, `0x0488B21E`) at the
+derivation path, paired with a key origin descriptor. Updated `get_btc_xpub()`:
+
+- **Output format changed**: `Zpub` (SLIP-132 `0x02AA7ED3`) → `xpub` (BIP-32 `0x0488B21E`)
+- **Fingerprint added**: master key fingerprint derived from `root.my_fingerprint`
+- **Full Specter descriptor**: `[fingerprint/48'/0'/0'/2']xpub...` — this is what Specter Desktop
+  expects when adding a new signer manually
+- **wallet-config.json**: now stores `rex_xpub`, `rex_xpub_path`, `rex_fingerprint`,
+  `rex_descriptor` (was `rex_zpub`, `rex_zpub_path`)
+- **Audit ledger**: `wallet_btc_xpub` event includes all four fields
+- **Telegram message**: displays fingerprint + full descriptor for easy paste into Specter
+
+Pre-push scanner also updated (`execution/adapters/github.py`):
+- Assignment patterns (`API_KEY=`, `TOKEN=`, `PASSWORD=`) now use negative lookahead to
+  exclude placeholder values like `<REVOKED>`, `<REDACTED>` — already-redacted documentation
+  no longer blocked
+- RFC1918 IPs skipped for `.md`, `.txt`, `.rst` files — infrastructure documentation
+  legitimately references internal addresses; `_DOC_EXTENSIONS` set controls this exemption
+
+Containers rebuilt: sovereign-core. Health check: ok.
+
