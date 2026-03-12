@@ -2078,3 +2078,116 @@ Three gaps identified in the skill lifecycle audit were fixed. No changes to the
 - Health: ok, soul_guardian: active ✓
 - Startup log: "Qdrant: skill install sequence procedural entry seeded" ✓
 - Governance signed on startup: 36c022869576604c ✓
+
+
+## Config Change — Skill definition (2026-03-11 11:04 UTC)
+
+**What changed:** New skill 'weather' installed (from ClawhHub: weather) — NOT certified. Active for: research_agent. Governance tier: LOW. Security review decision: review.
+
+- **File:** `SKILL.md` (in `skills/weather/`)
+- **Proposed by:** devops_agent
+- **Reason:** Director confirmed skill installation after review.
+- **Tier:** MID — Director confirmation was received before the write.
+
+_Full technical detail (checksums, audit hash) is in the security ledger._
+## Stage 1 — OpenClaw Adapter Fix + Path 1 Skills (2026-03-12)
+
+**Architectural direction**: Four-stage slow march toward full OpenClaw skill emulator.
+Stage 1: fix adapters using community skills as reference; wrap as Path 1 (prompt/knowledge) skills.
+
+### Reference Implementation
+- `openclaw/skills/keithvassallomt/openclaw-nextcloud/SKILL.md` — WebDAV + CalDAV + Contacts patterns
+- `openclaw/skills/gzlicanyi/imap-smtp-email/SKILL.md` — IMAP + SMTP patterns
+
+### Files Changed
+- `core/app/adapters/webdav.py` — raise_for_status() removed; http_calls_made added everywhere; search() method added
+- `core/app/adapters/caldav.py` — list_events(), update_event(), complete_task() added; RFC 5545 escaping; discovery fallback improved
+- `core/app/adapters/imap.py` — UID commands throughout (was mixing sequence numbers + UIDs); _connect() helper; fetch_message(), mark_read(), mark_unread(), list_folders() added
+- `core/app/adapters/smtp.py` — full try/except wrapper; CC/BCC/HTML; port 465 SSL + port 587 STARTTLS auto-detect; structured SMTP error codes returned
+- `core/app/execution/engine.py` — new intents: search_files (LOW), list_events (LOW), complete_task (MID), fetch_message (LOW), mark_read (LOW), mark_unread (LOW), list_folders (LOW); SMTP send wired for cc/bcc/html
+
+### Skills Deployed to RAID
+| Skill | Path | Specialists | Tier |
+|---|---|---|---|
+| sovereign-webdav | /home/sovereign/skills/sovereign-webdav/SKILL.md | business_agent | LOW |
+| sovereign-caldav | /home/sovereign/skills/sovereign-caldav/SKILL.md | business_agent | LOW |
+| sovereign-imap | /home/sovereign/skills/sovereign-imap/SKILL.md | business_agent | LOW |
+| sovereign-smtp | /home/sovereign/skills/sovereign-smtp/SKILL.md | business_agent | MID |
+
+### Validation
+- Build: clean (`docker compose build sovereign-core`)
+- Health: `{"status":"ok","soul_checksum":"5f61b00852b0...","soul_guardian":"active"}`
+- SkillLoader startup scan: all 4 skills load cleanly for business_agent (checksum verified)
+
+### Key Bugs Fixed
+1. `raise_for_status()` in WebDAV read/write/delete/mkdir — HTTP status invariant violation
+2. IMAP sequence numbers in fetch_unread — message stability bug under concurrent access
+3. SMTP no try/except — exceptions propagated to callers as unhandled, not structured errors
+
+### Model B Flagged Decisions
+- Each adapter method is a natural candidate for a typed `operations:` DSL entry (noted in each SKILL.md body)
+- CalDAV REPORT for list_events requires a different HTTP method than PROPFIND — Model B DSL needs a `method` field (not just `adapter` + `operation`)
+- SMTP port selection (465 vs 587) is runtime config — DSL needs to express this as a param, not hardcode
+
+### Stage 2 Preview
+Nanobot sidecar on ai_net — dumb capability node, no channels, no direct secrets.
+Rex dispatches via NanobotAdapter; governed like any adapter.
+
+---
+
+## Stage 2 — Nanobot Sidecar Architecture (2026-03-12)
+
+### Soul Document Update — Section 12: Division of Sovereignty
+Added section 12 to `/home/sovereign/personas/sovereign-soul.md` capturing the architectural principle:
+Rex's sovereign core has exactly four responsibilities — cognition, security, governance, and delegation.
+It does not execute protocols. It does not implement integrations. Everything else is delegated.
+Modification logged. Soul checksum will be recomputed on next sovereign-core restart.
+
+---
+
+## Stage 2 — Nanobot Sidecar Architecture — Full Deployment (2026-03-12)
+
+### Principle Established
+Section 12 "Division of Sovereignty" added to `/home/sovereign/personas/sovereign-soul.md`:
+Rex's sovereign core has exactly four responsibilities — cognition, security, governance, and delegation.
+It does not execute protocols. It does not implement integrations. Everything else is delegated.
+
+### Files Created / Modified
+| File | Change |
+|---|---|
+| `/home/sovereign/personas/sovereign-soul.md` | Section 12 "Division of Sovereignty" added |
+| `/home/sovereign/governance/governance.json` | v1.13 — `nanobots` block + nanobot intents in `intent_tiers` |
+| `/docker/sovereign/nanobot-01/Dockerfile` | python:3.12-slim + git clone HKUDS/nanobot + FastAPI bridge |
+| `/docker/sovereign/nanobot-01/server.py` | FastAPI bridge on port 8080 — Rex's dispatch format → nanobot CLI |
+| `/docker/sovereign/nanobot-01/workspace/.nanobot/config.json` | ollama provider, llama3.1 model, shell+filesystem enabled, web disabled |
+| `/docker/sovereign/core/app/adapters/nanobot.py` | NanobotAdapter — POST /run, 30s timeout, audit ledger, secret strip |
+| `/docker/sovereign/core/app/execution/engine.py` | nanobot domain added — nanobot_run (MID), nanobot_health (LOW) |
+| `/docker/sovereign/compose.yml` | nanobot-01 service — ai_net only, 3 volumes, no docker.sock, no privileged |
+
+### Validation Results
+1. **Health**: nanobot-01 healthy (v0.1.4.post4, config exists, skills readable)
+2. **Ollama**: reachable on ai_net — llama3.1:8b-instruct-q4_K_M, mistral, nomic-embed-text visible
+3. **Skills**: /skills mount readable — 8 skills including all 4 Stage 1 skills
+4. **Isolation**: business_net BLOCKED — nextcloud unreachable from nanobot-01
+5. **Test task**: `{skill: "session-wrap-up", action: "summarise", params: {test: true}}` → `{"action": "container restart", "outcome": "revealed a recurring issue"}` ✓
+
+### Soul Guardian
+- Checksums updated post-modification; restart confirmed clean: "all protected files verified clean"
+- Soul backup updated at `/home/sovereign/governance/soul-backup/Sovereign-soul.md`
+
+### Governance
+- `nanobots.nanobot-01.tier_minimum: MID` — shell access requires human confirmation
+- `nanobots.nanobot-01.can_contact_director: false`
+- `nanobots.nanobot-01.can_write_sovereign_memory: false`
+- `nanobots.nanobot-01.can_modify_governance: false`
+- Intent tiers: `nanobot_run: MID`, `nanobot_health: LOW`
+
+### Architecture Notes
+- nanobot CLI: `nanobot agent --message <prompt> --config --workspace --no-markdown --no-logs`
+- llama3.1:8b required (mistral doesn't support function calling/tools)
+- Config schema: strict — only {agents, channels, providers, gateway, tools} allowed (no extra keys)
+- NANOBOT_01_URL env var overrides default http://nanobot-01:8080 (for testing/migration)
+- Credential safety: NanobotAdapter strips keys matching password|secret|token|key|apikey|credential|auth|passwd before dispatch
+
+### Signed Off
+Stage 2 complete. Nanobot sidecar operational. Rex delegates; nanobots execute.

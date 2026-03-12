@@ -1,0 +1,45 @@
+{
+  "providers": {
+    "ollama": {
+      "apiBase": "http://ollama:11434"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "ollama",
+      "model": "llama3.1:8b-instruct-q4_K_M",
+      "maxTokens": 4096,
+      "temperature": 0.2,
+      "maxToolIterations": 10,
+      "workspace": "/workspace",
+      "systemPrompt": "You are a nanobot execution agent running inside the Sovereign AI system. You receive delegated tasks from Sovereign Core (Rex). You execute them using available tools and return structured JSON results. You have no knowledge of secrets, credentials, or governance. You do not communicate with the Director. You do not write to sovereign memory. You execute tasks. You return results. That is all."
+    }
+  },
+  "tools": {
+    "exec": {
+      "enabled": true,
+      "timeout": 25,
+      "restrictToWorkspace": true,
+      "pathAppend": "/usr/local/bin:/usr/bin:/bin"
+    },
+    "filesystem": {
+      "enabled": true,
+      "restrictToWorkspace": false,
+      "allowedPaths": ["/workspace", "/memory", "/skills"]
+    },
+    "webSearch": {
+      "enabled": false
+    },
+    "browser": {
+      "enabled": false
+    },
+    "fetch": {
+      "enabled": false
+    }
+  },
+  "channels": {},
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 18790
+  }
+}

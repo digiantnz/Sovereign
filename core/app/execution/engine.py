@@ -7,6 +7,7 @@ from adapters.webdav import WebDAVAdapter
 from adapters.caldav import CalDAVAdapter
 from adapters.imap import IMAPAdapter
 from adapters.smtp import SMTPAdapter
+from adapters.nanobot import NanobotAdapter
 from execution.adapters.github import GitHubAdapter
 from execution.adapters.browser import BrowserAdapter
 from execution.adapters.qdrant import (
@@ -28,6 +29,7 @@ _DOMAIN_SOURCE = {
     "memory":     "qdrant_memory",
     "wallet":     "wallet_live",
     "scheduler":  "scheduler_live",
+    "nanobot":    "nanobot_live",
 }
 
 # Maps CEO delegation intent → execution action dict
@@ -72,6 +74,9 @@ INTENT_ACTION_MAP = {
     "skill_load":    {"domain": "skills", "operation": "load"},
     "skill_audit":   {"domain": "skills", "operation": "audit"},
     "skill_install": {"domain": "skills", "operation": "install"},  # composite: search→review→load
+    # Nanobot intents — delegated execution sidecar (MID tier minimum)
+    "nanobot_run":    {"domain": "nanobot", "operation": "run",    "name": "nanobot_run"},
+    "nanobot_health": {"domain": "nanobot", "operation": "health", "name": "nanobot_health"},
     # System examination intents — devops_agent scope (all LOW, all read-only via broker)
     "inspect_container":  {"domain": "docker", "operation": "read", "name": "inspect_container"},
     "get_compose":        {"domain": "docker", "operation": "read", "name": "get_compose"},
@@ -80,6 +85,15 @@ INTENT_ACTION_MAP = {
     "list_processes":     {"domain": "docker", "operation": "read", "name": "list_processes"},
     # WebDAV navigate — returns items with full paths (superset of list_files)
     "navigate":      {"domain": "webdav", "operation": "read",    "name": "file_navigate"},
+    "search_files":  {"domain": "webdav", "operation": "search",  "name": "file_search"},
+    # CalDAV extended
+    "list_events":   {"domain": "caldav", "operation": "read",    "name": "calendar_list_events"},
+    "complete_task": {"domain": "caldav", "operation": "write",   "name": "task_complete"},
+    # Mail extended
+    "fetch_message": {"domain": "mail",   "operation": "fetch",   "name": "mail_fetch_one"},
+    "mark_read":     {"domain": "mail",   "operation": "flag",    "name": "mail_mark_read"},
+    "mark_unread":   {"domain": "mail",   "operation": "flag",    "name": "mail_mark_unread"},
+    "list_folders":  {"domain": "mail",   "operation": "read",    "name": "mail_list_folders"},
     # Scheduler intents — devops_agent scope
     "schedule_task": {"domain": "scheduler", "operation": "schedule", "name": "schedule_task"},
     "list_tasks":    {"domain": "scheduler", "operation": "list",     "name": "list_tasks"},
@@ -99,10 +113,14 @@ INTENT_TIER_MAP = {
     "inspect_container": "LOW", "get_compose": "LOW", "read_host_file": "LOW",
     "get_hardware": "LOW", "list_processes": "LOW",
     "list_containers": "LOW", "get_logs": "LOW", "get_stats": "LOW",
-    "list_files": "LOW", "navigate": "LOW", "read_file": "LOW", "fetch_email": "LOW", "search_email": "LOW", "move_email": "MID",
-    "list_calendars": "LOW", "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
+    "list_files": "LOW", "navigate": "LOW", "read_file": "LOW", "search_files": "LOW",
+    "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
+    "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW",
+    "move_email": "MID",
+    "list_calendars": "LOW", "list_events": "LOW",
+    "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
     "restart_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
-    "create_task": "MID", "create_folder": "MID",
+    "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
     "delete_file": "HIGH", "delete_email": "HIGH", "delete_task": "HIGH",
     "remember_fact": "LOW",
     # NOTE: skill_* tiers are governed by governance.json intent_tiers — not hardcoded here
@@ -118,6 +136,9 @@ INTENT_TIER_MAP = {
     "list_tasks":    "LOW",
     "pause_task":    "MID",
     "cancel_task":   "MID",
+    # Nanobot tiers — nanobot_run is MID (shell access), nanobot_health is LOW (read-only check)
+    "nanobot_run":    "MID",
+    "nanobot_health": "LOW",
     # GitHub — tiers enforced per governance policy
     "github_read":          "LOW",   # monitoring, releases, pending updates
     "github_push_doc":      "MID",   # standard docs and as-built updates
@@ -502,6 +523,7 @@ class ExecutionEngine:
         self.caldav = CalDAVAdapter()
         self.github = GitHubAdapter()
         self.browser = BrowserAdapter()
+        self.nanobot = NanobotAdapter(ledger=ledger)
         from execution.adapters.wallet import WalletControlAdapter
         self.wallet_control = WalletControlAdapter(ledger=ledger)
         # Skill lifecycle manager — instantiated lazily to avoid circular imports
@@ -1138,6 +1160,13 @@ class ExecutionEngine:
                 return await self.webdav.read(path)
             if name == "folder_create":
                 return await self.webdav.mkdir(path)
+            if name == "file_search":
+                sp = specialist or {}
+                query = sp.get("query") or action.get("query") or prompt or ""
+                search_path = sp.get("path") or action.get("path", "/")
+                if not query:
+                    return {"error": "search_files requires a query term"}
+                return await self.webdav.search(query, search_path)
             if name == "file_write":
                 sp = specialist or {}
                 content = (
@@ -1202,6 +1231,19 @@ class ExecutionEngine:
                     description=task_description,
                     status=task_status,
                 )
+            if name == "calendar_list_events":
+                sp = specialist or {}
+                evt_calendar  = sp.get("calendar") or action.get("calendar", "personal")
+                evt_from_date = sp.get("from_date") or action.get("from_date", "")
+                evt_to_date   = sp.get("to_date")   or action.get("to_date",   "")
+                return await self.caldav.list_events(evt_calendar, evt_from_date, evt_to_date)
+            if name == "task_complete":
+                sp = specialist or {}
+                comp_calendar = sp.get("calendar") or action.get("calendar", "tasks")
+                comp_uid      = sp.get("uid")      or action.get("uid", "")
+                if not comp_uid:
+                    return {"error": "complete_task requires a UID — please specify which task"}
+                return await self.caldav.complete_task(comp_calendar, comp_uid)
             if name in ("task_delete", "calendar_delete"):
                 sp = specialist or {}
                 del_calendar = sp.get("calendar") or action.get("calendar", "personal")
@@ -1217,15 +1259,29 @@ class ExecutionEngine:
             account = sp.get("account") or action.get("account", "personal")
             op = action.get("operation")
             if op == "read":
-                return await IMAPAdapter(account=account).fetch_unread()
+                if name == "mail_list_folders":
+                    return await IMAPAdapter(account=account).list_folders()
+                count = sp.get("count") or action.get("count", 10)
+                return await IMAPAdapter(account=account).fetch_unread(max_messages=int(count))
+            if op == "fetch":
+                uid = sp.get("uid") or action.get("uid", "")
+                if not uid:
+                    return {"error": "fetch_message requires a message UID"}
+                return await IMAPAdapter(account=account).fetch_message(uid)
             if op == "search":
-                # criteria come from the specialist output or action dict
-                criteria = (specialist or {}).get("criteria") or action.get("criteria") or {}
-                # Also accept flat fields passed directly on the action
+                criteria = sp.get("criteria") or action.get("criteria") or {}
                 for key in ("subject", "from_addr", "since", "body"):
                     if action.get(key) and key not in criteria:
                         criteria[key] = action[key]
                 return await IMAPAdapter(account=account).search(criteria)
+            if op == "flag":
+                uid = sp.get("uid") or action.get("uid", "")
+                if not uid:
+                    return {"error": f"{name} requires a message UID"}
+                if name == "mail_mark_read":
+                    return await IMAPAdapter(account=account).mark_read(uid)
+                if name == "mail_mark_unread":
+                    return await IMAPAdapter(account=account).mark_unread(uid)
             if op == "move":
                 uid = sp.get("uid") or action.get("uid", "")
                 dest = sp.get("destination") or action.get("destination", "Archive")
@@ -1242,6 +1298,9 @@ class ExecutionEngine:
                     to=action.get("to", ""),
                     subject=action.get("subject", delegation.get("intent", "") if delegation else ""),
                     body=draft or action.get("body", ""),
+                    cc=s.get("cc", ""),
+                    bcc=s.get("bcc", ""),
+                    html=s.get("html", ""),
                 )
 
         if domain == "ollama":
@@ -1695,6 +1754,36 @@ class ExecutionEngine:
                 return await self.task_scheduler.store_task(parsed, human_confirmed=confirmed)
 
             return {"error": f"Unknown scheduler action: {name}"}
+
+        if domain == "nanobot":
+            # Delegated execution — MID tier enforced upstream (governance.json intent_tiers)
+            # No secrets in params — specialist may not pass credentials to nanobot
+            if name == "nanobot_health":
+                node = (specialist or {}).get("node") or "nanobot-01"
+                return await self.nanobot.health(node=node)
+
+            if name == "nanobot_run":
+                nb_skill   = (specialist or {}).get("skill")   or (delegation or {}).get("target", "")
+                nb_action  = (specialist or {}).get("action")  or ""
+                nb_params  = (specialist or {}).get("params")  or {}
+                nb_context = (specialist or {}).get("context") or {}
+                nb_node    = (specialist or {}).get("node")    or "nanobot-01"
+                if not nb_skill:
+                    return {"status": "error", "error": "nanobot_run requires a skill name"}
+                # Safety: strip any key that looks like a credential from params
+                _safe_params = {k: v for k, v in nb_params.items()
+                                if not any(s in k.lower() for s in
+                                           ("password", "secret", "token", "key", "apikey",
+                                            "credential", "auth", "passwd"))}
+                return await self.nanobot.run(
+                    skill=nb_skill,
+                    action=nb_action,
+                    params=_safe_params,
+                    context=nb_context,
+                    node=nb_node,
+                )
+
+            return {"error": f"Unknown nanobot action: {name}"}
 
         return {"error": f"Unknown domain: {domain}"}
 

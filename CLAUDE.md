@@ -166,6 +166,9 @@ memory/
 | W1 | **BUILT — pending first boot** | Sovereign Wallet Phase 1: sov-wallet container, BIP-39 keygen, HKDF+AES-256-GCM seed encryption, GPG Director backup, signed Telegram notification, /verify anti-spoofing |
 | W2 | **BUILT** | Sovereign Wallet Phase 2: WalletControlAdapter (eth_account direct signing, no MetaMask/Playwright), sign_message (MID), propose_safe_transaction (HIGH, EIP-712 SafeTx), get_pending_proposals, get_btc_xpub (LOW), Safe API proxy via sov-wallet |
 | 7 | **COMPLETE** | Generalised task scheduler: NL intent parser, Qdrant-backed task storage (PROSPECTIVE+PROCEDURAL+EPISODIC), 60s background executor, cron/interval/one_time schedules, capability checking, conditional notification, schedule_task/list_tasks/pause_task/cancel_task intents |
+| OC-S1 | **COMPLETE** | OpenClaw March Stage 1: WebDAV/CalDAV/IMAP/SMTP adapters rewritten using community skills as reference; four Path 1 SKILL.md prompt wrappers deployed to RAID; new intents wired (search_files, list_events, complete_task, fetch_message, mark_read, mark_unread, list_folders) |
+| OC-S2 | **COMPLETE** | OpenClaw March Stage 2: nanobot-01 sidecar live on ai_net (port 8080, HKUDS/nanobot v0.1.4); FastAPI bridge + NanobotAdapter (MID minimum, credential stripping, audit ledger); soul section 12 "Division of Sovereignty" recorded; governance.json v1.13 nanobots block |
+| OC-S3 | **NEXT** | OpenClaw March Stage 3: Model B DSL — typed `operations:` frontmatter in SKILL.md, adapter/method/params schema, sovereign-core DSL interpreter, eliminate per-intent dispatch boilerplate |
 
 ### Phase 0 Validated Capabilities
 - `docker ps`, `docker logs`, `docker stats` → observer status (read-only)

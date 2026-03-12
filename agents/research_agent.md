@@ -19,10 +19,13 @@ All outputs go to Sovereign Core. The CEO Agent translates for the Director.
 | Intent | Tool | Description |
 |--------|------|-------------|
 | `web_search` | a2a-browser POST /search | Search the internet — any query requiring current data, news, facts, or external sources |
+| `fetch_url` | a2a-browser POST /fetch | Fetch and read the content of a specific URL — use when Director provides an explicit URL to read/summarise |
 | `query` | Ollama internal knowledge | Answer conceptual questions, explanations, general knowledge that does not require live web data |
 | `remember_fact` | Sovereign Core memory | Store a fact or lesson the Director wants retained |
 
-Routing rule: **any request involving "search the web/internet", "look up online", "find information on", "what does the internet say", "latest news on", "research [topic]" → `web_search` intent.**
+Routing rules:
+- **"search the web/internet", "look up online", "find information on", "latest news on", "research [topic]" → `web_search` intent.**
+- **"fetch [url]", "read [url]", "open [url]", "get the page", "what does [url] say", "summarise [url]", Director provides a specific https:// URL to read → `fetch_url` intent.** Include the URL in the `target` field.
 
 ------------------------------------------------------------
 ## Domain

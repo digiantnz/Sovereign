@@ -144,25 +144,25 @@
     }
   },
   "security": {
-    "advisory_feed_url": "<ADVISORY_FEED_URL>",
-    "releases_url": "<RELEASES_URL>",
-    "pending_dir": "<RAID_PATH>",
-    "pattern_dir": "<RAID_PATH>",
+    "advisory_feed_url": "https://clawsec.prompt.security/advisories/feed.json",
+    "releases_url": "https://api.github.com/repos/prompt-security/clawsec/releases",
+    "pending_dir": "/home/sovereign/security/pending",
+    "pattern_dir": "/home/sovereign/security",
     "promotion_requires": "director-review",
-    "ledger_path": "<RAID_PATH>",
+    "ledger_path": "/home/sovereign/audit/security-ledger.jsonl",
     "soul_guardian_protected_files": [
-      "<RAID_PATH>",
-      "<RAID_PATH>",
-      "<RAID_PATH>",
-      "<RAID_PATH>",
-      "<RAID_PATH>",
-      "<RAID_PATH>",
-      "<RAID_PATH>",
-      "<RAID_PATH>"
+      "/home/sovereign/personas/sovereign-soul.md",
+      "/home/sovereign/governance/governance.json",
+      "/home/sovereign/personas/orchestrator.md",
+      "/home/sovereign/security/injection_patterns.yaml",
+      "/home/sovereign/security/sensitive_data_patterns.yaml",
+      "/home/sovereign/security/policy_rules.yaml",
+      "/home/sovereign/security/destructive_commands.yaml",
+      "/home/sovereign/security/exfiltration_patterns.yaml"
     ],
     "soul_md": {
-      "path": "<RAID_PATH>",
-      "backup": "<RAID_PATH>",
+      "path": "/home/sovereign/personas/sovereign-soul.md",
+      "backup": "/home/sovereign/governance/soul-backup/Sovereign-soul.md",
       "load_order": "first",
       "auto_restore": true,
       "modification_requires": "director_double_confirmation",
@@ -204,17 +204,35 @@
     "note": "Protected path pushes require HIGH tier + double confirmation + explicit Director acknowledgement"
   },
   "intent_tiers": {
-    "skill_search": "LOW",
-    "skill_review": "LOW",
-    "skill_audit": "LOW",
-    "skill_load": "MID",
-    "skill_unload": "MID",
-    "skill_install": "MID"
+    "skill_search":   "LOW",
+    "skill_review":   "LOW",
+    "skill_audit":    "LOW",
+    "skill_load":     "MID",
+    "skill_unload":   "MID",
+    "skill_install":  "MID",
+    "nanobot_run":    "MID",
+    "nanobot_health": "LOW"
+  },
+  "nanobots": {
+    "nanobot-01": {
+      "tier_minimum": "MID",
+      "shell_enabled": true,
+      "web_enabled": false,
+      "can_contact_director": false,
+      "can_write_sovereign_memory": false,
+      "can_modify_governance": false,
+      "endpoint": "http://nanobot-01:8080",
+      "skills_mount": "/skills",
+      "memory_mount": "/memory",
+      "workspace_mount": "/workspace",
+      "network": "ai_net",
+      "note": "Delegated execution sidecar. Shell+filesystem enabled. No internet. No secrets. No Director access. Governed by Rex."
+    }
   },
   "meta": {
-    "version": "1.12",
-    "description": "Sovereign governance policy \u2014 Phase 0\u20134 + typed memory + weighted retrieval + prospective briefing + browser_fetch + VTODO task support + BTC Zpub export + broker examination API + generalised task scheduler + skills domain governance",
-    "raid_path": "<RAID_PATH>",
+    "version": "1.13",
+    "description": "Sovereign governance policy \u2014 Phase 0\u20134 + typed memory + weighted retrieval + prospective briefing + browser_fetch + VTODO task support + BTC Zpub export + broker examination API + generalised task scheduler + skills domain governance + nanobot sidecar (nanobot-01, MID tier)",
+    "raid_path": "/home/sovereign/governance/governance.json",
     "reasoning_authority": "sovereign-core",
     "director_interface": "translator",
     "specialists": [
@@ -296,7 +314,7 @@
       "audit",
       "episodic"
     ],
-    "audit_path": "<RAID_PATH>",
+    "audit_path": "/home/sovereign/audit/memory-promotions.jsonl",
     "auto_promote_on_shutdown": true,
     "procedural_requires_human_confirmation": true
   }
