@@ -14,6 +14,7 @@ Model B note: operations candidates for future DSL frontmatter:
 
 import imaplib
 import email
+import email.message
 import os
 import re
 import asyncio
@@ -141,6 +142,72 @@ class IMAPAdapter:
         return None
 
     # ── Sync implementations (run in executor) ────────────────────────────────
+
+    def _list_inbox_sync(self, max_messages: int = 50) -> dict:
+        """List inbox messages with UIDs using ALL search + header-only fetch.
+
+        Uses mail.uid('SEARCH', None, 'ALL') so every returned ID is a stable
+        UID, then mail.uid('FETCH', uid, '(RFC822.HEADER)') for lightweight
+        header retrieval. Returns {uid, subject, from, date} for each message.
+
+        This is the correct method to call before move_message — the specialist
+        must have a real UID before calling move; this provides it.
+        """
+        mail, err = self._connect()
+        if err:
+            return err
+        try:
+            select_typ, select_data = mail.select("INBOX")
+            if select_typ != "OK":
+                return {
+                    "status": "error", "step": "select_inbox",
+                    "account": self.account,
+                    "imap_response": select_typ,
+                    "response_data": str(select_data),
+                }
+
+            search_typ, search_data = mail.uid("SEARCH", None, "ALL")
+            if search_typ != "OK":
+                return {
+                    "status": "error", "step": "uid_search_all",
+                    "account": self.account,
+                    "imap_response": search_typ,
+                    "response_data": str(search_data),
+                }
+
+            uid_list = search_data[0].split() if search_data and search_data[0] else []
+            uid_list = uid_list[-max_messages:]  # most recent N
+
+            messages = []
+            for uid_bytes in uid_list:
+                uid_str = uid_bytes.decode() if isinstance(uid_bytes, bytes) else str(uid_bytes)
+                fetch_typ, msg_data = mail.uid("FETCH", uid_str, "(RFC822.HEADER)")
+                if fetch_typ != "OK" or not msg_data or msg_data[0] is None:
+                    messages.append({"uid": uid_str, "error": f"FETCH returned {fetch_typ}"})
+                    continue
+                raw = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
+                if not isinstance(raw, bytes):
+                    messages.append({"uid": uid_str, "error": "unexpected fetch payload type"})
+                    continue
+                msg = email.message_from_bytes(raw)
+                messages.append({
+                    "uid":     uid_str,
+                    "from":    msg.get("From", ""),
+                    "subject": _decode_header_value(msg.get("Subject", "")),
+                    "date":    msg.get("Date", ""),
+                })
+
+            return {
+                "status": "ok",
+                "account": self.account,
+                "count": len(messages),
+                "messages": messages,
+            }
+        finally:
+            try:
+                mail.logout()
+            except Exception:
+                pass
 
     def _fetch_unread_sync(self, max_messages: int = 10) -> dict:
         """Fetch unread messages using UID commands throughout."""
@@ -325,6 +392,13 @@ class IMAPAdapter:
 
     def _move_sync(self, uid: str, destination: str = "Archive") -> dict:
         """Move: LIST to discover Archive → UID COPY → UID STORE \\Deleted → EXPUNGE."""
+        if not uid or not str(uid).strip():
+            return {
+                "status": "error",
+                "step": "uid_guard",
+                "error": "No UID provided for move operation — specialist must fetch inbox first to obtain a real UID",
+            }
+        uid = str(uid).strip()
         mail, err = self._connect()
         if err:
             return err
@@ -478,6 +552,13 @@ class IMAPAdapter:
             "method": method,
             "message": f"Credentials not set for {self.account} account",
         }
+
+    async def list_inbox(self, max_messages: int = 50) -> dict:
+        """List inbox with UIDs — ALL messages, headers only. Use this before move_message."""
+        if not self.host or not self.user:
+            return self._unconfigured("list_inbox")
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: self._list_inbox_sync(max_messages))
 
     async def fetch_unread(self, max_messages: int = 10) -> dict:
         if not self.host or not self.user:

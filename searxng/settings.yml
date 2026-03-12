@@ -1,0 +1,37 @@
+# SearXNG settings — Sovereign internal metasearch instance
+# Secret key is overridden by SEARXNG_SECRET env var at runtime.
+# JSON format is explicitly enabled (disabled by default upstream).
+# All engine selection is left to SearXNG defaults — we only override what we must.
+
+use_default_settings: true
+
+general:
+  debug: false
+  donation_url: false
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "changeme-overridden-by-SEARXNG_SECRET-env-var"
+  limiter: false          # Disable bot-protection rate limiting (internal use only)
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json             # Must be explicit — disabled by default in SearXNG
+
+ui:
+  static_use_hash: true
+  default_locale: en
+  theme_args:
+    simple_style: auto
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+  pool_connections: 50
+  pool_maxsize: 10
+  enable_http2: true

@@ -17,3 +17,13 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+*.bak-*
+runtime/
+tmp/
+
+# A2A browser deploy (separate repo)
+a2a-browser-deploy/
+
+# Nanobot workspace sessions (ephemeral)
+nanobot-01/workspace/sessions/
+nanobot-01/workspace/memory/

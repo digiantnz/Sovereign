@@ -1,0 +1,86 @@
+{
+  "tiers": {
+    "LOW": {
+      "docker_read": true,
+      "file_read": true,
+      "mail_read": true,
+      "webdav_read": true,
+      "caldav_read": true,
+      "ollama_query": true,
+      "requires_confirmation": false,
+      "requires_double_confirmation": false,
+      "allowed_actions": [
+        "docker_ps",
+        "docker_logs",
+        "docker_stats",
+        "file_list",
+        "file_read",
+        "memory_read",
+        "mail_fetch_unread",
+        "calendar_read",
+        "system_status"
+      ]
+    },
+    "MID": {
+      "docker_read": true,
+      "docker_workflows": ["restart", "update"],
+      "file_read": true,
+      "file_write": true,
+      "mail_read": true,
+      "mail_send": true,
+      "webdav_read": true,
+      "webdav_write": true,
+      "caldav_read": true,
+      "calendar_write": true,
+      "ollama_query": true,
+      "requires_confirmation": true,
+      "requires_double_confirmation": false,
+      "allowed_actions": [
+        "docker_restart",
+        "docker_update",
+        "file_write",
+        "file_move",
+        "mail_send",
+        "calendar_create",
+        "memory_write"
+      ]
+    },
+    "HIGH": {
+      "docker_read": true,
+      "docker_workflows": ["rebuild", "prune", "stop", "remove"],
+      "file_read": true,
+      "file_write": true,
+      "file_delete": true,
+      "mail_read": true,
+      "mail_send": true,
+      "webdav_read": true,
+      "webdav_write": true,
+      "webdav_delete": true,
+      "caldav_read": true,
+      "calendar_write": true,
+      "calendar_delete": true,
+      "ollama_query": true,
+      "requires_confirmation": true,
+      "requires_double_confirmation": true,
+      "allowed_actions": [
+        "docker_rebuild",
+        "docker_prune",
+        "docker_stop",
+        "docker_remove",
+        "file_delete",
+        "calendar_delete",
+        "backup_restore",
+        "governance_reload"
+      ]
+    }
+  },
+  "meta": {
+    "version": "1.0",
+    "description": "Sovereign governance policy — Phase 0/1/2",
+    "raid_path": "/home/sovereign/governance/governance.json",
+    "specialists_can_override_tier": false,
+    "specialists_can_write_memory": false,
+    "specialists_can_escalate": false,
+    "ceo_approval_required_for_execution": true
+  }
+}

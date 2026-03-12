@@ -94,6 +94,7 @@ INTENT_ACTION_MAP = {
     "mark_read":     {"domain": "mail",   "operation": "flag",    "name": "mail_mark_read"},
     "mark_unread":   {"domain": "mail",   "operation": "flag",    "name": "mail_mark_unread"},
     "list_folders":  {"domain": "mail",   "operation": "read",    "name": "mail_list_folders"},
+    "list_inbox":    {"domain": "mail",   "operation": "read",    "name": "mail_list_inbox"},
     # Scheduler intents — devops_agent scope
     "schedule_task": {"domain": "scheduler", "operation": "schedule", "name": "schedule_task"},
     "list_tasks":    {"domain": "scheduler", "operation": "list",     "name": "list_tasks"},
@@ -115,7 +116,7 @@ INTENT_TIER_MAP = {
     "list_containers": "LOW", "get_logs": "LOW", "get_stats": "LOW",
     "list_files": "LOW", "navigate": "LOW", "read_file": "LOW", "search_files": "LOW",
     "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
-    "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW",
+    "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
     "move_email": "MID",
     "list_calendars": "LOW", "list_events": "LOW",
     "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
@@ -1088,13 +1089,18 @@ class ExecutionEngine:
         payload = payload or {}
         confirmed = payload.get("confirmed", False)
 
-        # For webdav ops: if path is still default "/", try extracting from specialist target
+        # For webdav ops: if path is still default "/", try extracting from specialist output.
+        # Check specialist.path first (direct file path field), then fall back to target.
+        # IMPORTANT: specialist.path is the primary field for file paths — target is for
+        # container names and is only used as last resort for webdav.
         if domain == "webdav" and path == "/" and specialist:
+            sp_path   = specialist.get("path", "")
             sp_target = specialist.get("target", "")
-            if sp_target and isinstance(sp_target, str):
-                # Extract clean path — strip trailing descriptions like " (on Nextcloud)"
+            source = sp_path or sp_target
+            if source and isinstance(source, str):
                 import re as _re
-                clean = _re.split(r"\s+\(", sp_target)[0].strip()
+                # Strip trailing descriptions like " (on Nextcloud)" or " (file)"
+                clean = _re.split(r"\s+[\(\[]", source)[0].strip()
                 if clean and clean != "/":
                     path = clean if clean.startswith("/") else f"/{clean}"
 
@@ -1261,6 +1267,9 @@ class ExecutionEngine:
             if op == "read":
                 if name == "mail_list_folders":
                     return await IMAPAdapter(account=account).list_folders()
+                if name == "mail_list_inbox":
+                    count = sp.get("count") or action.get("count", 50)
+                    return await IMAPAdapter(account=account).list_inbox(max_messages=int(count))
                 count = sp.get("count") or action.get("count", 10)
                 return await IMAPAdapter(account=account).fetch_unread(max_messages=int(count))
             if op == "fetch":
