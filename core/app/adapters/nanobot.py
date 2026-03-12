@@ -43,7 +43,7 @@ _SKILLS_DIR = os.environ.get("SKILLS_DIR", "/home/sovereign/skills")
 _dsl_cache: dict[str, tuple[float, dict | None]] = {}
 
 # Tools handled natively by this adapter (sovereign-core has credentials/access)
-_NATIVE_TOOLS = {"imap", "webdav", "caldav", "broker_exec"}
+_NATIVE_TOOLS = {"imap", "webdav", "caldav", "broker_exec", "browser"}
 
 # Tools forwarded to nanobot-01 (handled by nanobot-01's own DSL)
 _REMOTE_TOOLS = {"filesystem", "exec"}
@@ -160,7 +160,7 @@ def _validate_dsl_params(op_spec: dict, params: dict) -> tuple[dict, list[str]]:
 async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: dict | None = None) -> dict:
     """Dispatch a DSL operation using local adapter classes.
 
-    Called for tool: imap | webdav | caldav | broker_exec.
+    Called for tool: imap | webdav | caldav | broker_exec | browser.
     Returns structured result dict. Never raises.
     """
     try:
@@ -188,6 +188,11 @@ async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: di
             # operation keys like "uname" also work without an explicit action field.
             command_name = (op_spec or {}).get("action", action)
             return await broker.exec_command(command_name, params)
+
+        elif tool == "browser":
+            from adapters.browser import BrowserAdapter
+            browser = BrowserAdapter()
+            return await _call_browser(browser, action, params)
 
         else:
             return {"status": "error", "error": f"_dispatch_dsl_native: unsupported tool {tool!r}"}
@@ -292,6 +297,23 @@ async def _call_caldav(adapter, action: str, params: dict) -> dict:
         )
     else:
         return {"status": "error", "error": f"caldav: unknown action {action!r}"}
+
+
+async def _call_browser(adapter, action: str, params: dict) -> dict:
+    """Route a browser DSL action to the BrowserAdapter."""
+    if action == "search":
+        return await adapter.search(
+            query=params["query"],
+            locale=params.get("locale", "en-NZ"),
+            return_format=params.get("return_format", "standard"),
+        )
+    elif action == "fetch":
+        return await adapter.fetch(
+            url=params["url"],
+            extract=params.get("extract", "text"),
+        )
+    else:
+        return {"status": "error", "error": f"browser: unknown action {action!r}"}
 
 
 class NanobotAdapter:

@@ -254,13 +254,46 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     )
     prior_has_system = prior_domain is not None
 
-    # Time-sensitive queries always pass through to the LLM — it knows to use web_search.
-    # "current", "right now", "live", "today" etc. → LLM routes to web_search for live data.
+    # ── Web search — direct to browser, bypass specialist + evaluate passes ──
+    # Explicit web search intent → domain:browser short-circuit (no LLM passes needed).
+    # Time-sensitive variants fall through to CEO so it can pick up live-data context.
+    _web_search_kw = (
+        "search the web", "search the internet", "search online", "look online",
+        "find on the internet", "find online", "look it up online", "look up online",
+        "web search", "google", "search for", "search up",
+        "look it up", "look up", "find out about", "find information",
+        "what do you know about", "find me information", "look for information",
+        "search for information", "find articles", "find news about",
+    )
     _time_signals = (
         "right now", "at the moment", "live", "real-time", "real time",
         "current", "currently", "today", "latest", "what is it at", "what's it at",
         "how much is it", "what's the", "what is the", "how is the",
     )
+    # Explicit web-search phrases always route direct-to-browser, regardless of time signals.
+    # Time signal guard only applies below for implicit live-data queries (no explicit search verb).
+    _explicit_web_kw = (
+        "search the web", "search the internet", "search online", "look online",
+        "find on the internet", "find online", "look it up online", "look up online",
+        "web search for", "google for", "google this", "search for information about",
+        "find me information about", "find information about", "look for information about",
+        "find articles about", "find news about", "find out about",
+    )
+    if any(sig in u for sig in _explicit_web_kw):
+        query = user_input
+        for phrase in sorted(_explicit_web_kw, key=len, reverse=True):
+            if phrase in u:
+                idx = u.index(phrase) + len(phrase)
+                remainder = user_input[idx:].strip().lstrip("for ").strip()
+                if remainder:
+                    query = remainder
+                break
+        return {
+            "delegate_to": "research_agent", "intent": "web_search",
+            "target": query, "tier": "LOW",
+            "reasoning_summary": "Explicit web search phrase — deterministic direct-to-browser",
+        }
+
     if not prior_has_system and any(sig in u for sig in _time_signals):
         return None  # fall through to CEO LLM — likely web_search
 
@@ -1056,8 +1089,11 @@ class ExecutionEngine:
             # path defaults to "/" — will be overridden in _dispatch if specialist provides one
         elif action["domain"] == "mail" and target:
             action["account"] = target
-        elif action["domain"] == "browser" and action.get("operation") == "fetch" and target:
-            action["url"] = target
+        elif action["domain"] == "browser":
+            if action.get("operation") == "fetch" and target:
+                action["url"] = target
+            elif action.get("operation") == "search" and target:
+                action["query"] = target
         return action
 
     # ── Adapter dispatch ─────────────────────────────────────────────────
@@ -1338,7 +1374,9 @@ class ExecutionEngine:
                     }
                 return result
 
-            query = prompt or action.get("query", "")
+            # action["query"] set by _delegation_to_action when quick_classify extracts the query;
+            # prefer it over the full prompt (which may include "search the web for..." prefix).
+            query = action.get("query") or prompt or ""
             if not query:
                 return {"error": "query required for browser search"}
             result = await self.browser.search(
