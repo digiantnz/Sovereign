@@ -2,7 +2,7 @@ const express = require('express');
 const yaml = require('js-yaml');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const { promisify } = require('util');
 const Docker = require('dockerode');
 
@@ -12,6 +12,39 @@ app.use(express.json());
 
 const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 const policy = yaml.load(fs.readFileSync(process.env.BROKER_POLICY, 'utf8'));
+
+// Command execution policy (separate from container trust policy)
+const COMMANDS_POLICY_PATH = process.env.COMMANDS_POLICY || '/policy/commands-policy.yaml';
+const SCRIPTS_DIR = process.env.SCRIPTS_DIR || '/scripts';
+let cmdPolicy = {};
+try {
+  cmdPolicy = yaml.load(fs.readFileSync(COMMANDS_POLICY_PATH, 'utf8'));
+  console.log(`Commands policy loaded: ${Object.keys(cmdPolicy.commands || {}).length} commands`);
+} catch (e) {
+  console.warn(`Commands policy not found at ${COMMANDS_POLICY_PATH}: ${e.message}`);
+}
+
+// Shell metacharacter pattern — any of these in a param value → HTTP 400
+const SHELL_META = /[;&|`$<>(){}\[\]\\'"\n\r\x00-\x08\x0b\x0c\x0e-\x1f]/;
+
+// Tier order for access control
+const TIER_ORDER = { low: 0, medium: 1, high: 2 };
+
+// Run a binary with args — shell: false, fixed timeout, sanitised env
+function spawnRun(binary, args, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    let stdout = '', stderr = '';
+    const proc = spawn(binary, args, {
+      shell: false,
+      timeout: timeoutMs,
+      env: { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' },
+    });
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.on('close', code => resolve({ stdout, stderr, return_code: code ?? -1 }));
+    proc.on('error', err => resolve({ stdout: '', stderr: err.message, return_code: -1 }));
+  });
+}
 
 // Host filesystem is bind-mounted read-only at /hostfs
 const HOSTFS = '/hostfs';
@@ -53,6 +86,141 @@ async function execInContainer(containerName, cmd) {
 }
 
 app.get('/health', (req, res) => res.send('OK'));
+
+// ── POST /exec/:commandName ───────────────────────────────────────────────────
+// Allowlisted CLI command execution. Completely separate from Docker operations.
+// Trust level is enforced per-command from commands-policy.yaml.
+// Shell metacharacters in any param → 400. Command not in allowlist → 403.
+// Disabled commands → 503 (infra change required, not a policy denial).
+app.post('/exec/:commandName', async (req, res) => {
+  const { commandName } = req.params;
+  const cmds = cmdPolicy.commands || {};
+  const cmd = cmds[commandName];
+
+  if (!cmd) {
+    return res.status(403).json({
+      status: 'denied',
+      error: `Command not in allowlist: ${commandName}`,
+      allowlist: Object.keys(cmds),
+    });
+  }
+
+  if (!cmd.enabled) {
+    return res.status(503).json({
+      status: 'disabled',
+      command: commandName,
+      reason: cmd.description,
+    });
+  }
+
+  // Trust level check
+  const requestedTrust = req.headers['x-trust-level'] || 'low';
+  const cmdTier = cmd.tier || 'low';
+  if ((TIER_ORDER[requestedTrust] ?? -1) < (TIER_ORDER[cmdTier] ?? 0)) {
+    return res.status(403).json({
+      status: 'denied',
+      error: `Command ${commandName} requires trust level: ${cmdTier}`,
+    });
+  }
+
+  const params = req.body?.params || {};
+  const paramErrors = [];
+  const validated = {};
+
+  // Validate and coerce params against schema
+  for (const [pname, pspec] of Object.entries(cmd.params || {})) {
+    const raw = params[pname];
+
+    if (raw === undefined || raw === null) {
+      if (pspec.required) { paramErrors.push(`missing required param: ${pname}`); continue; }
+      if (pspec.default !== undefined) validated[pname] = pspec.default;
+      continue;
+    }
+
+    const strVal = String(raw);
+
+    // Shell metacharacter guard — reject before any further processing
+    if (SHELL_META.test(strVal)) {
+      return res.status(400).json({
+        status: 'rejected',
+        error: `Shell metacharacter detected in param ${pname}`,
+        param: pname,
+      });
+    }
+
+    if (pspec.type === 'integer') {
+      const n = parseInt(strVal, 10);
+      if (isNaN(n)) { paramErrors.push(`${pname}: expected integer, got ${strVal}`); continue; }
+      if (pspec.min !== undefined && n < pspec.min) { paramErrors.push(`${pname}: ${n} below minimum ${pspec.min}`); continue; }
+      if (pspec.max !== undefined && n > pspec.max) { paramErrors.push(`${pname}: ${n} above maximum ${pspec.max}`); continue; }
+      validated[pname] = n;
+    } else {
+      // String — if allowlist key is present (even empty array), value must be in it.
+      // Empty allowlist = nothing approved yet → deny all.
+      if (pspec.allowlist !== undefined && !pspec.allowlist.includes(strVal)) {
+        return res.status(403).json({
+          status: 'denied',
+          error: `Param ${pname}=${JSON.stringify(strVal)} not in allowlist`,
+          allowlist: pspec.allowlist,
+        });
+      }
+      validated[pname] = strVal;
+    }
+  }
+
+  if (paramErrors.length > 0) {
+    return res.status(400).json({ status: 'invalid', errors: paramErrors });
+  }
+
+  // ── Execute ───────────────────────────────────────────────────────────────
+  try {
+    let result;
+
+    if (cmd.binary === '__container_exec__') {
+      // Runs inside a named container via Docker exec API
+      const raw = await execInContainer(cmd.container, [...(cmd.fixed_args || [])]);
+      result = { stdout: raw.replace(/[\x00-\x08\x0e-\x1f]/g, ''), stderr: '', return_code: 0 };
+
+    } else if (cmd.binary === '__script__') {
+      // Approved script from scripts/ directory — name already validated against allowlist
+      const scriptName = validated.name;
+      const scriptPath = path.resolve(SCRIPTS_DIR, scriptName);
+      if (!scriptPath.startsWith(path.resolve(SCRIPTS_DIR) + path.sep)) {
+        return res.status(403).json({ status: 'denied', error: 'Script path traversal blocked' });
+      }
+      if (!fs.existsSync(scriptPath)) {
+        return res.status(404).json({ status: 'not_found', error: `Script not found: ${scriptName}` });
+      }
+      result = await spawnRun(scriptPath, [], 30000);
+
+    } else {
+      // Direct binary with fixed_args + param-derived args
+      // If param spec has a `flag` field, emit [flag, value]; else emit bare value.
+      const args = [...(cmd.fixed_args || [])];
+      for (const [pname, pspec] of Object.entries(cmd.params || {})) {
+        if (validated[pname] === undefined) continue;
+        if (pspec.flag) {
+          args.push(pspec.flag, String(validated[pname]));
+        } else {
+          args.push(String(validated[pname]));
+        }
+      }
+      result = await spawnRun(cmd.binary, args);
+    }
+
+    return res.json({
+      status: 'ok',
+      command: commandName,
+      return_code: result.return_code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    });
+
+  } catch (err) {
+    console.error(`/exec/${commandName} error:`, err.message);
+    return res.status(500).json({ status: 'error', command: commandName, error: err.message });
+  }
+});
 
 app.all('/:methodPath(*)', async (req, res) => {
   const trust = req.headers['x-trust-level'] || policy.trust.default;

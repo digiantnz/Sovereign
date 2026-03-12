@@ -1,0 +1,122 @@
+# Broker CLI command execution allowlist
+# POST /exec/{command_name} — read-only diagnostics only.
+# Destructive/write commands are explicitly out of scope until Director requests.
+#
+# Each entry:
+#   binary:       absolute path to executable in broker container, OR __container_exec__ / __script__
+#   fixed_args:   args always prepended — callers cannot override these
+#   params:       typed parameter schema (string with optional allowlist, integer with min/max)
+#   tier:         low | medium | high — minimum trust level header required
+#   enabled:      true | false — false = 503 with reason, never 403 (command exists but needs infra change)
+#   description:  human-readable purpose and any notes
+
+commands:
+
+  uname:
+    description: "Kernel name, hostname, kernel release, machine architecture"
+    binary: /bin/uname
+    fixed_args: ["-a"]
+    params: {}
+    tier: low
+    enabled: true
+
+  df:
+    description: "Disk free space (human-readable). Shows broker container mounts including /hostfs bind."
+    binary: /bin/df
+    fixed_args: ["-h"]
+    params: {}
+    tier: low
+    enabled: true
+
+  free:
+    description: "RAM and swap usage in megabytes. Reads /proc/meminfo — reflects host kernel values."
+    binary: /usr/bin/free
+    fixed_args: ["-m"]
+    params: {}
+    tier: low
+    enabled: true
+
+  ps:
+    description: "Process list visible to broker container. Not host-wide — use nvidia_smi or system/processes for broader view."
+    binary: /bin/ps
+    fixed_args: ["aux"]
+    params: {}
+    tier: low
+    enabled: true
+
+  nvidia_smi:
+    description: "NVIDIA GPU status. Runs inside ollama container (has GPU device access)."
+    binary: __container_exec__
+    container: ollama
+    fixed_args:
+      - nvidia-smi
+      - --query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu,power.draw
+      - --format=csv,noheader,nounits
+    params: {}
+    tier: low
+    enabled: true
+
+  systemctl_status:
+    description: >
+      Systemd service status. DISABLED: requires pid:host in compose.yml (broker service)
+      and nsenter in Dockerfile (apk add util-linux). Enable by: (1) add pid: host to broker
+      compose service, (2) add RUN apk add util-linux to broker Dockerfile, (3) set enabled: true.
+    binary: /usr/bin/nsenter
+    fixed_args: ["-t", "1", "-m", "--", "/usr/bin/systemctl", "status", "--no-pager", "-l"]
+    params:
+      service:
+        type: string
+        required: true
+        allowlist:
+          - docker
+          - ssh
+          - ufw
+          - fail2ban
+          - nfs-server
+          - cron
+          - unattended-upgrades
+    tier: low
+    enabled: false
+
+  journalctl:
+    description: >
+      Read systemd journal. DISABLED: same requirement as systemctl_status — pid:host + nsenter.
+      params: unit (optional, allowlisted), lines (1-500, default 50).
+    binary: /usr/bin/nsenter
+    fixed_args: ["-t", "1", "-m", "--", "/usr/bin/journalctl", "--no-pager"]
+    params:
+      unit:
+        type: string
+        flag: "-u"
+        required: false
+        allowlist:
+          - docker
+          - ssh
+          - ufw
+          - fail2ban
+          - kernel
+          - cron
+          - syslog
+      lines:
+        type: integer
+        flag: "-n"
+        required: false
+        default: 50
+        min: 1
+        max: 500
+    tier: low
+    enabled: false
+
+  script:
+    description: >
+      Run an approved read-only script from the broker scripts/ directory.
+      Scripts must be present on disk — name allowlist below controls which are callable.
+      Add script name to allowlist only after Director review. No scripts initially.
+    binary: __script__
+    params:
+      name:
+        type: string
+        required: true
+        allowlist: []   # populated as scripts are reviewed and approved
+    tier: medium
+    enabled: true

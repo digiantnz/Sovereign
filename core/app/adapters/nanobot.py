@@ -42,8 +42,8 @@ _SKILLS_DIR = os.environ.get("SKILLS_DIR", "/home/sovereign/skills")
 # mtime-invalidated DSL cache: skill_name -> (mtime_float, operations_dict | None)
 _dsl_cache: dict[str, tuple[float, dict | None]] = {}
 
-# Tools handled natively by this adapter (sovereign-core has credentials)
-_NATIVE_TOOLS = {"imap", "webdav", "caldav"}
+# Tools handled natively by this adapter (sovereign-core has credentials/access)
+_NATIVE_TOOLS = {"imap", "webdav", "caldav", "broker_exec"}
 
 # Tools forwarded to nanobot-01 (handled by nanobot-01's own DSL)
 _REMOTE_TOOLS = {"filesystem", "exec"}
@@ -157,10 +157,10 @@ def _validate_dsl_params(op_spec: dict, params: dict) -> tuple[dict, list[str]]:
     return validated, errors
 
 
-async def _dispatch_dsl_native(tool: str, action: str, params: dict) -> dict:
+async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: dict | None = None) -> dict:
     """Dispatch a DSL operation using local adapter classes.
 
-    Called only for tool: imap | webdav | caldav.
+    Called for tool: imap | webdav | caldav | broker_exec.
     Returns structured result dict. Never raises.
     """
     try:
@@ -179,6 +179,15 @@ async def _dispatch_dsl_native(tool: str, action: str, params: dict) -> dict:
             from adapters.caldav import CalDAVAdapter
             adapter = CalDAVAdapter()
             return await _call_caldav(adapter, action, params)
+
+        elif tool == "broker_exec":
+            from adapters.broker import BrokerAdapter
+            broker = BrokerAdapter()
+            # op_spec['action'] names the command in commands-policy.yaml.
+            # Outer `action` (the DSL operation key) is used as fallback so that
+            # operation keys like "uname" also work without an explicit action field.
+            command_name = (op_spec or {}).get("action", action)
+            return await broker.exec_command(command_name, params)
 
         else:
             return {"status": "error", "error": f"_dispatch_dsl_native: unsupported tool {tool!r}"}
@@ -400,7 +409,7 @@ class NanobotAdapter:
 
             if tool in _NATIVE_TOOLS:
                 # Call adapter classes directly — no HTTP to nanobot-01
-                native_result = await _dispatch_dsl_native(tool, action, validated)
+                native_result = await _dispatch_dsl_native(tool, action, validated, op_spec=op_spec)
                 elapsed = round(time.monotonic() - t0, 2)
                 result = {
                     "status": native_result.get("status", "ok"),

@@ -121,3 +121,32 @@ class BrokerAdapter:
             )
             r.raise_for_status()
             return r.json()
+
+    async def exec_command(self, command_name: str, params: dict | None = None) -> dict:
+        """Run an allowlisted CLI command via POST /exec/{command_name}.
+
+        Returns structured dict with status, return_code, stdout, stderr.
+        HTTP 403 → command not in allowlist or param denied.
+        HTTP 503 → command disabled (infra change required).
+        HTTP 400 → shell metacharacter or param validation failure.
+        Never raises — all errors returned as structured dicts.
+        """
+        params = params or {}
+        # Determine tier from the command name — low by default; scripts need medium
+        trust = "medium" if command_name == "script" else "low"
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.post(
+                    f"{BROKER_URL}/exec/{command_name}",
+                    headers={"X-Trust-Level": trust},
+                    json={"params": params},
+                )
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
+            body["http_status"] = r.status_code
+            return body
+        except httpx.ConnectError:
+            return {"status": "error", "error": "broker connection refused", "command": command_name}
+        except httpx.TimeoutException:
+            return {"status": "error", "error": "broker exec timed out", "command": command_name}
+        except Exception as e:
+            return {"status": "error", "error": f"{type(e).__name__}: {e}", "command": command_name}

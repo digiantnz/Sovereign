@@ -66,9 +66,13 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /home/sovereign/governance/docker-policy.yaml:/policy/docker-policy.yaml:ro
+      - ./broker/commands-policy.yaml:/policy/commands-policy.yaml:ro
+      - ./broker/scripts:/scripts:ro
       - /:/hostfs:ro  # Host filesystem — read-only examination by Rex
     environment:
       - BROKER_POLICY=/policy/docker-policy.yaml
+      - COMMANDS_POLICY=/policy/commands-policy.yaml
+      - SCRIPTS_DIR=/scripts
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8088/health || exit 1"]
       interval: 15s
