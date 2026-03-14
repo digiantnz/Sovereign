@@ -130,10 +130,50 @@ Respond with ONLY this JSON and nothing else:
 
 
 def specialist(agent_persona: str, delegation: dict, user_input: str) -> str:
+    from datetime import date as _date
+    intent = delegation.get("intent", "")
+
+    # Intent-specific schema reminders — the small LLM needs an explicit anchor
+    # when the output schema differs from the default operation/target/content pattern.
+    _schema_hint = ""
+    if intent == "create_event":
+        _schema_hint = f"""
+REQUIRED OUTPUT FIELDS for intent "create_event" (today is {_date.today().isoformat()}):
+  "operation": "create_event"
+  "summary": "<exact event title from the request>"
+  "start": "<ISO 8601 — YYYY-MM-DDTHH:MM:SS — convert all natural-language dates>"
+  "end": "<ISO 8601 — default to start + 1 hour if not specified>"
+  "calendar": "personal"
+  "description": ""
+  "uid": ""
+  "risk": "LOW"
+  "confidence": 0.9
+
+Convert "Monday 16th March at 10AM" → "2026-03-16T10:00:00". Never leave start/end blank."""
+    elif intent == "create_task":
+        _schema_hint = f"""
+REQUIRED OUTPUT FIELDS for intent "create_task" (today is {_date.today().isoformat()}):
+  "operation": "create_task"
+  "summary": "<task title>"
+  "due": "<ISO 8601 or empty>"
+  "calendar": "tasks"
+  "description": ""
+  "risk": "LOW"
+  "confidence": 0.9"""
+    elif intent in ("delete_event", "update_event"):
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this calendar operation:
+  "operation": "<delete_event or update_event>"
+  "uid": "<event UID from prior list_events result>"
+  "calendar": "personal"
+  "risk": "MID"
+  "confidence": 0.9"""
+
     return f"""{agent_persona}
 
 ---
 TASK — SPECIALIST REASONING
+{_schema_hint}
 
 CEO delegation:
 {json.dumps(delegation, indent=2)}

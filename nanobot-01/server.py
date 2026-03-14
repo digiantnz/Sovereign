@@ -23,6 +23,7 @@ import subprocess
 import uuid
 from typing import Any
 
+import httpx
 import yaml
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -70,6 +71,377 @@ class TaskRequest(BaseModel):
     action:  str
     params:  dict[str, Any] = {}
     context: dict[str, Any] = {}
+
+
+class TranslateRequest(BaseModel):
+    content: str          # raw SKILL.md text (any format)
+    name:    str = ""     # hint for skill name if not parseable from content
+
+
+# ---------------------------------------------------------------------------
+# Skill format translation — OpenClaw → Sovereign DSL
+# ---------------------------------------------------------------------------
+
+def _parse_skill_md(content: str) -> tuple[dict, str]:
+    """Split raw skill content into (frontmatter_dict, body). Returns ({}, content) on failure."""
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return {}, content
+    try:
+        fm = yaml.safe_load(parts[1]) or {}
+    except Exception:
+        fm = {}
+    return fm, parts[2].strip()
+
+
+def _detect_skill_category(fm: dict, body: str) -> str:
+    """Infer skill category from frontmatter metadata and body content."""
+    # OpenClaw: metadata.openclaw.requires.env tells us what credentials are needed
+    oc_meta = (fm.get("metadata") or {}).get("openclaw") or {}
+    req_env = (oc_meta.get("requires") or {}).get("env") or []
+    env_str = " ".join(req_env).lower()
+    body_lower = (body or "").lower()
+
+    if any(k in env_str for k in ("imap_host", "smtp_host")):
+        return "imap_smtp"
+    if any(k in env_str for k in ("nextcloud_url", "nextcloud_user")):
+        return "nextcloud"
+
+    # Fallback: check body for strong signals
+    name = (fm.get("name") or "").lower()
+    desc = (fm.get("description") or "").lower()
+    hints = name + " " + desc + " " + body_lower[:500]
+    if "imap" in hints and "smtp" in hints:
+        return "imap_smtp"
+    if "nextcloud" in hints and ("caldav" in hints or "webdav" in hints):
+        return "nextcloud"
+    return "unknown"
+
+
+def _translate_imap_smtp() -> dict:
+    """Generate Sovereign sovereign: block for an IMAP/SMTP community skill.
+
+    Operations route to broker_exec commands (mail_personal.sh / mail_business.sh wrappers).
+    Both personal and business account variants included.
+    """
+    return {
+        "specialists": ["business_agent"],
+        "tier_required": "MID",
+        "adapter_deps": ["broker"],
+        "description": "IMAP email read/search/flag and SMTP send. Personal and business accounts via broker Node.js scripts.",
+        "operations": {
+            "fetch_unread": {
+                "tool": "broker_exec",
+                "action": "imap_personal_check",
+                "tier": "LOW",
+                "params": {
+                    "limit": {"type": "int", "required": False, "default": 10},
+                },
+                "returns": "{messages: [{uid, from, subject, date, body}], count}",
+            },
+            "fetch_unread_business": {
+                "tool": "broker_exec",
+                "action": "imap_business_check",
+                "tier": "LOW",
+                "params": {
+                    "limit": {"type": "int", "required": False, "default": 10},
+                },
+                "returns": "{messages: [{uid, from, subject, date, body}], count}",
+            },
+            "fetch_message": {
+                "tool": "broker_exec",
+                "action": "imap_personal_fetch",
+                "tier": "LOW",
+                "params": {
+                    "uid": {"type": "str", "required": True},
+                },
+                "returns": "{uid, from, subject, date, body}",
+            },
+            "fetch_message_business": {
+                "tool": "broker_exec",
+                "action": "imap_business_fetch",
+                "tier": "LOW",
+                "params": {
+                    "uid": {"type": "str", "required": True},
+                },
+                "returns": "{uid, from, subject, date, body}",
+            },
+            "search": {
+                "tool": "broker_exec",
+                "action": "imap_personal_search",
+                "tier": "LOW",
+                "params": {
+                    "subject":   {"type": "str", "required": False},
+                    "from_addr": {"type": "str", "required": False},
+                    "since":     {"type": "str", "required": False},
+                    "limit":     {"type": "int", "required": False, "default": 20},
+                },
+                "returns": "{messages: [{uid, from, subject, date}], count}",
+            },
+            "search_business": {
+                "tool": "broker_exec",
+                "action": "imap_business_search",
+                "tier": "LOW",
+                "params": {
+                    "subject":   {"type": "str", "required": False},
+                    "from_addr": {"type": "str", "required": False},
+                    "since":     {"type": "str", "required": False},
+                    "limit":     {"type": "int", "required": False, "default": 20},
+                },
+                "returns": "{messages: [{uid, from, subject, date}], count}",
+            },
+            "mark_read": {
+                "tool": "broker_exec",
+                "action": "imap_personal_mark_read",
+                "tier": "LOW",
+                "params": {
+                    "uid": {"type": "str", "required": True},
+                },
+                "returns": "{status}",
+            },
+            "mark_unread": {
+                "tool": "broker_exec",
+                "action": "imap_personal_mark_unread",
+                "tier": "LOW",
+                "params": {
+                    "uid": {"type": "str", "required": True},
+                },
+                "returns": "{status}",
+            },
+            "list_folders": {
+                "tool": "broker_exec",
+                "action": "imap_personal_list_mailboxes",
+                "tier": "LOW",
+                "params": {},
+                "returns": "{folders: [...]}",
+            },
+            "send_email": {
+                "tool": "broker_exec",
+                "action": "smtp_send_personal",
+                "tier": "MID",
+                "params": {
+                    "to":      {"type": "str", "required": True},
+                    "subject": {"type": "str", "required": True},
+                    "body":    {"type": "str", "required": True},
+                    "cc":      {"type": "str", "required": False},
+                    "bcc":     {"type": "str", "required": False},
+                },
+                "returns": "{smtp_code, smtp_response}",
+            },
+            "send_email_business": {
+                "tool": "broker_exec",
+                "action": "smtp_send_business",
+                "tier": "MID",
+                "params": {
+                    "to":      {"type": "str", "required": True},
+                    "subject": {"type": "str", "required": True},
+                    "body":    {"type": "str", "required": True},
+                    "cc":      {"type": "str", "required": False},
+                    "bcc":     {"type": "str", "required": False},
+                },
+                "returns": "{smtp_code, smtp_response}",
+            },
+        },
+    }
+
+
+def _translate_nextcloud() -> dict:
+    """Generate Sovereign sovereign: block for an OpenClaw Nextcloud community skill.
+
+    Operations route to broker_exec nc_* commands (nextcloud_run.sh wrapper).
+    Broker must be on business_net to reach http://nextcloud.
+    """
+    return {
+        "specialists": ["business_agent"],
+        "tier_required": "MID",
+        "adapter_deps": ["broker"],
+        "description": "Nextcloud calendar, tasks, and files via community Node.js scripts. Runs in broker (business_net access).",
+        "operations": {
+            "list_events": {
+                "tool": "broker_exec",
+                "action": "nc_calendar_list",
+                "tier": "LOW",
+                "params": {
+                    "from": {"type": "str", "required": False},
+                    "to":   {"type": "str", "required": False},
+                },
+                "returns": "{status, data: [{uid, calendar, summary, start, end}]}",
+            },
+            "create_event": {
+                "tool": "broker_exec",
+                "action": "nc_calendar_create",
+                "tier": "MID",
+                "params": {
+                    "summary":     {"type": "str", "required": True},
+                    "start":       {"type": "str", "required": True},
+                    "end":         {"type": "str", "required": True},
+                    "description": {"type": "str", "required": False},
+                    "calendar":    {"type": "str", "required": False},
+                },
+                "returns": "{status, data}",
+            },
+            "delete_event": {
+                "tool": "broker_exec",
+                "action": "nc_calendar_delete",
+                "tier": "MID",
+                "params": {
+                    "uid":      {"type": "str", "required": True},
+                    "calendar": {"type": "str", "required": False},
+                },
+                "returns": "{status}",
+            },
+            "list_tasks": {
+                "tool": "broker_exec",
+                "action": "nc_tasks_list",
+                "tier": "LOW",
+                "params": {
+                    "calendar": {"type": "str", "required": False},
+                },
+                "returns": "{status, data: [{uid, summary, status, due}]}",
+            },
+            "create_task": {
+                "tool": "broker_exec",
+                "action": "nc_tasks_create",
+                "tier": "MID",
+                "params": {
+                    "title":       {"type": "str", "required": True},
+                    "due":         {"type": "str", "required": False},
+                    "priority":    {"type": "str", "required": False},
+                    "description": {"type": "str", "required": False},
+                    "calendar":    {"type": "str", "required": False},
+                },
+                "returns": "{status, data}",
+            },
+            "complete_task": {
+                "tool": "broker_exec",
+                "action": "nc_tasks_complete",
+                "tier": "MID",
+                "params": {
+                    "uid":      {"type": "str", "required": True},
+                    "calendar": {"type": "str", "required": False},
+                },
+                "returns": "{status}",
+            },
+            "list_files": {
+                "tool": "broker_exec",
+                "action": "nc_files_list",
+                "tier": "LOW",
+                "params": {
+                    "path": {"type": "str", "required": False, "default": "/"},
+                },
+                "returns": "{status, data: [{name, path, type, size}]}",
+            },
+            "search_files": {
+                "tool": "broker_exec",
+                "action": "nc_files_search",
+                "tier": "LOW",
+                "params": {
+                    "query": {"type": "str", "required": True},
+                },
+                "returns": "{status, data: [{name, path}]}",
+            },
+        },
+    }
+
+
+def _audit_skill_deps(fm: dict, body: str, name: str) -> dict:
+    """Inspect an unknown-category skill and determine what would be needed to emulate it.
+
+    Returns a dict: {can_emulate: bool, reason: str, steps: list[str], missing: list[str]}
+    Used to generate the advisory message when nanobot cannot handle a skill automatically.
+    """
+    oc_meta = (fm.get("metadata") or {}).get("openclaw") or {}
+    req_env  = (oc_meta.get("requires") or {}).get("env") or []
+    req_bins = (oc_meta.get("requires") or {}).get("bins") or []
+    body_lower = body.lower()
+
+    missing = []
+    steps = []
+
+    # Check binary dependencies
+    for b in req_bins:
+        if b not in ("node", "npm", "python3", "sh", "bash"):
+            missing.append(f"binary: {b}")
+            steps.append(f"Install '{b}' in the broker or nanobot container")
+
+    # Check environment variables that don't map to known Sovereign vars
+    known_mappings = {
+        "imap_host", "imap_user", "imap_pass", "smtp_host", "smtp_user", "smtp_pass",
+        "nextcloud_url", "nextcloud_user", "nextcloud_token",
+        "webdav_user", "webdav_pass", "webdav_base",
+    }
+    for env in req_env:
+        if env.lower() not in known_mappings:
+            missing.append(f"env: {env}")
+            steps.append(f"Add '{env}' to broker environment (secrets file + compose env_file)")
+
+    # Check for runtime dependencies mentioned in body
+    if "docker" in body_lower and "docker.sock" in body_lower:
+        missing.append("docker.sock access")
+        steps.append("Broker already has docker.sock — broker_exec __container_exec__ can be used")
+
+    if "npm install" in body_lower or "node_modules" in body_lower:
+        steps.append("Add npm packages from skill's package.json to broker/package.json and rebuild broker")
+
+    if not missing and not steps:
+        # Unknown format but no obvious gaps — might work via LLM path
+        can_emulate = True
+        reason = (
+            f"Skill '{name}' has no known category mapping but has no obvious missing dependencies. "
+            "It will fall through to the nanobot LLM path. "
+            "Results may vary — if it fails, review the skill body and add explicit operations: DSL."
+        )
+    else:
+        can_emulate = False
+        reason = (
+            f"Skill '{name}' cannot be fully emulated without development work. "
+            f"nanobot-01 detected {len(missing)} missing requirement(s) that need Director action."
+        )
+
+    return {
+        "can_emulate": can_emulate,
+        "reason": reason,
+        "steps": steps,
+        "missing": missing,
+    }
+
+
+def _translate_skill_content(fm: dict, body: str, name: str) -> tuple[dict, dict | None]:
+    """Deterministic translation of community skill content to Sovereign DSL format.
+
+    Returns (sovereign_block, advisory | None).
+
+    advisory is set when the skill cannot be fully emulated — it contains:
+      {can_emulate: bool, reason: str, steps: list[str], missing: list[str]}
+    Lifecycle.py surfaces the advisory in the install response so Sovereign can
+    inform the Director of what development work is needed.
+
+    Known categories: imap_smtp, nextcloud → full emulation, no advisory.
+    Unknown category → advisory returned, minimal sovereign block, LLM path fallback.
+    """
+    category = _detect_skill_category(fm, body)
+    logger.info(f"translate: skill={name!r} category={category}")
+
+    if category == "imap_smtp":
+        return _translate_imap_smtp(), None
+
+    elif category == "nextcloud":
+        return _translate_nextcloud(), None
+
+    else:
+        advisory = _audit_skill_deps(fm, body, name)
+        logger.info(
+            f"translate: skill={name!r} unknown category — "
+            f"can_emulate={advisory['can_emulate']} missing={advisory['missing']}"
+        )
+        sovereign_block = {
+            "specialists": ["research_agent"],
+            "tier_required": "LOW",
+            "adapter_deps": [],
+            "description": fm.get("description", f"Community skill: {name}"),
+            "operations": {},  # LLM fallback — nanobot agent reads skill body
+        }
+        return sovereign_block, advisory
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +610,7 @@ def _dispatch_filesystem(action: str, params: dict, run_id: str) -> dict:
         return {"status": "error", "path": "dsl", "error": f"unknown filesystem action: {action!r}"}
 
 
-def _dispatch_exec(params: dict, run_id: str) -> dict:
+def _dispatch_exec(params: dict, run_id: str, extra_env: dict | None = None) -> dict:
     """Native subprocess dispatch with strict command allowlist."""
     command = params.get("command", "").strip()
     timeout = int(params.get("timeout", 20))
@@ -253,6 +625,10 @@ def _dispatch_exec(params: dict, run_id: str) -> dict:
             "error": f"command '{cmd0}' not in exec allowlist — allowed: {sorted(_EXEC_ALLOWLIST)}",
         }
 
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
     logger.info(f"[{run_id}] DSL exec: {command[:120]}")
     try:
         proc = subprocess.run(
@@ -262,6 +638,7 @@ def _dispatch_exec(params: dict, run_id: str) -> dict:
             text=True,
             timeout=timeout,
             cwd=WORKSPACE,
+            env=env,
         )
         return {
             "status":    "ok",
@@ -276,8 +653,84 @@ def _dispatch_exec(params: dict, run_id: str) -> dict:
         return {"status": "error", "path": "dsl", "error": f"exec failed: {e}"}
 
 
-def _dispatch_dsl(op_spec: dict, params: dict, run_id: str) -> dict:
-    """Route a validated DSL operation to the correct native handler."""
+def _redeem_credential_token(context: dict) -> dict:
+    """Redeem a session_token from sovereign-core's /credential_proxy.
+
+    Returns a dict of env var name → value to inject into the subprocess env.
+    Returns empty dict if no token present or redemption fails.
+    """
+    token = context.get("session_token")
+    proxy_url = context.get("credential_proxy_url", "http://sovereign-core:8000/credential_proxy")
+    if not token:
+        return {}
+    try:
+        r = httpx.post(proxy_url, json={"token": token}, timeout=5.0)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "ok":
+                return data.get("credentials", {})
+            logger.warning("_redeem_credential_token: proxy returned error: %s", data.get("error"))
+        else:
+            logger.warning("_redeem_credential_token: HTTP %s from %s", r.status_code, proxy_url)
+    except Exception as e:
+        logger.warning("_redeem_credential_token: %s — %s", proxy_url, e)
+    return {}
+
+
+def _dispatch_python3_exec(skill: str, op_spec: dict, params: dict, run_id: str,
+                           context: dict | None = None) -> dict:
+    """Run a python3 script from the skill's scripts/ workspace directory.
+
+    op_spec fields:
+      script: path relative to skill workspace dir, e.g. "scripts/feeds.py"
+      args:   list of fixed CLI args, e.g. ["--category", "news"]
+    Additional params are passed as --key value flags.
+    Credentials available as env vars (Phase 1 static mounts in compose.yml).
+    """
+    script_rel = op_spec.get("script", "")
+    if not script_rel:
+        return {"status": "error", "path": "dsl", "error": "python3_exec: no 'script' in op_spec"}
+
+    skill_dir  = os.path.join(WORKSPACE, "skills", skill)
+    script_path = os.path.normpath(os.path.join(skill_dir, script_rel))
+
+    # Path traversal guard
+    if not script_path.startswith(os.path.normpath(WORKSPACE)):
+        return {"status": "error", "path": "dsl",
+                "error": f"python3_exec: path traversal rejected: {script_path}"}
+
+    if not os.path.isfile(script_path):
+        return {"status": "error", "path": "dsl",
+                "error": f"python3_exec: script not found at {script_path} — "
+                         "deploy scripts/ to workspace/skills/<name>/ at install time"}
+
+    fixed_args   = [str(a) for a in op_spec.get("args", [])]
+    dynamic_args = []
+    for k, v in params.items():
+        if k not in ("command", "timeout", "script"):
+            dynamic_args.extend([f"--{k}", str(v)])
+
+    cmd = "python3 " + script_path + ((" " + " ".join(fixed_args)) if fixed_args else "") + \
+          ((" " + " ".join(dynamic_args)) if dynamic_args else "")
+
+    # Phase 2: redeem credential token if provided — inject as subprocess env vars
+    extra_env: dict[str, str] = {}
+    if context:
+        extra_env = _redeem_credential_token(context)
+        if extra_env:
+            logger.info("[%s] python3_exec: redeemed credential token (%d vars injected)",
+                        run_id, len(extra_env))
+
+    return _dispatch_exec({"command": cmd, "timeout": params.get("timeout", 30)},
+                          run_id, extra_env=extra_env)
+
+
+def _dispatch_dsl(op_spec: dict, params: dict, run_id: str, skill: str = "") -> dict:
+    """Route a validated DSL operation to the correct native handler.
+
+    nanobot-01 is the primary execution environment for all OpenClaw/ClawhHub skills.
+    Supported tools: filesystem, exec, python3_exec.
+    """
     tool   = op_spec.get("tool", "").lower()
     action = op_spec.get("action", "").lower()
 
@@ -285,11 +738,13 @@ def _dispatch_dsl(op_spec: dict, params: dict, run_id: str) -> dict:
         return _dispatch_filesystem(action, params, run_id)
     elif tool == "exec":
         return _dispatch_exec(params, run_id)
+    elif tool == "python3_exec":
+        return _dispatch_python3_exec(skill, op_spec, params, run_id)
     else:
         return {
             "status": "error", "path": "dsl",
-            "error": f"tool '{tool}' not handled by nanobot-01 (must be filesystem or exec); "
-                     f"sovereign adapters (imap/webdav/caldav) are dispatched by NanobotAdapter directly",
+            "error": f"tool '{tool}' not handled natively. "
+                     f"Supported: filesystem, exec, python3_exec.",
         }
 
 
@@ -389,6 +844,47 @@ def _run_nanobot(prompt: str, run_id: str) -> dict:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@app.post("/translate")
+async def translate_skill(req: TranslateRequest):
+    """Translate an external community skill (e.g. OpenClaw format) into Sovereign DSL format.
+
+    Called by SkillLifecycleManager.load() when incoming SKILL.md lacks a sovereign: block.
+
+    Response schema:
+      {
+        "status": "ok" | "needs_development",
+        "name": str,
+        "sovereign": {specialists, tier_required, adapter_deps, description, operations},
+        "advisory": null | {can_emulate, reason, steps, missing}  -- set when needs_development
+      }
+
+    Deterministic for known categories (imap_smtp, nextcloud) → status: "ok", full operations DSL.
+    Unknown categories → status: "needs_development" if missing deps, advisory explains what's needed.
+    If unknown but no obvious gaps → status: "ok" with empty operations (LLM fallback path).
+
+    Lifecycle.py surfaces any advisory in the install response so Sovereign can advise the Director.
+    """
+    fm, body = _parse_skill_md(req.content)
+    name = req.name or fm.get("name", "unknown")
+    sovereign_block, advisory = _translate_skill_content(fm, body, name)
+
+    status = "ok"
+    if advisory and not advisory.get("can_emulate", True):
+        status = "needs_development"
+
+    logger.info(
+        f"translate: name={name!r} status={status} "
+        f"specialists={sovereign_block.get('specialists')} "
+        f"ops={list((sovereign_block.get('operations') or {}).keys())}"
+    )
+    return JSONResponse(content={
+        "status": status,
+        "name": name,
+        "sovereign": sovereign_block,
+        "advisory": advisory,
+    })
+
+
 @app.get("/health")
 async def health():
     """Health check — includes DSL skill summary."""
@@ -432,13 +928,15 @@ async def health():
 async def run_task(req: TaskRequest):
     """Execute a sovereign skill task.
 
-    Stage 3: checks SKILL.md operations: DSL first.
-      - If action matches DSL with tool=filesystem|exec → native Python dispatch (no Ollama).
-      - If action matches DSL with tool=imap|webdav|caldav → error (those are sovereign-side).
-      - If no DSL match → LLM path via nanobot agent CLI.
+    nanobot-01 is the primary execution environment for all OpenClaw/ClawhHub skills.
+    DSL dispatch order:
+      - tool=filesystem → native Python pathlib dispatch (no subprocess)
+      - tool=exec       → allowlisted subprocess
+      - tool=python3_exec → python3 script from workspace/skills/<name>/scripts/
+      - no DSL match    → LLM path via nanobot agent CLI
 
     Called by NanobotAdapter in sovereign-core. Governance already applied upstream.
-    No secrets in the request. No governance decisions happen here.
+    Credentials available as env vars (Phase 1). No governance decisions here.
     """
     run_id = str(uuid.uuid4())[:8]
     logger.info(f"[{run_id}] task: skill={req.skill} action={req.action}")
@@ -459,7 +957,10 @@ async def run_task(req: TaskRequest):
 
         logger.info(f"[{run_id}] DSL path: tool={tool} action={op_spec.get('action')}")
         loop   = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: _dispatch_dsl(op_spec, validated, run_id))
+        _skill = req.skill
+        result = await loop.run_in_executor(
+            None, lambda: _dispatch_dsl(op_spec, validated, run_id, skill=_skill)
+        )
         return JSONResponse(content={
             "run_id": run_id, "skill": req.skill, "action": req.action, **result,
         })

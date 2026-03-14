@@ -91,7 +91,12 @@ class GovernanceEngine:
         elif domain == 'skills':
             if operation in ('search', 'review', 'audit') and rules.get('skill_read', False):
                 return rules
-            if operation in ('load', 'unload', 'install') and rules.get('skill_load', False):
+            if operation in ('load', 'unload') and rules.get('skill_load', False):
+                return rules
+            # install = composite (search+review+load); search/review are LOW read ops.
+            # The load step inside the composite flow has its own confirmed=True gate.
+            # Allow at LOW (skill_read) or MID (skill_load) — composite handles confirmation.
+            if operation == 'install' and (rules.get('skill_read', False) or rules.get('skill_load', False)):
                 return rules
         elif domain == 'security':
             if operation in ('check_updates', 'read') and rules.get('security_read', False):

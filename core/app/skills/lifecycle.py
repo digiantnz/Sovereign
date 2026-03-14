@@ -212,6 +212,32 @@ class SkillLifecycleManager:
         candidates: list[dict] = []
         search_error: Optional[str] = None
 
+        # ── Direct URL shortcut — if query contains a raw GitHub URL, fetch directly ──
+        import re as _re_url
+        _url_in_query = _re_url.search(r'https?://[^\s]+', query)
+        if _url_in_query:
+            direct_url = _url_in_query.group(0).rstrip(".,)")
+            raw_url = _github_url_to_raw(direct_url) or direct_url
+            content = await self._fetch_raw_url(raw_url)
+            if content:
+                fm, body = _parse_skill_md_content(content)
+                slug = fm.get("name") or raw_url.rstrip("/").split("/")[-2] or "unknown"
+                return {
+                    "query": query,
+                    "candidates": [{
+                        "slug": slug,
+                        "summary": fm.get("description", ""),
+                        "github_url": direct_url,
+                        "raw_url": raw_url,
+                        "certified": None,
+                        "skill_md": content,
+                        "WARNING": "Source: direct URL — review required before loading",
+                    }],
+                    "total": 1,
+                    "_source": "direct_url",
+                    "certified_only": certified_only,
+                }
+
         # ── Primary: GitHub SKILL.md search via SearXNG ────────────────────
         try:
             search_q = f'sovereign skill {query} "SKILL.md" site:github.com'
@@ -227,8 +253,14 @@ class SkillLifecycleManager:
                 if not content:
                     continue
                 fm, body = _parse_skill_md_content(content)
-                if not fm.get("name") and "sovereign:" not in content:
-                    continue  # skip — not a valid Sovereign SKILL.md
+                # Accept if it has a name field (covers Sovereign AND OpenClaw formats)
+                # or if it explicitly has a sovereign: block.
+                # Pure stubs with no name and no sovereign: block are skipped.
+                has_name = bool(fm.get("name"))
+                has_sovereign = "sovereign:" in content
+                has_openclaw = "openclaw" in content.lower() or "allowed-tools" in content
+                if not has_name and not has_sovereign and not has_openclaw:
+                    continue  # skip — no identifiable skill format
                 slug = fm.get("name") or url.rstrip("/").split("/")[-2] or "unknown"
                 candidate: dict = {
                     "slug": slug,
@@ -303,17 +335,35 @@ class SkillLifecycleManager:
         return result_out
 
     async def _fetch_raw_url(self, url: str) -> Optional[str]:
-        """Fetch raw content from a URL (expected: raw.githubusercontent.com)."""
+        """Fetch raw content from a URL (expected: raw.githubusercontent.com).
+
+        Tries direct httpx first (works if sovereign-core has internet egress).
+        Falls back to browser.fetch() via a2a-browser on browser_net (internet egress).
+        """
+        # Try direct httpx (fast path — works if internet egress is available)
         try:
             async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
                 r = await client.get(url, headers={"Accept": "text/plain", "User-Agent": "SovereignCore/1.0"})
                 if r.status_code == 200:
                     return r.text
                 logger.warning("SkillLifecycle._fetch_raw_url: HTTP %s for %s", r.status_code, url)
-                return None
         except Exception as e:
-            logger.warning("SkillLifecycle._fetch_raw_url: %s — %s", url, e)
-            return None
+            logger.warning("SkillLifecycle._fetch_raw_url direct: %s — %s", url, e)
+
+        # Fall back to a2a-browser /fetch (browser_net has internet egress)
+        if self.browser:
+            try:
+                result = await self.browser.fetch(url, extract="text")
+                if result.get("status") == "ok":
+                    content = result.get("data", {}).get("content", "")
+                    if content:
+                        logger.info("SkillLifecycle._fetch_raw_url: browser fallback succeeded for %s", url)
+                        return content
+                logger.warning("SkillLifecycle._fetch_raw_url browser fallback: %s", result.get("message", "no content"))
+            except Exception as e:
+                logger.warning("SkillLifecycle._fetch_raw_url browser fallback: %s — %s", url, e)
+
+        return None
 
     # ── REVIEW ────────────────────────────────────────────────────────────────
 
@@ -501,10 +551,26 @@ class SkillLifecycleManager:
 
         existing_sov = existing_fm.get("sovereign") or {}
 
-        # Build sovereign: block — overrides win; fall back to parsed values
-        specialists = specialist_overrides or existing_sov.get("specialists") or ["research_agent"]
-        tier = tier_override or existing_sov.get("tier_required") or "LOW"
-        adapter_deps = existing_sov.get("adapter_deps") or []
+        # ── Nanobot translation (OpenClaw / community format) ─────────────
+        # If the skill has no sovereign: block (or no operations), call nanobot-01
+        # /translate which detects the format and returns the full sovereign: block
+        # including the operations: DSL. This is how OpenClaw skills gain their
+        # broker_exec operations without any Python adapter involvement.
+        nanobot_translated: dict = {}
+        nanobot_advisory: dict | None = None
+        if not existing_sov:
+            nanobot_translated, nanobot_advisory = await self._translate_via_nanobot(
+                skill_md_content, safe_name
+            )
+
+        # Merge: nanobot translation → parsed values → defaults
+        translated_sov = nanobot_translated or existing_sov
+
+        # Build sovereign: block — overrides win; fall back to translated/parsed values
+        specialists = specialist_overrides or translated_sov.get("specialists") or ["research_agent"]
+        tier = tier_override or translated_sov.get("tier_required") or "LOW"
+        adapter_deps = translated_sov.get("adapter_deps") or existing_sov.get("adapter_deps") or []
+        operations = translated_sov.get("operations") or existing_sov.get("operations") or {}
 
         # Validate and sanitise
         specialists = [s for s in specialists if s in KNOWN_SPECIALISTS] or ["research_agent"]
@@ -516,19 +582,24 @@ class SkillLifecycleManager:
         body_checksum = _sha256_text(body)
 
         # Build the new frontmatter dict
+        sovereign_block: dict = {
+            "specialists": specialists,
+            "tier_required": tier,
+            "adapter_deps": adapter_deps,
+            "checksum": body_checksum,
+        }
+        if operations:
+            sovereign_block["operations"] = operations
+
         fm_dict: dict = {
             "name": safe_name,
             "version": str(existing_fm.get("version", "1.0")),
-            "description": existing_fm.get(
-                "description",
-                f"Skill loaded from ClawhHub: {clawhub_slug or safe_name}",
+            "description": (
+                translated_sov.get("description")
+                or existing_fm.get("description")
+                or f"Skill loaded from ClawhHub: {clawhub_slug or safe_name}"
             ),
-            "sovereign": {
-                "specialists": specialists,
-                "tier_required": tier,
-                "adapter_deps": adapter_deps,
-                "checksum": body_checksum,
-            },
+            "sovereign": sovereign_block,
         }
         if clawhub_slug:
             fm_dict["clawhub_slug"] = clawhub_slug
@@ -612,7 +683,7 @@ class SkillLifecycleManager:
             "escalation_reasons": review_result.get("escalation_reasons", []),
         })
 
-        return {
+        result: dict = {
             "status": "installed",
             "skill": safe_name,
             "path": skill_path,
@@ -621,11 +692,28 @@ class SkillLifecycleManager:
             "body_checksum": body_checksum,
             "file_hash": whole_file_hash,
             "activates": "next_session",
+            "operations_count": len(operations),
+            "execution_path": "dsl_native" if operations else "llm_fallback",
             "message": (
                 f"Skill '{safe_name}' installed. "
-                f"It will be active for {', '.join(specialists)} from the next session."
+                f"Active for {', '.join(specialists)} from the next session. "
+                f"{len(operations)} operation(s) mapped to DSL execution path."
             ),
         }
+
+        # Surface any nanobot advisory so Sovereign can inform the Director
+        if nanobot_advisory:
+            result["nanobot_advisory"] = nanobot_advisory
+            if not nanobot_advisory.get("can_emulate", True):
+                result["status"] = "installed_with_warnings"
+                result["message"] += (
+                    f" WARNING: nanobot-01 reports this skill needs development work "
+                    f"before it can be fully executed. "
+                    f"Reason: {nanobot_advisory.get('reason', '')} "
+                    f"Steps: {'; '.join(nanobot_advisory.get('steps', []))}"
+                )
+
+        return result
 
     # ── AUDIT ─────────────────────────────────────────────────────────────────
 
@@ -795,6 +883,57 @@ class SkillLifecycleManager:
             logger.info(
                 "SkillLifecycle: registered '%s' in soul-guardian watchlist (durable)", path
             )
+
+    async def _translate_via_nanobot(
+        self, skill_md_content: str, name: str
+    ) -> tuple[dict, dict | None]:
+        """Call nanobot-01 /translate to convert community skill format to Sovereign DSL.
+
+        Returns (sovereign_block, advisory).
+          sovereign_block: the sovereign: dict to embed in frontmatter (specialists, ops, etc.)
+          advisory: None if full emulation, or {can_emulate, reason, steps, missing} dict
+
+        On any error: returns ({}, None) — caller falls back to defaults silently.
+        Advisory is also logged to audit ledger so the Director has a record.
+        """
+        nanobot_url = os.environ.get("NANOBOT_01_URL", "http://nanobot-01:8080")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(
+                    f"{nanobot_url}/translate",
+                    json={"content": skill_md_content, "name": name},
+                )
+            if r.status_code == 200:
+                body = r.json()
+                sov = body.get("sovereign") or {}
+                advisory = body.get("advisory")  # None for known categories
+                translate_status = body.get("status", "ok")
+
+                if sov:
+                    logger.info(
+                        "SkillLifecycle: nanobot translated %r → status=%s specialists=%s ops=%s",
+                        name, translate_status,
+                        sov.get("specialists"),
+                        list((sov.get("operations") or {}).keys()),
+                    )
+                    self._audit("skill_translate", translate_status, {
+                        "skill": name,
+                        "translate_status": translate_status,
+                        "operations_count": len(sov.get("operations") or {}),
+                        "specialists": sov.get("specialists"),
+                        "needs_development": translate_status == "needs_development",
+                        "advisory_missing": (advisory or {}).get("missing", []),
+                        "advisory_steps": (advisory or {}).get("steps", []),
+                    })
+                    return sov, advisory
+
+            logger.warning(
+                "SkillLifecycle._translate_via_nanobot: HTTP %s — falling back to defaults",
+                r.status_code,
+            )
+        except Exception as e:
+            logger.warning("SkillLifecycle._translate_via_nanobot: %s — falling back to defaults", e)
+        return {}, None
 
     def _audit(self, event_type: str, stage: str, extra: Optional[dict] = None):
         if not self.ledger:

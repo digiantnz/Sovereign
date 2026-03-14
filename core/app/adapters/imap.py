@@ -432,12 +432,22 @@ class IMAPAdapter:
             else:
                 folder_action = "discovered"
 
-            copy_typ, copy_data = mail.uid("COPY", uid, archive_folder)
+            if not uid or not archive_folder:
+                return {
+                    "status": "error",
+                    "step": "pre_copy_guard",
+                    "error": f"Cannot UID COPY — uid={uid!r} archive_folder={archive_folder!r}",
+                    "available_folders": available_folders,
+                }
+            # IMAP requires mailbox names with spaces to be double-quoted
+            imap_folder = f'"{archive_folder}"' if " " in archive_folder else archive_folder
+            copy_typ, copy_data = mail.uid("COPY", uid, imap_folder)
             if copy_typ != "OK":
                 return {
                     "status": "error", "step": "uid_copy",
                     "imap_response": copy_typ, "response_data": str(copy_data),
-                    "archive_folder": archive_folder, "folder_action": folder_action,
+                    "archive_folder": archive_folder, "imap_folder_arg": imap_folder,
+                    "folder_action": folder_action,
                 }
 
             store_typ, store_data = mail.uid("STORE", uid, "+FLAGS", "\\Deleted")
@@ -464,6 +474,13 @@ class IMAPAdapter:
 
     def _delete_sync(self, uid: str) -> dict:
         """Hard delete: UID STORE \\Deleted then EXPUNGE."""
+        if not uid or not str(uid).strip():
+            return {
+                "status": "error",
+                "step": "uid_guard",
+                "error": "No UID provided for delete operation — specialist must fetch inbox first to obtain a real UID",
+            }
+        uid = str(uid).strip()
         mail, err = self._connect()
         if err:
             return err
@@ -495,6 +512,13 @@ class IMAPAdapter:
 
     def _mark_flag_sync(self, uid: str, flag: str, set_flag: bool) -> dict:
         """Set or clear a flag (e.g. \\Seen) using UID STORE."""
+        if not uid or not str(uid).strip():
+            return {
+                "status": "error",
+                "step": "uid_guard",
+                "error": f"No UID provided for flag operation ({flag}) — specialist must fetch inbox first to obtain a real UID",
+            }
+        uid = str(uid).strip()
         mail, err = self._connect()
         if err:
             return err

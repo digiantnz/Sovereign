@@ -17,6 +17,7 @@ from skills.loader import scan_all_skills
 from skills.lifecycle import load_skill_watchlist
 from execution.adapters.wallet import WalletAdapter
 from scheduling.task_scheduler import TaskScheduler
+from execution.credential_proxy import CredentialProxy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -156,6 +157,12 @@ async def lifespan(app: FastAPI):
     app.state.task_scheduler = task_scheduler
     _task_scheduler_task = task_scheduler.start()
 
+    # ── Step 3c: Credential proxy — session-scoped token delegation for nanobot-01
+    credential_proxy = CredentialProxy(default_ttl=60, ledger=ledger)
+    app.state.credential_proxy = credential_proxy
+    app.state.exec.set_credential_proxy(credential_proxy)
+    logger.info("CredentialProxy: session-scoped token delegation active")
+
     yield
 
     _scheduler_task.cancel()
@@ -194,6 +201,27 @@ async def wallet_verify(prefix: str):
     if not wallet:
         return {"verified": False, "error": "Wallet adapter not initialized"}
     return wallet.verify_sig(prefix)
+
+
+@app.post("/credential_proxy")
+async def credential_proxy(payload: dict):
+    """Single-use credential token redemption for nanobot-01.
+
+    Called by nanobot-01 server.py before executing a python3_exec op.
+    Token was issued by NanobotAdapter.run() and passed in request context.
+    Token is invalidated immediately on first redeem.
+    Only reachable from ai_net (nanobot-01) — not exposed externally.
+    """
+    token = payload.get("token", "")
+    if not token:
+        return {"status": "error", "error": "token required"}
+    proxy = getattr(app.state, "credential_proxy", None)
+    if not proxy:
+        return {"status": "error", "error": "credential proxy not initialized"}
+    credentials = proxy.redeem(token)
+    if credentials is None:
+        return {"status": "error", "error": "invalid, expired, or already-used token"}
+    return {"status": "ok", "credentials": credentials}
 
 
 @app.post("/chat")

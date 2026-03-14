@@ -7,8 +7,11 @@ RUN apt-get update && \
 
 # Install nanobot from source + bridge server deps
 RUN git clone --depth 1 https://github.com/HKUDS/nanobot.git /opt/nanobot && \
-    pip install --no-cache-dir -e "/opt/nanobot[all]" && \
-    pip install --no-cache-dir fastapi uvicorn httpx
+    pip install --no-cache-dir -e "/opt/nanobot[all]"
+
+# Install bridge + skill runtime deps from requirements.txt
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Create app dir and workspace
 RUN mkdir -p /app /workspace /memory /skills

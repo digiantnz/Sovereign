@@ -42,11 +42,25 @@ _SKILLS_DIR = os.environ.get("SKILLS_DIR", "/home/sovereign/skills")
 # mtime-invalidated DSL cache: skill_name -> (mtime_float, operations_dict | None)
 _dsl_cache: dict[str, tuple[float, dict | None]] = {}
 
-# Tools handled natively by this adapter (sovereign-core has credentials/access)
-_NATIVE_TOOLS = {"imap", "webdav", "caldav", "broker_exec", "browser"}
+# Tools handled natively by this adapter (sovereign-core proxy — minimal set)
+_NATIVE_TOOLS = {"browser"}
 
-# Tools forwarded to nanobot-01 (handled by nanobot-01's own DSL)
-_REMOTE_TOOLS = {"filesystem", "exec"}
+# Tools forwarded to nanobot-01 (nanobot-01 is the primary skill execution environment)
+# imap/smtp/webdav/caldav: nanobot-01 has credential env vars (Phase 1) — handles directly
+# python3_exec: Bash(python3:*) OpenClaw format — nanobot-01 python3 runtime
+_REMOTE_TOOLS = {"filesystem", "exec", "python3_exec",
+                 "imap", "smtp", "webdav", "caldav"}
+
+# broker_exec commands that are legitimate system/OS calls — route to broker
+# Everything else labelled broker_exec routes to nanobot-01 instead
+SYSTEM_COMMANDS = frozenset({
+    # Docker operations (broker holds docker.sock)
+    "docker_ps", "docker_logs", "docker_stats", "docker_restart",
+    "docker_inspect", "docker_exec",
+    # OS read-only (whitelisted in commands-policy.yaml)
+    "uname", "df", "free", "ps", "nvidia_smi",
+    "systemctl_status", "journalctl",
+})
 
 
 def _load_skill_dsl(skill: str) -> dict | None:
@@ -184,9 +198,18 @@ async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: di
             from adapters.broker import BrokerAdapter
             broker = BrokerAdapter()
             # op_spec['action'] names the command in commands-policy.yaml.
-            # Outer `action` (the DSL operation key) is used as fallback so that
-            # operation keys like "uname" also work without an explicit action field.
+            # Outer `action` (the DSL operation key) is used as fallback.
             command_name = (op_spec or {}).get("action", action)
+            # Only true system/OS calls go to broker — application-level commands
+            # (imap_*, smtp_*, nc_*, feeds) are rejected here; callers should use
+            # tool: python3_exec or tool: imap/smtp/webdav/caldav instead.
+            if command_name not in SYSTEM_COMMANDS:
+                logger.warning(
+                    "nanobot: broker_exec '%s' is not a system command — "
+                    "use tool: python3_exec or a native tool instead. "
+                    "Routing to broker anyway (backward compat — update SKILL.md).",
+                    command_name,
+                )
             return await broker.exec_command(command_name, params)
 
         elif tool == "browser":
@@ -324,21 +347,30 @@ class NanobotAdapter:
     governance — it trusts that the caller has done so and passes the result
     to the audit ledger for the record.
 
-    Stage 3 dispatch order for run():
+    Dispatch order for run():
       1. Load skill DSL. If action is defined in DSL:
          a. Validate params.
-         b. If tool in {imap, webdav, caldav}: call adapter directly (no nanobot-01 HTTP).
-         c. If tool in {filesystem, exec}: forward to nanobot-01 (handles natively).
+         b. If tool in _NATIVE_TOOLS: call adapter directly in sovereign-core (browser only).
+         c. If tool in _REMOTE_TOOLS or broker_exec non-system: forward to nanobot-01.
       2. No DSL or action not in DSL: forward to nanobot-01 for LLM path.
+
+    Phase 2 credential delegation:
+      Before _forward(), issue a one-time token from CredentialProxy for any
+      credential_services declared in the op_spec. Token is passed in context
+      and redeemed by nanobot-01 via POST sovereign-core:8000/credential_proxy.
     """
 
     def __init__(self, ledger=None):
         self._ledger = ledger
+        self._credential_proxy = None
+
+    def set_credential_proxy(self, proxy) -> None:
+        self._credential_proxy = proxy
 
     def _log(self, event_type: str, payload: dict) -> None:
         if self._ledger:
             try:
-                self._ledger.log(event_type=event_type, **payload)
+                self._ledger.append(event_type=event_type, stage="nanobot_dispatch", data=payload)
             except Exception as e:
                 logger.warning(f"NanobotAdapter: ledger log failed: {e}")
 
@@ -456,10 +488,20 @@ class NanobotAdapter:
                 })
                 return result
 
-            # tool in _REMOTE_TOOLS or unknown — forward to nanobot-01
-            # nanobot-01's /run will see it in its own DSL and dispatch natively
+            # tool in _REMOTE_TOOLS (or broker_exec non-system) — forward to nanobot-01
+            # Phase 2: if op_spec declares credential_services, issue a one-time token
+            # and inject it into context so nanobot-01 can redeem via /credential_proxy.
+            fwd_context = dict(context)
+            credential_services = op_spec.get("credential_services") or []
+            if credential_services and self._credential_proxy:
+                token = self._credential_proxy.issue(credential_services)
+                if token:
+                    fwd_context["session_token"] = token
+                    fwd_context["credential_proxy_url"] = "http://sovereign-core:8000/credential_proxy"
+                    logger.debug("NanobotAdapter: issued credential token for %s", credential_services)
+
             return await self._forward(
-                skill, action, validated, context, node, t0, path="dsl_remote"
+                skill, action, validated, fwd_context, node, t0, path="dsl_remote"
             )
 
         # ── LLM fallback — no DSL match ─────────────────────────────────────

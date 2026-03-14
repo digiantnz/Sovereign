@@ -89,6 +89,8 @@ INTENT_ACTION_MAP = {
     # CalDAV extended
     "list_events":   {"domain": "caldav", "operation": "read",    "name": "calendar_list_events"},
     "complete_task": {"domain": "caldav", "operation": "write",   "name": "task_complete"},
+    "delete_event":  {"domain": "caldav", "operation": "delete",  "name": "calendar_delete"},
+    "update_event":  {"domain": "caldav", "operation": "write",   "name": "calendar_update"},
     # Mail extended
     "fetch_message": {"domain": "mail",   "operation": "fetch",   "name": "mail_fetch_one"},
     "mark_read":     {"domain": "mail",   "operation": "flag",    "name": "mail_mark_read"},
@@ -119,6 +121,7 @@ INTENT_TIER_MAP = {
     "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
     "move_email": "MID",
     "list_calendars": "LOW", "list_events": "LOW",
+    "delete_event": "MID", "update_event": "MID",
     "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
     "restart_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
     "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
@@ -146,6 +149,70 @@ INTENT_TIER_MAP = {
     "github_push_soul":     "HIGH",  # soul/constitution/governance docs — double confirmation
     "github_push_security": "HIGH",  # security pattern files — double confirmation
 }
+
+def _normalise_dt(value: str, default_year: int = 2026) -> str:
+    """Normalise a freeform datetime string to ISO 8601 YYYY-MM-DDTHH:MM:SS.
+
+    Accepts: ISO strings (with/without T), "YYYY-MM-DD HH:MM", natural language
+    like "Monday 16th March at 10AM NZST", or split date+time concatenated as
+    "DATE TIME" (caller should join them with a space before passing).
+
+    Returns empty string if parsing fails — caller decides whether that is fatal.
+    Timezone abbreviations NZDT/NZST/NZT/UTC/GMT are stripped; the resulting
+    datetime is naive (CalDAVAdapter formats it without TZID, which is correct
+    for Nextcloud floating-time events displayed in the server's local timezone).
+    """
+    import re as _re
+    from datetime import datetime as _dt
+
+    if not value or not isinstance(value, str):
+        return ""
+    v = value.strip()
+
+    # Strip known timezone abbreviations (they are NZ-local anyway; CalDAV stores floating)
+    v = _re.sub(r'\s*\b(NZDT|NZST|NZT|UTC|GMT)\b', '', v, flags=_re.IGNORECASE).strip()
+
+    # Strip ordinal suffixes: 1st 2nd 3rd 4th ... 31st
+    v = _re.sub(r'(\d+)(st|nd|rd|th)\b', r'\1', v, flags=_re.IGNORECASE)
+
+    # Normalise "at NNam/pm" → "NN am/pm" so strptime %I%p works cleanly
+    v = _re.sub(r'\bat\s+', ' ', v).strip()
+
+    # Already ISO-like: "YYYY-MM-DD HH:MM..." or "YYYY-MM-DDTHH:MM..."
+    _iso_m = _re.match(r'^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)', v)
+    if _iso_m:
+        date_part = _iso_m.group(1)
+        time_part = _iso_m.group(2)
+        if len(time_part) == 5:
+            time_part += ":00"
+        return f"{date_part}T{time_part}"
+
+    # strptime candidates — ordered from most to least specific
+    _fmts = [
+        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+        "%A %d %B %Y %I:%M%p", "%A %d %B %Y %I%p",
+        "%A %d %B %Y %H:%M",
+        "%d %B %Y %I:%M%p",   "%d %B %Y %I%p",
+        "%d %B %Y %H:%M",     "%d %B %Y",
+        "%B %d %Y %I:%M%p",   "%B %d %Y %I%p",
+        "%B %d, %Y %I:%M%p",  "%B %d, %Y %I%p",
+        "%A %d %B %I:%M%p",   "%A %d %B %I%p",    # no year
+        "%d %B %I:%M%p",      "%d %B %I%p",        # no year
+        "%B %d %I:%M%p",      "%B %d %I%p",        # no year
+        "%d/%m/%Y %H:%M",     "%m/%d/%Y %H:%M",
+    ]
+    for fmt in _fmts:
+        try:
+            parsed = _dt.strptime(v, fmt)
+            if parsed.year == 1900:
+                parsed = parsed.replace(year=default_year)
+            return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+
+    return ""
+
 
 def _infer_prior_domain(context_window) -> str | None:
     """
@@ -184,10 +251,66 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     import re as _re
     _url_match = _re.search(r'https?://[^\s"\']+', user_input)
     if _url_match:
+        # If the URL appears alongside a skill install verb, route to skill_install
+        # so lifecycle.search() can fetch the SKILL.md directly from the URL.
+        import re as _re_url_sk
+        _has_skill_verb = _re_url_sk.search(r'\b(install|load|add)\b', u) and "skill" in u
+        if _has_skill_verb:
+            return {
+                "delegate_to": "devops_agent", "intent": "skill_install",
+                "target": user_input, "tier": "MID",
+                "reasoning_summary": "Skill install from direct URL — deterministic pre-classifier",
+            }
         return {
             "delegate_to": "research_agent", "intent": "fetch_url",
             "target": _url_match.group(0).rstrip(".,)"), "tier": "LOW",
             "reasoning_summary": "Explicit URL detected — deterministic fetch_url",
+        }
+
+    # ── Calendar events — must precede scheduler and file-write checks ────
+    # These phrases are unambiguous calendar operations and must never be stolen
+    # by the scheduler ("create a task") or WebDAV ("create a note/document") paths.
+    _cal_create_kw = (
+        "add to my calendar", "add to the calendar", "add to calendar",
+        "put on my calendar", "put on the calendar", "put in my calendar",
+        "create an event", "create event", "add an event", "add event",
+        "new event", "new calendar event",
+        "schedule a meeting", "schedule meeting", "book a meeting", "book meeting",
+        "schedule an appointment", "book an appointment", "book appointment",
+        "create an appointment", "create appointment",
+        "add a meeting", "add meeting", "add appointment",
+        "create a calendar entry", "calendar entry",
+        "make an appointment", "make appointment",
+    )
+    _cal_delete_kw = (
+        "delete event", "delete the event", "delete calendar event",
+        "remove event", "remove the event", "cancel the event",
+        "remove from calendar", "delete from calendar",
+        "delete from my calendar", "remove from my calendar",
+    )
+    _cal_update_kw = (
+        "update event", "update the event", "reschedule event", "reschedule the event",
+        "move the event", "change the event", "edit the event", "edit event",
+        "change the time of", "move the meeting", "reschedule the meeting",
+        "reschedule my meeting", "change my appointment",
+    )
+    if any(w in u for w in _cal_create_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "create_event",
+            "target": None, "tier": "MID",
+            "reasoning_summary": "Calendar event creation — deterministic pre-classifier",
+        }
+    if any(w in u for w in _cal_delete_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "delete_event",
+            "target": None, "tier": "MID",
+            "reasoning_summary": "Calendar event deletion — deterministic pre-classifier",
+        }
+    if any(w in u for w in _cal_update_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "update_event",
+            "target": None, "tier": "MID",
+            "reasoning_summary": "Calendar event update — deterministic pre-classifier",
         }
 
     # ── Scheduler quick-check — before conversational guard ────────────────
@@ -251,6 +374,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "shopping list", "grocery list", "to-do list", "todo list", "wish list",
         "to my list", "on my list", "to the list", "on the list",
         "github", "repo", "commit", "push to", "sovereign repo",
+        "skill", "clawhub", "openclaw",
     )
     prior_has_system = prior_domain is not None
 
@@ -421,12 +545,25 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "get me a skill", "get a skill", "load a skill", "load skill",
         "add a skill", "add skill", "set up a skill",
     )
-    if any(w in u for w in _skill_install_kw):
+    import re as _re_sk_pre
+    _skill_install_match = (
+        any(w in u for w in _skill_install_kw)
+        or bool(_re_sk_pre.search(r"\b(install|load|add)\b.{0,40}\bskill\b", u))
+    )
+    if _skill_install_match:
         import re as _re_sk_i
-        _q_i = _re_sk_i.sub(
-            r"(install|load|add|get me|get|set up)\s+(a\s+|the\s+)?skill(\s+for|\s+that|\s+to|\s+which)?",
-            "", u, flags=_re_sk_i.IGNORECASE
-        ).strip(" :,")
+        # Try "install [the|a] <skill-name> skill" pattern first — extracts the skill name
+        _name_match = _re_sk_i.search(
+            r"\b(?:install|load|add|get me|get|set up)\b\s+(?:the\s+|a\s+)?(.+?)\s+skill\b",
+            u, _re_sk_i.IGNORECASE
+        )
+        if _name_match:
+            _q_i = _name_match.group(1).strip().strip(".,!?")
+        else:
+            _q_i = _re_sk_i.sub(
+                r"(install|load|add|get me|get|set up)\s+(a\s+|the\s+)?skill(\s+for|\s+that|\s+to|\s+which)?",
+                "", u, flags=_re_sk_i.IGNORECASE
+            ).strip(" :,")
         return {
             "delegate_to": "devops_agent", "intent": "skill_install",
             "target": _q_i or user_input, "tier": "MID",
@@ -877,24 +1014,36 @@ class ExecutionEngine:
                 result_dict["morning_briefing"] = morning_briefing
             return result_dict
 
-        # PASS 2 — Specialist Reasoning (action-oriented domains only)
-        try:
-            specialist_output = await self.cog.specialist_reason(agent, delegation, user_input)
-        except Exception as e:
-            dm = await self._safe_translate(user_input, {"error": f"Specialist reasoning failed: {e}"}, tier=tier)
-            return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
+        # Short-circuit for confirmed continuations — when Director has already reviewed
+        # a proposed action (e.g. skill_install search+review) and confirmed=True with
+        # a _pending_load stash, there is no new reasoning to do. Skip PASS 2+3 to
+        # avoid 2× Ollama overhead (~80s) on what is a mechanical "proceed" decision.
+        _confirmed_continuation = (
+            confirmed
+            and pending_delegation is not None
+            and pending_delegation.get("_pending_load") is not None
+        )
+        if _confirmed_continuation:
+            specialist_output = {}  # no new specialist input needed
+        else:
+            # PASS 2 — Specialist Reasoning (action-oriented domains only)
+            try:
+                specialist_output = await self.cog.specialist_reason(agent, delegation, user_input)
+            except Exception as e:
+                dm = await self._safe_translate(user_input, {"error": f"Specialist reasoning failed: {e}"}, tier=tier)
+                return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
-        # PASS 3 — CEO Evaluation
-        try:
-            evaluation = await self.cog.ceo_evaluate(user_input, delegation, specialist_output)
-        except Exception as e:
-            dm = await self._safe_translate(user_input, {"error": f"CEO evaluation failed: {e}"}, tier=tier)
-            return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
+            # PASS 3 — CEO Evaluation
+            try:
+                evaluation = await self.cog.ceo_evaluate(user_input, delegation, specialist_output)
+            except Exception as e:
+                dm = await self._safe_translate(user_input, {"error": f"CEO evaluation failed: {e}"}, tier=tier)
+                return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
-        if not evaluation.get("approved", False):
-            feedback = evaluation.get("feedback", "")
-            dm = await self._safe_translate(user_input, {"error": "plan_rejected", "feedback": feedback}, tier=tier)
-            return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
+            if not evaluation.get("approved", False):
+                feedback = evaluation.get("feedback", "")
+                dm = await self._safe_translate(user_input, {"error": "plan_rejected", "feedback": feedback}, tier=tier)
+                return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # PASS 4 — Execution (deterministic)
         try:
@@ -1029,7 +1178,19 @@ class ExecutionEngine:
             pass
 
         # CEO Agent translation — mandatory on all Director-bound messages
-        director_msg = await self._safe_translate(user_input, execution_result, tier=tier)
+        # For requires_confirmation responses, pass a simplified context so the
+        # translator generates a confirmation prompt rather than an error message.
+        if execution_result.get("requires_confirmation") or execution_result.get("requires_double_confirmation"):
+            _confirm_ctx = {
+                "status": "awaiting_director_confirmation",
+                "action": execution_result.get("action", intent),
+                "summary": execution_result.get("summary", ""),
+                "review_decision": (execution_result.get("review_result") or {}).get("decision", ""),
+                "escalated": bool(execution_result.get("escalation_notice")),
+            }
+            director_msg = await self._safe_translate(user_input, _confirm_ctx, tier=tier)
+        else:
+            director_msg = await self._safe_translate(user_input, execution_result, tier=tier)
         result_dict = {
             "status": "ok",
             "intent": intent,
@@ -1041,6 +1202,13 @@ class ExecutionEngine:
             "gaps": gaps,
             "director_message": director_msg,
         }
+        # Promote gateway-critical fields to top level if present in execution_result.
+        # Gateway reads data.get("requires_confirmation") / data.get("pending_delegation")
+        # from the top-level response — they must not be buried under "result".
+        for _gw_key in ("requires_confirmation", "requires_double_confirmation",
+                        "pending_delegation", "summary", "escalation_notice"):
+            if execution_result.get(_gw_key) is not None:
+                result_dict[_gw_key] = execution_result[_gw_key]
         if morning_briefing:
             result_dict["morning_briefing"] = morning_briefing
         return result_dict
@@ -1074,6 +1242,12 @@ class ExecutionEngine:
     def set_task_scheduler(self, scheduler) -> None:
         """Inject TaskScheduler post-lifespan init."""
         self.task_scheduler = scheduler
+
+    def set_credential_proxy(self, proxy) -> None:
+        """Inject CredentialProxy post-lifespan init — passed to NanobotAdapter."""
+        self.credential_proxy = proxy
+        if self.nanobot:
+            self.nanobot.set_credential_proxy(proxy)
 
     def _delegation_to_action(self, delegation: dict) -> dict:
         intent = delegation.get("intent", "")
@@ -1233,18 +1407,64 @@ class ExecutionEngine:
             if name == "calendar_create":
                 d = delegation or {}
                 sp = specialist or {}
-                # Extract calendar fields from specialist output (preferred) → action → delegation fallback
+
+                def _sp_dt(*keys) -> str:
+                    """Try multiple field names in specialist output, return first non-empty."""
+                    for k in keys:
+                        v = sp.get(k) or action.get(k)
+                        if v and isinstance(v, str) and v.strip():
+                            return v.strip()
+                    return ""
+
                 cal_summary     = sp.get("summary")     or action.get("summary")     or d.get("intent", "")
-                cal_start       = sp.get("start")       or action.get("start",  "")
-                cal_end         = sp.get("end")         or action.get("end",    "")
                 cal_calendar    = sp.get("calendar")    or action.get("calendar", "personal")
                 cal_description = sp.get("description") or action.get("description", "")
                 import uuid as _uuid
                 cal_uid = sp.get("uid") or action.get("uid") or str(_uuid.uuid4())
+
+                # ── Datetime extraction — accept any reasonable field name ──
+                # Specialist may output: start, start_time, datetime, when, date_time,
+                # event_start, scheduled_at, begin, date, at, or split date+time fields.
+                _start_raw = _sp_dt(
+                    "start", "start_time", "start_datetime", "datetime",
+                    "when", "date_time", "event_start", "scheduled_at", "begin",
+                )
+                # If still empty, try combining separate date + time fields
+                if not _start_raw:
+                    _date_part = _sp_dt("date", "event_date", "start_date")
+                    _time_part = _sp_dt("time", "event_time", "start_time", "at")
+                    if _date_part and _time_part:
+                        _start_raw = f"{_date_part} {_time_part}"
+                    elif _date_part:
+                        _start_raw = _date_part  # date-only; normaliser will give midnight
+
+                # Last resort: if specialist output has any field whose value looks like
+                # a date/time string, try to normalise it. Covers cases where the LLM
+                # puts the datetime in a wrong-named field like "content" or "draft_content".
+                if not _start_raw:
+                    for _fb_key in ("content", "draft_content", "target", "description"):
+                        _fb_val = sp.get(_fb_key, "")
+                        if _fb_val and isinstance(_fb_val, str) and _normalise_dt(_fb_val):
+                            _start_raw = _fb_val
+                            break
+
+                _end_raw = _sp_dt(
+                    "end", "end_time", "end_datetime", "end_date",
+                    "until", "finish", "event_end",
+                )
+
+                cal_start = _normalise_dt(_start_raw)
+                cal_end   = _normalise_dt(_end_raw) if _end_raw else ""
+
                 if not cal_start:
-                    return {"error": "create_event requires a start time — please specify date and time"}
+                    return {
+                        "error": "create_event requires a start time — please specify date and time",
+                        "specialist_fields_checked": list(sp.keys()),
+                        "raw_start_value": _start_raw or None,
+                    }
                 if not cal_end:
-                    cal_end = cal_start  # same-time point event if end omitted
+                    cal_end = cal_start  # point event if end omitted
+
                 return await self.caldav.create_event(
                     calendar=cal_calendar,
                     uid=cal_uid,
@@ -1286,6 +1506,25 @@ class ExecutionEngine:
                 if not comp_uid:
                     return {"error": "complete_task requires a UID — please specify which task"}
                 return await self.caldav.complete_task(comp_calendar, comp_uid)
+            if name == "calendar_update":
+                sp = specialist or {}
+                import uuid as _uuid
+                upd_calendar    = sp.get("calendar")    or action.get("calendar", "personal")
+                upd_uid         = sp.get("uid")         or action.get("uid", "")
+                upd_summary     = sp.get("summary")     or action.get("summary", "")
+                upd_description = sp.get("description") or action.get("description", "")
+                _upd_start_raw = (sp.get("start") or sp.get("start_time") or
+                                  sp.get("datetime") or sp.get("when") or action.get("start", ""))
+                _upd_end_raw   = (sp.get("end")   or sp.get("end_time")   or action.get("end", ""))
+                upd_start = _normalise_dt(_upd_start_raw) if _upd_start_raw else ""
+                upd_end   = _normalise_dt(_upd_end_raw)   if _upd_end_raw   else ""
+                if not upd_uid:
+                    return {"error": "update_event requires a UID — list events first to obtain one"}
+                return await self.caldav.update_event(
+                    calendar=upd_calendar, uid=upd_uid,
+                    summary=upd_summary, start=upd_start, end=upd_end,
+                    description=upd_description,
+                )
             if name in ("task_delete", "calendar_delete"):
                 sp = specialist or {}
                 del_calendar = sp.get("calendar") or action.get("calendar", "personal")
@@ -1297,56 +1536,71 @@ class ExecutionEngine:
                 return await self.caldav.delete_event(del_calendar, del_uid)
 
         if domain == "mail":
+            # All mail ops route through imap-smtp-email community skill → broker_exec (DSL path).
+            # Python IMAPAdapter / SMTPAdapter are bypassed — community Node.js scripts are authoritative.
             sp = specialist or {}
             account = sp.get("account") or action.get("account", "personal")
+            _suf = "" if account == "business" else "_personal"
             op = action.get("operation")
+            _skill = "imap-smtp-email"
+
             if op == "read":
                 if name == "mail_list_folders":
-                    return await IMAPAdapter(account=account).list_folders()
-                if name == "mail_list_inbox":
-                    count = sp.get("count") or action.get("count", 50)
-                    return await IMAPAdapter(account=account).list_inbox(max_messages=int(count))
-                count = sp.get("count") or action.get("count", 10)
-                return await IMAPAdapter(account=account).fetch_unread(max_messages=int(count))
+                    nb = await self.nanobot.run(_skill, "list_mailboxes", {})
+                elif name == "mail_list_inbox":
+                    count = int(sp.get("count") or action.get("count", 50))
+                    nb = await self.nanobot.run(_skill, f"fetch_unread{_suf}", {"limit": count})
+                else:
+                    count = int(sp.get("count") or action.get("count", 10))
+                    nb = await self.nanobot.run(_skill, f"fetch_unread{_suf}", {"limit": count})
+                return nb.get("result", nb)
+
             if op == "fetch":
                 uid = sp.get("uid") or action.get("uid", "")
                 if not uid:
                     return {"error": "fetch_message requires a message UID"}
-                return await IMAPAdapter(account=account).fetch_message(uid)
+                nb = await self.nanobot.run(_skill, f"fetch_message{_suf}", {"uid": uid})
+                return nb.get("result", nb)
+
             if op == "search":
                 criteria = sp.get("criteria") or action.get("criteria") or {}
                 for key in ("subject", "from_addr", "since", "body"):
                     if action.get(key) and key not in criteria:
                         criteria[key] = action[key]
-                return await IMAPAdapter(account=account).search(criteria)
+                # Flatten criteria dict to a query string for the broker imap search
+                query_parts = [str(v) for v in criteria.values() if v]
+                query = " ".join(query_parts) if query_parts else (sp.get("query") or action.get("query", ""))
+                nb = await self.nanobot.run(_skill, f"search{_suf}", {"query": query, "limit": 10})
+                return nb.get("result", nb)
+
             if op == "flag":
                 uid = sp.get("uid") or action.get("uid", "")
                 if not uid:
                     return {"error": f"{name} requires a message UID"}
                 if name == "mail_mark_read":
-                    return await IMAPAdapter(account=account).mark_read(uid)
-                if name == "mail_mark_unread":
-                    return await IMAPAdapter(account=account).mark_unread(uid)
+                    nb = await self.nanobot.run(_skill, "mark_read", {"uid": uid})
+                else:
+                    nb = await self.nanobot.run(_skill, "mark_unread", {"uid": uid})
+                return nb.get("result", nb)
+
             if op == "move":
-                uid = sp.get("uid") or action.get("uid", "")
-                dest = sp.get("destination") or action.get("destination", "Archive")
-                return await IMAPAdapter(account=account).move_message(uid, dest)
+                return {"status": "error", "error": "Email move not available — no broker command. Use mark_read to flag instead."}
+
             if op == "delete":
-                uid = sp.get("uid") or action.get("uid", "")
-                if not uid:
-                    return {"error": "Cannot delete email — no message UID provided. Ask which specific email to delete."}
-                return await IMAPAdapter(account=account).delete_message(uid)
+                return {"status": "error", "error": "Email delete not available via community skill — no broker command yet."}
+
             if op == "send":
                 s = specialist or {}
                 draft = s.get("draft_content", "")
-                return await SMTPAdapter(account=account).send(
-                    to=action.get("to", ""),
-                    subject=action.get("subject", delegation.get("intent", "") if delegation else ""),
-                    body=draft or action.get("body", ""),
-                    cc=s.get("cc", ""),
-                    bcc=s.get("bcc", ""),
-                    html=s.get("html", ""),
+                nb = await self.nanobot.run(
+                    _skill, f"send_email{_suf}",
+                    {
+                        "to": action.get("to", ""),
+                        "subject": action.get("subject", delegation.get("intent", "") if delegation else ""),
+                        "body": draft or action.get("body", ""),
+                    }
                 )
+                return nb.get("result", nb)
 
         if domain == "ollama":
             if not prompt:
@@ -1585,13 +1839,38 @@ class ExecutionEngine:
 
             if op == "install":
                 # Composite 3-step flow: search → review → load
+                # Short-circuit: if Director already confirmed and pending_load is stashed in
+                # delegation, skip search+review and go straight to load.
+                _dl_pending = (delegation or {}).get("_pending_load")
+                if confirmed and _dl_pending:
+                    return await lifecycle.load(
+                        name=_dl_pending.get("name", ""),
+                        skill_md_content=_dl_pending.get("skill_md", ""),
+                        review_result=_dl_pending.get("review_result", {}),
+                        confirmed=True,
+                        clawhub_slug=_dl_pending.get("clawhub_slug"),
+                        clawhub_certified=bool(_dl_pending.get("clawhub_certified", False)),
+                        proposed_by=(delegation or {}).get("delegate_to", "devops_agent"),
+                        reason="Director confirmed skill installation after review.",
+                    )
+
                 # Step 1: search for candidates
-                query = (
-                    sp.get("search_query")
-                    or action.get("query")
-                    or prompt
-                    or ""
-                )
+                # If the original request contained a direct URL (in delegation.target),
+                # pass it straight to lifecycle.search() to trigger the direct URL shortcut.
+                # Specialist may strip the URL and return a clean search query — we must
+                # preserve the URL so lifecycle.py can fetch SKILL.md without SearXNG.
+                import re as _re_install_url
+                _delegation_target = (delegation or {}).get("target", "")
+                _direct_url_match = _re_install_url.search(r'https?://\S+', _delegation_target)
+                if _direct_url_match:
+                    query = _direct_url_match.group(0).rstrip(".,)")
+                else:
+                    query = (
+                        sp.get("search_query")
+                        or action.get("query")
+                        or prompt
+                        or ""
+                    )
                 search_result = await lifecycle.search(query=query, certified_only=True, limit=5)
 
                 # Step 2: review the top candidate that has skill_md content
@@ -1622,30 +1901,47 @@ class ExecutionEngine:
                     }
 
                 # Present findings to Director — require explicit confirmation before load
+                _pending_load = {
+                    "name": top.get("slug"),
+                    "skill_md": top["skill_md"],
+                    "review_result": review_result,
+                    "clawhub_slug": top.get("slug"),
+                    "clawhub_certified": bool(top.get("certified", False)),
+                }
+                _decision = review_result.get("decision", "review")
+                _escalated = review_result.get("escalate_to_director", False)
+                _summary = (
+                    f"Install skill '{top.get('slug', 'unknown')}' "
+                    f"from {top.get('github_url', 'unknown source')}.\n"
+                    f"Security review: {_decision.upper()}"
+                    + (" — ESCALATED (see reasons below)" if _escalated else "") + ".\n"
+                    + (
+                        f"Escalation reasons: {'; '.join(review_result.get('escalation_reasons', []))}.\n"
+                        if _escalated else ""
+                    )
+                    + "Reply yes to install or no to cancel."
+                )
                 resp = {
                     "status": "awaiting_director_confirmation",
                     "requires_confirmation": True,
                     "tier": "MID",
                     "action": "skill_install",
+                    "summary": _summary,
                     "candidate": {
                         "slug": top.get("slug"),
                         "summary": top.get("summary"),
                         "github_url": top.get("github_url"),
                     },
                     "review_result": review_result,
-                    "next_step": (
-                        "Review the security findings above. "
-                        "Reply 'yes, install it' to proceed with skill_load, or 'no' to cancel."
-                    ),
-                    "_pending_load": {
-                        "name": top.get("slug"),
-                        "skill_md": top["skill_md"],
-                        "review_result": review_result,
-                        "clawhub_slug": top.get("slug"),
-                        "clawhub_certified": bool(top.get("certified", False)),
+                    # pending_delegation: gateway stores and re-sends on confirm; must contain
+                    # intent + _pending_load so engine resumes at the confirmed load step.
+                    "pending_delegation": {
+                        "delegate_to": "devops_agent",
+                        "intent": "skill_install",
+                        "_pending_load": _pending_load,
                     },
                 }
-                if review_result.get("escalate_to_director"):
+                if _escalated:
                     resp["escalation_notice"] = (
                         "This skill was flagged for Director review. "
                         f"Reasons: {'; '.join(review_result.get('escalation_reasons', []))}. "
@@ -1653,8 +1949,9 @@ class ExecutionEngine:
                     )
 
                 if confirmed:
-                    # Director confirmed — proceed with load
-                    pending = action.get("_pending_load") or resp["_pending_load"]
+                    # Director confirmed — resume load using _pending_load from delegation
+                    # (_delegation_to_action strips custom fields so read from delegation directly)
+                    pending = (delegation or {}).get("_pending_load") or _pending_load
                     return await lifecycle.load(
                         name=pending.get("name", top.get("slug", "")),
                         skill_md_content=pending.get("skill_md", top["skill_md"]),
@@ -1663,7 +1960,7 @@ class ExecutionEngine:
                         clawhub_slug=pending.get("clawhub_slug"),
                         clawhub_certified=bool(pending.get("clawhub_certified", False)),
                         proposed_by=(delegation or {}).get("delegate_to", "devops_agent"),
-                        reason=action.get("reason") or "Director confirmed skill installation after review.",
+                        reason="Director confirmed skill installation after review.",
                     )
 
                 return resp

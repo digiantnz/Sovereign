@@ -120,3 +120,355 @@ commands:
         allowlist: []   # populated as scripts are reviewed and approved
     tier: medium
     enabled: true
+
+  # ── IMAP/SMTP community skill commands (imap-smtp-email, gzlicanyi) ──────────
+  # Node.js scripts via wrapper that maps PERSONAL_IMAP_* → IMAP_* format.
+  # Broker must have imap-personal.env and imap-business.env in env_file.
+
+  imap_personal_check:
+    description: "Check personal mailbox (e.email) for new/unread emails. Returns JSON array of messages."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "check"]
+    params:
+      limit:
+        type: integer
+        flag: "--limit"
+        required: false
+        default: 10
+        min: 1
+        max: 100
+    tier: low
+    enabled: true
+
+  imap_personal_fetch:
+    description: "Fetch full content of a personal email by UID."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "fetch"]
+    params:
+      uid:
+        type: string
+        required: true
+    tier: low
+    enabled: true
+
+  imap_personal_search:
+    description: "Search personal mailbox with filters (subject, from, since, unseen)."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "search"]
+    params:
+      subject:
+        type: string
+        flag: "--subject"
+        required: false
+      from_addr:
+        type: string
+        flag: "--from"
+        required: false
+      since:
+        type: string
+        flag: "--since"
+        required: false
+      limit:
+        type: integer
+        flag: "--limit"
+        required: false
+        default: 20
+      unseen:
+        type: string
+        flag: "--unseen"
+        required: false
+    tier: low
+    enabled: true
+
+  imap_personal_mark_read:
+    description: "Mark a personal email as read by UID."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "mark-read"]
+    params:
+      uid:
+        type: string
+        required: true
+    tier: low
+    enabled: true
+
+  imap_personal_mark_unread:
+    description: "Mark a personal email as unread by UID."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "mark-unread"]
+    params:
+      uid:
+        type: string
+        required: true
+    tier: low
+    enabled: true
+
+  imap_personal_list_mailboxes:
+    description: "List all IMAP mailboxes/folders in the personal account."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "list-mailboxes"]
+    params: {}
+    tier: low
+    enabled: true
+
+  smtp_send_personal:
+    description: "Send email from personal account (e.email) via SMTP."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_personal.sh", "smtp.js", "send"]
+    params:
+      to:
+        type: string
+        flag: "--to"
+        required: true
+      subject:
+        type: string
+        flag: "--subject"
+        required: true
+      body:
+        type: string
+        flag: "--body"
+        required: true
+      cc:
+        type: string
+        flag: "--cc"
+        required: false
+      bcc:
+        type: string
+        flag: "--bcc"
+        required: false
+    tier: medium
+    enabled: true
+
+  imap_business_check:
+    description: "Check business mailbox (digiant.co.nz) for new/unread emails."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_business.sh", "imap.js", "check"]
+    params:
+      limit:
+        type: integer
+        flag: "--limit"
+        required: false
+        default: 10
+        min: 1
+        max: 100
+    tier: low
+    enabled: true
+
+  imap_business_fetch:
+    description: "Fetch full content of a business email by UID."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_business.sh", "imap.js", "fetch"]
+    params:
+      uid:
+        type: string
+        required: true
+    tier: low
+    enabled: true
+
+  imap_business_search:
+    description: "Search business mailbox with filters."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_business.sh", "imap.js", "search"]
+    params:
+      subject:
+        type: string
+        flag: "--subject"
+        required: false
+      from_addr:
+        type: string
+        flag: "--from"
+        required: false
+      since:
+        type: string
+        flag: "--since"
+        required: false
+      limit:
+        type: integer
+        flag: "--limit"
+        required: false
+        default: 20
+    tier: low
+    enabled: true
+
+  imap_business_mark_read:
+    description: "Mark a business email as read by UID."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_business.sh", "imap.js", "mark-read"]
+    params:
+      uid:
+        type: string
+        required: true
+    tier: low
+    enabled: true
+
+  smtp_send_business:
+    description: "Send email from business account (digiant.co.nz) via SMTP."
+    binary: /bin/sh
+    fixed_args: ["/scripts/mail_business.sh", "smtp.js", "send"]
+    params:
+      to:
+        type: string
+        flag: "--to"
+        required: true
+      subject:
+        type: string
+        flag: "--subject"
+        required: true
+      body:
+        type: string
+        flag: "--body"
+        required: true
+      cc:
+        type: string
+        flag: "--cc"
+        required: false
+      bcc:
+        type: string
+        flag: "--bcc"
+        required: false
+    tier: medium
+    enabled: true
+
+  # ── Nextcloud community skill commands (openclaw-nextcloud, keithvassallomt) ──
+  # nextcloud.js is a pre-bundled self-contained file (647KB, no npm deps).
+  # Broker must be on business_net and have NEXTCLOUD_URL, WEBDAV_USER, WEBDAV_PASS.
+
+  nc_calendar_list:
+    description: "List Nextcloud calendar events (default: next 7 days)."
+    binary: /bin/sh
+    fixed_args: ["/scripts/nextcloud_run.sh", "calendar", "list"]
+    params:
+      from:
+        type: string
+        flag: "--from"
+        required: false
+      to:
+        type: string
+        flag: "--to"
+        required: false
+    tier: low
+    enabled: true
+
+  nc_calendar_create:
+    description: "Create a Nextcloud calendar event."
+    binary: /bin/sh
+    fixed_args: ["/scripts/nextcloud_run.sh", "calendar", "create"]
+    params:
+      summary:
+        type: string
+        flag: "--summary"
+        required: true
+      start:
+        type: string
+        flag: "--start"
+        required: true
+      end:
+        type: string
+        flag: "--end"
+        required: true
+      description:
+        type: string
+        flag: "--description"
+        required: false
+      calendar:
+        type: string
+        flag: "--calendar"
+        required: false
+    tier: medium
+    enabled: true
+
+  nc_calendar_delete:
+    description: "Delete a Nextcloud calendar event by UID."
+    binary: /bin/sh
+    fixed_args: ["/scripts/nextcloud_run.sh", "calendar", "delete"]
+    params:
+      uid:
+        type: string
+        flag: "--uid"
+        required: true
+      calendar:
+        type: string
+        flag: "--calendar"
+        required: false
+    tier: medium
+    enabled: true
+
+  nc_tasks_list:
+    description: "List Nextcloud tasks/todos."
+    binary: /bin/sh
+    fixed_args: ["/scripts/nextcloud_run.sh", "tasks", "list"]
+    params:
+      calendar:
+        type: string
+        flag: "--calendar"
+        required: false
+    tier: low
+    enabled: true
+
+  nc_tasks_create:
+    description: "Create a Nextcloud task/todo."
+    binary: /bin/sh
+    fixed_args: ["/scripts/nextcloud_run.sh", "tasks", "create"]
+    params:
+      title:
+        type: string
+        flag: "--title"
+        required: true
+      due:
+        type: string
+        flag: "--due"
+        required: false
+      priority:
+        type: string
+        flag: "--priority"
+        required: false
+      description:
+        type: string
+        flag: "--description"
+        required: false
+      calendar:
+        type: string
+        flag: "--calendar"
+        required: false
+    tier: medium
+    enabled: true
+
+  nc_tasks_complete:
+    description: "Mark a Nextcloud task as complete by UID."
+    binary: /bin/sh
+    fixed_args: ["/scripts/nextcloud_run.sh", "tasks", "complete"]
+    params:
+      uid:
+        type: string
+        flag: "--uid"
+        required: true
+      calendar:
+        type: string
+        flag: "--calendar"
+        required: false
+    tier: medium
+    enabled: true
+
+  nc_files_list:
+    description: "List files/folders in Nextcloud via WebDAV."
+    binary: /bin/sh
+    fixed_args: ["/scripts/nextcloud_run.sh", "files", "list"]
+    params:
+      path:
+        type: string
+        flag: "--path"
+        required: false
+        default: "/"
+    tier: low
+    enabled: true
+
+  nc_files_search:
+    description: "Search files in Nextcloud by name/content."
+    binary: /bin/sh
+    fixed_args: ["/scripts/nextcloud_run.sh", "files", "search"]
+    params:
+      query:
+        type: string
+        flag: "--query"
+        required: true
+    tier: low
+    enabled: true

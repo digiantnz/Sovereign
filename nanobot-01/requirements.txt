@@ -1,0 +1,22 @@
+# nanobot-01 Python dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+# Bridge server (current)
+fastapi
+uvicorn
+httpx
+
+# Skill script runtime — OpenClaw/ClawhHub community skill execution
+feedparser          # RSS/Atom feed parsing (openclaw-feeds)
+requests            # HTTP client for scripts
+caldav              # CalDAV protocol (calendar skills)
+webdav4             # WebDAV protocol (file skills)
+python-dateutil     # Date/time parsing
+PyYAML              # YAML parsing
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Future / planned (add when skills require)
+# imaplib2          # async IMAP (if python3_exec imap skills added)
+# smtplib-async     # async SMTP
+# beautifulsoup4    # HTML parsing for feed/web skills
+# lxml              # fast XML/HTML parser
+# cryptography      # signing / encryption in scripts

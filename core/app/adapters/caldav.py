@@ -217,10 +217,11 @@ class CalDAVAdapter:
                 }
 
             if from_date and to_date:
-                # Convert to CalDAV UTC format
+                # Use floating datetime (no Z suffix) to match floating DTSTART values.
+                # UTC-anchored queries (with Z) fail to match events stored without TZID.
                 try:
-                    start_dt = datetime.fromisoformat(from_date).strftime("%Y%m%dT000000Z")
-                    end_dt   = datetime.fromisoformat(to_date).strftime("%Y%m%dT235959Z")
+                    start_dt = datetime.fromisoformat(from_date).strftime("%Y%m%dT000000")
+                    end_dt   = datetime.fromisoformat(to_date).strftime("%Y%m%dT235959")
                     time_range = _TIME_RANGE_TMPL.format(start=start_dt, end=end_dt)
                 except ValueError:
                     time_range = ""
@@ -240,7 +241,7 @@ class CalDAVAdapter:
 
         events = []
         if r.status_code in (207, 200):
-            for block in re.findall(r"<C:calendar-data[^>]*>(.*?)</C:calendar-data>", r.text, re.DOTALL):
+            for block in re.findall(r"<[^:>]+:calendar-data[^>]*>(.*?)</[^:>]+:calendar-data>", r.text, re.DOTALL):
                 uid_m      = re.search(r"^UID:(.+)$", block, re.MULTILINE)
                 summary_m  = re.search(r"^SUMMARY:(.+)$", block, re.MULTILINE)
                 dtstart_m  = re.search(r"^DTSTART[^:]*:(.+)$", block, re.MULTILINE)

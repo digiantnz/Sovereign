@@ -62,17 +62,24 @@ services:
       dockerfile: Dockerfile
     container_name: docker-broker
     restart: unless-stopped
-    networks: [ai_net]
+    networks:
+      - ai_net
+      - business_net  # needed for Nextcloud (nc_*) commands via Node.js scripts
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /home/sovereign/governance/docker-policy.yaml:/policy/docker-policy.yaml:ro
       - ./broker/commands-policy.yaml:/policy/commands-policy.yaml:ro
       - ./broker/scripts:/scripts:ro
       - /:/hostfs:ro  # Host filesystem — read-only examination by Rex
+    env_file:
+      - ./secrets/imap-personal.env
+      - ./secrets/imap-business.env
+      - ./secrets/webdav.env
     environment:
       - BROKER_POLICY=/policy/docker-policy.yaml
       - COMMANDS_POLICY=/policy/commands-policy.yaml
       - SCRIPTS_DIR=/scripts
+      - NODE_PATH=/app/node_modules  # imap/smtp deps installed in broker image
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8088/health || exit 1"]
       interval: 15s
@@ -294,7 +301,12 @@ services:
       - /docker/sovereign/nanobot-01/workspace:/workspace  # Task workspace
       - /home/sovereign/nanobot-01/memory:/memory  # Durable nanobot memory (RAID)
     # No docker.sock, no privileged, no extra capabilities, no host ports
-    # No secrets mounts — nanobot-01 receives no credentials from sovereign-core
+    # Phase 1 credential delegation: static env var mounts (ai_net only, contained risk)
+    # Phase 2 will replace these with session-scoped token proxy via sovereign-core
+    env_file:
+      - ./secrets/imap-business.env
+      - ./secrets/imap-personal.env
+      - ./secrets/nextcloud.env
     environment:
       - NANOBOT_CONFIG=/workspace/.nanobot/config.json
       - NANOBOT_WORKSPACE=/workspace

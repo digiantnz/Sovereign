@@ -37,7 +37,9 @@ function spawnRun(binary, args, timeoutMs = 15000) {
     const proc = spawn(binary, args, {
       shell: false,
       timeout: timeoutMs,
-      env: { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' },
+      // Merge parent env so skill scripts can access credentials (IMAP, SMTP, WebDAV)
+      // and NODE_PATH for community skill npm modules. PATH is explicitly enforced.
+      env: { ...process.env, PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' },
     });
     proc.stdout.on('data', d => { stdout += d.toString(); });
     proc.stderr.on('data', d => { stderr += d.toString(); });
