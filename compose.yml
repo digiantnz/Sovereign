@@ -62,6 +62,12 @@ services:
       dockerfile: Dockerfile
     container_name: docker-broker
     restart: unless-stopped
+    pid: host  # required for nsenter → systemctl_status, journalctl, apt_check
+    cap_add:
+      - SYS_ADMIN   # nsenter: enter host mount namespace (needed for systemctl/journalctl/apt_check)
+      - SYS_PTRACE  # nsenter: read /proc/1/ns/* symlinks
+    security_opt:
+      - apparmor=unconfined  # AppArmor blocks setns even with SYS_ADMIN — broker already holds docker.sock
     networks:
       - ai_net
       - business_net  # needed for Nextcloud (nc_*) commands via Node.js scripts

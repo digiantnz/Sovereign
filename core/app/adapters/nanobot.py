@@ -59,7 +59,7 @@ SYSTEM_COMMANDS = frozenset({
     "docker_inspect", "docker_exec",
     # OS read-only (whitelisted in commands-policy.yaml)
     "uname", "df", "free", "ps", "nvidia_smi",
-    "systemctl_status", "journalctl",
+    "systemctl_status", "journalctl", "apt_check",
 })
 
 

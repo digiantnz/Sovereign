@@ -58,9 +58,8 @@ commands:
 
   systemctl_status:
     description: >
-      Systemd service status. DISABLED: requires pid:host in compose.yml (broker service)
-      and nsenter in Dockerfile (apk add util-linux). Enable by: (1) add pid: host to broker
-      compose service, (2) add RUN apk add util-linux to broker Dockerfile, (3) set enabled: true.
+      Systemd service status on host. Uses nsenter into host PID namespace.
+      Requires pid:host (compose.yml) + util-linux (Dockerfile) — both enabled.
     binary: /usr/bin/nsenter
     fixed_args: ["-t", "1", "-m", "--", "/usr/bin/systemctl", "status", "--no-pager", "-l"]
     params:
@@ -76,11 +75,11 @@ commands:
           - cron
           - unattended-upgrades
     tier: low
-    enabled: false
+    enabled: true
 
   journalctl:
     description: >
-      Read systemd journal. DISABLED: same requirement as systemctl_status — pid:host + nsenter.
+      Read systemd journal on host. Uses nsenter into host PID namespace.
       params: unit (optional, allowlisted), lines (1-500, default 50).
     binary: /usr/bin/nsenter
     fixed_args: ["-t", "1", "-m", "--", "/usr/bin/journalctl", "--no-pager"]
@@ -105,7 +104,18 @@ commands:
         min: 1
         max: 500
     tier: low
-    enabled: false
+    enabled: true
+
+  apt_check:
+    description: >
+      Check host OS for available package updates. Runs apt-get update + apt list --upgradable
+      via nsenter into host PID namespace. Returns one upgradable package per line.
+      Read-only — never installs or modifies packages.
+    binary: /bin/sh
+    fixed_args: ["/scripts/apt_check.sh"]
+    params: {}
+    tier: low
+    enabled: true
 
   script:
     description: >
