@@ -112,6 +112,14 @@ ROUTING RULES:
 - "inspect [container]", "docker inspect" → devops_agent, intent=inspect_container, target=container name
 - "show compose", "read compose", "show docker-compose", "what's in compose.yml" → devops_agent, intent=get_compose
 - "read file [path]", "show file [path]", "list [path]", "what's in [path]", "read host" — when path is a system path (not Nextcloud) → devops_agent, intent=read_host_file, target=the absolute path
+- Sovereign's own files (NOT on Nextcloud — read via read_host_file, devops_agent):
+    "as-built", "as-built.md"   → /home/sovereign/docs/as-built.md
+    "MEMORY.md", "memory file"  → /home/sovereign/memory/MEMORY.md
+    "governance", "policy file" → /home/sovereign/governance/governance.json
+    "soul", "sovereign-soul"    → /home/sovereign/personas/sovereign-soul.md
+    "skills list", "skill dir"  → /home/sovereign/skills/
+    "audit log", "ledger"       → /home/sovereign/audit/security-ledger.jsonl
+    "compose.yml"               → use get_compose intent (not read_host_file)
 - "hardware", "disk space", "disk usage", "cpu info", "memory info", "system hardware", "df -h", "free -m", "lscpu" → devops_agent, intent=get_hardware
 - "processes", "running processes", "ps aux", "what's running on the system", "list processes" → devops_agent, intent=list_processes
 - "schedule a task", "run every", "run daily", "every morning at", "daily briefing", "recurring task", "remind me every", "monitor daily", "search daily", "search weekly", "notify me when", "alert me every" → devops_agent, intent=schedule_task (MID — requires confirmation)

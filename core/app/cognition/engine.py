@@ -128,25 +128,70 @@ class CognitionEngine:
     # ── Pass 2: Specialist Reasoning ──────────────────────────────────────
     async def specialist_reason(self, agent_name: str, delegation: dict, user_input: str) -> dict:
         from skills.loader import SkillLoader
+        import re as _re_json
+        _log = __import__("logging").getLogger(__name__)
         persona = self.load_persona(agent_name)
         try:
             loader = SkillLoader(agent_name, ledger=self.ledger)
             persona = loader.inject_into_persona(persona)
             if loader.skills:
-                import logging as _log
-                _log.getLogger(__name__).debug(
-                    "SkillLoader: injected %s into %s persona",
-                    loader.get_skill_names(), agent_name,
-                )
+                _log.debug("SkillLoader: injected %s into %s persona",
+                           loader.get_skill_names(), agent_name)
         except Exception as e:
-            import logging as _log
-            _log.getLogger(__name__).warning("SkillLoader: failed for %s: %s", agent_name, e)
+            _log.warning("SkillLoader: failed for %s: %s", agent_name, e)
+
         prompt = prompts.specialist(
             agent_persona=persona,
             delegation=delegation,
             user_input=user_input,
         )
-        return await self.call_llm_json(prompt)
+
+        # ── PASS 2 routing: external for complex/explicit requests ──────────
+        # PASS 1/3/4 always stay local; PASS 2 is the only externally-routed pass.
+        # Governance (PASS 3) and classification (PASS 1) must remain deterministic.
+        decision = self._routing_decision(prompt, user_input=user_input)
+
+        if decision["use_external"]:
+            _log.info(
+                "specialist_reason[%s]: routing to %s (reason=%s score=%.3f→%.3f)",
+                agent_name, decision["provider"], decision["reason"],
+                decision["score"], decision["penalised_score"],
+            )
+            try:
+                if decision["provider"] == "claude":
+                    raw = await self.ask_claude(prompt, agent=agent_name)
+                else:
+                    raw = await self.ask_grok(prompt, agent=agent_name)
+
+                response_text = raw.get("response", "")
+                # External providers return freeform text; may wrap JSON in ```json...```
+                # Strip markdown code fences first, then extract the outermost {...} block.
+                stripped = _re_json.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
+                m = _re_json.search(r"\{.*\}", stripped, _re_json.DOTALL)
+                if m:
+                    try:
+                        result = json.loads(m.group())
+                        result["_routed_external"] = True
+                        result["_provider"]        = decision["provider"]
+                        result["_complexity_score"] = decision["score"]
+                        result["_routing_reason"]  = decision["reason"]
+                        return result
+                    except json.JSONDecodeError:
+                        pass
+                _log.warning("specialist_reason[%s]: external response had no parseable JSON, falling back to local",
+                             agent_name)
+            except Exception as exc:
+                _log.warning("specialist_reason[%s]: external call failed (%s), falling back to local",
+                             agent_name, exc)
+
+        # Local path (default, or fallback from failed external)
+        result = await self.call_llm_json(prompt)
+        result["_routed_external"]  = False
+        result["_provider"]         = "ollama"
+        result["_routing_reason"]   = decision["reason"]
+        result["_complexity_score"] = decision["score"]
+        result["_intended_provider"] = decision["provider"] if decision["use_external"] else "ollama"
+        return result
 
     # ── Pass 3: CEO Evaluation ────────────────────────────────────────────
     async def ceo_evaluate(self, user_input: str, delegation: dict, specialist_output: dict) -> dict:
@@ -309,31 +354,75 @@ class CognitionEngine:
             return {"error": str(e)}
 
     # ── Routed cognition (local-first, external on complexity/explicit request) ──
-    # Complexity threshold: prompt scores above this → eligible for external routing
-    _COMPLEXITY_THRESHOLD = 0.50
+    #
+    # ROUTING LOGIC (for Rex's self-diagnostic):
+    #
+    # Step 1 — Explicit override:
+    #   "use claude" / "ask claude" / "architectural" / "plan" / "review" /
+    #   "design" / "strategy"                            → provider = claude
+    #   "use grok" / "ask grok" / "current" / "latest" /
+    #   "news" / "today" / "recent" / "market"          → provider = grok
+    #   (both trigger external regardless of score)
+    #
+    # Step 2 — DCL sensitivity gate:
+    #   PRIVATE or SECRET content → hard local, no external call ever
+    #
+    # Step 3 — Complexity scoring (five factors, score in [0,1]):
+    #   • Length       (>300 words)                     weight 0.40
+    #   • Conjunctions (and/also/furthermore/moreover)   weight 0.20
+    #   • Depth kw     (analyse/compare/evaluate/etc.)   weight 0.25
+    #   • Question cnt (multiple ?)                      weight 0.15
+    #   • Operational penalty: if score ≥ 0.50 AND prompt contains
+    #     restart/container/service/deploy/mount/volume/port → -0.20
+    #     (biases operational/infra queries back to local Ollama)
+    #
+    # Step 4 — score ≥ 0.50 (after penalty) → external, default provider = grok
+    #
+    # Step 5 — Default → Ollama local
+    #
+    # ALL external calls are DCL-gated and audit-logged regardless of trigger.
+    # PASS 1 (classify), PASS 3 (evaluate), PASS 4 (memory) are NEVER routed
+    # externally — governance must remain deterministic and local.
 
-    # Explicit external-routing keywords from Director
+    _COMPLEXITY_THRESHOLD = 0.50
+    _PREFER_LOCAL_TIERS   = {"PRIVATE", "SECRET"}
+
     _EXPLICIT_EXTERNAL_RE = __import__("re").compile(
         r"\b(use claude|use grok|ask claude|ask grok|via claude|via grok"
         r"|external llm|external model|external ai)\b",
         __import__("re").IGNORECASE,
     )
-
-    _PREFER_LOCAL_TIERS = {"PRIVATE", "SECRET"}  # hard-prefer local regardless of complexity
+    # Provider-selection signals (checked against raw user input, not full prompt)
+    _CLAUDE_SIGNAL_RE = __import__("re").compile(
+        r"\b(use claude|ask claude|via claude"
+        r"|architectural|architecture|plan|review|design|strategy|strategic)\b",
+        __import__("re").IGNORECASE,
+    )
+    _GROK_SIGNAL_RE = __import__("re").compile(
+        r"\b(use grok|ask grok|via grok"
+        r"|current|latest|news|today|recent|market|trending)\b",
+        __import__("re").IGNORECASE,
+    )
+    # Operational/infra keywords that trigger the complexity penalty
+    _OPERATIONAL_RE = __import__("re").compile(
+        r"\b(restart|container|service|deploy|mount|volume|port|compose|dockerfile"
+        r"|nginx|redis|mariadb|healthcheck|network|subnet)\b",
+        __import__("re").IGNORECASE,
+    )
 
     @staticmethod
     def _complexity_score(prompt: str) -> float:
         """Heuristic complexity score in [0, 1]. Higher = more complex.
 
-        Factors:
-          - Length (>300 words → high complexity)
-          - Presence of multi-part conjunctions (and/also/additionally/furthermore)
-          - Technical depth markers (analyse, synthesise, compare, evaluate, contrast)
-          - Question count (multiple questions in one prompt)
+        Factors (weights sum to 1.0):
+          • Length       — >300 words                              (0.40)
+          • Conjunctions — and/also/furthermore/moreover/however   (0.20)
+          • Depth kw     — analyse/compare/evaluate/trade-offs     (0.25)
+          • Question cnt — multiple ? marks                        (0.15)
+        Operational penalty applied separately in _routing_decision.
         """
         words      = prompt.split()
-        length_s   = min(len(words) / 300, 1.0)                               # 0–1
-
+        length_s   = min(len(words) / 300, 1.0)
         multi_conj = len(__import__("re").findall(
             r"\b(and|also|additionally|furthermore|moreover|however)\b",
             prompt, __import__("re").IGNORECASE,
@@ -344,51 +433,91 @@ class CognitionEngine:
             prompt, __import__("re").IGNORECASE,
         )) / 5
         q_count    = min(prompt.count("?") / 3, 1.0)
-
         return min(length_s * 0.4 + multi_conj * 0.2 + depth_kw * 0.25 + q_count * 0.15, 1.0)
+
+    def _routing_decision(self, prompt: str, user_input: str = "") -> dict:
+        """Compute routing decision for a prompt. Returns a dict:
+          {use_external, provider, score, penalised_score, explicit, force_local, reason}
+        Centralises all routing logic so specialist_reason and route_cognition share it.
+        user_input is the raw Director message (for provider-signal matching).
+        """
+        signal_text = user_input or prompt
+        explicit    = bool(self._EXPLICIT_EXTERNAL_RE.search(signal_text))
+        # Score complexity on user_input (Director's message) only, not the full
+        # specialist prompt — personas are inherently long and would inflate every score.
+        score       = self._complexity_score(user_input or prompt)
+        tier        = self.dcl.classify(prompt)
+        force_local = tier in self._PREFER_LOCAL_TIERS
+
+        # Operational penalty: score ≥ threshold but strongly infra-flavoured → bias local
+        penalised = score
+        if score >= self._COMPLEXITY_THRESHOLD and self._OPERATIONAL_RE.search(prompt):
+            penalised = max(0.0, score - 0.20)
+
+        use_external = (explicit or penalised >= self._COMPLEXITY_THRESHOLD) and not force_local
+
+        # Provider selection from signal keywords; default grok
+        if self._CLAUDE_SIGNAL_RE.search(signal_text):
+            provider = "claude"
+        elif self._GROK_SIGNAL_RE.search(signal_text):
+            provider = "grok"
+        else:
+            provider = "grok"  # default for complexity-triggered external calls
+
+        reason = (
+            "force_local(dcl)"   if force_local else
+            "explicit_external"  if explicit else
+            "complexity"         if penalised >= self._COMPLEXITY_THRESHOLD else
+            "local_default"
+        )
+        return {
+            "use_external":   use_external,
+            "provider":       provider,
+            "score":          round(score, 3),
+            "penalised_score": round(penalised, 3),
+            "explicit":       explicit,
+            "force_local":    force_local,
+            "reason":         reason,
+        }
 
     async def route_cognition(
         self,
-        prompt:    str,
-        agent:     str = "sovereign-core",
-        system:    str = "You are a helpful assistant.",
-        provider:  str = "grok",               # preferred external provider if routed externally
+        prompt:   str,
+        agent:    str = "sovereign-core",
+        system:   str = "You are a helpful assistant.",
+        provider: str | None = None,   # None = auto-select via _routing_decision
+        user_input: str = "",
     ) -> dict:
-        """Local-first cognition routing per EXTERNAL_COGNITION.md.
-
-        Decision flow:
-          1. Explicit Director request → external (DCL still applies)
-          2. Sensitivity tier PRIVATE/SECRET → local only
-          3. Complexity score >= threshold → external (DCL still applies)
-          4. Default → local Ollama
+        """Local-first cognition routing. See class-level routing comment block.
 
         Returns {response, provider_used, complexity_score, routed_external}.
         """
-        explicit  = bool(self._EXPLICIT_EXTERNAL_RE.search(prompt))
-        score     = self._complexity_score(prompt)
-        tier      = self.dcl.classify(prompt)
-        force_local = tier in self._PREFER_LOCAL_TIERS
+        decision = self._routing_decision(prompt, user_input=user_input)
+        # Explicit provider arg overrides keyword-based selection
+        chosen = provider or decision["provider"]
 
-        use_external = (explicit or score >= self._COMPLEXITY_THRESHOLD) and not force_local
-
-        if use_external:
-            if provider == "claude":
+        if decision["use_external"]:
+            if chosen == "claude":
                 result = await self.ask_claude(prompt, agent=agent, system=system)
             else:
                 result = await self.ask_grok(prompt, agent=agent, system=system)
-            result["provider_used"]     = provider
-            result["complexity_score"]  = round(score, 3)
-            result["routed_external"]   = True
-            result["explicit_request"]  = explicit
+            result["provider_used"]      = chosen
+            result["complexity_score"]   = decision["score"]
+            result["penalised_score"]    = decision["penalised_score"]
+            result["routed_external"]    = True
+            result["explicit_request"]   = decision["explicit"]
+            result["routing_reason"]     = decision["reason"]
             return result
         else:
             raw = await self.ollama.generate(prompt, model=MODEL)
             return {
                 "response":          raw.get("response", ""),
                 "provider_used":     "ollama",
-                "complexity_score":  round(score, 3),
+                "complexity_score":  decision["score"],
+                "penalised_score":   decision["penalised_score"],
                 "routed_external":   False,
-                "explicit_request":  explicit,
+                "explicit_request":  decision["explicit"],
+                "routing_reason":    decision["reason"],
             }
 
     # ── Task intent parsing ───────────────────────────────────────────────

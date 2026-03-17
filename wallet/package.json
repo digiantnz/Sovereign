@@ -1,0 +1,12 @@
+{
+  "name": "sov-wallet",
+  "version": "2.0.0",
+  "description": "Sovereign Safe Transaction Service proxy",
+  "main": "wallet-api.js",
+  "scripts": {
+    "start": "node wallet-api.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

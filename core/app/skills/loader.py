@@ -32,7 +32,7 @@ SKILLS_DIR = "/home/sovereign/skills"
 CHECKSUMS_PATH = "/home/sovereign/security/skill-checksums.json"
 
 # Adapters always present in the running Sovereign stack (no env check required)
-_ALWAYS_AVAILABLE = {"broker", "ollama", "qdrant"}
+_ALWAYS_AVAILABLE = {"broker", "ollama", "qdrant", "nanobot"}
 
 
 def _available_adapters() -> set[str]:

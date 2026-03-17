@@ -5,8 +5,6 @@ from datetime import datetime, timezone
 from adapters.broker import BrokerAdapter
 from adapters.webdav import WebDAVAdapter
 from adapters.caldav import CalDAVAdapter
-from adapters.imap import IMAPAdapter
-from adapters.smtp import SMTPAdapter
 from adapters.nanobot import NanobotAdapter
 from execution.adapters.github import GitHubAdapter
 from execution.adapters.browser import BrowserAdapter
@@ -83,6 +81,9 @@ INTENT_ACTION_MAP = {
     "read_host_file":     {"domain": "docker", "operation": "read", "name": "host_file_read"},
     "get_hardware":       {"domain": "docker", "operation": "read", "name": "get_hardware"},
     "list_processes":     {"domain": "docker", "operation": "read", "name": "list_processes"},
+    "apt_check":          {"domain": "docker", "operation": "read", "name": "apt_check"},
+    "systemctl_status":   {"domain": "docker", "operation": "read", "name": "systemctl_status"},
+    "journalctl":         {"domain": "docker", "operation": "read", "name": "journalctl"},
     # WebDAV navigate — returns items with full paths (superset of list_files)
     "navigate":      {"domain": "webdav", "operation": "read",    "name": "file_navigate"},
     "search_files":  {"domain": "webdav", "operation": "search",  "name": "file_search"},
@@ -115,6 +116,7 @@ INTENT_ACTION_MAP = {
 INTENT_TIER_MAP = {
     "inspect_container": "LOW", "get_compose": "LOW", "read_host_file": "LOW",
     "get_hardware": "LOW", "list_processes": "LOW",
+    "apt_check": "LOW", "systemctl_status": "LOW", "journalctl": "LOW",
     "list_containers": "LOW", "get_logs": "LOW", "get_stats": "LOW",
     "list_files": "LOW", "navigate": "LOW", "read_file": "LOW", "search_files": "LOW",
     "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
@@ -313,6 +315,42 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Calendar event update — deterministic pre-classifier",
         }
 
+    # ── Sovereign RAID file reads — deterministic aliases ──────────────────
+    # "read the as-built file" must never fall through to memory/query.
+    # These are physical files on RAID mounted into sovereign-core — always read_host_file.
+    _SOVEREIGN_FILE_ALIASES = {
+        "as-built":            "/home/sovereign/docs/as-built.md",
+        "as built":            "/home/sovereign/docs/as-built.md",
+        "memory.md":           "/home/sovereign/memory/MEMORY.md",
+        "memory file":         "/home/sovereign/memory/MEMORY.md",
+        "sovereign-soul":      "/home/sovereign/personas/sovereign-soul.md",
+        "sovereign soul":      "/home/sovereign/personas/sovereign-soul.md",
+        "governance.json":     "/home/sovereign/governance/governance.json",
+        "governance file":     "/home/sovereign/governance/governance.json",
+        "audit log":           "/home/sovereign/audit/security-ledger.jsonl",
+        "security ledger":     "/home/sovereign/audit/security-ledger.jsonl",
+        "skill dir":           "/home/sovereign/skills/",
+        "skills directory":    "/home/sovereign/skills/",
+    }
+    _read_verbs = ("read", "show", "cat", "display", "open", "view", "list")
+    _has_read_verb = any(v in u for v in _read_verbs)
+    for _alias, _fpath in _SOVEREIGN_FILE_ALIASES.items():
+        if _alias in u:
+            return {
+                "delegate_to": "devops_agent", "intent": "read_host_file",
+                "target": _fpath, "tier": "LOW",
+                "reasoning_summary": f"Known Sovereign RAID file alias '{_alias}' — deterministic read_host_file",
+            }
+    # Also catch explicit /home/sovereign/ or /docker/sovereign/ paths in the input
+    import re as _re_path
+    _path_match = _re_path.search(r'(/home/sovereign/|/docker/sovereign/)[\w./\-]+', user_input)
+    if _path_match and _has_read_verb:
+        return {
+            "delegate_to": "devops_agent", "intent": "read_host_file",
+            "target": _path_match.group(0), "tier": "LOW",
+            "reasoning_summary": "Explicit RAID/NVMe path detected — deterministic read_host_file",
+        }
+
     # ── Scheduler quick-check — before conversational guard ────────────────
     # Scheduling requests often contain no system-domain signals ("search daily",
     # "monitor weekly") so they must be tested before the conversational guard fires.
@@ -360,6 +398,35 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "reasoning_summary": "Scheduling request — deterministic pre-classifier",
             }
 
+    # ── System diagnostics — deterministic devops shortcuts ────────────────
+    _os_update_kw = (
+        "os update", "system update", "apt update", "apt upgrade",
+        "check for updates", "package update", "kernel update",
+        "upgradable packages", "available updates", "pending updates",
+        "what needs updating", "what needs to be updated",
+        "update check", "check updates",
+    )
+    if any(kw in u for kw in _os_update_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "apt_check",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "OS update check — deterministic pre-classifier",
+        }
+    _systemctl_kw = ("systemctl", "service status", "systemd", "is docker running", "is ssh running")
+    if any(kw in u for kw in _systemctl_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "systemctl_status",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Systemctl status — deterministic pre-classifier",
+        }
+    _journal_kw = ("journalctl", "journal log", "system journal", "systemd log")
+    if any(kw in u for kw in _journal_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "journalctl",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Journal log — deterministic pre-classifier",
+        }
+
     # ── Conversational/personal guard ──────────────────────────────────────
     # If no system-domain signal is present, route to query immediately.
     # Prevents personal/lifestyle statements (buying shirts, weekend plans, etc.)
@@ -375,6 +442,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "to my list", "on my list", "to the list", "on the list",
         "github", "repo", "commit", "push to", "sovereign repo",
         "skill", "clawhub", "openclaw",
+        "os update", "system update", "apt", "kernel", "package",
+        "as-built", "as built", "memory.md", "governance",
     )
     prior_has_system = prior_domain is not None
 
@@ -1065,6 +1134,9 @@ class ExecutionEngine:
             else:
                 execution_result = {"status": "error", "error": str(e)}
 
+        if execution_result is None:
+            execution_result = {"status": "error", "error": f"dispatch returned None for domain={action.get('domain')!r} op={action.get('operation')!r}"}
+
         # PASS 4.5 — Memory cross-reference for file operations
         # After a successful file list/read, search Qdrant for related knowledge.
         # IMPORTANT: Qdrant hits are stored memory — NOT live adapter results.
@@ -1365,14 +1437,34 @@ class ExecutionEngine:
                 return await self.broker.get_hardware()
             if name == "list_processes":
                 return await self.broker.get_processes()
+            if name == "apt_check":
+                return await self.broker.exec_command("apt_check", {})
+            if name == "systemctl_status":
+                svc = container or (specialist or {}).get("service") or action.get("service", "docker")
+                return await self.broker.exec_command("systemctl_status", {"service": svc})
+            if name == "journalctl":
+                sp = specialist or {}
+                unit = sp.get("unit") or action.get("unit")
+                lines = sp.get("lines") or action.get("lines", 50)
+                params = {}
+                if unit:
+                    params["unit"] = unit
+                params["lines"] = lines
+                return await self.broker.exec_command("journalctl", params)
             return {"error": f"Unknown docker action: {name}"}
 
         if domain == "webdav":
             if name == "file_navigate":
                 return await self.webdav.navigate(path)
             if name in ("file_list",):
+                # RAID paths are mounted directly in sovereign-core — read via broker, not Nextcloud
+                if path.startswith(("/home/sovereign/", "/docker/sovereign/")):
+                    return await self.broker.read_host_file(path)
                 return await self.webdav.list(path)
             if name == "file_read":
+                # RAID paths are mounted in sovereign-core — route to broker hostfs, not Nextcloud WebDAV
+                if path.startswith(("/home/sovereign/", "/docker/sovereign/")):
+                    return await self.broker.read_host_file(path)
                 return await self.webdav.read(path)
             if name == "folder_create":
                 return await self.webdav.mkdir(path)
@@ -1601,6 +1693,8 @@ class ExecutionEngine:
                     }
                 )
                 return nb.get("result", nb)
+
+            return {"status": "error", "error": f"Unhandled mail operation: op={op!r} name={name!r}"}
 
         if domain == "ollama":
             if not prompt:

@@ -107,6 +107,11 @@ def _detect_skill_category(fm: dict, body: str) -> str:
     if any(k in env_str for k in ("nextcloud_url", "nextcloud_user")):
         return "nextcloud"
 
+    # Explicit OpenClaw category field
+    oc_category = (oc_meta.get("category") or "").lower()
+    if oc_category in ("rss", "feeds", "rss_feeds"):
+        return "rss_feeds"
+
     # Fallback: check body for strong signals
     name = (fm.get("name") or "").lower()
     desc = (fm.get("description") or "").lower()
@@ -115,51 +120,63 @@ def _detect_skill_category(fm: dict, body: str) -> str:
         return "imap_smtp"
     if "nextcloud" in hints and ("caldav" in hints or "webdav" in hints):
         return "nextcloud"
+    # RSS/feeds signals: feed binary, feedparser, rss/atom feed patterns
+    rss_signals = ("feed get entries", "feed get entry", "feed cli", "rss digest",
+                   "rss feed", "atom feed", "feedparser", "rss-digest")
+    if any(s in hints for s in rss_signals):
+        return "rss_feeds"
+    if "rss" in name or "feed" in name or "digest" in name:
+        return "rss_feeds"
     return "unknown"
 
 
 def _translate_imap_smtp() -> dict:
     """Generate Sovereign sovereign: block for an IMAP/SMTP community skill.
 
-    Operations route to broker_exec commands (mail_personal.sh / mail_business.sh wrappers).
-    Both personal and business account variants included.
+    Operations use python3_exec with imap_check.py / smtp_send.py scripts
+    deployed at workspace/skills/<name>/scripts/.
+    No broker dependency — nanobot-01 handles all email operations natively.
     """
     return {
         "specialists": ["business_agent"],
-        "tier_required": "MID",
-        "adapter_deps": ["broker"],
-        "description": "IMAP email read/search/flag and SMTP send. Personal and business accounts via broker Node.js scripts.",
+        "tier_required": "LOW",
+        "adapter_deps": ["nanobot"],
+        "description": "IMAP email read/search/flag and SMTP send via Python scripts. Personal and business accounts.",
         "operations": {
             "fetch_unread": {
-                "tool": "broker_exec",
-                "action": "imap_personal_check",
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "check", "--account", "business"],
                 "tier": "LOW",
                 "params": {
                     "limit": {"type": "int", "required": False, "default": 10},
                 },
-                "returns": "{messages: [{uid, from, subject, date, body}], count}",
+                "returns": "{messages: [{uid, from, subject, date}], count}",
             },
-            "fetch_unread_business": {
-                "tool": "broker_exec",
-                "action": "imap_business_check",
+            "fetch_unread_personal": {
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "check", "--account", "personal"],
                 "tier": "LOW",
                 "params": {
                     "limit": {"type": "int", "required": False, "default": 10},
                 },
-                "returns": "{messages: [{uid, from, subject, date, body}], count}",
+                "returns": "{messages: [{uid, from, subject, date}], count}",
             },
             "fetch_message": {
-                "tool": "broker_exec",
-                "action": "imap_personal_fetch",
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "fetch", "--account", "business"],
                 "tier": "LOW",
                 "params": {
                     "uid": {"type": "str", "required": True},
                 },
                 "returns": "{uid, from, subject, date, body}",
             },
-            "fetch_message_business": {
-                "tool": "broker_exec",
-                "action": "imap_business_fetch",
+            "fetch_message_personal": {
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "fetch", "--account", "personal"],
                 "tier": "LOW",
                 "params": {
                     "uid": {"type": "str", "required": True},
@@ -167,79 +184,86 @@ def _translate_imap_smtp() -> dict:
                 "returns": "{uid, from, subject, date, body}",
             },
             "search": {
-                "tool": "broker_exec",
-                "action": "imap_personal_search",
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "search", "--account", "business"],
                 "tier": "LOW",
                 "params": {
-                    "subject":   {"type": "str", "required": False},
-                    "from_addr": {"type": "str", "required": False},
-                    "since":     {"type": "str", "required": False},
+                    "query":     {"type": "str", "required": False, "default": ""},
+                    "from_addr": {"type": "str", "required": False, "default": ""},
+                    "subject":   {"type": "str", "required": False, "default": ""},
+                    "since":     {"type": "str", "required": False, "default": ""},
                     "limit":     {"type": "int", "required": False, "default": 20},
                 },
                 "returns": "{messages: [{uid, from, subject, date}], count}",
             },
-            "search_business": {
-                "tool": "broker_exec",
-                "action": "imap_business_search",
+            "search_personal": {
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "search", "--account", "personal"],
                 "tier": "LOW",
                 "params": {
-                    "subject":   {"type": "str", "required": False},
-                    "from_addr": {"type": "str", "required": False},
-                    "since":     {"type": "str", "required": False},
+                    "query":     {"type": "str", "required": False, "default": ""},
+                    "from_addr": {"type": "str", "required": False, "default": ""},
+                    "subject":   {"type": "str", "required": False, "default": ""},
+                    "since":     {"type": "str", "required": False, "default": ""},
                     "limit":     {"type": "int", "required": False, "default": 20},
                 },
                 "returns": "{messages: [{uid, from, subject, date}], count}",
             },
             "mark_read": {
-                "tool": "broker_exec",
-                "action": "imap_personal_mark_read",
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "mark-read", "--account", "business"],
                 "tier": "LOW",
                 "params": {
                     "uid": {"type": "str", "required": True},
                 },
-                "returns": "{status}",
+                "returns": "{status, uid}",
             },
             "mark_unread": {
-                "tool": "broker_exec",
-                "action": "imap_personal_mark_unread",
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "mark-unread", "--account", "personal"],
                 "tier": "LOW",
                 "params": {
                     "uid": {"type": "str", "required": True},
                 },
-                "returns": "{status}",
+                "returns": "{status, uid}",
             },
             "list_folders": {
-                "tool": "broker_exec",
-                "action": "imap_personal_list_mailboxes",
+                "tool": "python3_exec",
+                "script": "scripts/imap_check.py",
+                "args": ["--command", "list-mailboxes", "--account", "personal"],
                 "tier": "LOW",
                 "params": {},
-                "returns": "{folders: [...]}",
+                "returns": "{mailboxes: [...], count}",
             },
             "send_email": {
-                "tool": "broker_exec",
-                "action": "smtp_send_personal",
+                "tool": "python3_exec",
+                "script": "scripts/smtp_send.py",
+                "args": ["--account", "business"],
                 "tier": "MID",
                 "params": {
                     "to":      {"type": "str", "required": True},
                     "subject": {"type": "str", "required": True},
                     "body":    {"type": "str", "required": True},
-                    "cc":      {"type": "str", "required": False},
-                    "bcc":     {"type": "str", "required": False},
+                    "cc":      {"type": "str", "required": False, "default": ""},
                 },
-                "returns": "{smtp_code, smtp_response}",
+                "returns": "{status, message_id}",
             },
-            "send_email_business": {
-                "tool": "broker_exec",
-                "action": "smtp_send_business",
+            "send_email_personal": {
+                "tool": "python3_exec",
+                "script": "scripts/smtp_send.py",
+                "args": ["--account", "personal"],
                 "tier": "MID",
                 "params": {
                     "to":      {"type": "str", "required": True},
                     "subject": {"type": "str", "required": True},
                     "body":    {"type": "str", "required": True},
-                    "cc":      {"type": "str", "required": False},
-                    "bcc":     {"type": "str", "required": False},
+                    "cc":      {"type": "str", "required": False, "default": ""},
                 },
-                "returns": "{smtp_code, smtp_response}",
+                "returns": "{status, message_id}",
             },
         },
     }
@@ -248,97 +272,174 @@ def _translate_imap_smtp() -> dict:
 def _translate_nextcloud() -> dict:
     """Generate Sovereign sovereign: block for an OpenClaw Nextcloud community skill.
 
-    Operations route to broker_exec nc_* commands (nextcloud_run.sh wrapper).
-    Broker must be on business_net to reach http://nextcloud.
+    Operations use python3_exec with nextcloud.py script deployed at
+    workspace/skills/<name>/scripts/. nanobot-01 must be on business_net
+    to reach http://nextcloud directly.
+    No broker dependency.
     """
     return {
         "specialists": ["business_agent"],
-        "tier_required": "MID",
-        "adapter_deps": ["broker"],
-        "description": "Nextcloud calendar, tasks, and files via community Node.js scripts. Runs in broker (business_net access).",
+        "tier_required": "LOW",
+        "adapter_deps": ["nanobot"],
+        "description": "Nextcloud calendar, tasks, and files via Python CalDAV/WebDAV scripts.",
         "operations": {
-            "list_events": {
-                "tool": "broker_exec",
-                "action": "nc_calendar_list",
+            "calendar_list": {
+                "tool": "python3_exec",
+                "script": "scripts/nextcloud.py",
+                "args": ["--command", "calendar_list"],
                 "tier": "LOW",
-                "params": {
-                    "from": {"type": "str", "required": False},
-                    "to":   {"type": "str", "required": False},
-                },
-                "returns": "{status, data: [{uid, calendar, summary, start, end}]}",
+                "params": {},
+                "returns": "{calendars: [{name, url}], count}",
             },
-            "create_event": {
-                "tool": "broker_exec",
-                "action": "nc_calendar_create",
-                "tier": "MID",
-                "params": {
-                    "summary":     {"type": "str", "required": True},
-                    "start":       {"type": "str", "required": True},
-                    "end":         {"type": "str", "required": True},
-                    "description": {"type": "str", "required": False},
-                    "calendar":    {"type": "str", "required": False},
-                },
-                "returns": "{status, data}",
-            },
-            "delete_event": {
-                "tool": "broker_exec",
-                "action": "nc_calendar_delete",
-                "tier": "MID",
-                "params": {
-                    "uid":      {"type": "str", "required": True},
-                    "calendar": {"type": "str", "required": False},
-                },
-                "returns": "{status}",
-            },
-            "list_tasks": {
-                "tool": "broker_exec",
-                "action": "nc_tasks_list",
-                "tier": "LOW",
-                "params": {
-                    "calendar": {"type": "str", "required": False},
-                },
-                "returns": "{status, data: [{uid, summary, status, due}]}",
-            },
-            "create_task": {
-                "tool": "broker_exec",
-                "action": "nc_tasks_create",
+            "calendar_create": {
+                "tool": "python3_exec",
+                "script": "scripts/nextcloud.py",
+                "args": ["--command", "calendar_create"],
                 "tier": "MID",
                 "params": {
                     "title":       {"type": "str", "required": True},
-                    "due":         {"type": "str", "required": False},
-                    "priority":    {"type": "str", "required": False},
-                    "description": {"type": "str", "required": False},
-                    "calendar":    {"type": "str", "required": False},
+                    "start":       {"type": "str", "required": True},
+                    "end":         {"type": "str", "required": False, "default": ""},
+                    "description": {"type": "str", "required": False, "default": ""},
+                    "calendar":    {"type": "str", "required": False, "default": "personal"},
                 },
-                "returns": "{status, data}",
+                "returns": "{status, uid}",
             },
-            "complete_task": {
-                "tool": "broker_exec",
-                "action": "nc_tasks_complete",
+            "calendar_delete": {
+                "tool": "python3_exec",
+                "script": "scripts/nextcloud.py",
+                "args": ["--command", "calendar_delete"],
                 "tier": "MID",
                 "params": {
                     "uid":      {"type": "str", "required": True},
-                    "calendar": {"type": "str", "required": False},
+                    "calendar": {"type": "str", "required": False, "default": "personal"},
                 },
-                "returns": "{status}",
+                "returns": "{status, uid}",
             },
-            "list_files": {
-                "tool": "broker_exec",
-                "action": "nc_files_list",
+            "tasks_list": {
+                "tool": "python3_exec",
+                "script": "scripts/nextcloud.py",
+                "args": ["--command", "tasks_list"],
+                "tier": "LOW",
+                "params": {
+                    "calendar": {"type": "str", "required": False, "default": "tasks"},
+                },
+                "returns": "{tasks: [{uid, summary, status, due}], count}",
+            },
+            "tasks_create": {
+                "tool": "python3_exec",
+                "script": "scripts/nextcloud.py",
+                "args": ["--command", "tasks_create"],
+                "tier": "MID",
+                "params": {
+                    "summary":     {"type": "str", "required": True},
+                    "due":         {"type": "str", "required": False, "default": ""},
+                    "description": {"type": "str", "required": False, "default": ""},
+                    "calendar":    {"type": "str", "required": False, "default": "tasks"},
+                },
+                "returns": "{status, uid}",
+            },
+            "tasks_complete": {
+                "tool": "python3_exec",
+                "script": "scripts/nextcloud.py",
+                "args": ["--command", "tasks_complete"],
+                "tier": "MID",
+                "params": {
+                    "uid":      {"type": "str", "required": True},
+                    "calendar": {"type": "str", "required": False, "default": "tasks"},
+                },
+                "returns": "{status, uid}",
+            },
+            "files_list": {
+                "tool": "python3_exec",
+                "script": "scripts/nextcloud.py",
+                "args": ["--command", "files_list"],
                 "tier": "LOW",
                 "params": {
                     "path": {"type": "str", "required": False, "default": "/"},
                 },
-                "returns": "{status, data: [{name, path, type, size}]}",
+                "returns": "{files: [{name, path, type, size}], count}",
             },
-            "search_files": {
-                "tool": "broker_exec",
-                "action": "nc_files_search",
+            "files_search": {
+                "tool": "python3_exec",
+                "script": "scripts/nextcloud.py",
+                "args": ["--command", "files_search"],
                 "tier": "LOW",
                 "params": {
                     "query": {"type": "str", "required": True},
+                    "path":  {"type": "str", "required": False, "default": "/"},
                 },
-                "returns": "{status, data: [{name, path}]}",
+                "returns": "{files: [{name, path, size}], count}",
+            },
+        },
+    }
+
+
+def _translate_rss_feeds() -> dict:
+    """Generate Sovereign sovereign: block for RSS/Atom feed skills (rss-digest compatible).
+
+    Operations use python3_exec with feeds.py script deployed at
+    workspace/skills/rss-digest/scripts/feeds.py.
+    feedparser + httpx are pre-installed in nanobot-01 requirements.txt.
+    Feed subscriptions stored in /workspace/feeds/subscriptions.json (persistent).
+    """
+    return {
+        "specialists": ["research_agent", "business_agent"],
+        "tier_required": "LOW",
+        "adapter_deps": ["nanobot"],
+        "description": "RSS/Atom feed reader — fetch, search, and manage feed subscriptions.",
+        "operations": {
+            "get_entries": {
+                "tool": "python3_exec",
+                "script": "scripts/feeds.py",
+                "args": ["get-entries"],
+                "tier": "LOW",
+                "params": {
+                    "limit": {"type": "int", "required": False, "default": 20},
+                    "category": {"type": "str", "required": False, "default": ""},
+                },
+                "returns": "{entries: [{title, feed, url, date, summary}], count}",
+            },
+            "get_entry": {
+                "tool": "python3_exec",
+                "script": "scripts/feeds.py",
+                "args": ["get-entry"],
+                "tier": "LOW",
+                "params": {
+                    "url": {"type": "str", "required": True},
+                },
+                "returns": "{url, content, word_count}",
+            },
+            "add_feed": {
+                "tool": "python3_exec",
+                "script": "scripts/feeds.py",
+                "args": ["add-feed"],
+                "tier": "MID",
+                "params": {
+                    "name": {"type": "str", "required": True},
+                    "url":  {"type": "str", "required": True},
+                    "category": {"type": "str", "required": False, "default": "general"},
+                },
+                "returns": "{status, action, name, url}",
+            },
+            "list_feeds": {
+                "tool": "python3_exec",
+                "script": "scripts/feeds.py",
+                "args": ["list-feeds"],
+                "tier": "LOW",
+                "params": {},
+                "returns": "{feeds: [{name, url, category}], count}",
+            },
+            "search": {
+                "tool": "python3_exec",
+                "script": "scripts/feeds.py",
+                "args": ["search"],
+                "tier": "LOW",
+                "params": {
+                    "query": {"type": "str", "required": True},
+                    "limit": {"type": "int", "required": False, "default": 10},
+                },
+                "returns": "{entries: [{title, feed, url, date, summary}], count, query}",
             },
         },
     }
@@ -427,6 +528,9 @@ def _translate_skill_content(fm: dict, body: str, name: str) -> tuple[dict, dict
 
     elif category == "nextcloud":
         return _translate_nextcloud(), None
+
+    elif category == "rss_feeds":
+        return _translate_rss_feeds(), None
 
     else:
         advisory = _audit_skill_deps(fm, body, name)
@@ -683,35 +787,39 @@ def _dispatch_python3_exec(skill: str, op_spec: dict, params: dict, run_id: str,
 
     op_spec fields:
       script: path relative to skill workspace dir, e.g. "scripts/feeds.py"
-      args:   list of fixed CLI args, e.g. ["--category", "news"]
+      args:   list of fixed CLI args, e.g. ["--command", "check", "--account", "business"]
     Additional params are passed as --key value flags.
     Credentials available as env vars (Phase 1 static mounts in compose.yml).
+    Uses shell=False + arg list to handle param values with spaces correctly.
+    Script JSON output is parsed and merged directly into the response.
     """
     script_rel = op_spec.get("script", "")
     if not script_rel:
-        return {"status": "error", "path": "dsl", "error": "python3_exec: no 'script' in op_spec"}
+        return {"status": "error", "path": "dsl_python3",
+                "error": "python3_exec: no 'script' in op_spec"}
 
-    skill_dir  = os.path.join(WORKSPACE, "skills", skill)
+    skill_dir   = os.path.join(WORKSPACE, "skills", skill)
     script_path = os.path.normpath(os.path.join(skill_dir, script_rel))
 
     # Path traversal guard
     if not script_path.startswith(os.path.normpath(WORKSPACE)):
-        return {"status": "error", "path": "dsl",
+        return {"status": "error", "path": "dsl_python3",
                 "error": f"python3_exec: path traversal rejected: {script_path}"}
 
     if not os.path.isfile(script_path):
-        return {"status": "error", "path": "dsl",
+        return {"status": "error", "path": "dsl_python3",
                 "error": f"python3_exec: script not found at {script_path} — "
                          "deploy scripts/ to workspace/skills/<name>/ at install time"}
 
+    # Build command as a list (shell=False) so param values with spaces are safe
     fixed_args   = [str(a) for a in op_spec.get("args", [])]
     dynamic_args = []
     for k, v in params.items():
         if k not in ("command", "timeout", "script"):
             dynamic_args.extend([f"--{k}", str(v)])
 
-    cmd = "python3 " + script_path + ((" " + " ".join(fixed_args)) if fixed_args else "") + \
-          ((" " + " ".join(dynamic_args)) if dynamic_args else "")
+    cmd_list = ["python3", script_path] + fixed_args + dynamic_args
+    timeout  = int(params.get("timeout", 30))
 
     # Phase 2: redeem credential token if provided — inject as subprocess env vars
     extra_env: dict[str, str] = {}
@@ -721,11 +829,63 @@ def _dispatch_python3_exec(skill: str, op_spec: dict, params: dict, run_id: str,
             logger.info("[%s] python3_exec: redeemed credential token (%d vars injected)",
                         run_id, len(extra_env))
 
-    return _dispatch_exec({"command": cmd, "timeout": params.get("timeout", 30)},
-                          run_id, extra_env=extra_env)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
+    logger.info("[%s] python3_exec: %s %s", run_id, script_path, fixed_args)
+    try:
+        proc = subprocess.run(
+            cmd_list,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=WORKSPACE,
+            env=env,
+        )
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+
+        if proc.returncode != 0:
+            # Try to parse JSON error from stdout before falling back to stderr
+            if stdout:
+                try:
+                    parsed = json.loads(stdout)
+                    return {"path": "dsl_python3", **parsed}
+                except json.JSONDecodeError:
+                    pass
+            return {
+                "status": "error", "path": "dsl_python3",
+                "exit_code": proc.returncode,
+                "error": stderr[:500] or f"script exited {proc.returncode}",
+                "stdout": stdout[:500],
+            }
+
+        if stdout:
+            try:
+                parsed = json.loads(stdout)
+                # Merge script JSON output directly into response
+                return {"path": "dsl_python3", **parsed}
+            except json.JSONDecodeError:
+                pass
+
+        return {
+            "status": "ok", "path": "dsl_python3",
+            "exit_code": proc.returncode,
+            "stdout": stdout[:4000],
+            "stderr": stderr[:200],
+        }
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "path": "dsl_python3",
+                "error": f"script timed out after {timeout}s"}
+    except Exception as e:
+        return {"status": "error", "path": "dsl_python3",
+                "error": f"python3_exec failed: {e}"}
 
 
-def _dispatch_dsl(op_spec: dict, params: dict, run_id: str, skill: str = "") -> dict:
+def _dispatch_dsl(op_spec: dict, params: dict, run_id: str, skill: str = "",
+                  context: dict | None = None) -> dict:
     """Route a validated DSL operation to the correct native handler.
 
     nanobot-01 is the primary execution environment for all OpenClaw/ClawhHub skills.
@@ -739,7 +899,7 @@ def _dispatch_dsl(op_spec: dict, params: dict, run_id: str, skill: str = "") -> 
     elif tool == "exec":
         return _dispatch_exec(params, run_id)
     elif tool == "python3_exec":
-        return _dispatch_python3_exec(skill, op_spec, params, run_id)
+        return _dispatch_python3_exec(skill, op_spec, params, run_id, context=context)
     else:
         return {
             "status": "error", "path": "dsl",
@@ -956,10 +1116,11 @@ async def run_task(req: TaskRequest):
             })
 
         logger.info(f"[{run_id}] DSL path: tool={tool} action={op_spec.get('action')}")
-        loop   = asyncio.get_event_loop()
-        _skill = req.skill
+        loop     = asyncio.get_event_loop()
+        _skill   = req.skill
+        _context = req.context
         result = await loop.run_in_executor(
-            None, lambda: _dispatch_dsl(op_spec, validated, run_id, skill=_skill)
+            None, lambda: _dispatch_dsl(op_spec, validated, run_id, skill=_skill, context=_context)
         )
         return JSONResponse(content={
             "run_id": run_id, "skill": req.skill, "action": req.action, **result,

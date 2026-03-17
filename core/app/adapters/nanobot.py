@@ -10,10 +10,11 @@ All results are structured dicts — never raises to callers.
 All calls are logged to the audit ledger.
 
 Stage 3 DSL dispatch:
-  For tool: imap | webdav | caldav — adapter classes are called directly here in
-  sovereign-core. nanobot-01 has no credentials, so these ops never cross the wire.
-  For tool: filesystem | exec — forwarded to nanobot-01 which handles them natively.
+  For tool: browser — BrowserAdapter called directly in sovereign-core (a2a-browser proxy).
+  For tool: broker_exec — BrokerAdapter called directly (SYSTEM_COMMANDS only).
+  For tool: python3_exec | filesystem | exec — forwarded to nanobot-01 with credential token.
   For unknown/no DSL ops — forwarded to nanobot-01 for LLM fallback.
+  imap/webdav/caldav are now python3_exec scripts in nanobot-01 workspace (OC-S6).
 
 REST API: POST http://nanobot-01:8080/run
   Request:  {skill, action, params, context}
@@ -172,29 +173,14 @@ def _validate_dsl_params(op_spec: dict, params: dict) -> tuple[dict, list[str]]:
 
 
 async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: dict | None = None) -> dict:
-    """Dispatch a DSL operation using local adapter classes.
+    """Dispatch a DSL operation that must run natively in sovereign-core.
 
-    Called for tool: imap | webdav | caldav | broker_exec | browser.
+    Called only when tool in _NATIVE_TOOLS (currently: browser) or tool == broker_exec.
+    imap/webdav/caldav are no longer native — they are forwarded to nanobot-01 via python3_exec.
     Returns structured result dict. Never raises.
     """
     try:
-        if tool == "imap":
-            from adapters.imap import IMAPAdapter
-            account = params.pop("account", "personal")
-            adapter = IMAPAdapter(account=account)
-            return await _call_imap(adapter, action, params)
-
-        elif tool == "webdav":
-            from adapters.webdav import WebDAVAdapter
-            adapter = WebDAVAdapter()
-            return await _call_webdav(adapter, action, params)
-
-        elif tool == "caldav":
-            from adapters.caldav import CalDAVAdapter
-            adapter = CalDAVAdapter()
-            return await _call_caldav(adapter, action, params)
-
-        elif tool == "broker_exec":
+        if tool == "broker_exec":
             from adapters.broker import BrokerAdapter
             broker = BrokerAdapter()
             # op_spec['action'] names the command in commands-policy.yaml.
@@ -202,18 +188,18 @@ async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: di
             command_name = (op_spec or {}).get("action", action)
             # Only true system/OS calls go to broker — application-level commands
             # (imap_*, smtp_*, nc_*, feeds) are rejected here; callers should use
-            # tool: python3_exec or tool: imap/smtp/webdav/caldav instead.
+            # tool: python3_exec instead.
             if command_name not in SYSTEM_COMMANDS:
                 logger.warning(
                     "nanobot: broker_exec '%s' is not a system command — "
-                    "use tool: python3_exec or a native tool instead. "
+                    "use tool: python3_exec instead. "
                     "Routing to broker anyway (backward compat — update SKILL.md).",
                     command_name,
                 )
             return await broker.exec_command(command_name, params)
 
         elif tool == "browser":
-            from adapters.browser import BrowserAdapter
+            from execution.adapters.browser import BrowserAdapter
             browser = BrowserAdapter()
             return await _call_browser(browser, action, params)
 
@@ -223,103 +209,6 @@ async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: di
     except Exception as e:
         logger.exception(f"_dispatch_dsl_native: {tool}.{action} raised {type(e).__name__}")
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
-
-
-async def _call_imap(adapter, action: str, params: dict) -> dict:
-    """Route an IMAP DSL action to the IMAPAdapter."""
-    if action == "fetch_unread":
-        return await adapter.fetch_unread(max_messages=params.get("max_messages", 20))
-    elif action == "list_inbox":
-        return await adapter.list_inbox(max_messages=params.get("max_messages", 50))
-    elif action == "fetch_message":
-        return await adapter.fetch_message(uid=params["uid"])
-    elif action == "search":
-        # criteria is a dict: {subject, from_addr, since, body} (any subset)
-        criteria = params.get("criteria") or {k: v for k, v in params.items() if k != "account"}
-        return await adapter.search(criteria=criteria)
-    elif action == "move_message":
-        return await adapter.move_message(uid=params["uid"], destination=params["destination"])
-    elif action == "delete_message":
-        return await adapter.delete_message(uid=params["uid"])
-    elif action == "mark_read":
-        return await adapter.mark_read(uid=params["uid"])
-    elif action == "mark_unread":
-        return await adapter.mark_unread(uid=params["uid"])
-    elif action == "list_folders":
-        return await adapter.list_folders()
-    else:
-        return {"status": "error", "error": f"imap: unknown action {action!r}"}
-
-
-async def _call_webdav(adapter, action: str, params: dict) -> dict:
-    """Route a WebDAV DSL action to the WebDAVAdapter."""
-    if action == "list":
-        return await adapter.list(path=params.get("path", "/"))
-    elif action == "read":
-        return await adapter.read(path=params["path"])
-    elif action == "write":
-        return await adapter.write(path=params["path"], content=params["content"])
-    elif action == "delete":
-        return await adapter.delete(path=params["path"])
-    elif action == "mkdir":
-        return await adapter.mkdir(path=params["path"])
-    elif action == "search":
-        return await adapter.search(query=params["query"], path=params.get("path", "/"))
-    else:
-        return {"status": "error", "error": f"webdav: unknown action {action!r}"}
-
-
-def _make_uid() -> str:
-    import uuid
-    return str(uuid.uuid4())
-
-
-async def _call_caldav(adapter, action: str, params: dict) -> dict:
-    """Route a CalDAV DSL action to the CalDAVAdapter."""
-    if action == "list_calendars":
-        return await adapter.list_calendars()
-    elif action == "list_events":
-        return await adapter.list_events(
-            calendar=params.get("calendar", "personal"),
-            from_date=params.get("from_date"),
-            to_date=params.get("to_date"),
-        )
-    elif action == "create_event":
-        return await adapter.create_event(
-            calendar=params.get("calendar", "personal"),
-            uid=params.get("uid") or _make_uid(),
-            summary=params["summary"],
-            start=params["start"],
-            end=params["end"],
-            description=params.get("description", ""),
-        )
-    elif action == "delete_event":
-        return await adapter.delete_event(
-            calendar=params.get("calendar", "personal"),
-            uid=params["uid"],
-        )
-    elif action == "create_task":
-        return await adapter.create_task(
-            calendar=params.get("calendar", "tasks"),
-            uid=params.get("uid") or _make_uid(),
-            summary=params["summary"],
-            due=params.get("due"),
-            start=params.get("start"),
-            description=params.get("description"),
-            status=params.get("status", "NEEDS-ACTION"),
-        )
-    elif action == "complete_task":
-        return await adapter.complete_task(
-            calendar=params.get("calendar", "tasks"),
-            uid=params["uid"],
-        )
-    elif action == "delete_task":
-        return await adapter.delete_task(
-            calendar=params.get("calendar", "tasks"),
-            uid=params["uid"],
-        )
-    else:
-        return {"status": "error", "error": f"caldav: unknown action {action!r}"}
 
 
 async def _call_browser(adapter, action: str, params: dict) -> dict:
@@ -548,6 +437,13 @@ class NanobotAdapter:
                 return result
 
             body = r.json()
+            # For python3_exec/DSL paths nanobot-01 merges script output directly at the
+            # top level (no nested "result" key).  For the LLM path there is a nested
+            # "result" field.  Normalise so result["result"] is always the actual data.
+            _body_result = body.get("result")
+            if _body_result is None:
+                _wrapper = {"run_id", "skill", "action", "path", "elapsed_s"}
+                _body_result = {k: v for k, v in body.items() if k not in _wrapper}
             result = {
                 "status": body.get("status", "ok"),
                 "node": node,
@@ -555,7 +451,7 @@ class NanobotAdapter:
                 "action": action,
                 "run_id": body.get("run_id"),
                 "http_status": http_status,
-                "result": body.get("result"),
+                "result": _body_result,
                 "path": body.get("path", path),
                 "elapsed_s": elapsed,
             }

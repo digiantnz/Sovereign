@@ -24,6 +24,16 @@ tmp/
 # A2A browser deploy (separate repo)
 a2a-browser-deploy/
 
-# Nanobot workspace sessions (ephemeral)
+# Nanobot workspace sessions + runtime state (ephemeral)
 nanobot-01/workspace/sessions/
 nanobot-01/workspace/memory/
+nanobot-01/workspace/.nanobot/
+nanobot-01/workspace/feeds/
+nanobot-01/workspace/HEARTBEAT.md
+
+# TLS certificates (Tailscale etc.)
+*.crt
+*.cert
+
+# Wallet browser profile (Chromium runtime state)
+wallet/profile/

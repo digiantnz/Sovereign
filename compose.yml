@@ -301,7 +301,8 @@ services:
     container_name: nanobot-01
     restart: unless-stopped
     networks:
-      - ai_net      # sovereign-core reaches it here; no business_net, no browser_net
+      - ai_net      # sovereign-core reaches it here
+      - business_net  # required: nextcloud.py connects to http://nextcloud (business_net)
     volumes:
       - /home/sovereign/skills:/skills:ro          # Read-only skill definitions
       - /docker/sovereign/nanobot-01/workspace:/workspace  # Task workspace
@@ -334,9 +335,13 @@ services:
     networks: [business_net]
     ports:
       - "127.0.0.1:8080:80"
-      - "172.16.201.25:8080:80"  # LAN binding per historical as-built.md
+      - "100.111.130.60:80:80"
+      - "100.111.130.60:8443:8443"
     volumes:
       - ./nginx/nextcloud.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/sovereign.tail887d2b.ts.net.crt:/etc/nginx/certs/sovereign.tail887d2b.ts.net.crt:ro
+      - ./nginx/sovereign.tail887d2b.ts.net.key:/etc/nginx/certs/sovereign.tail887d2b.ts.net.key:ro    
+
     healthcheck:
       test: ["CMD", "wget", "-T", "4", "-qO-", "http://127.0.0.1/status.php"]
       interval: 30s

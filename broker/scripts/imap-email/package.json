@@ -1,0 +1,12 @@
+{
+  "name": "imap-smtp-email-skill",
+  "version": "1.0.0",
+  "description": "IMAP/SMTP email scripts for Sovereign broker execution",
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "imap": "^0.8.19",
+    "imap-simple": "^5.1.0",
+    "mailparser": "^3.9.3",
+    "nodemailer": "^7.0.13"
+  }
+}
