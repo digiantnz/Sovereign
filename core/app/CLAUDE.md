@@ -1,0 +1,212 @@
+# Sovereign Core — Implementation Invariants
+
+This file is loaded by Claude Code when working inside `core/app/`. It supplements the root `CLAUDE.md` with all adapter-level, cognition, and governance implementation rules.
+
+---
+
+## General Rules
+
+- All adapters use `httpx.AsyncClient` (never blocking `requests` in async methods)
+- Ollama API: always set `"stream": False` (default streams NDJSON, breaks `r.json()`)
+- FastAPI uses lifespan context manager (not deprecated `@app.on_event`)
+- Governance validates → raises `ValueError` on failure, returns rules dict on success
+- Execution engine wraps `gov.validate()` in `try/except ValueError`
+- `requires_confirmation` / `requires_double_confirmation` read from returned rules dict
+
+---
+
+## Cognitive Loop Invariants
+
+### Pass routing
+- PASS 1 (orchestrator classify), PASS 3b (specialist inbound), PASS 4 (orchestrator evaluate), PASS 5 (translator) → always local Ollama
+- PASS 2 (specialist outbound) → only externally-routable pass via `_routing_decision()`
+- `_routing_decision(prompt, user_input)` scores complexity on `user_input` (NOT full specialist prompt — persona length would inflate every score)
+- DCL hard-block: tier in `{"PRIVATE","SECRET"}` → `force_local=True` regardless of explicit override
+- Provider signals: `_CLAUDE_SIGNAL_RE` (architectural/plan/review/design/strategy) → claude; `_GROK_SIGNAL_RE` (current/latest/news/today/recent/market) → grok; default → grok
+- Operational penalty: score≥0.50 AND `_OPERATIONAL_RE` (restart/container/service/deploy/port/compose/nginx) → -0.20
+- `specialist_plan` always includes `_routing_reason`, `_complexity_score`, `_intended_provider` (even on local fallback)
+- Claude/Grok API unavailable → graceful fallback to Ollama; no error raised
+
+### Confirmed-continuation bypass
+- When `confirmed=True` and `pending_delegation._pending_load is not None`: skip PASS 2 + PASS 3 (specialist + CEO evaluation)
+- Reasoning already happened before confirmation prompt; re-running is pure overhead (~80s saved)
+- Stash carry-forward state in `pending_delegation._pending_load` to get this bypass
+- Remaining work: PASS 4 dispatch + translate only (~45s)
+
+### Untrusted nanobot content
+- All nanobot results stamped `_trust: "untrusted_external"` in `nanobot.py _forward()`
+- Scanner runs on result content between EXEC and PASS 3b
+- Flagged content: `_untrusted_flagged: True` + `_scan_categories` set; ledger entry logged
+- `prompts.specialist_inbound()` surfaces trust warning when `_untrusted_flagged` or `_trust == "untrusted_external"`
+- `result_for_translator` from PASS 4 is the fabrication firewall — translator receives ONLY this
+
+### InternalMessage envelope (`cognition/message.py`)
+- Director input hashed at PASS 1 (SHA-256); raw text never stored in envelope or passed between agents
+- `append_pass()` hashes current payload (SHA-256 hex[:16]) — never stores raw content
+- `nanobot_request_slice()` returns only `{request_id, skill, operation, payload, timeout_ms}`
+- `translator_slice()` returns only `result.get("result_for_translator")`
+- `validate()` pass_num check uses `pass_num > 0` guard (avoids false failures on PASS 1 construction)
+- `set_security_clearance()` only accepts: `"cleared"` | `"conditional"` | `"blocked"`
+
+### Memory dispatch
+- Async memory write via `asyncio.create_task()` — never blocks return path
+- Prospective memory confirmation gate: for mutating intents (`create_event`, `create_task`, `write_file`, `send_email`, `delete_file`, `delete_email`, `delete_task`, `restart_container`, `create_folder`) — `execution_confirmed` stamped from actual HTTP status code; never from LLM assertion
+- Not 2xx → `execution_confirmed: False, outcome: "unconfirmed"` regardless of LLM memory decision
+
+---
+
+## Nanobot Adapter (`adapters/nanobot.py`)
+
+### Dispatch model
+- `_NATIVE_TOOLS={"browser"}` stays in sovereign-core
+- `_REMOTE_TOOLS={"filesystem","exec","python3_exec","imap","smtp","webdav","caldav"}` forwarded to nanobot-01
+- `broker_exec` checked against SYSTEM_COMMANDS whitelist first; non-whitelisted → nanobot-01 + deprecation warning
+
+### Credential delegation
+- `op_spec.credential_services` → `CredentialProxy.issue()` → UUID token → forwarded in context
+- nanobot-01 redeems via POST sovereign-core:8000/credential_proxy → injected as subprocess env vars → immediately invalidated
+- Single-use token, 60s TTL
+
+### Response normalisation
+- `_forward()` reads contract fields: `success`, `raw_error`, `status_code`, `data`
+- Derives legacy `status` field from `contract_success` for backward compat
+- python3_exec responses are flat (no nested "result" key) — if `body.get("result")` is None, builds `body_result` from all non-wrapper body fields (wrapper = `{run_id, skill, action, path, elapsed_s}`)
+- Use `nb.get("result") if nb.get("result") is not None else nb` — NOT `nb.get("result", nb)` (latter returns None when key exists)
+- All results stamped `_trust: "untrusted_external"`
+
+### Hard boundary (do not violate)
+- Broker handles ONLY: `docker_ps/logs/restart/stats/inspect/exec, uname/df/free/ps/nvidia_smi/systemctl_status/journalctl`
+- All other application skills (IMAP/SMTP/feeds/WebDAV/CalDAV) → nanobot-01
+- Do NOT add new system commands to broker without architectural review
+
+---
+
+## CalDAV Adapter (`adapters/caldav.py`)
+
+- `_discover_calendar()` always returns a dict `{url, propfind_http_status, propfind_response_body, calendars_found}` — never `None`
+- `create_event` / `delete_event` / `create_task` / `delete_task` always include `http_calls_made`, `http_status`, `response_body`, `propfind_http_status`; if call not made → says so explicitly ("PUT not attempted")
+- No synthesised error strings — only raw status codes and bodies
+- All write ops PROPFIND to `/remote.php/dav/calendars/digiant/` (Depth:1) first, then PUT/DELETE to `{discovered_url}/{uid}.ics`. Never assume LLM label is valid Nextcloud slug
+- All methods check `r.status_code` directly — no `raise_for_status()`. Return `{"status": "error", "error": ..., "http_status": ...}` for non-2xx
+- `_safe_translate` never passes error results to translator; error path is deterministic
+- `create_task(calendar, uid, summary, due, start, description, status)` generates valid VTODO ICS; `delete_task` delegates to `delete_event`
+- Tasks calendar slug discovery: same `_discover_calendar` partial-match logic with `"tasks"` as default name
+
+### CalDAV in execution/engine.py
+- Calendar fast-path in `_quick_classify`: `create_event`, `delete_event`, `update_event` always route to `business_agent` — never through CEO LLM
+- `delete_event` and `update_event` in `INTENT_ACTION_MAP` (domain=caldav) and `INTENT_TIER_MAP` (MID)
+- `_dispatch_inner` has `calendar_update` handler routing to `caldav.update_event()`
+- `_normalise_dt(value)`: strips NZDT/NZST/NZT/UTC/GMT suffixes, ordinal suffixes (st/nd/rd/th), "at" separators; tries `fromisoformat` → multiple `strptime` formats; default year 2026 if absent
+- `calendar_create` in `_dispatch_inner` tries 12+ field names for start/end (start, start_time, datetime, when, date_time, event_start, scheduled_at, begin + date+date_part+time combinations; scans content/draft_content/target as last resort)
+- `prompts.specialist()` injects intent-specific required-field reminders for create/delete/update_event, create_task — includes today's date for relative date resolution
+
+---
+
+## IMAP Adapter (`adapters/imap.py`)
+
+- All operations use `mail.uid()` throughout — sequence numbers are unstable
+- `list_inbox()` fetches all messages with real UIDs via `SEARCH + FETCH RFC822.HEADER`
+- UID guards in `_move_sync()`, `_delete_sync()`, `_mark_flag_sync()`: if uid is None/empty/whitespace → return `{status: error, step: uid_guard}` immediately
+- `import email.message` must be explicit (bare `import email` does not expose submodule)
+- Archive folder candidates: `["archive", "archives", "inbox.archive", "saved messages"]` — no Gmail-specific entries
+- Accounts on `digiant.co.nz`, `digiant.nz`, or `e.email`
+- `_move_sync()`: checks for spaces in `archive_folder` → wraps in double-quotes before IMAP UID COPY command. imaplib does NOT auto-quote mailbox names. Error dict includes `imap_folder_arg` showing exact string sent
+
+### Community skill routing (execution/engine.py)
+- Mail domain calls `self.nanobot.run("imap-smtp-email", action, params)` — NOT IMAPAdapter/SMTPAdapter
+- Account suffix: `_suf = "" if account == "business" else "_personal"` selects personal vs business command
+- CalDAV/WebDAV still use Python adapters
+
+---
+
+## WebDAV Adapter (`adapters/webdav.py`)
+
+- `path = action.get("path", "/")` always returns `"/"` (static `INTENT_ACTION_MAP` entries carry no runtime path)
+- Runtime file path always comes from specialist output: check `specialist.get("path")` first, then `specialist.get("target")`
+- `target` field is for container names; is last resort for webdav paths
+
+---
+
+## Broker Adapter (`adapters/broker.py`)
+
+- `broker.py exec_command()` never raises — all errors returned as structured dicts
+- `broker_exec` DSL tool resolves command name via `op_spec.get("action", action)` — op_spec's `action` names the broker command; outer DSL op key is fallback
+
+### Broker `index.js` invariants
+- `POST /exec/:commandName` route registered BEFORE docker-policy catch-all — bypasses docker-policy trust check; uses commands-policy tier
+- `SHELL_META` guard applied to all string params before any processing
+- `allowlist: []` (empty array) = deny all — check is `allowlist !== undefined && !includes(val)` not `length > 0`
+- `__container_exec__` → `execInContainer(cmd.container, cmd.fixed_args)`; `__script__` → path traversal + existence check + `spawnRun`
+- All execution via `spawn(shell:false)`
+- To enable systemctl/journalctl: (1) `pid: host` in broker compose.yml, (2) `nsenter` in broker Dockerfile (`apk add util-linux`), (3) `enabled: true` in commands-policy.yaml
+
+---
+
+## Skill System
+
+### SKILL.md format
+```yaml
+---
+name: <skill-name>
+version: "1.0"
+description: "<short description>"
+sovereign:
+  specialists: [research_agent]
+  tier_required: LOW
+  adapter_deps: [browser, ollama]
+  checksum: <sha256-of-body>
+---
+# Skill body
+```
+
+### Integrity model
+- `sovereign.checksum` = SHA256 of body (text after frontmatter's closing `---`)
+- `/home/sovereign/security/skill-checksums.json` = whole-file SHA256 reference (rw-mounted)
+- SkillLoader validates both on every load; either mismatch → refuse + audit log
+- First boot (no reference file) = bootstrap mode: reference created from current files
+- Body checksum method: SkillLoader regex `group(2)` — NOT `content.split('---', 2)[2]`
+- SkillLoader `_ALWAYS_AVAILABLE` must include `"nanobot"` — otherwise python3_exec skills are skipped
+
+### Skill Lifecycle Manager (`skills/lifecycle.py`)
+- **SEARCH**: SearXNG via a2a-browser — query `"sovereign skill <query> SKILL.md site:github.com"`. `_github_url_to_raw()` converts blob/tree URLs to raw. `_fetch_raw_url()` tries direct httpx first, falls back to `self.browser.fetch()` (a2a-browser has internet egress; sovereign-core does not)
+- No direct calls to clawhub/OpenClaw registry URLs
+- **REVIEW**: escalation keyword scan → SecurityScanner → `cog.security_evaluate()` → structured verdict. Non-certified → always "review" decision. Escalation keywords: memory/governance/soul/identity/signing/credential/guardian/audit/ledger/checksum/persona/orchestrator/translator
+- **LOAD**: MID tier; `confirmed=True` required; writes to RAID; updates skill-checksums.json + skill-metadata.json + skill-watchlist.json; soul-guardian registration; Telegram + as-built.md notification
+- **AUDIT**: compare current whole-file hash vs reference; drift = HIGH tier incident
+
+### skill_install composite flow
+- `_system_signals` must include `"skill", "clawhub", "openclaw"` or conversational guard fires first
+- `intent_tiers.skill_install` must be `LOW` in governance.json (composite manages its own confirmation)
+- `handle_chat` promotes `requires_confirmation`, `pending_delegation`, `summary`, `escalation_notice` to top-level result_dict
+- `_quick_classify` sets `target: user_input` (full text including URL) — URL preservation is critical
+- `op == "install"` in engine.py extracts URL from `delegation.get("target")` BEFORE falling back to `sp.get("search_query")` — specialist strips the URL; without this the URL is lost and SearXNG returns wrong skill
+- Confirmed-continuation: `confirmed=True + _pending_load` → short-circuit to `lifecycle.load()` only
+
+### Config change notification (`config_policy/notifier.py`)
+- Fires AFTER confirmed write to any in-scope file (post-write)
+- In-scope: `governance.json` (ANY), `sovereign-soul.md` (HIGH), `/home/sovereign/security/*.yaml` (MID), `/home/sovereign/personas/*` (MID), `/home/sovereign/skills/*` (MID), `skill-checksums.json` (HIGH)
+- Sends Telegram + appends narrative to `/home/sovereign/docs/as-built.md`
+- Technical detail (checksums, hashes) → AuditLedger ONLY, not as-built.md
+
+---
+
+## Task Scheduler (`scheduling/task_scheduler.py`)
+
+- Data-driven — no task-specific code
+- Task types: PROSPECTIVE (when/status/next_due), PROCEDURAL (steps, `human_confirmed=True`), EPISODIC (run history) — all share `task_id`
+- Scheduler loop: every 60s; uses `qdrant.client.set_payload()` to update next_due/status without re-embedding
+- `compute_next_due()` handles cron/interval/one_time
+- Scheduler keywords in `_quick_classify`: must be checked BEFORE conversational guard and BEFORE email keywords to avoid misrouting
+- `confirmed=True` must be passed via `payload={"confirmed": confirmed}` in short-circuit `_dispatch` call so PROCEDURAL writes get `human_confirmed=True`
+
+---
+
+## Wallet Implementation
+
+- `SigningAdapter.encrypt_seed(phrase)` / `decrypt_seed(blob)`: HKDF-SHA256 from Ed25519 private key bytes (info=`b"sovereign-wallet-seed-v1"`) → AES-256-GCM (AAD=`b"sovereign-wallet-v1"`); format: 12-byte nonce || ciphertext+GCM-tag
+- Derived key **never written to disk** — zeroed after each encrypt/decrypt
+- `sovereign.key` mounted as Docker secret at `/run/secrets/sovereign_key`; `SOVEREIGN_KEY_PATH` env var points to it
+- `wallet-config.json` at `/home/sovereign/governance/wallet-config.json` — mounted `:rw`
+- ETH nodes NOT active — config stored for future use only
+- Every wallet op includes `rex_sig:<8-char-prefix>` for `/verify` anti-spoofing
+- Wallet governance: `wallet_read_config/get_btc_xpub` → LOW; `get_address/sign_message/get_proposals` → MID; `propose_safe_tx` → HIGH

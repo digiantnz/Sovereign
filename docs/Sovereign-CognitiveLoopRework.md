@@ -94,7 +94,17 @@ Existing fields (`action`, `params`, `context`) accepted for backward compat.
 Nanobot is a dumb executor: fires the skill, returns protocol result verbatim.
 No retry logic, no interpretation, no fabrication inside nanobot.
 
-### (4) Retry logic in the loop
+### (4) Nanobot results are untrusted external content by definition
+
+Every result returned by nanobot-01 is stamped `_trust: "untrusted_external"` in `nanobot.py _forward()` unconditionally — before any other code sees it. Before `specialist_inbound` (PASS 3b) runs, the security scanner evaluates the result content. If the scanner flags anything, `_untrusted_flagged: True` is set on the result and an audit ledger entry is written. `specialist_inbound` prompts surface an explicit warning whenever the flag is set.
+
+**Why this is a principle, not a convenience flag**: nanobot-01 executes skills against live external systems whose content sovereign-core does not control. A compromised IMAP server, a malicious RSS feed, or a tampered Nextcloud file could embed adversarial content in result data. Without screening, that content reaches a local Ollama LLM in `specialist_inbound` — a prompt injection vector delivered via data, not via the Director channel. The trust boundary is structural: nanobot-01 cannot be implicitly trusted simply because it runs on the same Docker network. It handles external data; sovereign-core does not.
+
+The `result_for_translator` firewall (PASS 4 → PASS 5) provides a second layer: the translator only receives the orchestrator's curated summary, never raw adapter output. A future nanobot data source automatically inherits this model — no per-source opt-in required.
+
+Full ADR: `docs/CLAUDE-ARCH.md` ADR-001.
+
+### (5) Retry logic in the loop
 `specialist_inbound()` may set `retry_with` (corrected payload dict).
 Loop calls dispatch once more with merged payload → runs `specialist_inbound` on second result.
 No further retries. Nanobot receives whatever payload it is given.
