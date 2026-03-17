@@ -99,10 +99,11 @@ INTENT_ACTION_MAP = {
     "list_folders":  {"domain": "mail",   "operation": "read",    "name": "mail_list_folders"},
     "list_inbox":    {"domain": "mail",   "operation": "read",    "name": "mail_list_inbox"},
     # Scheduler intents — devops_agent scope
-    "schedule_task": {"domain": "scheduler", "operation": "schedule", "name": "schedule_task"},
-    "list_tasks":    {"domain": "scheduler", "operation": "list",     "name": "list_tasks"},
-    "pause_task":    {"domain": "scheduler", "operation": "update",   "name": "pause_task"},
-    "cancel_task":   {"domain": "scheduler", "operation": "update",   "name": "cancel_task"},
+    "schedule_task":      {"domain": "scheduler", "operation": "schedule", "name": "schedule_task"},
+    "list_tasks":         {"domain": "scheduler", "operation": "list",     "name": "list_tasks"},
+    "pause_task":         {"domain": "scheduler", "operation": "update",   "name": "pause_task"},
+    "cancel_task":        {"domain": "scheduler", "operation": "update",   "name": "cancel_task"},
+    "recall_last_briefing": {"domain": "scheduler", "operation": "recall", "name": "recall_last_briefing"},
     # Wallet intents — devops_agent scope (LOW/MID/HIGH tier)
     "wallet_read_config":     {"domain": "wallet", "operation": "read",    "name": "wallet_read_config"},
     "wallet_get_address":     {"domain": "wallet", "operation": "read",    "name": "wallet_get_address"},
@@ -137,11 +138,13 @@ INTENT_TIER_MAP = {
     "wallet_propose_safe_tx": "HIGH",
     "wallet_get_proposals":   "MID",
     "wallet_get_btc_xpub":    "LOW",
-    # Scheduler tiers
-    "schedule_task": "MID",
-    "list_tasks":    "LOW",
-    "pause_task":    "MID",
-    "cancel_task":   "MID",
+    # Scheduler tiers — all LOW: Rex managing prospective memory is internal,
+    # equivalent to writing in a notebook. No Director confirmation required.
+    "schedule_task":        "LOW",
+    "list_tasks":           "LOW",
+    "pause_task":           "LOW",
+    "cancel_task":          "LOW",
+    "recall_last_briefing": "LOW",
     # Nanobot tiers — nanobot_run is MID (shell access), nanobot_health is LOW (read-only check)
     "nanobot_run":    "MID",
     "nanobot_health": "LOW",
@@ -351,6 +354,20 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Explicit RAID/NVMe path detected — deterministic read_host_file",
         }
 
+    # ── Briefing recall — check episodic memory, never fabricate ──────────────
+    _briefing_recall_kw = (
+        "what was the briefing", "what was today's briefing", "morning briefing",
+        "today's briefing", "yesterday's briefing", "last briefing",
+        "did the briefing run", "briefing result", "show me the briefing",
+        "what did the briefing say", "briefing summary",
+    )
+    if any(w in u for w in _briefing_recall_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "recall_last_briefing",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Briefing recall — query episodic memory, no fabrication",
+        }
+
     # ── Scheduler quick-check — before conversational guard ────────────────
     # Scheduling requests often contain no system-domain signals ("search daily",
     # "monitor weekly") so they must be tested before the conversational guard fires.
@@ -383,19 +400,19 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             if any(w in u for w in ("cancel task", "stop task", "delete task", "remove task")):
                 return {
                     "delegate_to": "devops_agent", "intent": "cancel_task",
-                    "target": None, "tier": "MID",
+                    "target": None, "tier": "LOW",
                     "reasoning_summary": "Task cancellation — deterministic pre-classifier",
                 }
             if any(w in u for w in ("pause task", "suspend task")):
                 return {
                     "delegate_to": "devops_agent", "intent": "pause_task",
-                    "target": None, "tier": "MID",
+                    "target": None, "tier": "LOW",
                     "reasoning_summary": "Task pause — deterministic pre-classifier",
                 }
             return {
                 "delegate_to": "devops_agent", "intent": "schedule_task",
-                "target": None, "tier": "MID",
-                "reasoning_summary": "Scheduling request — deterministic pre-classifier",
+                "target": None, "tier": "LOW",
+                "reasoning_summary": "Scheduling request — no confirmation required (internal memory write)",
             }
 
     # ── System diagnostics — deterministic devops shortcuts ────────────────
@@ -723,7 +740,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     if any(w in u for w in _cancel_task_kw):
         return {
             "delegate_to": "devops_agent", "intent": "cancel_task",
-            "target": None, "tier": "MID",
+            "target": None, "tier": "LOW",
             "reasoning_summary": "Task cancellation — deterministic pre-classifier",
         }
 
@@ -731,7 +748,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     if any(w in u for w in _pause_task_kw):
         return {
             "delegate_to": "devops_agent", "intent": "pause_task",
-            "target": None, "tier": "MID",
+            "target": None, "tier": "LOW",
             "reasoning_summary": "Task pause — deterministic pre-classifier",
         }
 
@@ -847,19 +864,29 @@ class ExecutionEngine:
                           context_window=None) -> dict:
         # PROSPECTIVE + HEALTH SESSION-START CHECK — fires on first message of a new session
         # (no prior context, no pending delegation = fresh session)
+        # NOTE: Do NOT pass due_items through ceo_translate — the LLM fabricates briefing
+        # content from vague prospective entries. Instead use the actual episodic run record.
         morning_briefing: str | None = None
         if not context_window and not pending_delegation and self.qdrant:
             try:
-                due_items = await self.cog.get_due_prospective()
-                if due_items:
-                    briefing_result = {
-                        "status": "ok",
-                        "domain": "prospective",
-                        "due_items": due_items,
-                    }
-                    morning_briefing = await self.cog.ceo_translate(
-                        "morning briefing — items due today", briefing_result
-                    )
+                if self.task_scheduler:
+                    briefing_data = await self.task_scheduler.recall_last_briefing()
+                    if briefing_data.get("status") == "ok":
+                        morning_briefing = briefing_data.get("message", "")
+                    elif briefing_data.get("status") == "error" and briefing_data.get("message"):
+                        morning_briefing = briefing_data["message"]
+                    # status == "not_found" → no morning_briefing; don't fabricate
+                else:
+                    # Task scheduler not yet available — fall back to due prospective items
+                    # but only show count, never have LLM narrate them
+                    due_items = await self.cog.get_due_prospective()
+                    if due_items:
+                        scheduled = [d for d in due_items if d.get("type") == "scheduled_task"]
+                        if scheduled:
+                            morning_briefing = (
+                                f"{len(scheduled)} scheduled task(s) are due. "
+                                "Use 'list tasks' to see them."
+                            )
             except Exception:
                 pass
 
@@ -929,10 +956,30 @@ class ExecutionEngine:
                 if mitigation:
                     user_input = f"[UNTRUSTED CONTENT — sanitized]\n{user_input}"
 
-        # PASS 1 — CEO Classification (skip if re-submitting a confirmed delegation)
+        import asyncio as _asyncio
+        import hashlib as _hashlib
+        import time as _time_mod
+        _t_total = _time_mod.monotonic()
+        _PASS_TIMEOUT  = float(os.environ.get("PASS_TIMEOUT_SECONDS",  "30"))
+        _TOTAL_TIMEOUT = float(os.environ.get("TOTAL_TIMEOUT_SECONDS", "120"))
+
+        # Track whether the pre-LLM scanner already evaluated security
+        _scanner_evaluated = False
+
+        # ── Construct InternalMessage envelope ────────────────────────────────
+        # The envelope carries routing metadata, context, and audit history
+        # through all passes. Raw Director input is hashed here; never stored.
+        from cognition.message import InternalMessage as _IMsgCls
+        _session_id = str(id(context_window)) if context_window else ""
+        _msg = _IMsgCls.create(
+            director_input=user_input,
+            session_id=_session_id,
+            tier="LOW",  # updated after PASS 1 determines the real tier
+        )
+
+        # PASS 1 — Orchestrator Classification (skip if re-submitting confirmed delegation)
         if pending_delegation:
             delegation = pending_delegation
-            # Restore confidence/gaps that were stashed in pending_delegation
             confidence = delegation.pop("_memory_confidence", 1.0)
             gaps = delegation.pop("_memory_gaps", [])
         else:
@@ -942,27 +989,50 @@ class ExecutionEngine:
                 delegation = quick
                 confidence, gaps = 1.0, []
             else:
+                _t_p1 = _time_mod.monotonic()
                 try:
-                    delegation = await self.cog.ceo_classify(user_input, context_window=context_window)
+                    delegation = await _asyncio.wait_for(
+                        self.cog.orchestrator_classify(user_input, context_window=context_window),
+                        timeout=_PASS_TIMEOUT,
+                    )
+                except _asyncio.TimeoutError:
+                    _rft = {"success": False, "outcome": "Classification timed out.", "detail": {},
+                            "error": "PASS 1 timeout — please retry.", "next_action": None}
+                    _dm = await self.cog.translator_pass(_rft)
+                    return {"director_message": _dm, "confidence": 0.0, "gaps": []}
                 except Exception as e:
-                    return {"error": f"CEO classification failed: {e}",
-                            "confidence": 0.0, "gaps": []}
+                    _rft = {"success": False, "outcome": "Classification failed.", "detail": {},
+                            "error": str(e), "next_action": None}
+                    _dm = await self.cog.translator_pass(_rft)
+                    return {"director_message": _dm, "confidence": 0.0, "gaps": []}
+                self._log_pass(1, "orchestrator", user_input, delegation,
+                               _time_mod.monotonic() - _t_p1)
                 confidence = delegation.pop("_memory_confidence", 1.0)
                 gaps = delegation.pop("_memory_gaps", [])
 
-        agent = delegation.get("delegate_to", "")
+        agent = delegation.get("specialist") or delegation.get("delegate_to", "")
 
-        # Normalise intent — CEO returns free-form labels; map to a known key
+        # Normalise intent — map to a known key
         intent = delegation.get("intent", "")
         if intent not in INTENT_ACTION_MAP:
             intent = _AGENT_DEFAULT_INTENT.get(agent, "query")
 
-        # Tier is always derived deterministically — never trust the LLM
-        # governance.json intent_tiers takes precedence over the local map
+        # Tier always derived deterministically — never trust the LLM
         tier = self.gov.get_intent_tier(intent) or INTENT_TIER_MAP.get(intent, "LOW")
 
-        # Confidence gate — only for MID/HIGH tier actions where uncertain memory
-        # could drive a wrong consequential decision. Conversational (LOW/ollama) flows through.
+        # ── Update envelope with PASS 1 results ──────────────────────────────
+        _msg.envelope.tier = tier
+        _msg.context.original_intent   = intent
+        _msg.context.routing_rationale = delegation.get("reasoning_summary", "")
+        _msg.set_payload({"intent": intent, "agent": agent, "delegation": delegation})
+        _msg.append_pass(1, "orchestrator", 0.0, True)
+        # Validate envelope before proceeding
+        _env_errs = _msg.validate(1)
+        if _env_errs:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("PASS 1 envelope validation: %s", _env_errs)
+
+        # Confidence gate — MID/HIGH only
         if (not confidence_acknowledged
                 and not pending_delegation
                 and tier in ("MID", "HIGH")
@@ -983,25 +1053,24 @@ class ExecutionEngine:
                 ),
             }
 
-        # CEO override logging when user acknowledges low confidence
         if confidence_acknowledged and pending_delegation:
             try:
                 await self._log_ceo_confidence_override(user_input)
             except Exception:
                 pass
 
-        # Build the action dict with the normalised intent
         action = self._delegation_to_action({**delegation, "intent": intent})
 
         # Governance check
         try:
             rules = self.gov.validate(action, tier)
         except ValueError as e:
-            dm = await self._safe_translate(user_input, {"error": str(e)}, tier=tier)
+            _rft = {"success": False, "outcome": str(e), "detail": {},
+                    "error": str(e), "next_action": None}
+            dm = await self.cog.translator_pass(_rft, tier=tier)
             return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
-        # Confirmation gate — skip only when user has explicitly confirmed (confirmed=True).
-        # confidence_acknowledged re-submissions still require confirmation for MID/HIGH.
+        # Confirmation gate
         if not confirmed:
             if rules.get("requires_double_confirmation"):
                 return {
@@ -1020,16 +1089,61 @@ class ExecutionEngine:
                     "gaps": gaps,
                 }
 
-        # Short-circuit for simple domains — no specialist/evaluation passes needed
+        # PASS 2 — Conditional security (tier=HIGH only; scanner path already evaluated above)
+        # The pre-LLM scanner fires before PASS 1 (injection detection).
+        # PASS 2 adds a second LLM-based evaluation for HIGH-tier actions regardless of scanner.
+        if tier == "HIGH" and not _scanner_evaluated and not security_confirmed:
+            _t_p2 = _time_mod.monotonic()
+            try:
+                # Build a minimal scan result for the security agent
+                class _HighTierScan:
+                    flagged = True
+                    categories = ["high_tier_action"]
+                    matched_phrases = [intent]
+                sec2 = await _asyncio.wait_for(
+                    self.cog.security_evaluate(_HighTierScan(), user_input),
+                    timeout=_PASS_TIMEOUT,
+                )
+            except Exception:
+                sec2 = {"block": False, "risk_level": "low", "risk_categories": [],
+                        "reasoning_summary": "Security PASS 2 unavailable — proceeding",
+                        "required_mitigation": ""}
+            _p2_dur = (_time_mod.monotonic() - _t_p2) * 1000
+            self._log_pass(2, "security_agent", user_input, sec2,
+                           _p2_dur / 1000)
+            # Record PASS 2 clearance in envelope
+            _clearance = "blocked" if sec2.get("block") else (
+                "conditional" if sec2.get("required_mitigation") else "cleared"
+            )
+            try:
+                _msg.set_security_clearance(_clearance)
+                _msg.append_pass(2, "security_agent", _p2_dur, not sec2.get("block", False))
+            except Exception:
+                pass
+            if sec2.get("block"):
+                if self.ledger:
+                    try:
+                        self.ledger.append("pass2_security_block", "inbound", {
+                            "intent": intent, "tier": tier,
+                            "risk_level": sec2.get("risk_level", "high"),
+                            "reasoning": sec2.get("reasoning_summary", ""),
+                        })
+                    except Exception:
+                        pass
+                _rft = {"success": False,
+                        "outcome": f"Security review blocked this action: {sec2.get('reasoning_summary', '')}",
+                        "detail": {}, "error": "Security block — HIGH tier action rejected.",
+                        "next_action": None}
+                dm = await self.cog.translator_pass(_rft, tier=tier)
+                return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
+
+        # Short-circuit paths — all pass through translator (no raw output to Director)
         if action.get("domain") in ("ollama", "memory", "browser", "scheduler"):
             if action.get("domain") == "ollama":
-                result = await self.cog.ask_conversational(user_input, context_window=context_window)
-                exec_result = {"status": "ok", "response": result.get("response", "")}
-                # Conversational responses are already Director-facing plain text.
-                # Skip ceo_translate to avoid double-processing and corruption.
-                director_msg = result.get("response", "")
-                # Bug 4 fix: detect stated intentions in conversational responses and commit to
-                # working memory immediately. When Sovereign says "I'll remember X" it must do so.
+                conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
+                conv_text = conv_result.get("response", "")
+                exec_result = {"status": "ok", "response": conv_text}
+                # Detect stated intentions and commit to memory (preserve existing Bug 4 fix)
                 import re as _re_intent
                 _intention_re = _re_intent.compile(
                     r"\bI('?ll| will)\s+(remember|store|save|add|note|keep|write that|make a note)\b"
@@ -1037,91 +1151,102 @@ class ExecutionEngine:
                     r"|\bI've\s+(saved|stored|noted|added|written that)\b",
                     _re_intent.IGNORECASE,
                 )
-                if self.qdrant and _intention_re.search(director_msg):
+                if self.qdrant and _intention_re.search(conv_text):
                     try:
                         from datetime import date as _date, timedelta as _td
-                        # Detect monitoring/alerting commitments — these need a next_due
-                        # so they surface in morning briefings. Default: tomorrow.
                         _monitor_re = _re_intent.compile(
                             r"\b(keep an eye|monitor|watch|alert me|check.*daily|daily.*check"
                             r"|notify me|remind me|track|follow up)\b",
                             _re_intent.IGNORECASE,
                         )
                         is_monitoring = bool(_monitor_re.search(user_input))
-                        extra_meta = {
-                            "source": "stated_intention",
-                            "response_preview": director_msg[:120],
-                        }
+                        extra_meta = {"source": "stated_intention", "response_preview": conv_text[:120]}
                         if is_monitoring:
                             extra_meta["next_due"] = str(_date.today() + _td(days=1))
                         await self.cog.save_lesson(
-                            f"Stated intention: {user_input[:250]}",
-                            user_input,
+                            f"Stated intention: {user_input[:250]}", user_input,
                             collection=PROSPECTIVE if is_monitoring else WORKING,
-                            memory_type="prospective",
-                            writer="sovereign-core",
+                            memory_type="prospective", writer="sovereign-core",
                             extra_metadata=extra_meta,
                         )
                     except Exception:
                         pass
+                # Ollama response is already in Rex's voice — wrap as-is for translator
+                _rft = {"success": True, "outcome": conv_text, "detail": {},
+                        "error": None, "next_action": None}
             else:
                 exec_result = await self._dispatch(action, user_input,
-                                                    payload={"confirmed": confirmed},
-                                                    security_confirmed=security_confirmed)
-                director_msg = await self._safe_translate(user_input, exec_result, tier=tier)
+                                                   payload={"confirmed": confirmed},
+                                                   security_confirmed=security_confirmed)
+                _rft = self._build_result_for_translator(intent, exec_result)
+            director_msg = await self.cog.translator_pass(_rft, tier=tier)
             result_dict = {
-                "status": "ok",
-                "intent": intent,
-                "tier": tier,
-                "agent": agent,
-                "result": exec_result,
-                "confidence": round(confidence, 3),
-                "gaps": gaps,
+                "status": "ok", "intent": intent, "tier": tier, "agent": agent,
+                "result": exec_result, "confidence": round(confidence, 3), "gaps": gaps,
                 "director_message": director_msg,
             }
             if morning_briefing:
                 result_dict["morning_briefing"] = morning_briefing
             return result_dict
 
-        # Short-circuit for confirmed continuations — when Director has already reviewed
-        # a proposed action (e.g. skill_install search+review) and confirmed=True with
-        # a _pending_load stash, there is no new reasoning to do. Skip PASS 2+3 to
-        # avoid 2× Ollama overhead (~80s) on what is a mechanical "proceed" decision.
+        # ── PASS 3 outbound — Specialist plans the action ────────────────────
+        # Confirmed continuations (skill_install confirm path): skip outbound reasoning —
+        # the Director already reviewed and approved; proceed straight to execution.
         _confirmed_continuation = (
             confirmed
             and pending_delegation is not None
             and pending_delegation.get("_pending_load") is not None
         )
+        _t3out_start = _time_mod.monotonic()
         if _confirmed_continuation:
-            specialist_output = {}  # no new specialist input needed
+            sp_out = {}
         else:
-            # PASS 2 — Specialist Reasoning (action-oriented domains only)
             try:
-                specialist_output = await self.cog.specialist_reason(agent, delegation, user_input)
+                sp_out = await _asyncio.wait_for(
+                    self.cog.specialist_outbound(agent, delegation, user_input),
+                    timeout=_PASS_TIMEOUT,
+                )
+            except _asyncio.TimeoutError:
+                sp_out = {}
             except Exception as e:
-                dm = await self._safe_translate(user_input, {"error": f"Specialist reasoning failed: {e}"}, tier=tier)
-                return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
-
-            # PASS 3 — CEO Evaluation
-            try:
-                evaluation = await self.cog.ceo_evaluate(user_input, delegation, specialist_output)
-            except Exception as e:
-                dm = await self._safe_translate(user_input, {"error": f"CEO evaluation failed: {e}"}, tier=tier)
-                return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
-
-            if not evaluation.get("approved", False):
-                feedback = evaluation.get("feedback", "")
-                dm = await self._safe_translate(user_input, {"error": "plan_rejected", "feedback": feedback}, tier=tier)
-                return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
-
-        # PASS 4 — Execution (deterministic)
+                _rft = {"success": False, "outcome": "specialist_outbound_failed",
+                        "detail": {}, "error": str(e), "next_action": None}
+                _dm = await self.cog.translator_pass(_rft, tier=tier)
+                return {"director_message": _dm, "confidence": round(confidence, 3), "gaps": gaps,
+                        "status": "error", "intent": intent, "tier": tier, "agent": agent}
+        _p3out_dur = (_time_mod.monotonic() - _t3out_start) * 1000
+        self._log_pass(3, f"{agent}_outbound", delegation, sp_out,
+                       _p3out_dur / 1000)
+        # Record specialist's skill/operation selection in envelope context
         try:
-            execution_result = await self._dispatch(
-                action, None,
-                delegation={**delegation, "intent": intent},
-                specialist=specialist_output,
-                security_confirmed=security_confirmed,
+            _msg.set_skill(
+                sp_out.get("skill", ""),
+                sp_out.get("operation", ""),
             )
+            _msg.set_payload(sp_out)
+            _msg.append_pass(3, f"{agent}_outbound", _p3out_dur, bool(sp_out))
+            # Validate context has skill/operation for non-trivial operations
+            if sp_out and action.get("domain") not in ("ollama", "memory"):
+                _env_errs = _msg.validate(3, required_context_fields=["original_intent"])
+                if _env_errs:
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning("PASS 3 outbound envelope: %s", _env_errs)
+        except Exception:
+            pass
+
+        # ── Execution (deterministic) ─────────────────────────────────────────
+        try:
+            execution_result = await _asyncio.wait_for(
+                self._dispatch(
+                    action, None,
+                    delegation={**delegation, "intent": intent},
+                    specialist=sp_out,
+                    security_confirmed=security_confirmed,
+                ),
+                timeout=_PASS_TIMEOUT * 3,  # nanobot scripts can be slow
+            )
+        except _asyncio.TimeoutError:
+            execution_result = {"status": "error", "error": "execution_timeout"}
         except Exception as e:
             import httpx as _httpx
             if isinstance(e, _httpx.HTTPStatusError):
@@ -1135,19 +1260,57 @@ class ExecutionEngine:
                 execution_result = {"status": "error", "error": str(e)}
 
         if execution_result is None:
-            execution_result = {"status": "error", "error": f"dispatch returned None for domain={action.get('domain')!r} op={action.get('operation')!r}"}
+            execution_result = {"status": "error",
+                                "error": f"dispatch returned None for domain={action.get('domain')!r} op={action.get('operation')!r}"}
 
-        # PASS 4.5 — Memory cross-reference for file operations
-        # After a successful file list/read, search Qdrant for related knowledge.
-        # IMPORTANT: Qdrant hits are stored memory — NOT live adapter results.
-        # Every hit is tagged _result_source="qdrant_memory" so the translator
-        # cannot confuse them with data that came directly from WebDAV/IMAP/CalDAV.
+        # Early exit for governance confirmation gates — translator generates the prompt
+        if execution_result.get("requires_confirmation") or execution_result.get("requires_double_confirmation"):
+            _confirm_ctx = {
+                "success": False, "outcome": "awaiting_confirmation",
+                "detail": {
+                    "action": execution_result.get("action", intent),
+                    "summary": execution_result.get("summary", ""),
+                    "review_decision": (execution_result.get("review_result") or {}).get("decision", ""),
+                    "escalated": bool(execution_result.get("escalation_notice")),
+                },
+                "error": None, "next_action": "confirm_or_deny",
+            }
+            _dm = await self.cog.translator_pass(_confirm_ctx, tier=tier)
+            result_dict = {
+                "status": "ok", "intent": intent, "tier": tier, "agent": agent,
+                "specialist_plan": sp_out, "result": execution_result,
+                "confidence": round(confidence, 3), "gaps": gaps, "director_message": _dm,
+            }
+            for _gw_key in ("requires_confirmation", "requires_double_confirmation",
+                            "pending_delegation", "summary", "escalation_notice"):
+                if execution_result.get(_gw_key) is not None:
+                    result_dict[_gw_key] = execution_result[_gw_key]
+            if morning_briefing:
+                result_dict["morning_briefing"] = morning_briefing
+            return result_dict
+
+        # Stamp execution_confirmed deterministically — LLM must never assert completion
+        _exec_http = execution_result.get("http_status")
+        if _exec_http is not None:
+            _execution_confirmed = (
+                execution_result.get("status") == "ok"
+                and isinstance(_exec_http, int)
+                and 200 <= _exec_http < 300
+                and not execution_result.get("error")
+            )
+        else:
+            _execution_confirmed = (
+                (execution_result.get("status") == "ok"
+                 or execution_result.get("success") is True)
+                and not execution_result.get("error")
+            )
+        execution_result["execution_confirmed"] = _execution_confirmed
+
+        # Memory cross-reference for file operations — Qdrant hits tagged _result_source="qdrant_memory"
         if (intent in ("list_files", "read_file")
                 and execution_result.get("status") == "ok"
                 and self.qdrant):
             try:
-                # Flag when the live adapter returned empty data — the translator must
-                # say so explicitly before mentioning any memory context.
                 _live_items = execution_result.get("items")
                 _live_content = execution_result.get("content")
                 _live_empty = (
@@ -1156,9 +1319,7 @@ class ExecutionEngine:
                 )
                 if _live_empty:
                     execution_result["_live_result_empty"] = True
-
                 search_term = delegation.get("target") or user_input
-                # Build a meaningful search string from path + user input
                 path_parts = [p for p in str(search_term).replace("/", " ").split() if len(p) > 2]
                 search_q = " ".join(path_parts[:6]) if path_parts else user_input
                 mem_hits = await self.qdrant.search_all_weighted(
@@ -1166,117 +1327,160 @@ class ExecutionEngine:
                 )
                 if mem_hits:
                     execution_result["memory_context"] = [
-                        {
-                            "content": h.get("content", ""),
-                            "score": round(h.get("score", 0), 3),
-                            "_result_source": "qdrant_memory",
-                        }
+                        {"content": h.get("content", ""), "score": round(h.get("score", 0), 3),
+                         "_result_source": "qdrant_memory"}
                         for h in mem_hits if h.get("score", 0) > 0.4
                     ]
             except Exception:
                 pass
 
-        # PASS 5 — Memory Decision (non-fatal if it fails)
+        # ── Security scan on nanobot results — all external data is untrusted ──
+        # Nanobot results come from live external systems (IMAP, Nextcloud, etc.)
+        # and could contain adversarial content injected by a compromised server.
+        # Mark every nanobot result as [UNTRUSTED EXTERNAL CONTENT] until scanned.
+        # specialist_inbound sees the annotation and treats the content accordingly.
+        if execution_result.get("_trust") == "untrusted_external" and self.scanner:
+            try:
+                _nb_text = json.dumps(execution_result.get("result") or {})[:2000]
+                _nb_scan = self.scanner.scan(_nb_text)
+                if _nb_scan.flagged:
+                    if self.ledger:
+                        try:
+                            self.ledger.append("nanobot_result_scan_flagged", "inbound", {
+                                "intent": intent,
+                                "categories": _nb_scan.categories,
+                                "content_hash": _hashlib.sha256(_nb_text.encode()).hexdigest()[:16],
+                            })
+                        except Exception:
+                            pass
+                    execution_result["_untrusted_flagged"] = True
+                    execution_result["_scan_categories"] = _nb_scan.categories
+                execution_result["_trust"] = "scanned"
+            except Exception:
+                execution_result["_trust"] = "scan_error"
+
+        # ── PASS 3 inbound — Specialist interprets the execution result ───────
+        _t3in_start = _time_mod.monotonic()
         try:
-            # Deterministic execution confirmation check — computed BEFORE the LLM call so the
-            # LLM sees execution_confirmed in the result dict it reasons over.
-            # The LLM must never be trusted to assert completion; we stamp it from real data.
-            _exec_http = execution_result.get("http_status")
-            if _exec_http is not None:
-                # HTTP adapter (WebDAV, CalDAV, broker, browser) — require 2xx
-                _execution_confirmed = (
-                    execution_result.get("status") == "ok"
-                    and isinstance(_exec_http, int)
-                    and 200 <= _exec_http < 300
-                    and not execution_result.get("error")
-                )
-            else:
-                # Non-HTTP adapter (SMTP, IMAP, wallet signing) — trust status/success fields
-                _execution_confirmed = (
-                    (execution_result.get("status") == "ok"
-                     or execution_result.get("success") is True)
-                    and not execution_result.get("error")
-                )
-
-            # Stamp onto the result dict so the LLM sees authoritative confirmation state
-            execution_result["execution_confirmed"] = _execution_confirmed
-
-            # Intents that make real mutations — require confirmed success
-            # before a prospective entry can be marked as anything other than "unconfirmed".
-            _MUTATING_INTENTS = frozenset({
-                "create_event", "create_task", "write_file", "send_email",
-                "delete_file", "delete_email", "delete_task",
-                "restart_container", "create_folder",
-            })
-
-            memory = await self.cog.ceo_memory_decision(user_input, execution_result)
-            if memory.get("store") and memory.get("lesson"):
-                coll_decision = memory.get("collection", "working_memory")
-                mem_type = coll_decision if coll_decision in SOVEREIGN_COLLECTIONS else "lesson"
-
-                # Build collection-specific metadata from richer schema fields
-                extra_meta: dict = {}
-                if mem_type == "episodic":
-                    extra_meta["outcome"] = memory.get("outcome", "neutral")
-                elif mem_type == "prospective":
-                    if memory.get("next_due"):
-                        extra_meta["next_due"] = memory["next_due"]
-                    # For mutating intents, stamp execution_confirmed deterministically.
-                    # If the HTTP call was not confirmed with a 2xx, override outcome to
-                    # "unconfirmed" so the entry remains visible as a pending intention —
-                    # regardless of what the LLM's memory decision contains.
-                    if intent in _MUTATING_INTENTS:
-                        extra_meta["execution_confirmed"] = _execution_confirmed
-                        if not _execution_confirmed:
-                            extra_meta["outcome"] = "unconfirmed"
-                elif mem_type == "relational":
-                    for f in ("concept_a", "concept_b", "shared", "diverges", "insight"):
-                        if memory.get(f):
-                            extra_meta[f] = memory[f]
-                elif mem_type == "associative":
-                    for f in ("item_a_id", "item_b_id", "link_type"):
-                        if memory.get(f):
-                            extra_meta[f] = memory[f]
-
-                # Stage in working_memory with type tag; shutdown_promote moves to sovereign
-                await self.cog.save_lesson(
-                    memory["lesson"], user_input,
-                    collection=WORKING,
-                    memory_type=mem_type,
-                    writer="sovereign-core",
-                    extra_metadata=extra_meta,
-                )
+            sp_in = await _asyncio.wait_for(
+                self.cog.specialist_inbound(agent, delegation, sp_out, execution_result),
+                timeout=_PASS_TIMEOUT,
+            )
+        except (_asyncio.TimeoutError, Exception) as _e3in:
+            sp_in = {"success": _execution_confirmed, "outcome": "inbound_interpretation_unavailable",
+                     "detail": execution_result, "anomaly": str(_e3in), "retry_with": None}
+        _p3in_dur = (_time_mod.monotonic() - _t3in_start) * 1000
+        self._log_pass(3, f"{agent}_inbound", execution_result, sp_in,
+                       _p3in_dur / 1000)
+        # Merge nanobot result into envelope and append PASS 3 inbound history
+        try:
+            _msg.merge_result({"sp_in": sp_in, "exec": execution_result})
+            _msg.append_pass(3, f"{agent}_inbound", _p3in_dur, sp_in.get("success", False))
         except Exception:
             pass
 
-        # CEO Agent translation — mandatory on all Director-bound messages
-        # For requires_confirmation responses, pass a simplified context so the
-        # translator generates a confirmation prompt rather than an error message.
-        if execution_result.get("requires_confirmation") or execution_result.get("requires_double_confirmation"):
-            _confirm_ctx = {
-                "status": "awaiting_director_confirmation",
-                "action": execution_result.get("action", intent),
-                "summary": execution_result.get("summary", ""),
-                "review_decision": (execution_result.get("review_result") or {}).get("decision", ""),
-                "escalated": bool(execution_result.get("escalation_notice")),
+        # Optional retry — one attempt if specialist requests it (not on confirmed continuations)
+        if sp_in.get("retry_with") and not _confirmed_continuation:
+            try:
+                _retry_result = await _asyncio.wait_for(
+                    self._dispatch(
+                        action, None,
+                        delegation={**delegation, "intent": intent, **sp_in["retry_with"]},
+                        specialist=sp_out,
+                        security_confirmed=security_confirmed,
+                    ),
+                    timeout=_PASS_TIMEOUT * 3,
+                )
+                if _retry_result:
+                    execution_result = _retry_result
+                    execution_result.setdefault("execution_confirmed", _execution_confirmed)
+                    sp_in = await _asyncio.wait_for(
+                        self.cog.specialist_inbound(agent, delegation, sp_out, execution_result),
+                        timeout=_PASS_TIMEOUT,
+                    )
+            except Exception:
+                pass  # keep original sp_in if retry fails
+
+        # ── PASS 4 — Orchestrator evaluates result + makes memory decision ────
+        _t4_start = _time_mod.monotonic()
+        try:
+            orch_eval = await _asyncio.wait_for(
+                self.cog.orchestrator_evaluate(delegation, sp_in),
+                timeout=_PASS_TIMEOUT,
+            )
+        except (_asyncio.TimeoutError, Exception) as _e4:
+            orch_eval = {
+                "approved": True,
+                "feedback": f"Evaluation unavailable: {_e4}",
+                "memory_action": "skip",
+                "memory_payload": {},
+                "result_for_translator": self._build_result_for_translator(intent, execution_result),
             }
-            director_msg = await self._safe_translate(user_input, _confirm_ctx, tier=tier)
-        else:
-            director_msg = await self._safe_translate(user_input, execution_result, tier=tier)
+        _p4_dur = (_time_mod.monotonic() - _t4_start) * 1000
+        self._log_pass(4, "orchestrator_evaluate", sp_in, orch_eval,
+                       _p4_dur / 1000)
+        # Store orchestrator evaluation result + result_for_translator in envelope
+        try:
+            _msg.merge_result({"orch_eval": orch_eval,
+                               "result_for_translator": orch_eval.get("result_for_translator")})
+            _msg.append_pass(4, "orchestrator", _p4_dur, orch_eval.get("approved", True))
+        except Exception:
+            pass
+
+        if not orch_eval.get("approved", True):
+            _rft = {"success": False, "outcome": "plan_rejected",
+                    "detail": {"feedback": orch_eval.get("feedback", "")},
+                    "error": "Orchestrator rejected the plan.", "next_action": None}
+            _dm = await self.cog.translator_pass(_rft, tier=tier)
+            return {"director_message": _dm, "confidence": round(confidence, 3), "gaps": gaps,
+                    "status": "error", "intent": intent, "tier": tier, "agent": agent}
+
+        # ── Async memory write — never blocks the return path ─────────────────
+        _memory_action = orch_eval.get("memory_action", "skip")
+        _memory_payload = orch_eval.get("memory_payload") or {}
+        if _memory_action and _memory_action != "skip" and self.qdrant:
+            _asyncio.create_task(self._async_memory_write(
+                _memory_action, _memory_payload, user_input, intent, _execution_confirmed,
+            ))
+        if self.qdrant:
+            _asyncio.create_task(self._async_store_routing_decision(
+                intent, agent, tier, _execution_confirmed,
+            ))
+
+        # ── PASS 5 — Translator (receives ONLY result_for_translator) ─────────
+        _rft = (orch_eval.get("result_for_translator")
+                or self._build_result_for_translator(intent, execution_result))
+        _t5_start = _time_mod.monotonic()
+        try:
+            director_msg = await _asyncio.wait_for(
+                self.cog.translator_pass(_rft, tier=tier),
+                timeout=_PASS_TIMEOUT,
+            )
+        except (_asyncio.TimeoutError, Exception):
+            director_msg = str(_rft.get("outcome", "Action completed."))
+        _p5_dur = (_time_mod.monotonic() - _t5_start) * 1000
+        self._log_pass(5, "translator", _rft, {"director_message": director_msg},
+                       _p5_dur / 1000)
+        # Append PASS 5 to history
+        try:
+            _msg.append_pass(5, "translator", _p5_dur, bool(director_msg))
+        except Exception:
+            pass
+
         result_dict = {
             "status": "ok",
             "intent": intent,
             "tier": tier,
             "agent": agent,
-            "specialist_plan": specialist_output,
+            "specialist_plan": sp_out,
             "result": execution_result,
             "confidence": round(confidence, 3),
             "gaps": gaps,
             "director_message": director_msg,
+            "_envelope": _msg.envelope.to_dict(),
+            "_history": [r.to_dict() for r in _msg.history],
         }
-        # Promote gateway-critical fields to top level if present in execution_result.
-        # Gateway reads data.get("requires_confirmation") / data.get("pending_delegation")
-        # from the top-level response — they must not be buried under "result".
+        # Promote gateway-critical fields to top level — gateway reads top-level only
         for _gw_key in ("requires_confirmation", "requires_double_confirmation",
                         "pending_delegation", "summary", "escalation_notice"):
             if execution_result.get(_gw_key) is not None:
@@ -1320,6 +1524,107 @@ class ExecutionEngine:
         self.credential_proxy = proxy
         if self.nanobot:
             self.nanobot.set_credential_proxy(proxy)
+
+    # ── Cognitive loop helpers ───────────────────────────────────────────────
+
+    def _log_pass(self, pass_num: int, persona: str, input_data, output_data,
+                  duration_s: float) -> None:
+        """Audit hash per cognitive pass — structural hashes only, no raw content."""
+        import hashlib as _hl, json as _js, logging as _lg
+        _log = _lg.getLogger(__name__)
+        try:
+            _in_h = _hl.sha256(
+                _js.dumps(input_data, default=str, sort_keys=True).encode()
+            ).hexdigest()[:16]
+            _out_h = _hl.sha256(
+                _js.dumps(output_data, default=str, sort_keys=True).encode()
+            ).hexdigest()[:16]
+            _log.debug("PASS %d [%s] in=%s out=%s dur=%.2fs",
+                       pass_num, persona, _in_h, _out_h, duration_s)
+        except Exception:
+            pass
+
+    def _build_result_for_translator(self, intent: str, exec_result: dict) -> dict:
+        """Convert raw adapter result → result_for_translator format for PASS 5."""
+        if exec_result is None:
+            return {"success": False, "outcome": "no_result", "detail": {},
+                    "error": "dispatch returned None", "next_action": None}
+        success = (
+            (exec_result.get("status") == "ok" or exec_result.get("success") is True
+             or exec_result.get("execution_confirmed") is True)
+            and not exec_result.get("error")
+        )
+        detail = {k: v for k, v in exec_result.items()
+                  if not k.startswith("_")
+                  and k not in ("status", "success", "error", "execution_confirmed")}
+        return {
+            "success": success,
+            "outcome": "ok" if success else "error",
+            "detail": detail,
+            "error": exec_result.get("error"),
+            "next_action": None,
+        }
+
+    async def _async_memory_write(
+        self, memory_action: str, memory_payload: dict, user_input: str,
+        intent: str, execution_confirmed: bool,
+    ) -> None:
+        """Async memory write dispatched via asyncio.create_task() — never blocks return path."""
+        _MUTATING_INTENTS = frozenset({
+            "create_event", "create_task", "write_file", "send_email",
+            "delete_file", "delete_email", "delete_task", "restart_container", "create_folder",
+        })
+        try:
+            if not memory_payload.get("lesson"):
+                return
+            coll_decision = memory_payload.get("collection", "working_memory")
+            mem_type = coll_decision if coll_decision in SOVEREIGN_COLLECTIONS else "lesson"
+            extra_meta: dict = {}
+            if mem_type == "episodic":
+                extra_meta["outcome"] = memory_payload.get("outcome", "neutral")
+            elif mem_type == "prospective":
+                if memory_payload.get("next_due"):
+                    extra_meta["next_due"] = memory_payload["next_due"]
+                if intent in _MUTATING_INTENTS:
+                    extra_meta["execution_confirmed"] = execution_confirmed
+                    if not execution_confirmed:
+                        extra_meta["outcome"] = "unconfirmed"
+            elif mem_type == "relational":
+                for f in ("concept_a", "concept_b", "shared", "diverges", "insight"):
+                    if memory_payload.get(f):
+                        extra_meta[f] = memory_payload[f]
+            elif mem_type == "associative":
+                for f in ("item_a_id", "item_b_id", "link_type"):
+                    if memory_payload.get(f):
+                        extra_meta[f] = memory_payload[f]
+            await self.cog.save_lesson(
+                memory_payload["lesson"], user_input,
+                collection=WORKING,
+                memory_type=mem_type,
+                writer="sovereign-core",
+                extra_metadata=extra_meta,
+            )
+        except Exception as _e:
+            import logging as _lg
+            _lg.getLogger(__name__).warning("async_memory_write failed: %s", _e)
+
+    async def _async_store_routing_decision(
+        self, intent: str, agent: str, tier: str, success: bool,
+    ) -> None:
+        """Store routing decision in episodic memory after PASS 4 approves."""
+        try:
+            lesson = (f"Routing: intent={intent!r} → agent={agent!r} "
+                      f"tier={tier} success={success}")
+            await self.cog.save_lesson(
+                lesson, intent,
+                collection=WORKING,
+                memory_type="episodic",
+                writer="sovereign-core",
+                extra_metadata={"outcome": "positive" if success else "negative",
+                                "routing": True},
+            )
+        except Exception:
+            pass
 
     def _delegation_to_action(self, delegation: dict) -> dict:
         intent = delegation.get("intent", "")
@@ -2206,8 +2511,11 @@ class ExecutionEngine:
                             f"Please configure: {'; '.join(cap['blockers'])}"
                         ),
                     }
-                # Store the task (confirmed=True because user passed the MID gate)
-                return await self.task_scheduler.store_task(parsed, human_confirmed=confirmed)
+                # Store the task — LOW tier, no confirmation gate
+                return await self.task_scheduler.store_task(parsed, human_confirmed=True)
+
+            if name == "recall_last_briefing":
+                return await self.task_scheduler.recall_last_briefing()
 
             return {"error": f"Unknown scheduler action: {name}"}
 

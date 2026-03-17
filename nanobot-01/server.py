@@ -67,10 +67,14 @@ _dsl_cache: dict[str, tuple[float, dict | None]] = {}
 # ---------------------------------------------------------------------------
 
 class TaskRequest(BaseModel):
-    skill:   str
-    action:  str
-    params:  dict[str, Any] = {}
-    context: dict[str, Any] = {}
+    skill:      str
+    action:     str = ""        # legacy field — use operation when present
+    operation:  str = ""        # new contract field (preferred over action)
+    params:     dict[str, Any] = {}
+    payload:    dict[str, Any] = {}   # new contract field (preferred over params)
+    context:    dict[str, Any] = {}
+    request_id: str = ""        # caller-supplied idempotency key; generated if absent
+    timeout_ms: int = 25000     # execution timeout hint
 
 
 class TranslateRequest(BaseModel):
@@ -925,11 +929,13 @@ def _build_prompt(req: TaskRequest) -> str:
         except Exception as e:
             logger.warning(f"Could not read skill {req.skill}: {e}")
 
+    operation = req.operation or req.action
+    params    = req.payload or req.params
     lines = [
         "TASK DISPATCH FROM SOVEREIGN CORE",
         f"Skill: {req.skill}",
-        f"Action: {req.action}",
-        f"Parameters: {json.dumps(req.params, indent=2)}",
+        f"Action: {operation}",
+        f"Parameters: {json.dumps(params, indent=2)}",
     ]
     if req.context:
         lines.append(f"Context: {json.dumps(req.context, indent=2)}")
@@ -998,6 +1004,66 @@ def _run_nanobot(prompt: str, run_id: str) -> dict:
     except Exception as e:
         logger.exception(f"[{run_id}] unexpected error running nanobot")
         return {"status": "error", "path": "llm", "error": f"{type(e).__name__}: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Protocol contract normaliser
+# ---------------------------------------------------------------------------
+
+def _normalise_to_contract(result: dict, request_id: str, skill: str, operation: str) -> dict:
+    """Convert any dispatcher result to the sovereign-core ↔ nanobot response contract.
+
+    Contract output:
+      request_id  — echoed from request (or generated run_id)
+      skill       — echoed
+      operation   — echoed (new name for action)
+      success     — bool; derived deterministically from status + error fields
+      status_code — verbatim protocol status string (HTTP 201, IMAP OK, SCRIPT EXIT 1, ...)
+      data        — actual result payload (all non-wrapper, non-meta fields)
+      raw_error   — verbatim error string or null; never sanitised or interpreted
+
+    Backward-compat wrapper fields (run_id, action, status, path) preserved alongside.
+    """
+    status    = result.get("status", "ok")
+    raw_error = result.get("error") or result.get("raw_error") or None
+    success   = (status == "ok") and not raw_error
+
+    # status_code: prefer explicit field, then http_status, then derive
+    status_code = result.get("status_code") or result.get("http_status")
+    if status_code is None:
+        path = result.get("path", "")
+        if success:
+            status_code = "OK"
+        elif result.get("exit_code") is not None:
+            status_code = f"SCRIPT EXIT {result.get('exit_code', 1)}"
+        elif path.startswith("dsl_python3"):
+            status_code = "SCRIPT ERROR"
+        else:
+            status_code = "ERROR"
+
+    # data: strip wrapper / meta keys; keep only meaningful payload fields
+    _META = {
+        "status", "error", "raw_error", "path", "exit_code",
+        "run_id", "request_id", "skill", "action", "operation",
+        "status_code", "http_status", "elapsed_s",
+    }
+    data = {k: v for k, v in result.items() if k not in _META}
+
+    return {
+        # New contract fields
+        "request_id":  request_id,
+        "skill":       skill,
+        "operation":   operation,
+        "success":     success,
+        "status_code": str(status_code),
+        "data":        data,
+        "raw_error":   raw_error,
+        # Backward-compat fields preserved so existing _forward() normalisation still works
+        "run_id":  request_id,
+        "action":  operation,
+        "status":  status,
+        "path":    result.get("path", "dsl"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1096,41 +1162,49 @@ async def run_task(req: TaskRequest):
       - no DSL match    → LLM path via nanobot agent CLI
 
     Called by NanobotAdapter in sovereign-core. Governance already applied upstream.
-    Credentials available as env vars (Phase 1). No governance decisions here.
+    Nanobot is a dumb executor: fires the skill, returns result verbatim. No retry,
+    no interpretation, no fabrication here.
+
+    Response follows the sovereign-core ↔ nanobot protocol contract:
+      {request_id, skill, operation, success, status_code, data, raw_error}
+    Plus backward-compat fields: {run_id, action, status, path}
     """
-    run_id = str(uuid.uuid4())[:8]
-    logger.info(f"[{run_id}] task: skill={req.skill} action={req.action}")
+    # Resolve operation (new contract field) vs action (legacy) — prefer operation
+    operation = req.operation or req.action
+    # Resolve params — prefer payload (new contract) over params (legacy)
+    params    = req.payload or req.params
+    # Resolve request_id — prefer caller-supplied, fall back to generated
+    request_id = req.request_id or str(uuid.uuid4())[:8]
+
+    logger.info(f"[{request_id}] task: skill={req.skill!r} operation={operation!r}")
 
     # --- Stage 3: DSL dispatch path ---
     operations = _load_operations(req.skill)
-    if operations and req.action in operations:
-        op_spec = operations[req.action]
+    if operations and operation in operations:
+        op_spec = operations[operation]
         tool    = op_spec.get("tool", "")
 
-        validated, errors = _validate_params(op_spec, req.params)
+        validated, errors = _validate_params(op_spec, params)
         if errors:
-            logger.warning(f"[{run_id}] DSL param validation failed: {errors}")
-            return JSONResponse(content={
-                "run_id": run_id, "skill": req.skill, "action": req.action,
-                "status": "error", "step": "param_validation", "errors": errors, "path": "dsl",
-            })
+            logger.warning(f"[{request_id}] DSL param validation failed: {errors}")
+            raw = {
+                "status": "error", "path": "dsl",
+                "step": "param_validation", "errors": errors,
+            }
+            return JSONResponse(content=_normalise_to_contract(raw, request_id, req.skill, operation))
 
-        logger.info(f"[{run_id}] DSL path: tool={tool} action={op_spec.get('action')}")
+        logger.info(f"[{request_id}] DSL path: tool={tool} action={op_spec.get('action')}")
         loop     = asyncio.get_event_loop()
         _skill   = req.skill
         _context = req.context
         result = await loop.run_in_executor(
-            None, lambda: _dispatch_dsl(op_spec, validated, run_id, skill=_skill, context=_context)
+            None, lambda: _dispatch_dsl(op_spec, validated, request_id, skill=_skill, context=_context)
         )
-        return JSONResponse(content={
-            "run_id": run_id, "skill": req.skill, "action": req.action, **result,
-        })
+        return JSONResponse(content=_normalise_to_contract(result, request_id, req.skill, operation))
 
     # --- LLM fallback path ---
-    logger.info(f"[{run_id}] LLM path: no DSL match for {req.skill}/{req.action}")
+    logger.info(f"[{request_id}] LLM path: no DSL match for {req.skill!r}/{operation!r}")
     prompt = _build_prompt(req)
     loop   = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, lambda: _run_nanobot(prompt, run_id))
-    return JSONResponse(content={
-        "run_id": run_id, "skill": req.skill, "action": req.action, **result,
-    })
+    result = await loop.run_in_executor(None, lambda: _run_nanobot(prompt, request_id))
+    return JSONResponse(content=_normalise_to_contract(result, request_id, req.skill, operation))

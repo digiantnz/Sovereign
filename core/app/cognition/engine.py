@@ -105,6 +105,28 @@ class CognitionEngine:
                     continue  # retry once
                 raise ValueError(f"LLM returned invalid JSON after retry: {raw[:200]}")
 
+    # ── Routing history for PASS 1 ───────────────────────────────────────
+    async def load_routing_history(self, intent: str) -> str:
+        """Search episodic memory for prior routing decisions matching this intent.
+        Returns formatted context string for injection into PASS 1 prompt.
+        """
+        if not self.qdrant:
+            return ""
+        try:
+            results = await self.qdrant.search_all_weighted(
+                f"routing_decision {intent}", query_type="action", top_k=3
+            )
+            hits = [r for r in results
+                    if r.get("score", 0) > 0.5
+                    and "routing_decision" in r.get("content", "")]
+            if not hits:
+                return ""
+            lines = [f"- [{h.get('_collection','?')}|{h.get('timestamp','')[:10]}] {h.get('content','')}"
+                     for h in hits[:3]]
+            return "Prior routing decisions for similar intents:\n" + "\n".join(lines)
+        except Exception:
+            return ""
+
     # ── Pass 1: CEO Classification ────────────────────────────────────────
     async def ceo_classify(self, user_input: str, context_window=None) -> dict:
         from execution.adapters.qdrant import classify_query_type
@@ -123,6 +145,18 @@ class CognitionEngine:
         result = await self.call_llm_json(prompt)
         result["_memory_confidence"] = confidence
         result["_memory_gaps"] = gaps
+        return result
+
+    async def orchestrator_classify(self, user_input: str, context_window=None) -> dict:
+        """PASS 1: Orchestrator classification with routing memory lookup.
+        New contract: adds specialist + routing_rationale fields.
+        Backward compat: also sets delegate_to = specialist.
+        """
+        result = await self.ceo_classify(user_input, context_window=context_window)
+        # Normalise: ensure both specialist and delegate_to are present
+        agent = result.get("specialist") or result.get("delegate_to", "")
+        result["specialist"] = agent
+        result["delegate_to"] = agent
         return result
 
     # ── Pass 2: Specialist Reasoning ──────────────────────────────────────
@@ -192,6 +226,143 @@ class CognitionEngine:
         result["_complexity_score"] = decision["score"]
         result["_intended_provider"] = decision["provider"] if decision["use_external"] else "ollama"
         return result
+
+    # ── Pass 3 outbound: Specialist selects skill and builds payload ──────
+    async def specialist_outbound(self, agent_name: str, delegation: dict, user_input: str) -> dict:
+        """PASS 3 outbound: specialist plans execution — skill, operation, payload.
+
+        Externally routable (same routing logic as specialist_reason).
+        Output is a flat dict compatible with _dispatch_inner() (payload fields at top level).
+        """
+        import re as _re_json
+        _log = __import__("logging").getLogger(__name__)
+        persona = self.load_persona(agent_name)
+        try:
+            from skills.loader import SkillLoader
+            loader = SkillLoader(agent_name, ledger=self.ledger)
+            persona = loader.inject_into_persona(persona)
+        except Exception as e:
+            _log.warning("SkillLoader[outbound/%s]: %s", agent_name, e)
+
+        routing_history = await self.load_routing_history(delegation.get("intent", ""))
+        prompt = prompts.specialist_outbound(
+            agent_persona=persona,
+            delegation=delegation,
+            user_input=user_input,
+            routing_history=routing_history,
+        )
+
+        # External routing applies to outbound (research may use Claude/Grok)
+        decision = self._routing_decision(prompt, user_input=user_input)
+        if decision["use_external"]:
+            _log.info("specialist_outbound[%s]: routing to %s", agent_name, decision["provider"])
+            try:
+                if decision["provider"] == "claude":
+                    raw = await self.ask_claude(prompt, agent=agent_name)
+                else:
+                    raw = await self.ask_grok(prompt, agent=agent_name)
+                response_text = raw.get("response", "")
+                stripped = _re_json.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
+                m = _re_json.search(r"\{.*\}", stripped, _re_json.DOTALL)
+                if m:
+                    try:
+                        result = json.loads(m.group())
+                        result["mode"] = "outbound"
+                        result["_routed_external"] = True
+                        result["_provider"] = decision["provider"]
+                        return result
+                    except json.JSONDecodeError:
+                        pass
+                _log.warning("specialist_outbound[%s]: external JSON invalid — falling back", agent_name)
+            except Exception as exc:
+                _log.warning("specialist_outbound[%s]: external failed (%s) — falling back", agent_name, exc)
+
+        result = await self.call_llm_json(prompt)
+        result.setdefault("mode", "outbound")
+        result["_routed_external"] = False
+        result["_provider"] = "ollama"
+        return result
+
+    # ── Pass 3 inbound: Specialist interprets execution result ────────────
+    async def specialist_inbound(self, agent_name: str, delegation: dict,
+                                 outbound: dict, execution_result: dict) -> dict:
+        """PASS 3 inbound: specialist interprets the adapter result.
+
+        ALWAYS uses local Ollama — never externally routed.
+        Input is never the Director's raw message — fabrication prevention.
+        """
+        persona = self.load_persona(agent_name)
+        prompt = prompts.specialist_inbound(
+            agent_persona=persona,
+            delegation=delegation,
+            outbound=outbound,
+            execution_result=execution_result,
+        )
+        result = await self.call_llm_json(prompt)
+        result.setdefault("mode", "inbound")
+        result.setdefault("success", False)
+        result.setdefault("outcome", "")
+        result.setdefault("anomaly", None)
+        result.setdefault("retry_with", None)
+        return result
+
+    # ── Pass 4: Orchestrator evaluation (merged evaluate + memory decision) ─
+    async def orchestrator_evaluate(self, delegation: dict, specialist_inbound_result: dict) -> dict:
+        """PASS 4: Orchestrator evaluates result and decides memory action.
+
+        ALWAYS uses local Ollama — governance must be deterministic and local.
+        Merges the old ceo_evaluate() + ceo_memory_decision() into one LLM call.
+        """
+        prompt = prompts.orchestrator_evaluate(
+            orchestrator_persona=self.load_orchestrator(),
+            delegation=delegation,
+            specialist_inbound_result=specialist_inbound_result,
+        )
+        result = await self.call_llm_json(prompt)
+        result.setdefault("approved", True)
+        result.setdefault("feedback", None)
+        result.setdefault("memory_action", "none")
+        result.setdefault("memory_payload", None)
+        result.setdefault("result_for_translator", {
+            "success": specialist_inbound_result.get("success", False),
+            "outcome": specialist_inbound_result.get("outcome", ""),
+            "detail": {},
+            "error": None,
+            "next_action": None,
+        })
+        return result
+
+    # ── Pass 5: Translator (restricted input — result_for_translator only) ─
+    async def translator_pass(self, result_for_translator: dict, tier: str = "LOW") -> str:
+        """PASS 5: Translator receives ONLY result_for_translator — nothing else.
+
+        Uses local Ollama. Returns plain English string.
+        Restricted input prevents fabrication from raw adapter internals.
+        """
+        try:
+            prompt = prompts.translate_from_orchestrator(
+                translator_persona=self.load_translator(),
+                result_for_translator=result_for_translator,
+                tier=tier,
+            )
+            raw = await self.ollama.generate(prompt, model=MODEL)
+            text = raw.get("response", "").strip()
+            # Strip spurious urgency unless HIGH-tier error
+            has_error = bool(result_for_translator.get("error") or
+                             not result_for_translator.get("success", True))
+            allow_urgent = tier == "HIGH" and has_error
+            if not allow_urgent:
+                text = self._URGENT_STRIP_RE.sub("", text).strip()
+            # Strip preamble the model adds despite instructions
+            import re as _re2
+            text = _re2.sub(
+                r"^(Here(?:'s| is) the (?:Director message|translated message|message)[^:]*:\s*"
+                r"|Translation:\s*|Translated message:\s*|Plain English(?:\s+message)?:\s*)",
+                "", text, flags=_re2.IGNORECASE,
+            ).strip()
+            return text
+        except Exception:
+            return result_for_translator.get("outcome", "")
 
     # ── Pass 3: CEO Evaluation ────────────────────────────────────────────
     async def ceo_evaluate(self, user_input: str, delegation: dict, specialist_output: dict) -> dict:

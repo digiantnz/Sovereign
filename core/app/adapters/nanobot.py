@@ -17,8 +17,10 @@ Stage 3 DSL dispatch:
   imap/webdav/caldav are now python3_exec scripts in nanobot-01 workspace (OC-S6).
 
 REST API: POST http://nanobot-01:8080/run
-  Request:  {skill, action, params, context}
-  Response: {run_id, skill, action, status, result, path} | {status, error}
+  Request:  {skill, action, params, context}  (legacy)
+            {skill, operation, payload, request_id, timeout_ms, context}  (new contract)
+  Response contract: {request_id, skill, operation, success, status_code, data, raw_error}
+  Backward-compat fields also present: {run_id, action, status, path}
 """
 
 import logging
@@ -437,26 +439,51 @@ class NanobotAdapter:
                 return result
 
             body = r.json()
-            # For python3_exec/DSL paths nanobot-01 merges script output directly at the
-            # top level (no nested "result" key).  For the LLM path there is a nested
-            # "result" field.  Normalise so result["result"] is always the actual data.
-            _body_result = body.get("result")
+
+            # ── New contract fields (nanobot server.py ≥ Step-4) ──────────────
+            # success / status_code / data / raw_error are set by _normalise_to_contract
+            # in server.py. If absent (older nanobot), fall back to legacy derivation.
+            contract_success = body.get("success")
+            contract_raw_error = body.get("raw_error")
+            contract_status_code = body.get("status_code")
+            # data field holds the meaningful payload; fall back to nested "result" or
+            # top-level fields (python3_exec flat response from OC-S6)
+            _body_result = body.get("data") or body.get("result")
             if _body_result is None:
-                _wrapper = {"run_id", "skill", "action", "path", "elapsed_s"}
+                _wrapper = {"run_id", "request_id", "skill", "action", "operation",
+                            "path", "elapsed_s", "status", "error", "raw_error",
+                            "success", "status_code"}
                 _body_result = {k: v for k, v in body.items() if k not in _wrapper}
+
+            # Derive legacy status for callers that still check result["status"]
+            if contract_success is not None:
+                legacy_status = "ok" if contract_success else "error"
+            else:
+                legacy_status = body.get("status", "ok")
+
             result = {
-                "status": body.get("status", "ok"),
-                "node": node,
-                "skill": skill,
-                "action": action,
-                "run_id": body.get("run_id"),
+                "status":      legacy_status,
+                "success":     contract_success if contract_success is not None
+                               else (legacy_status == "ok"),
+                "status_code": contract_status_code,
+                "node":        node,
+                "skill":       skill,
+                "action":      action,
+                "run_id":      body.get("run_id") or body.get("request_id"),
                 "http_status": http_status,
-                "result": _body_result,
-                "path": body.get("path", path),
-                "elapsed_s": elapsed,
+                "result":      _body_result,
+                "path":        body.get("path", path),
+                "elapsed_s":   elapsed,
             }
-            if body.get("error"):
-                result["error"] = body["error"]
+            # Propagate error: prefer raw_error (verbatim protocol error) over legacy error
+            _err = contract_raw_error or body.get("error")
+            if _err:
+                result["error"]     = _err
+                result["raw_error"] = _err
+
+            # All nanobot results are from external systems — mark as untrusted
+            # until scanned by the security layer in handle_chat().
+            result["_trust"] = "untrusted_external"
 
             self._log("nanobot_result", {
                 "node": node,

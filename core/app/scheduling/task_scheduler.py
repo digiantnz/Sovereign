@@ -406,6 +406,57 @@ class TaskScheduler:
         except Exception as e:
             return {"status": "error", "error": f"Failed to update status: {e}"}
 
+    async def recall_last_briefing(self) -> dict:
+        """Return the most recent briefing task_run from episodic memory.
+
+        Never fabricates — if no run exists, says so explicitly.
+        Matches any task whose title contains "briefing" (case-insensitive).
+        """
+        try:
+            result = await self.qdrant.client.scroll(
+                collection_name=EPISODIC,
+                scroll_filter=None,
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points = result[0] if result else []
+            briefing_runs = [
+                p.payload for p in points
+                if p.payload.get("type") == "task_run"
+                and "briefing" in p.payload.get("title", "").lower()
+            ]
+            if not briefing_runs:
+                return {
+                    "status": "not_found",
+                    "message": "No briefing has run yet — the 7:30am task has not executed successfully.",
+                }
+            # Sort by timestamp desc, take most recent
+            briefing_runs.sort(key=lambda p: p.get("timestamp", ""), reverse=True)
+            latest = briefing_runs[0]
+            outcome = latest.get("outcome", "unknown")
+            ts = latest.get("timestamp", "unknown time")
+            title = latest.get("title", "Briefing")
+            preview = latest.get("summary_preview") or latest.get("result_preview") or ""
+            if outcome == "negative":
+                return {
+                    "status": "error",
+                    "title": title,
+                    "ran_at": ts,
+                    "outcome": outcome,
+                    "message": f"The briefing ran at {ts} but failed. Error summary: {preview}",
+                }
+            return {
+                "status": "ok",
+                "title": title,
+                "ran_at": ts,
+                "outcome": outcome,
+                "summary": preview,
+                "message": f"Last briefing ({title}) ran at {ts} — outcome: {outcome}.\n\n{preview}",
+            }
+        except Exception as e:
+            return {"status": "error", "error": f"Could not query episodic memory: {e}"}
+
     # ── Scheduler execution loop ──────────────────────────────────────────
 
     async def run_due_tasks(self) -> list:

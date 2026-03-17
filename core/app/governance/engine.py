@@ -82,11 +82,11 @@ class GovernanceEngine:
             elif operation == 'promote' and rules.get('memory_promote', False):
                 return rules
         elif domain == 'scheduler':
-            # list is read-only (memory_write suffices at LOW tier)
-            if operation == 'list' and rules.get('memory_write', False):
+            # list + recall are read-only (memory_write suffices at LOW tier)
+            if operation in ('list', 'recall') and rules.get('memory_write', False):
                 return rules
-            # schedule/update are write operations requiring MID tier
-            if operation in ('schedule', 'update') and rules.get('task_schedule', False):
+            # schedule/update — LOW tier (internal memory write, no Director confirmation)
+            if operation in ('schedule', 'update') and rules.get('memory_write', False):
                 return rules
         elif domain == 'skills':
             if operation in ('search', 'review', 'audit') and rules.get('skill_read', False):
