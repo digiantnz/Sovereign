@@ -1639,7 +1639,20 @@ class ExecutionEngine:
             if op == "read":
                 if name == "mail_list_folders":
                     nb = await self.nanobot.run(_skill, "list_mailboxes", {})
-                elif name == "mail_list_inbox":
+                    return nb.get("result", nb)
+                # Specialist may escalate a generic fetch_email to a targeted fetch_message
+                # when they can identify the sender/subject from the user request.
+                if sp.get("operation") == "fetch_message":
+                    uid       = sp.get("uid", "")
+                    from_addr = sp.get("from_addr", "")
+                    subject   = sp.get("subject", "")
+                    if uid or from_addr or subject:
+                        nb = await self.nanobot.run(
+                            _skill, f"fetch_message{_suf}",
+                            {"uid": uid, "from_addr": from_addr, "subject": subject},
+                        )
+                        return nb.get("result") if nb.get("result") is not None else nb
+                if name == "mail_list_inbox":
                     count = int(sp.get("count") or action.get("count", 50))
                     nb = await self.nanobot.run(_skill, f"fetch_unread{_suf}", {"limit": count})
                 else:
@@ -1648,11 +1661,16 @@ class ExecutionEngine:
                 return nb.get("result", nb)
 
             if op == "fetch":
-                uid = sp.get("uid") or action.get("uid", "")
-                if not uid:
-                    return {"error": "fetch_message requires a message UID"}
-                nb = await self.nanobot.run(_skill, f"fetch_message{_suf}", {"uid": uid})
-                return nb.get("result", nb)
+                uid       = sp.get("uid")       or action.get("uid", "")
+                from_addr = sp.get("from_addr") or action.get("from_addr", "")
+                subject   = sp.get("subject")   or action.get("subject", "")
+                if not uid and not from_addr and not subject:
+                    return {"error": "fetch_message requires uid, from_addr, or subject"}
+                nb = await self.nanobot.run(
+                    _skill, f"fetch_message{_suf}",
+                    {"uid": uid, "from_addr": from_addr, "subject": subject},
+                )
+                return nb.get("result") if nb.get("result") is not None else nb
 
             if op == "search":
                 criteria = sp.get("criteria") or action.get("criteria") or {}

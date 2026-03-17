@@ -177,6 +177,26 @@ REQUIRED OUTPUT FIELDS for this calendar operation:
   "risk": "MID"
   "confidence": 0.9"""
 
+    elif intent in ("fetch_email", "search_email", "fetch_message"):
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this email operation:
+  "operation": "<choose: fetch_email to list inbox, fetch_message to read a specific email>"
+  "account": "<personal or business — match the Director's request; default to business if unclear>"
+  "risk": "LOW"
+  "confidence": 0.9
+
+OPERATION SELECTION RULES:
+- Use "fetch_email" ONLY when Director wants to list/check the inbox with no specific email in mind.
+- Use "fetch_message" when Director asks about a SPECIFIC email (e.g. "what does the UptimeRobot email say?", "read the email from X", "what did Y say?").
+  When using fetch_message, also include:
+    "from_addr": "<the SENDER name or email — e.g. 'UptimeRobot', 'support@example.com'. Use this for service names like UptimeRobot, GitHub, Stripe etc.>"
+    "subject": "<a keyword from the subject line — only if the Director names a specific subject>"
+    "uid": "<UID if known from a prior list, else empty string>"
+  IMPORTANT: Service/tool names (UptimeRobot, GitHub, Stripe, Trade Me) go in from_addr, NOT subject.
+  At least one of uid, from_addr, or subject must be non-empty for fetch_message.
+
+THIS IS AN EMAIL OPERATION. Do NOT output a file/Nextcloud operation. Do NOT set operation to "list_files" or "read_file"."""
+
     return f"""{agent_persona}
 
 ---
@@ -276,10 +296,14 @@ def translate_for_director(ceo_agent_persona: str, user_input: str, result: dict
     elif "messages" in r:
         r_summary = {
             "message_count": len(r["messages"]),
+            # uid + subject preserved — Rex needs uid to fetch body in follow-up turns
+            # Cap raised to 10 so "list all subjects" queries work end-to-end
             "messages": [
-                {"from": m.get("from", m.get("sender", "unknown")),
-                 "subject": m.get("subject", "(no subject)")}
-                for m in r["messages"][:5]
+                {"uid": m.get("uid", ""),
+                 "from": m.get("from", m.get("sender", "unknown")),
+                 "subject": m.get("subject", "(no subject)"),
+                 "date": m.get("date", "")}
+                for m in r["messages"][:10]
             ],
         }
     elif "content" in r:
@@ -374,6 +398,7 @@ If memory context is present and directly relevant, you may weave it in as backg
 Apply your communication preferences silently — do NOT explain, list, or reference them.
 Do NOT write "This message meets...", "Here is the translated message:", or any preamble.
 Do NOT enumerate bullet points about your own communication rules.
+NEVER write phrases like "Urgency does not apply here", "This is an informational result", "The live adapter result", "skills_live", or any other meta-commentary about the result or your translation process.
 Respond with ONLY the translated message text and nothing else."""
 
 

@@ -21,6 +21,7 @@ Output: JSON to stdout. Errors: {"status":"error","error":"..."} + exit 1.
 import argparse
 import email
 import email.header
+import html
 import imaplib
 import json
 import os
@@ -42,21 +43,49 @@ def _decode_header(value):
     return " ".join(decoded).strip()
 
 
+def _strip_html(text):
+    """Strip HTML tags and decode entities for plain-text fallback."""
+    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def _text_body(msg):
-    """Extract plain-text body from an email.message.Message."""
+    """Extract plain-text body from an email.message.Message.
+
+    Prefers text/plain. If absent, strips HTML from text/html part.
+    """
+    html_fallback = None
     if msg.is_multipart():
         for part in msg.walk():
-            if part.get_content_type() == "text/plain" and \
-               "attachment" not in str(part.get("Content-Disposition", "")):
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="replace")
+            ct = part.get_content_type()
+            disp = str(part.get("Content-Disposition", ""))
+            if "attachment" in disp:
+                continue
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            decoded = payload.decode(charset, errors="replace")
+            if ct == "text/plain":
+                return decoded
+            if ct == "text/html" and html_fallback is None:
+                html_fallback = decoded
     else:
         payload = msg.get_payload(decode=True)
         if payload:
             charset = msg.get_content_charset() or "utf-8"
-            return payload.decode(charset, errors="replace")
+            decoded = payload.decode(charset, errors="replace")
+            if msg.get_content_type() == "text/html":
+                return _strip_html(decoded)
+            return decoded
+
+    if html_fallback:
+        return _strip_html(html_fallback)
     return ""
 
 
@@ -144,13 +173,63 @@ def cmd_check(mail, mailbox, limit, unseen):
     return {"status": "ok", "messages": messages, "count": len(messages)}
 
 
-def cmd_fetch(mail, mailbox, uid):
-    """Fetch full message by UID — returns headers + text body."""
-    if not uid or not uid.strip():
-        return {"status": "error", "step": "uid_guard",
-                "error": "fetch: uid is required and must be non-empty"}
+def cmd_fetch(mail, mailbox, uid, from_addr="", subject=""):
+    """Fetch full message by UID — returns headers + text body.
 
-    uid = uid.strip()
+    If uid is empty but from_addr or subject is provided, search for the most
+    recent matching message first, then fetch its body (search-then-fetch).
+    """
+    uid = (uid or "").strip()
+
+    # Search-then-fetch: resolve UID from from_addr / subject when uid absent
+    if not uid:
+        if not from_addr and not subject:
+            return {"status": "error", "step": "uid_guard",
+                    "error": "fetch: uid is required (or provide from_addr/subject to search)"}
+
+        typ, _ = mail.select(mailbox, readonly=True)
+        if typ != "OK":
+            return {"status": "error", "error": f"SELECT {mailbox!r} failed"}
+
+        def _imap_quote(s):
+            """Wrap value in double-quotes for IMAP SEARCH if it contains spaces."""
+            s = s.strip()
+            if " " in s and not (s.startswith('"') and s.endswith('"')):
+                return f'"{s}"'
+            return s
+
+        def _search(crit):
+            t, d = mail.uid("SEARCH", None, *crit)
+            if t != "OK":
+                return []
+            return d[0].decode("ascii", errors="replace").split() if d[0] else []
+
+        criteria = []
+        if from_addr:
+            criteria += ["FROM", _imap_quote(from_addr)]
+        if subject:
+            criteria += ["SUBJECT", _imap_quote(subject)]
+
+        uid_list = _search(criteria)
+
+        # Fallback 1: if combined criteria failed and subject was given but not from_addr,
+        # try treating subject value as a FROM search (handles LLM misclassifying sender as subject)
+        if not uid_list and subject and not from_addr:
+            uid_list = _search(["FROM", _imap_quote(subject)])
+
+        # Fallback 2: if from_addr + subject combined found nothing, try each independently
+        if not uid_list and from_addr and subject:
+            uid_list = _search(["FROM", _imap_quote(from_addr)])
+            if not uid_list:
+                uid_list = _search(["SUBJECT", _imap_quote(subject)])
+
+        if not uid_list:
+            return {"status": "error",
+                    "error": "No message found matching the search criteria"}
+
+        # Take the most recent (highest UID)
+        uid = uid_list[-1]
+
     typ, _ = mail.select(mailbox, readonly=True)
     if typ != "OK":
         return {"status": "error", "error": f"SELECT {mailbox!r} failed"}
@@ -185,13 +264,17 @@ def cmd_search(mail, mailbox, query, from_addr, subject, since, limit):
     if typ != "OK":
         return {"status": "error", "error": f"SELECT {mailbox!r} failed"}
 
+    def _q(s):
+        s = s.strip()
+        return f'"{s}"' if " " in s and not (s.startswith('"') and s.endswith('"')) else s
+
     criteria = []
     if query:
-        criteria += ["TEXT", query]
+        criteria += ["TEXT", _q(query)]
     if from_addr:
-        criteria += ["FROM", from_addr]
+        criteria += ["FROM", _q(from_addr)]
     if subject:
-        criteria += ["SUBJECT", subject]
+        criteria += ["SUBJECT", _q(subject)]
     if since:
         try:
             from datetime import datetime
@@ -307,7 +390,8 @@ def main():
         if args.command == "check":
             result = cmd_check(mail, args.mailbox, args.limit, args.unseen)
         elif args.command == "fetch":
-            result = cmd_fetch(mail, args.mailbox, args.uid)
+            result = cmd_fetch(mail, args.mailbox, args.uid,
+                               from_addr=args.from_addr, subject=args.subject)
         elif args.command == "search":
             result = cmd_search(mail, args.mailbox, args.query, args.from_addr,
                                 args.subject, args.since, args.limit)

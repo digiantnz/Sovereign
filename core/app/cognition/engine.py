@@ -257,9 +257,20 @@ class CognitionEngine:
                 text = self._URGENT_STRIP_RE.sub("", text).strip()
             # Strip any meta-commentary the model appended despite instructions
             import re as _re2
+            # Strip leading preamble the small model adds despite instructions
+            text = _re2.sub(
+                r"^(Here(?:'s| is) the (?:Director message|translated message|message)[^:]*:\s*"
+                r"|Translation:\s*"
+                r"|Translated message:\s*"
+                r"|Plain English(?:\s+message)?:\s*)",
+                "", text, flags=_re2.IGNORECASE,
+            ).strip()
+            # Strip trailing meta-commentary the model appends
             text = _re2.sub(
                 r"\n*(This message meets|Here is the translated|Communication preference|"
-                r"Director communication|Please note that|Note:|---+).*",
+                r"Director communication|Please note that|Note:|---+|"
+                r"Urgency does not apply|The live adapter result|skills_live|"
+                r"The source of this information is).*",
                 "", text, flags=_re2.IGNORECASE | _re2.DOTALL
             ).strip()
             return text
