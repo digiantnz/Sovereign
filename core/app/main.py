@@ -163,6 +163,24 @@ async def lifespan(app: FastAPI):
     app.state.exec.set_credential_proxy(credential_proxy)
     logger.info("CredentialProxy: session-scoped token delegation active")
 
+    # ── Step 3d: Nanobot capability discovery ─────────────────────────────────
+    # Fetch agent_card from nanobot-01 /capabilities on startup.
+    # Non-fatal — degraded gracefully if nanobot is not yet reachable.
+    # Cache is also refreshed on every successful _forward() response.
+    try:
+        from adapters.nanobot import NanobotAdapter as _NanobotAdapter
+        _nb = _NanobotAdapter(ledger=ledger)
+        _card = await _nb.fetch_capabilities("nanobot-01")
+        if _card:
+            logger.info(
+                "nanobot-01 capabilities: skills=%s caps=%s",
+                _card.get("skills", []), _card.get("capabilities", []),
+            )
+        else:
+            logger.warning("nanobot-01 /capabilities unreachable at startup — will retry on first use")
+    except Exception as _e:
+        logger.warning("nanobot capability fetch failed: %s", _e)
+
     yield
 
     _scheduler_task.cancel()

@@ -9,3 +9,5 @@ cryptography
 eth-account
 python-gnupg
 embit
+# A2A JSON-RPC 3.0 wire protocol — single source of truth for agent communications
+git+https://github.com/digiantnz/sovereign-a2a.git

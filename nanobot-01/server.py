@@ -1,13 +1,15 @@
 """Nanobot-01 bridge server — REST interface for Sovereign Core.
 
-Translates Rex's {skill, action, params, context} dispatch format into
-either a deterministic DSL operation (Stage 3) or a nanobot LLM task (fallback).
+Translates Rex's A2A JSON-RPC 3.0 dispatch format into either a deterministic
+DSL operation (Stage 3) or a nanobot LLM task (fallback).
 
-Stage 3 DSL path: if the skill's SKILL.md declares an operations: block in
-its frontmatter AND the requested action is listed there, dispatch directly
-using native Python (no Ollama, no nanobot CLI). path: "dsl" in response.
+Wire protocol: A2A JSON-RPC 3.0 (sovereign_a2a package).
+  Request:  {jsonrpc, id, method="skill/operation", params={skill,operation,payload}, metadata}
+  Response: {jsonrpc, id, result={success,status_code,data}, metadata={agent_card,context_hints}}
+  Error:    {jsonrpc, id, error={code,message,data}, metadata={context_hints}}
 
-LLM path: existing nanobot agent --message flow. path: "llm" in response.
+Legacy format (no "jsonrpc" key) is still accepted for backward compatibility.
+Detected via: "jsonrpc" in body → A2A 3.0; else → legacy {skill, action, params, context}.
 
 Rex talks to this server at http://nanobot-01:8080.
 This server has no knowledge of secrets, governance, or sovereign memory.
@@ -25,9 +27,10 @@ from typing import Any
 
 import httpx
 import yaml
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sovereign_a2a import A2AMessage, A2AErrorCodes, A2AResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [nanobot-01] %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -1007,6 +1010,32 @@ def _run_nanobot(prompt: str, run_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Agent card
+# ---------------------------------------------------------------------------
+
+def _get_agent_card() -> dict:
+    """Build current agent card from loaded DSL skills.
+
+    Returned in every success response metadata so sovereign-core always has
+    an up-to-date picture of what nanobot-01 currently has loaded.
+    """
+    skills: list[str] = []
+    try:
+        for skill_name in os.listdir(SKILLS_DIR):
+            ops = _load_operations(skill_name)
+            if ops:
+                skills.append(skill_name)
+    except Exception:
+        pass
+    return {
+        "name":        "nanobot-01",
+        "version":     "0.2.0",
+        "skills":      skills,
+        "capabilities": ["partial_results"],
+        "trust_level": "internal_sidecar",
+    }
+
+
 # Protocol contract normaliser
 # ---------------------------------------------------------------------------
 
@@ -1049,21 +1078,52 @@ def _normalise_to_contract(result: dict, request_id: str, skill: str, operation:
     }
     data = {k: v for k, v in result.items() if k not in _META}
 
-    return {
-        # New contract fields
-        "request_id":  request_id,
-        "skill":       skill,
-        "operation":   operation,
-        "success":     success,
-        "status_code": str(status_code),
-        "data":        data,
-        "raw_error":   raw_error,
-        # Backward-compat fields preserved so existing _forward() normalisation still works
-        "run_id":  request_id,
-        "action":  operation,
-        "status":  status,
-        "path":    result.get("path", "dsl"),
-    }
+    execution_path = result.get("path", "dsl")
+
+    if success:
+        return A2AMessage.success(
+            id=request_id,
+            result={
+                "success":     success,
+                "status_code": str(status_code),
+                "data":        data,
+                # Backward-compat fields so _forward() normalisation still works
+                "raw_error":   raw_error,
+                "run_id":      request_id,
+                "action":      operation,
+                "status":      status,
+                "path":        execution_path,
+            },
+            hints={"execution_path": execution_path, "protocol_quirks": None, "raw_error": None},
+            agent_card=_get_agent_card(),
+        )
+    else:
+        # Map to appropriate error code
+        step = result.get("step", "")
+        if step == "param_validation":
+            code = A2AErrorCodes.INVALID_PARAMS
+        elif "not found" in str(raw_error or "").lower() or "not loaded" in str(raw_error or "").lower():
+            code = A2AErrorCodes.SKILL_NOT_LOADED
+        elif "timed out" in str(raw_error or "").lower() or "timeout" in str(raw_error or "").lower():
+            code = A2AErrorCodes.TIMEOUT
+        else:
+            code = A2AErrorCodes.SERVER_ERROR
+        return A2AMessage.error(
+            id=request_id,
+            code=code,
+            message=raw_error or "execution failed",
+            data={
+                "skill":       skill,
+                "operation":   operation,
+                "status_code": str(status_code),
+                # Backward-compat fields
+                "run_id": request_id,
+                "action": operation,
+                "status": status,
+                "path":   execution_path,
+            },
+            hints={"execution_path": execution_path},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1150,61 +1210,137 @@ async def health():
     }
 
 
+@app.get("/capabilities")
+async def capabilities():
+    """Return agent card — sovereign-core calls this on startup to discover loaded skills.
+
+    Response is a standard A2A 3.0 success envelope with agent_card in metadata.
+    """
+    card = _get_agent_card()
+    return JSONResponse(content=A2AMessage.success(
+        id="capabilities",
+        result={"agent_card": card},
+        agent_card=card,
+    ))
+
+
 @app.post("/run")
-async def run_task(req: TaskRequest):
+async def run_task(request: Request):
     """Execute a sovereign skill task.
 
+    Accepts both A2A JSON-RPC 3.0 format and legacy flat format:
+      A2A 3.0:  {jsonrpc:"3.0", id, method:"skill/operation", params:{skill,operation,payload}, metadata}
+      Legacy:   {skill, action|operation, params|payload, context, request_id, timeout_ms}
+
+    Detection: "jsonrpc" in body → A2A 3.0; else → legacy.
+
     nanobot-01 is the primary execution environment for all OpenClaw/ClawhHub skills.
-    DSL dispatch order:
-      - tool=filesystem → native Python pathlib dispatch (no subprocess)
-      - tool=exec       → allowlisted subprocess
-      - tool=python3_exec → python3 script from workspace/skills/<name>/scripts/
-      - no DSL match    → LLM path via nanobot agent CLI
+    Governance already applied upstream. Nanobot is a dumb executor: fires the skill,
+    returns result verbatim. No retry, no interpretation, no fabrication here.
 
-    Called by NanobotAdapter in sovereign-core. Governance already applied upstream.
-    Nanobot is a dumb executor: fires the skill, returns result verbatim. No retry,
-    no interpretation, no fabrication here.
-
-    Response follows the sovereign-core ↔ nanobot protocol contract:
-      {request_id, skill, operation, success, status_code, data, raw_error}
-    Plus backward-compat fields: {run_id, action, status, path}
+    All responses are A2A 3.0 format (backward-compat fields preserved inside result/error.data).
     """
-    # Resolve operation (new contract field) vs action (legacy) — prefer operation
-    operation = req.operation or req.action
-    # Resolve params — prefer payload (new contract) over params (legacy)
-    params    = req.payload or req.params
-    # Resolve request_id — prefer caller-supplied, fall back to generated
-    request_id = req.request_id or str(uuid.uuid4())[:8]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content=A2AMessage.error(
+                id="unknown",
+                code=A2AErrorCodes.PARSE_ERROR,
+                message="Invalid JSON body",
+            ),
+        )
 
-    logger.info(f"[{request_id}] task: skill={req.skill!r} operation={operation!r}")
+    # ── Format detection and normalisation ───────────────────────────────────
+    if A2AResponse.is_a2a(body):
+        # A2A 3.0 format
+        request_id = body.get("id") or str(uuid.uuid4())[:8]
+        method     = body.get("method", "")
+        a2a_params = body.get("params") or {}
+        metadata   = body.get("metadata") or {}
 
-    # --- Stage 3: DSL dispatch path ---
-    operations = _load_operations(req.skill)
+        # Parse method: "skill/operation"
+        if "/" in method:
+            skill, _, operation = method.partition("/")
+        else:
+            # Malformed method — try to extract from params
+            skill     = a2a_params.get("skill", "")
+            operation = a2a_params.get("operation", method)
+
+        params  = a2a_params.get("payload") or a2a_params.get("params") or {}
+        context = metadata.get("context_hints") or {}
+        stream  = metadata.get("stream", False)  # read but ignored for atomic ops
+
+        if not skill:
+            return JSONResponse(content=A2AMessage.error(
+                id=request_id,
+                code=A2AErrorCodes.INVALID_REQUEST,
+                message="method must be 'skill/operation'",
+            ))
+    else:
+        # Legacy format — TaskRequest fields
+        skill      = body.get("skill", "")
+        operation  = body.get("operation") or body.get("action", "")
+        params     = body.get("payload") or body.get("params") or {}
+        context    = body.get("context") or {}
+        request_id = body.get("request_id") or str(uuid.uuid4())[:8]
+
+        if not skill:
+            return JSONResponse(content=A2AMessage.error(
+                id=request_id,
+                code=A2AErrorCodes.INVALID_REQUEST,
+                message="'skill' field is required",
+            ))
+
+    logger.info("[%s] task: skill=%r operation=%r", request_id, skill, operation)
+
+    # Check skill is known before attempting dispatch
+    operations = _load_operations(skill)
+    if operations is None and not os.path.isdir(os.path.join(SKILLS_DIR, skill)):
+        return JSONResponse(content=A2AMessage.error(
+            id=request_id,
+            code=A2AErrorCodes.SKILL_NOT_LOADED,
+            message=f"skill {skill!r} not found in {SKILLS_DIR}",
+            data={"skill": skill, "operation": operation},
+        ))
+
+    # ── Stage 3: DSL dispatch path ────────────────────────────────────────────
     if operations and operation in operations:
         op_spec = operations[operation]
         tool    = op_spec.get("tool", "")
 
         validated, errors = _validate_params(op_spec, params)
         if errors:
-            logger.warning(f"[{request_id}] DSL param validation failed: {errors}")
+            logger.warning("[%s] DSL param validation failed: %s", request_id, errors)
             raw = {
                 "status": "error", "path": "dsl",
                 "step": "param_validation", "errors": errors,
             }
-            return JSONResponse(content=_normalise_to_contract(raw, request_id, req.skill, operation))
+            return JSONResponse(content=_normalise_to_contract(raw, request_id, skill, operation))
 
-        logger.info(f"[{request_id}] DSL path: tool={tool} action={op_spec.get('action')}")
-        loop     = asyncio.get_event_loop()
-        _skill   = req.skill
-        _context = req.context
+        logger.info("[%s] DSL path: tool=%s action=%s", request_id, tool, op_spec.get("action"))
+        loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, lambda: _dispatch_dsl(op_spec, validated, request_id, skill=_skill, context=_context)
+            None, lambda: _dispatch_dsl(op_spec, validated, request_id, skill=skill, context=context)
         )
-        return JSONResponse(content=_normalise_to_contract(result, request_id, req.skill, operation))
+        return JSONResponse(content=_normalise_to_contract(result, request_id, skill, operation))
 
-    # --- LLM fallback path ---
-    logger.info(f"[{request_id}] LLM path: no DSL match for {req.skill!r}/{operation!r}")
-    prompt = _build_prompt(req)
+    # ── LLM fallback path ─────────────────────────────────────────────────────
+    if operations and operation not in operations:
+        # Skill has DSL but operation isn't defined in it
+        return JSONResponse(content=A2AMessage.error(
+            id=request_id,
+            code=A2AErrorCodes.METHOD_NOT_FOUND,
+            message=f"operation {operation!r} not found in skill {skill!r} DSL",
+            data={"skill": skill, "operation": operation,
+                  "available": list(operations.keys())},
+        ))
+
+    logger.info("[%s] LLM path: no DSL for %r/%r", request_id, skill, operation)
+    # Reconstruct a minimal TaskRequest-like object for _build_prompt
+    _req = TaskRequest(skill=skill, operation=operation, payload=params, context=context,
+                       request_id=request_id)
     loop   = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, lambda: _run_nanobot(prompt, request_id))
-    return JSONResponse(content=_normalise_to_contract(result, request_id, req.skill, operation))
+    result = await loop.run_in_executor(None, lambda: _run_nanobot(_build_prompt(_req), request_id))
+    return JSONResponse(content=_normalise_to_contract(result, request_id, skill, operation))

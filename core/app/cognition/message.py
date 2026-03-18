@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from sovereign_a2a import A2AMessage
+
 
 # ── History entry ────────────────────────────────────────────────────────────
 
@@ -242,18 +244,45 @@ class InternalMessage:
     # ── Boundary slices ──────────────────────────────────────────────────────
 
     def nanobot_request_slice(self) -> dict:
-        """Slice sent to nanobot — request_id, skill, operation, payload, timeout_ms only.
+        """A2A 3.0 request slice sent to nanobot — envelope never crosses this boundary.
 
-        Raw Director input never crosses this boundary.
+        Raw Director input never crosses this boundary (hashed at PASS 1).
         Specialist's full payload is included — nanobot executes it verbatim.
+        Returns a fully-formed A2A 3.0 request dict via A2AMessage.request().
         """
-        return {
-            "request_id": self.envelope.request_id,
-            "skill":      self.context.skill,
-            "operation":  self.context.operation,
-            "payload":    self.payload,
-            "timeout_ms": self.envelope.timeout_ms,
-        }
+        retry = (
+            "correct_payload"
+            if self.context.security_clearance == "conditional"
+            else "none"
+        )
+        return A2AMessage.request(
+            method=f"{self.context.skill}/{self.context.operation}",
+            params={
+                "skill":     self.context.skill,
+                "operation": self.context.operation,
+                "payload":   self.payload,
+            },
+            id=self.envelope.request_id,
+            metadata={
+                "context_hints": {
+                    "tier":            self.envelope.tier,
+                    "retry_strategy":  retry,
+                    "timeout_ms":      self.envelope.timeout_ms,
+                }
+            },
+        )
+
+    def merge_nanobot_hints(self, hints: dict) -> "InternalMessage":
+        """Store context_hints from a nanobot response into result.
+
+        Available to specialist_inbound() via result["_nanobot_context_hints"].
+        Stripped before translator_slice() — translator only sees result_for_translator.
+        Returns self.
+        """
+        if self.result is None:
+            self.result = {}
+        self.result["_nanobot_context_hints"] = hints
+        return self
 
     def translator_slice(self) -> dict | None:
         """Slice sent to translator — result_for_translator from orchestrator PASS 4 only.

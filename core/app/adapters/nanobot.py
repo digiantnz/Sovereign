@@ -26,16 +26,21 @@ REST API: POST http://nanobot-01:8080/run
 import logging
 import os
 import time
+import uuid
 from typing import Any
 
 import httpx
 import yaml
+from sovereign_a2a import A2AMessage, A2AErrorCodes, A2AResponse
 
 logger = logging.getLogger(__name__)
 
 NANOBOT_NODES = {
     "nanobot-01": os.environ.get("NANOBOT_01_URL", "http://nanobot-01:8080"),
 }
+
+# Cached agent cards per node — populated at startup and refreshed on each _forward() response
+_agent_card_cache: dict[str, dict] = {}
 
 TASK_TIMEOUT = 30.0  # seconds — must exceed nanobot's internal 25s timeout
 HEALTH_TIMEOUT = 5.0
@@ -398,6 +403,37 @@ class NanobotAdapter:
         # ── LLM fallback — no DSL match ─────────────────────────────────────
         return await self._forward(skill, action, params, context, node, t0, path="llm")
 
+    async def fetch_capabilities(self, node: str = "nanobot-01") -> dict | None:
+        """Fetch and cache agent_card from nanobot /capabilities endpoint.
+
+        Called at sovereign-core startup. Failure is non-fatal — logs warning and continues.
+        Cache is refreshed on every successful _forward() response that includes an agent_card.
+        """
+        try:
+            base_url = self._base_url(node)
+        except ValueError:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT) as client:
+                r = await client.get(f"{base_url}/capabilities")
+            if r.status_code == 200:
+                body = r.json()
+                card = A2AResponse.get_agent_card(body)
+                if not card:
+                    # /capabilities may also return the card at result.agent_card
+                    card = (A2AResponse.get_result(body) or {}).get("agent_card")
+                if card:
+                    _agent_card_cache[node] = card
+                    logger.info(
+                        "nanobot capabilities: node=%s skills=%s",
+                        node, card.get("skills", []),
+                    )
+                return card
+            logger.warning("fetch_capabilities %s: HTTP %s", node, r.status_code)
+        except Exception as e:
+            logger.warning("fetch_capabilities %s: %s", node, e)
+        return None
+
     async def _forward(
         self,
         skill: str,
@@ -408,122 +444,156 @@ class NanobotAdapter:
         t0: float,
         path: str = "llm",
     ) -> dict:
-        """Forward request to nanobot-01 via HTTP."""
+        """Forward request to nanobot-01 via A2A JSON-RPC 3.0."""
         try:
             base_url = self._base_url(node)
         except ValueError as e:
-            return {"status": "error", "error": str(e), "node": node, "path": path}
+            return {
+                "status": "error", "error": str(e),
+                "node": node, "path": path, "_trust": "untrusted_external",
+            }
 
-        payload = {"skill": skill, "action": action, "params": params, "context": context}
+        request_id = context.get("request_id") or str(uuid.uuid4())[:8]
+
+        # Build A2A 3.0 request — agents never construct raw dicts
+        a2a_request = A2AMessage.request(
+            method=f"{skill}/{action}",
+            params={"skill": skill, "operation": action, "payload": params},
+            id=request_id,
+            metadata={
+                "context_hints": {
+                    "tier":            context.get("tier", "LOW"),
+                    "retry_strategy":  "correct_payload",
+                    "timeout_ms":      int(TASK_TIMEOUT * 1000),
+                }
+            },
+        )
 
         try:
             async with httpx.AsyncClient(timeout=TASK_TIMEOUT) as client:
-                r = await client.post(f"{base_url}/run", json=payload)
+                r = await client.post(f"{base_url}/run", json=a2a_request)
 
             elapsed = round(time.monotonic() - t0, 2)
-            http_status = r.status_code
 
-            if http_status != 200:
+            if r.status_code != 200:
                 result = {
-                    "status": "error",
-                    "node": node,
-                    "skill": skill,
-                    "action": action,
-                    "http_status": http_status,
-                    "error": f"nanobot returned {http_status}",
+                    "status": "error", "success": False,
+                    "node": node, "skill": skill, "action": action,
+                    "http_status": r.status_code,
+                    "error": f"nanobot returned {r.status_code}",
                     "response_body": r.text[:300],
-                    "path": path,
-                    "elapsed_s": elapsed,
+                    "path": path, "elapsed_s": elapsed,
+                    # Untrusted even on HTTP-level failures — content is external
+                    "_trust": "untrusted_external",
                 }
                 self._log("nanobot_result", {**result, "ok": False})
                 return result
 
             body = r.json()
 
-            # ── New contract fields (nanobot server.py ≥ Step-4) ──────────────
-            # success / status_code / data / raw_error are set by _normalise_to_contract
-            # in server.py. If absent (older nanobot), fall back to legacy derivation.
-            contract_success = body.get("success")
-            contract_raw_error = body.get("raw_error")
-            contract_status_code = body.get("status_code")
-            # data field holds the meaningful payload; fall back to nested "result" or
-            # top-level fields (python3_exec flat response from OC-S6)
-            _body_result = body.get("data") or body.get("result")
-            if _body_result is None:
-                _wrapper = {"run_id", "request_id", "skill", "action", "operation",
-                            "path", "elapsed_s", "status", "error", "raw_error",
-                            "success", "status_code"}
-                _body_result = {k: v for k, v in body.items() if k not in _wrapper}
+            # Extract A2A metadata — available to specialist_inbound, never reaches translator
+            hints = A2AResponse.get_hints(body)
+            agent_card = A2AResponse.get_agent_card(body)
+            if agent_card:
+                _agent_card_cache[node] = agent_card
 
-            # Derive legacy status for callers that still check result["status"]
-            if contract_success is not None:
-                legacy_status = "ok" if contract_success else "error"
-            else:
-                legacy_status = body.get("status", "ok")
+            # ── Error response ────────────────────────────────────────────────
+            if A2AResponse.is_error(body):
+                err = A2AResponse.get_error(body) or {}
+                err_data = err.get("data") or {}
+                result = {
+                    "status": "error", "success": False,
+                    "node": node, "skill": skill, "action": action,
+                    "run_id": body.get("id", request_id),
+                    "http_status": r.status_code,
+                    "error":      err.get("message", "nanobot error"),
+                    "raw_error":  err.get("message"),
+                    "error_code": err.get("code"),
+                    "status_code": err_data.get("status_code"),
+                    "path": hints.get("execution_path", path),
+                    "elapsed_s": elapsed,
+                    "_trust":         "untrusted_external",
+                    "_context_hints": hints,
+                }
+                self._log("nanobot_result", {
+                    "node": node, "skill": skill, "action": action,
+                    "run_id": request_id, "ok": False,
+                    "path": result["path"], "elapsed_s": elapsed,
+                    "error_code": err.get("code"),
+                })
+                return result
+
+            # ── Success response ──────────────────────────────────────────────
+            r_data = A2AResponse.get_result(body) or {}
+
+            # data field: prefer r_data["data"], then whole result minus contract wrapper keys
+            _body_result = r_data.get("data")
+            if _body_result is None:
+                _wrapper = {"success", "status_code", "data", "raw_error"}
+                _body_result = {k: v for k, v in r_data.items() if k not in _wrapper}
+                if not _body_result:
+                    # Legacy flat response (python3_exec scripts) — strip meta fields
+                    _meta = {"run_id", "request_id", "skill", "action", "operation",
+                             "path", "elapsed_s", "status", "error", "raw_error",
+                             "success", "status_code"}
+                    _body_result = {k: v for k, v in body.items() if k not in _meta}
+
+            contract_success = r_data.get("success", True)
+            legacy_status = "ok" if contract_success else "error"
 
             result = {
                 "status":      legacy_status,
-                "success":     contract_success if contract_success is not None
-                               else (legacy_status == "ok"),
-                "status_code": contract_status_code,
+                "success":     contract_success,
+                "status_code": r_data.get("status_code"),
                 "node":        node,
                 "skill":       skill,
                 "action":      action,
-                "run_id":      body.get("run_id") or body.get("request_id"),
-                "http_status": http_status,
+                "run_id":      body.get("id", request_id),
+                "http_status": r.status_code,
                 "result":      _body_result,
-                "path":        body.get("path", path),
+                "path":        hints.get("execution_path", body.get("path", path)),
                 "elapsed_s":   elapsed,
+                # All nanobot results are untrusted until scanned in handle_chat()
+                "_trust":         "untrusted_external",
+                "_context_hints": hints,
             }
-            # Propagate error: prefer raw_error (verbatim protocol error) over legacy error
-            _err = contract_raw_error or body.get("error")
-            if _err:
-                result["error"]     = _err
-                result["raw_error"] = _err
-
-            # All nanobot results are from external systems — mark as untrusted
-            # until scanned by the security layer in handle_chat().
-            result["_trust"] = "untrusted_external"
+            raw_err = r_data.get("raw_error")
+            if raw_err:
+                result["error"]     = raw_err
+                result["raw_error"] = raw_err
 
             self._log("nanobot_result", {
-                "node": node,
-                "skill": skill,
-                "action": action,
-                "run_id": result.get("run_id"),
-                "ok": result["status"] == "ok",
-                "path": result["path"],
-                "elapsed_s": elapsed,
+                "node": node, "skill": skill, "action": action,
+                "run_id": result.get("run_id"), "ok": result["status"] == "ok",
+                "path": result["path"], "elapsed_s": elapsed,
             })
             return result
 
         except httpx.ConnectError:
             return {
-                "status": "error",
-                "node": node,
-                "skill": skill,
-                "action": action,
+                "status": "error", "success": False,
+                "node": node, "skill": skill, "action": action,
                 "error": f"connection refused — is {node} running on ai_net?",
-                "path": path,
-                "elapsed_s": round(time.monotonic() - t0, 2),
+                "error_code": A2AErrorCodes.ADAPTER_UNAVAILABLE,
+                "path": path, "elapsed_s": round(time.monotonic() - t0, 2),
+                "_trust": "untrusted_external",
             }
         except httpx.TimeoutException:
             return {
-                "status": "error",
-                "node": node,
-                "skill": skill,
-                "action": action,
+                "status": "error", "success": False,
+                "node": node, "skill": skill, "action": action,
                 "error": f"task timed out after {TASK_TIMEOUT}s",
-                "path": path,
-                "elapsed_s": round(time.monotonic() - t0, 2),
+                "error_code": A2AErrorCodes.TIMEOUT,
+                "path": path, "elapsed_s": round(time.monotonic() - t0, 2),
+                "_trust": "untrusted_external",
             }
         except Exception as e:
-            logger.exception(f"NanobotAdapter._forward: unexpected error dispatching to {node}")
+            logger.exception("NanobotAdapter._forward: unexpected error dispatching to %s", node)
             return {
-                "status": "error",
-                "node": node,
-                "skill": skill,
-                "action": action,
+                "status": "error", "success": False,
+                "node": node, "skill": skill, "action": action,
                 "error": f"{type(e).__name__}: {e}",
-                "path": path,
-                "elapsed_s": round(time.monotonic() - t0, 2),
+                "error_code": A2AErrorCodes.SERVER_ERROR,
+                "path": path, "elapsed_s": round(time.monotonic() - t0, 2),
+                "_trust": "untrusted_external",
             }
