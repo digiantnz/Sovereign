@@ -13,42 +13,62 @@ This file is loaded by Claude Code when working inside `nanobot-01/`. It supplem
 
 ---
 
-## Protocol Contract
+## Protocol Contract — A2A JSON-RPC 3.0
+
+Wire format via `sovereign_a2a` package (`digiantnz/sovereign-a2a`). Never construct raw dicts — use `A2AMessage.*`.
 
 ### Request (sovereign-core → nanobot-01)
 ```json
 {
-  "skill":      "skill-name",
-  "operation":  "operation-name",
-  "payload":    {},
-  "request_id": "uuid",
-  "timeout_ms": 25000
+  "jsonrpc": "3.0",
+  "id":      "request_id",
+  "method":  "skill-name/operation-name",
+  "params":  {"skill": "...", "operation": "...", "payload": {}},
+  "metadata": {
+    "priority": "normal",
+    "stream":   false,
+    "context_hints": {"tier": "LOW|MID|HIGH", "retry_strategy": "none|correct_payload", "timeout_ms": 25000}
+  }
 }
 ```
-Legacy fields (`action`, `params`, `context`) accepted for backward compat.
 
-### Response (nanobot-01 → sovereign-core)
+### Response — success
 ```json
 {
-  "request_id":  "uuid",
-  "skill":       "skill-name",
-  "operation":   "operation-name",
-  "success":     true,
-  "status_code": "HTTP 201 | IMAP OK | 404 | BAD | ...",
-  "data":        {},
-  "raw_error":   null
+  "jsonrpc": "3.0",
+  "id":      "request_id",
+  "result":  {"success": true, "status_code": "HTTP 201|IMAP OK|...", "data": {}},
+  "metadata": {
+    "agent_card":    {"name": "nanobot-01", "skills": [...], "trust_level": "internal_sidecar"},
+    "context_hints": {"execution_path": "dsl|llm"}
+  }
 }
 ```
-nanobot-01 is a dumb executor: fires the skill, returns protocol result verbatim. No retry logic, no interpretation, no fabrication.
+
+### Response — error
+```json
+{
+  "jsonrpc": "3.0",
+  "id":      "request_id",
+  "error":   {"code": -32000, "message": "verbatim error", "data": {"skill": "...", "operation": "..."}},
+  "metadata": {"context_hints": {"execution_path": "dsl|llm"}}
+}
+```
+
+Legacy flat format (no `"jsonrpc"` key) is still accepted by `/run` — detected and normalised. All responses are A2A 3.0.
+
+nanobot-01 is a dumb executor: fires the skill, returns protocol result verbatim. No retry, no interpretation, no fabrication.
 
 ---
 
 ## server.py Dispatch
 
 ### Endpoint: `POST /run`
-- Resolves: `operation = req.operation or req.action`; `params = req.payload or req.params`
-- Calls `_normalise_to_contract()` on all return paths
-- `_build_prompt()` uses resolved `operation` and `params` (not raw `req.action`/`req.params`)
+- Accepts raw `Request` body (not Pydantic) — detects format via `"jsonrpc" in body`
+- A2A 3.0: parses `method` as `skill/operation`, `params.payload` as operation params, `metadata.stream` (read but ignored for atomic ops)
+- Legacy: parses `skill`, `operation|action`, `payload|params`, `context`
+- All return paths call `_normalise_to_contract()` → wraps in `A2AMessage.success()` or `A2AMessage.error()`
+- `_build_prompt()` uses resolved `operation` and `params`
 
 ### `_normalise_to_contract(result, request_id, skill, operation)`
 - Derives `success`, `status_code`, `data`, `raw_error` from any dispatcher result format
@@ -106,6 +126,22 @@ Scripts are stdlib/requests Python — no heavy dependencies. Credentials inject
 - Model is on ai_net; nanobot-01 calls Ollama for LLM-path operations
 
 ---
+
+### Endpoint: `GET /capabilities`
+- Returns `A2AMessage.success()` with `agent_card` in metadata and `result.agent_card`
+- sovereign-core calls this on startup via `NanobotAdapter.fetch_capabilities()`
+- agent_card lists all DSL-enabled skills from `SKILLS_DIR`
+
+### Error code mapping
+| Situation | Code |
+|-----------|------|
+| Malformed JSON | -32700 |
+| Missing `skill` field | -32600 |
+| `operation` not in DSL | -32601 |
+| Param validation failure | -32602 |
+| General execution failure | -32000 |
+| Execution timeout | -32001 |
+| Skill directory not found | -32002 |
 
 ## Common Gotchas
 
