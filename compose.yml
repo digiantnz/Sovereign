@@ -73,8 +73,8 @@ services:
 
   sovereign-core:
     build:
-      context: ./core
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: core/Dockerfile
     container_name: sovereign-core
     restart: unless-stopped
     secrets: [sovereign_key]
@@ -260,8 +260,8 @@ services:
 
   nanobot-01:
     build:
-      context: ./nanobot-01
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: nanobot-01/Dockerfile
     container_name: nanobot-01
     restart: unless-stopped
     networks:

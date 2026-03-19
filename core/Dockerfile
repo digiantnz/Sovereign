@@ -11,10 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY sovereign-a2a /sovereign-a2a
 RUN pip install --no-cache-dir /sovereign-a2a
 
-COPY app/requirements.txt /app/requirements.txt
+COPY core/app/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app/. /app/
+COPY core/app/. /app/
 
 RUN useradd -r -s /bin/false sovereign && chown -R sovereign:sovereign /app
 USER sovereign

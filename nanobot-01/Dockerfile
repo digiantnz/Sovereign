@@ -14,13 +14,13 @@ COPY sovereign-a2a /sovereign-a2a
 RUN pip install --no-cache-dir /sovereign-a2a
 
 # Install bridge + skill runtime deps from requirements.txt
-COPY requirements.txt /tmp/requirements.txt
+COPY nanobot-01/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Create app dir and workspace
 RUN mkdir -p /app /workspace /memory /skills
 
-COPY server.py /app/server.py
+COPY nanobot-01/server.py /app/server.py
 
 WORKDIR /workspace
 
