@@ -238,46 +238,90 @@ class SkillLifecycleManager:
                     "certified_only": certified_only,
                 }
 
-        # ── Primary: GitHub SKILL.md search via SearXNG ────────────────────
+        # ── Primary: GitHub Code Search API (no auth required, 10 req/min) ───
+        # More reliable than SearXNG when DDG/Google are CAPTCHA-blocked.
+        # Routes through a2a-browser.fetch() for internet egress.
         try:
-            search_q = f'sovereign skill {query} "SKILL.md" site:github.com'
-            result = await self.browser.search(search_q)
-            raw_items = (result.get("data", {}).get("results", []) or [])
-
-            for item in raw_items[:limit * 3]:  # overscan to account for non-SKILL.md hits
-                url = item.get("url", "")
-                raw_url = _github_url_to_raw(url)
-                if not raw_url:
-                    continue
-                content = await self._fetch_raw_url(raw_url)
-                if not content:
-                    continue
-                fm, body = _parse_skill_md_content(content)
-                # Accept if it has a name field (covers Sovereign AND OpenClaw formats)
-                # or if it explicitly has a sovereign: block.
-                # Pure stubs with no name and no sovereign: block are skipped.
-                has_name = bool(fm.get("name"))
-                has_sovereign = "sovereign:" in content
-                has_openclaw = "openclaw" in content.lower() or "allowed-tools" in content
-                if not has_name and not has_sovereign and not has_openclaw:
-                    continue  # skip — no identifiable skill format
-                slug = fm.get("name") or url.rstrip("/").split("/")[-2] or "unknown"
-                candidate: dict = {
-                    "slug": slug,
-                    "summary": fm.get("description", item.get("content", "")[:200]),
-                    "github_url": url,
-                    "raw_url": raw_url,
-                    "certified": None,  # GitHub source — certification not deterministic
-                    "skill_md": content,
-                    "WARNING": "Source: GitHub — review required before loading",
-                }
-                candidates.append(candidate)
-                if len(candidates) >= limit:
-                    break
-
+            import urllib.parse as _urlparse
+            _gh_query = _urlparse.quote(f'filename:SKILL.md {query}')
+            _gh_api_url = f"https://api.github.com/search/code?q={_gh_query}&per_page={min(limit * 2, 30)}"
+            _gh_result = await self.browser.fetch(_gh_api_url, extract="text")
+            _gh_text = (_gh_result.get("data") or {}).get("text", "") or ""
+            if _gh_text:
+                import json as _json
+                try:
+                    _gh_data = _json.loads(_gh_text)
+                    for item in _gh_data.get("items", [])[:limit * 3]:
+                        _html_url = item.get("html_url", "")
+                        raw_url = _github_url_to_raw(_html_url)
+                        if not raw_url:
+                            continue
+                        content = await self._fetch_raw_url(raw_url)
+                        if not content:
+                            continue
+                        fm, body = _parse_skill_md_content(content)
+                        has_name = bool(fm.get("name"))
+                        has_sovereign = "sovereign:" in content
+                        has_openclaw = "openclaw" in content.lower() or "allowed-tools" in content
+                        if not has_name and not has_sovereign and not has_openclaw:
+                            continue
+                        slug = fm.get("name") or _html_url.rstrip("/").split("/")[-2] or "unknown"
+                        candidates.append({
+                            "slug": slug,
+                            "summary": fm.get("description", ""),
+                            "github_url": _html_url,
+                            "raw_url": raw_url,
+                            "certified": None,
+                            "skill_md": content,
+                            "WARNING": "Source: GitHub API — review required before loading",
+                        })
+                        if len(candidates) >= limit:
+                            break
+                    if candidates:
+                        logger.info("SkillLifecycle.search: GitHub API returned %d candidates", len(candidates))
+                except _json.JSONDecodeError:
+                    logger.warning("SkillLifecycle.search: GitHub API response not JSON")
         except Exception as e:
-            search_error = f"SearXNG GitHub search failed: {type(e).__name__}: {e}"
-            logger.warning("SkillLifecycle.search: %s — attempting general fallback", search_error)
+            logger.warning("SkillLifecycle.search: GitHub API path failed: %s", e)
+
+        # ── Secondary: GitHub SKILL.md search via SearXNG ──────────────────
+        if not candidates:
+            try:
+                search_q = f'sovereign skill {query} "SKILL.md" site:github.com'
+                result = await self.browser.search(search_q)
+                raw_items = (result.get("data", {}).get("results", []) or [])
+
+                for item in raw_items[:limit * 3]:  # overscan to account for non-SKILL.md hits
+                    url = item.get("url", "")
+                    raw_url = _github_url_to_raw(url)
+                    if not raw_url:
+                        continue
+                    content = await self._fetch_raw_url(raw_url)
+                    if not content:
+                        continue
+                    fm, body = _parse_skill_md_content(content)
+                    has_name = bool(fm.get("name"))
+                    has_sovereign = "sovereign:" in content
+                    has_openclaw = "openclaw" in content.lower() or "allowed-tools" in content
+                    if not has_name and not has_sovereign and not has_openclaw:
+                        continue
+                    slug = fm.get("name") or url.rstrip("/").split("/")[-2] or "unknown"
+                    candidate: dict = {
+                        "slug": slug,
+                        "summary": fm.get("description", item.get("content", "")[:200]),
+                        "github_url": url,
+                        "raw_url": raw_url,
+                        "certified": None,
+                        "skill_md": content,
+                        "WARNING": "Source: GitHub — review required before loading",
+                    }
+                    candidates.append(candidate)
+                    if len(candidates) >= limit:
+                        break
+
+            except Exception as e:
+                search_error = f"SearXNG GitHub search failed: {type(e).__name__}: {e}"
+                logger.warning("SkillLifecycle.search: %s — attempting general fallback", search_error)
 
         # ── Fallback: general web search if GitHub search yielded nothing ──
         if not candidates:

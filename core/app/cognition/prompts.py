@@ -751,7 +751,7 @@ Rules:
 - If outcome is already plain English in Rex's voice, return it substantially unchanged.
 - If next_action is present and non-null, append it naturally as a final sentence.
 - No preamble ("Here is the message:", "Translation:", etc.).
-- No trailing meta-commentary.
+- No trailing meta-commentary. No parenthetical notes. No "(Note: ...)" or "(I've followed...)" or any self-referential commentary about your own output.
 - If detail contains raw output fields (output, content, stdout, logs, containers, lines, items,
   files, events, messages, stats, hardware, text): render that data directly. Present multi-line
   text verbatim. Present lists as concise bullets. Do NOT collapse into a summary sentence —

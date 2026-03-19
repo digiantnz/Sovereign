@@ -249,6 +249,8 @@ def _infer_prior_domain(context_window) -> str | None:
             return "file"
         if any(w in combined for w in ("calendar", "event", "schedule", "appointment")):
             return "calendar"
+        if any(w in combined for w in ("skill", "clawhub", "no skills found", "skill search", "candidates")):
+            return "skills"
     return None
 
 
@@ -693,6 +695,15 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "skill_install",
             "target": _q_i or user_input, "tier": "MID",
             "reasoning_summary": "Skill install (search→review→load sequence) — deterministic pre-classifier",
+        }
+
+    # "try again" / "try that again" — retry the previous skill search if context shows one
+    _retry_kw = ("try again", "try that again", "search again", "look again", "retry")
+    if any(w in u for w in _retry_kw) and prior_domain == "skills":
+        return {
+            "delegate_to": "devops_agent", "intent": "skill_search",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Retry skill search — deterministic pre-classifier",
         }
 
     _skill_search_kw = (
@@ -1513,7 +1524,29 @@ class ExecutionEngine:
             "fetch_email", "search_email", "fetch_message",
             "skill_audit", "skill_search",
         })
-        if intent in _DIAGNOSTIC_INTENTS and execution_result:
+        # skill_search with no candidates — deterministic result, bypass translator invention
+        if intent == "skill_search" and execution_result is not None:
+            candidates = execution_result.get("candidates", [])
+            if not candidates:
+                _no_result_msg = (
+                    execution_result.get("info")
+                    or "No skills found matching your query. Try a more specific search or check GitHub directly."
+                )
+                _warn = execution_result.get("search_warning", "")
+                _rft = {
+                    "success": False,
+                    "outcome": _no_result_msg,
+                    "detail": {"search_warning": _warn} if _warn else {},
+                    "error": _no_result_msg,
+                    "next_action": None,
+                }
+            else:
+                # Candidates found — pass raw list directly, no LLM summarisation
+                _rft = dict(_rft)
+                _rft["detail"] = {"candidates": candidates}
+                _rft["outcome"] = f"Found {len(candidates)} candidate skill(s)."
+
+        elif intent in _DIAGNOSTIC_INTENTS and execution_result:
             _raw = {k: v for k, v in execution_result.items()
                     if not k.startswith("_")
                     and k not in ("status", "success", "error", "execution_confirmed",
