@@ -18,8 +18,13 @@ Credential-aware fetch (AUTH_PROFILES):
     "cookie"   — cookies dict passed to Playwright context
 
   Credentials sourced from env vars only — never hardcoded.
-  Only add an AUTH_PROFILES entry when the required env var(s) are set.
+  AUTH_PROFILES is populated from two sources (merged at startup):
+    1. Hardcoded env var guards below (backward compat)
+    2. RAID YAML config at /home/sovereign/governance/browser-auth-profiles.yaml
+       — managed by configure_browser_auth intent; YAML takes precedence.
 """
+import copy
+import logging
 import os
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -30,6 +35,65 @@ from sovereign_a2a import A2AResponse  # static methods only — never instantia
 _BASE_URL = os.environ.get("A2A_BROWSER_URL", "http://a2a-browser:8001")
 _SECRET = os.environ.get("A2A_SHARED_SECRET", "")
 _TIMEOUT = 200.0
+_YAML_PATH = "/home/sovereign/governance/browser-auth-profiles.yaml"
+
+_log = logging.getLogger(__name__)
+
+
+def _resolve_tokens(obj):
+    """Recursively resolve {VAR_NAME} tokens in strings using os.environ."""
+    if isinstance(obj, str):
+        try:
+            return obj.format_map(os.environ)
+        except KeyError:
+            return obj
+    if isinstance(obj, dict):
+        return {k: _resolve_tokens(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_tokens(v) for v in obj]
+    return obj
+
+
+def _load_auth_profiles_yaml() -> dict:
+    """Load browser auth profiles from RAID YAML config.
+
+    Resolves {VAR_NAME} tokens from os.environ. Skips profiles with missing
+    required_env vars (logs a warning). Returns resolved profiles dict.
+    Called at module load and after configure_browser_auth writes a new profile.
+    """
+    try:
+        import yaml as _yaml
+    except ImportError:
+        _log.warning("pyyaml not installed — browser-auth-profiles.yaml not loaded")
+        return {}
+    try:
+        with open(_YAML_PATH) as _f:
+            _data = _yaml.safe_load(_f)
+        if not isinstance(_data, dict) or not _data.get("profiles"):
+            return {}
+        _resolved = {}
+        for _host, _profile in _data["profiles"].items():
+            if not isinstance(_profile, dict):
+                continue
+            _required = _profile.get("required_env") or []
+            _missing = [_v for _v in _required if not os.environ.get(_v)]
+            if _missing:
+                _log.warning(
+                    "browser-auth-profiles.yaml: host %s skipped — missing env vars: %s",
+                    _host, _missing,
+                )
+                continue
+            # Strip metadata keys; deep-copy to avoid mutating the parsed dict
+            _clean = {k: copy.deepcopy(v) for k, v in _profile.items()
+                      if k not in ("required_env", "added_by", "added_at", "notes")}
+            _resolved[_host] = _resolve_tokens(_clean)
+        return _resolved
+    except FileNotFoundError:
+        return {}
+    except Exception as _e:
+        _log.warning("browser-auth-profiles.yaml load error: %s", _e)
+        return {}
+
 
 # ── Auth profiles — host-keyed AuthBlock dicts ───────────────────────────────
 # Each entry is passed verbatim as payload["auth"] to the a2a-browser fetch
@@ -62,11 +126,11 @@ if _GITHUB_PAT:
 #         "password": _INTERNAL_PASS,
 #     }
 
-# To add a new profile:
-#   1. Add env var(s) to secrets/browser.env
-#   2. Read them above with os.environ.get(...)
-#   3. Add an AUTH_PROFILES entry guarded by the env var being set
-#   Supported types: "headers" | "bearer" | "basic" | "cookie"
+# ── Dynamic profiles from RAID YAML — loaded at startup ──────────────────────
+# YAML profiles merge over hardcoded entries (YAML takes precedence).
+# configure_browser_auth intent writes to this YAML file; sovereign-core restart
+# re-runs this block to activate newly added profiles.
+AUTH_PROFILES.update(_load_auth_profiles_yaml())
 
 
 def _build_fetch_payload(url: str, extract: str) -> dict:

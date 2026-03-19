@@ -96,6 +96,7 @@ services:
       - /home/sovereign/governance/governance.json:/app/governance/governance.json:ro
       - /home/sovereign/governance:/home/sovereign/governance:ro
       - /home/sovereign/governance/wallet-config.json:/home/sovereign/governance/wallet-config.json:rw
+      - /home/sovereign/governance/browser-auth-profiles.yaml:/home/sovereign/governance/browser-auth-profiles.yaml:rw
       - /home/sovereign/personas:/home/sovereign/personas:ro
       - /home/sovereign/audit:/home/sovereign/audit
       - /home/sovereign/security:/home/sovereign/security

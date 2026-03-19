@@ -113,6 +113,10 @@ class GovernanceEngine:
                 return rules
             elif operation in ('push_soul', 'push_sec') and rules.get('github_push_soul', False):
                 return rules
+        elif domain == 'browser_config':
+            # Browser auth profile configuration — writes to RAID YAML; MID tier required
+            if operation == 'configure_auth' and rules.get('file_write', False):
+                return rules
         elif domain == 'wallet':
             if operation == 'read' and rules.get('wallet_read', False):
                 return rules

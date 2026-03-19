@@ -20,7 +20,8 @@ _DOMAIN_SOURCE = {
     "webdav":     "webdav_live",
     "caldav":     "caldav_live",
     "ollama":     "ollama_live",
-    "browser":    "browser_live",
+    "browser":        "browser_live",
+    "browser_config": "browser_live",
     "security":   "github_live",
     "github":     "github_live",
     "skills":     "skills_live",
@@ -110,6 +111,8 @@ INTENT_ACTION_MAP = {
     "pause_task":         {"domain": "scheduler", "operation": "update",   "name": "pause_task"},
     "cancel_task":        {"domain": "scheduler", "operation": "update",   "name": "cancel_task"},
     "recall_last_briefing": {"domain": "scheduler", "operation": "recall", "name": "recall_last_briefing"},
+    # Browser auth configuration — devops_agent scope (MID tier)
+    "configure_browser_auth": {"domain": "browser_config", "operation": "configure_auth"},
     # Wallet intents — devops_agent scope (LOW/MID/HIGH tier)
     "wallet_read_config":     {"domain": "wallet", "operation": "read",    "name": "wallet_read_config"},
     "wallet_get_address":     {"domain": "wallet", "operation": "read",    "name": "wallet_get_address"},
@@ -151,6 +154,8 @@ INTENT_TIER_MAP = {
     "pause_task":           "LOW",
     "cancel_task":          "LOW",
     "recall_last_briefing": "LOW",
+    # Browser auth config — MID: writes to RAID governance config
+    "configure_browser_auth": "MID",
     # Nanobot tiers — nanobot_run is MID (shell access), nanobot_health is LOW (read-only check)
     "nanobot_run":    "MID",
     "nanobot_health": "LOW",
@@ -481,6 +486,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "skill", "clawhub", "openclaw",
         "os update", "system update", "apt", "kernel", "package",
         "as-built", "as built", "memory.md", "governance",
+        "browser auth", "auth profile", "auth for", "credentials for",
     )
     prior_has_system = prior_domain is not None
 
@@ -721,6 +727,21 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "skill_search",
             "target": _q or user_input, "tier": "LOW",
             "reasoning_summary": "Skill registry search — deterministic pre-classifier",
+        }
+
+    # Browser auth profile management — deterministic fast-path
+    _browser_auth_kw = (
+        "configure browser auth", "add browser auth", "add auth for",
+        "browser authentication", "configure auth profile", "add auth profile",
+        "set up auth for", "add credentials for", "configure credentials for",
+        "add bearer token for", "add basic auth for", "add api key for",
+        "browser auth profile",
+    )
+    if any(w in u for w in _browser_auth_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "configure_browser_auth",
+            "target": user_input, "tier": "MID",
+            "reasoning_summary": "Browser auth profile configuration — deterministic pre-classifier",
         }
 
     # Memory / reminder intents — explicit storage requests the LLM often misses.
@@ -1198,7 +1219,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if action.get("domain") in ("ollama", "memory", "browser", "scheduler"):
+        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config"):
             if action.get("domain") == "ollama":
                 conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
                 conv_text = conv_result.get("response", "")
@@ -1523,6 +1544,7 @@ class ExecutionEngine:
             "list_events", "list_calendars", "list_tasks", "recall_last_briefing",
             "fetch_email", "search_email", "fetch_message",
             "skill_audit", "skill_search",
+            "configure_browser_auth",
         })
         # skill_search with no candidates — deterministic result, bypass translator invention
         if intent == "skill_search" and execution_result is not None:
@@ -2678,6 +2700,139 @@ class ExecutionEngine:
                 )
 
             return {"error": f"Unknown nanobot action: {name}"}
+
+        if domain == "browser_config":
+            import re as _re_bac
+            import yaml as _bac_yaml
+            _BAC_YAML_PATH = "/home/sovereign/governance/browser-auth-profiles.yaml"
+            sp = specialist or {}
+
+            # Deterministic parser: extract host, auth_type, env_var_names from prompt
+            # (used in short-circuit path where specialist=None)
+            _src = prompt or (delegation or {}).get("target", "") or ""
+            _src_l = _src.lower()
+            _host_det = (
+                _re_bac.search(r'\b([a-z0-9.-]+\.[a-z]{2,})\b', _src_l)
+            )
+            _type_det = None
+            for _t in ("headers", "bearer", "basic", "cookie"):
+                if _t in _src_l:
+                    _type_det = _t
+                    break
+            _env_vars_det = _re_bac.findall(r'\b([A-Z][A-Z0-9_]{2,})\b', _src)
+
+            host = (sp.get("host") or action.get("host", "")
+                    or (_host_det.group(1) if _host_det else "")).strip().lower()
+            auth_type = (sp.get("auth_type") or sp.get("type") or
+                         action.get("auth_type", "") or _type_det or "").strip().lower()
+
+            if not host:
+                return {"status": "error",
+                        "error": "configure_browser_auth requires a hostname (e.g. api.github.com)"}
+            if auth_type not in ("headers", "bearer", "basic", "cookie"):
+                return {"status": "error",
+                        "error": (f"Unknown auth type '{auth_type}' — "
+                                  "supported: headers, bearer, basic, cookie")}
+
+            from datetime import date as _bac_date
+            profile_entry: dict = {
+                "type": auth_type,
+                "required_env": [],
+                "added_by": "devops_agent",
+                "added_at": _bac_date.today().isoformat(),
+            }
+            if sp.get("notes"):
+                profile_entry["notes"] = sp["notes"]
+
+            if auth_type == "headers":
+                headers = sp.get("headers") or {}
+                env_var = sp.get("env_var") or ((_env_vars_det[0]) if _env_vars_det else "")
+                if not headers and env_var:
+                    headers = {"Authorization": f"Bearer {{{env_var}}}"}
+                if headers:
+                    profile_entry["headers"] = headers
+                    for _hv in headers.values():
+                        for _m in _re_bac.findall(r'\{(\w+)\}', str(_hv)):
+                            if _m not in profile_entry["required_env"]:
+                                profile_entry["required_env"].append(_m)
+            elif auth_type == "bearer":
+                token_var = (sp.get("token_var") or sp.get("env_var")
+                             or (_env_vars_det[0] if _env_vars_det else ""))
+                if token_var:
+                    profile_entry["token_var"] = token_var
+                    profile_entry["required_env"].append(token_var)
+            elif auth_type == "basic":
+                username_var = (sp.get("username_var") or sp.get("user_var")
+                                or (_env_vars_det[0] if _env_vars_det else ""))
+                password_var = (sp.get("password_var") or sp.get("pass_var")
+                                or (_env_vars_det[1] if len(_env_vars_det) > 1 else ""))
+                if username_var:
+                    profile_entry["username_var"] = username_var
+                    profile_entry["required_env"].append(username_var)
+                if password_var:
+                    profile_entry["password_var"] = password_var
+                    profile_entry["required_env"].append(password_var)
+            elif auth_type == "cookie":
+                cookie_var = (sp.get("cookie_var") or sp.get("env_var")
+                              or (_env_vars_det[0] if _env_vars_det else ""))
+                if cookie_var:
+                    profile_entry["cookie_var"] = cookie_var
+                    profile_entry["required_env"].append(cookie_var)
+
+            env_vars_missing = [v for v in profile_entry["required_env"]
+                                if not os.environ.get(v)]
+            env_vars_present = [v for v in profile_entry["required_env"]
+                                if os.environ.get(v)]
+
+            # Write YAML profile to RAID
+            try:
+                try:
+                    with open(_BAC_YAML_PATH) as _f:
+                        _yaml_data = _bac_yaml.safe_load(_f) or {"profiles": {}}
+                except FileNotFoundError:
+                    _yaml_data = {"profiles": {}}
+                if not isinstance(_yaml_data.get("profiles"), dict):
+                    _yaml_data["profiles"] = {}
+                _yaml_data["profiles"][host] = profile_entry
+                with open(_BAC_YAML_PATH, "w") as _f:
+                    _bac_yaml.dump(_yaml_data, _f, default_flow_style=False,
+                                   allow_unicode=True, sort_keys=False)
+            except Exception as _e:
+                return {"status": "error",
+                        "error": f"Failed to write browser-auth-profiles.yaml: {_e}"}
+
+            # Hot-reload in-memory AUTH_PROFILES for env vars already present
+            try:
+                from execution.adapters import browser as _bm
+                _bm.AUTH_PROFILES.update(_bm._load_auth_profiles_yaml())
+            except Exception:
+                pass
+
+            result = {
+                "status": "ok",
+                "host": host,
+                "auth_type": auth_type,
+                "profile_written": True,
+                "env_vars_present": env_vars_present,
+                "env_vars_missing": env_vars_missing,
+                "execution_confirmed": True,
+            }
+            if env_vars_missing:
+                _lines = ["Add to secrets/browser.env:"]
+                for _v in env_vars_missing:
+                    _lines.append(f"  {_v}=<your_value>")
+                _lines.append("Then restart sovereign-core to activate the profile.")
+                result["setup_instructions"] = "\n".join(_lines)
+                result["next_action"] = (
+                    f"Add {', '.join(env_vars_missing)} to secrets/browser.env, "
+                    "then restart sovereign-core."
+                )
+            else:
+                result["next_action"] = (
+                    "Restart sovereign-core to activate the new auth profile "
+                    "(or it will activate on next restart — in-memory update applied)."
+                )
+            return result
 
         return {"error": f"Unknown domain: {domain}"}
 

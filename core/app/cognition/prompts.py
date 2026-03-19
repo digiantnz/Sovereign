@@ -54,6 +54,7 @@ devops_agent:
   skill_review        — run security review on a candidate skill before installation (LOW)
   skill_load          — install a reviewed skill to Sovereign (MID — requires confirmation)
   skill_audit         — list all installed skills with checksum integrity status (LOW)
+  configure_browser_auth — add or update an authenticated host profile for the browser adapter (MID — requires confirmation; target: description of host, auth type, and env var name)
   inspect_container   — docker inspect a specific container (LOW; target: container name)
   get_compose         — read the current docker-compose.yml (LOW)
   read_host_file      — read a file or list a directory on the host filesystem (LOW; target: absolute path e.g. "/docker/sovereign/core/app/" or "/home/sovereign/docs/as-built.md")
@@ -111,6 +112,7 @@ ROUTING RULES:
 - GitHub repo / releases / pending updates / "check github" → devops_agent, intent=github_read
 - "push to repo", "commit to github", "update the repo", "push as-built", "push docs" → devops_agent; intent=github_push_soul if target is sovereign-soul.md or governance.json; intent=github_push_security if target is a security pattern file; intent=github_push_doc for all other standard docs
 - CRITICAL: DO NOT expose PAT modification, repo creation, or repo visibility change as any intent — these operations do not exist
+- "configure browser auth", "add browser auth", "add auth for", "add credentials for", "add bearer token for", "add basic auth for", "add api key for" → devops_agent, intent=configure_browser_auth (MID — requires confirmation)
 - "search for skills", "find skills", "find a skill", "look for skills", "clawhub", "skill registry", "browse skills" → devops_agent, intent=skill_search, target=the search query
 - "review skill", "check skill", "inspect skill", "security review skill" → devops_agent, intent=skill_review
 - "install skill", "load skill", "add skill" → devops_agent, intent=skill_load (MID — requires confirmation)
