@@ -146,11 +146,12 @@ Skills live at `/home/sovereign/skills/<name>/SKILL.md` (RAID, mounted :ro). See
 
 ## Search Backend
 
-- **SearXNG**: LIVE, self-hosted, always-primary (ai_net → browser_net via compose)
-- **DDG**: LIVE, always-on fallback
+- **a2a-browser**: node04 (172.16.201.4:8001) — external service, internet egress via browser_net; auth X-API-Key
+- **GitHub Search API**: primary for skill search — `browser.fetch("https://api.github.com/search/code?...")` with PAT headers from AUTH_PROFILES
+- **SearXNG** (on node04): secondary — DDG CAPTCHA-blocked, Google 403-blocked as of 2026-03-19; used as fallback only
 - **Brave / Bing**: dead letters — both retired 2025/2026
-- **a2a-browser**: node04 (172.16.201.4:8001), enrichment model phi3:mini; timeouts: 180s / 200s
-- No direct URL fetch from sovereign-core — `/search` query only; a2a-browser has browser_net egress
+- sovereign-core has no direct internet egress — all external fetches go through `browser.fetch()` → node04
+- `AUTH_PROFILES` in `execution/adapters/browser.py`: host-keyed header sets, auto-attached in `fetch()` — `GITHUB_PAT` env var from `secrets/browser.env`
 
 ---
 
