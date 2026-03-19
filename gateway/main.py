@@ -270,14 +270,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session.pending_delegation = None
             session.pending_input = None
             await _dispatch_and_reply(payload, saved or text, chat_id, context.bot, session)
+            return
         elif text.lower() in ("no", "n", "cancel"):
             session.awaiting_security_confirmation = False
             session.pending_delegation = None
             session.pending_input = None
             await update.message.reply_text("Cancelled — guardrail block upheld.")
+            return
         else:
-            await update.message.reply_text("Reply yes to proceed or no to cancel.")
-        return
+            session.awaiting_security_confirmation = False
+            session.pending_delegation = None
+            session.pending_input = None
+            await update.message.reply_text("Previous action cancelled — processing your new request.")
 
     if session.awaiting_confidence_ack:
         if text.lower() in ("yes", "y", "proceed"):
@@ -292,14 +296,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session.pending_delegation = None
             session.pending_input = None
             await _dispatch_and_reply(payload, saved or text, chat_id, context.bot, session)
+            return
         elif text.lower() in ("no", "n", "cancel"):
             session.awaiting_confidence_ack = False
             session.pending_delegation = None
             session.pending_input = None
             await update.message.reply_text("Cancelled.")
+            return
         else:
-            await update.message.reply_text("Reply yes to proceed anyway, or no to cancel.")
-        return
+            session.awaiting_confidence_ack = False
+            session.pending_delegation = None
+            session.pending_input = None
+            await update.message.reply_text("Previous action cancelled — processing your new request.")
 
     if session.awaiting_confirmation:
         if text.lower() in ("yes", "y", "confirm"):
@@ -314,14 +322,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session.pending_delegation = None
             session.pending_input = None
             await _dispatch_and_reply(payload, saved or text, chat_id, context.bot, session)
+            return
         elif text.lower() in ("no", "n", "cancel"):
             session.awaiting_confirmation = False
             session.pending_delegation = None
             session.pending_input = None
             await update.message.reply_text("Cancelled.")
+            return
         else:
-            await update.message.reply_text("Please reply yes or no.")
-        return
+            # New substantive message — cancel the stale pending confirmation and process fresh
+            session.awaiting_confirmation = False
+            session.pending_delegation = None
+            session.pending_input = None
+            await update.message.reply_text("Previous action cancelled — processing your new request.")
 
     # --- Normal message: buffer and debounce ---
     # Telegram splits pastes >4096 chars into sequential messages arriving

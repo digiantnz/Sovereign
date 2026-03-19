@@ -81,6 +81,7 @@ business_agent:
   move_email       — move email to a folder, e.g. archive (target: personal or business)
   delete_email     — delete an email (moves to Trash; requires HIGH tier confirmation)
   send_email       — send an email
+  list_folders     — list IMAP mailbox folders/folders for an email account (target: personal or business)
   list_calendars   — list calendars
   create_event     — add a calendar event
 
@@ -94,7 +95,12 @@ ROUTING RULES:
 - "Remember", "store", "note", "memorise", "don't forget", "add to my list", "add to shopping list", "save to my list", "put on my list" → research_agent, intent=remember_fact
 - Container/service/infrastructure operations → devops_agent
 - CRITICAL SELF-DIAGNOSTIC RULE: ANY question about Sovereign's own health, performance, resource usage, internal state, GPU/VRAM/RAM, system status, or self-monitoring → devops_agent, intent=get_stats, target=null. NEVER route these to research_agent.
-- CRITICAL EMAIL RULE: ANY mention of "email", "emails", "inbox", "messages", "mail" → business_agent, intent=fetch_email. Set target=personal for "personal" emails, target=business for "business" emails, target=null if unspecified. NEVER route email questions to research_agent.
+- CRITICAL EMAIL RULE: ANY mention of "email", "emails", "inbox", "messages", "mail" → business_agent. Intent rules (apply the FIRST match):
+    - "mailboxes", "mail folders", "IMAP folders", "what folders", "list folders" → intent=list_folders
+    - "send", "write", "reply", "compose", "draft" + email → intent=send_email
+    - "search", "find", "look for", "from", "filter", "containing" + email → intent=search_email
+    - all other email mentions → intent=fetch_email
+  Set target=personal for "personal" emails, target=business for "business" emails, target=null if unspecified. NEVER route email questions to research_agent.
 - Files, Nextcloud, Dropbox, cloud storage → business_agent, intent=list_files or read_file. ALWAYS set target to the folder/file path mentioned (e.g. "/Notes/todo.md"). Use "/" if no specific path is given — NEVER default to "/Projects" or any other folder name.
 - "create a folder", "make a folder", "new folder", "mkdir" → business_agent, intent=create_folder. Target = full path of folder to create.
 - "show me the contents of", "what does [filename] say", "what is in [filename]", "read [filename]", "open [filename]" → business_agent, intent=read_file. Target = the file path.
@@ -602,7 +608,8 @@ Interpret this result. You are the domain expert — determine:
 4. Should we retry with a corrected payload? (retry_with: corrected flat dict or null — max one retry)
 
 If the result contains an error, raw_error, or non-2xx status: success=false.
-If the result contains empty data when data was expected: success=false, note in outcome.
+If the result contains "_empty_search": true — this is a valid empty search result, success=true, outcome="No messages matched the search criteria."
+If the result contains empty data when data was expected (and _empty_search is not set): success=false, note in outcome.
 Never claim success based on absence of an error — require positive evidence.
 
 Respond with ONLY this JSON:
@@ -624,6 +631,7 @@ def orchestrator_evaluate(orchestrator_persona: str, delegation: dict,
     Always uses local Ollama — governance must remain deterministic and local.
     """
     intent = delegation.get("intent", "")
+    tier = delegation.get("tier", "LOW")
     specialist_success = specialist_inbound_result.get("success", False)
     specialist_outcome = specialist_inbound_result.get("outcome", "")
 
@@ -637,25 +645,44 @@ MEMORY DECISION RULES:
 - Do NOT store routine successful operations — no learning value.
 """
 
+    # Tier-aware evaluation gate — injected before the check questions
+    if tier == "LOW":
+        tier_gate = """\
+TIER GATE: This is a LOW tier operation.
+- Skip check 1 entirely. Do NOT evaluate whether the outcome matches the intent.
+- Set approved=true unless a governance concern exists (check 2).
+- LOW tier operations are pre-approved by governance. Your only job is check 2, memory, and translation."""
+    else:
+        tier_gate = """\
+TIER GATE: This is a MID/HIGH tier operation.
+- Apply both checks as written below."""
+
     return f"""{orchestrator_persona}
 
 ---
 TASK — PASS 4: EVALUATION AND MEMORY DECISION
 
 Original intent: {json.dumps(intent)}
-Tier: {json.dumps(delegation.get("tier", "LOW"))}
+Tier: {json.dumps(tier)}
 
 Specialist inbound result:
 {json.dumps(specialist_inbound_result, indent=2)}
 
 {memory_rules}
 
+{tier_gate}
+
 Check:
-1. Does the specialist outcome match the original intent? If not: approved=false, feedback=why.
-2. Any governance concern? (HIGH-tier action that produced unexpected scope?) If yes: approved=false.
+1. [MID/HIGH only — skip for LOW] Did the specialist attempt the CORRECT TYPE of action for the intent?
+   (e.g. send_email → specialist attempted to send an email ✓; send_email → specialist listed files ✗)
+   Do NOT set approved=false because the action failed — execution failure is reported in result_for_translator, not here.
+   Only set approved=false if the specialist attempted a DIFFERENT action type than the intent required.
+2. Any governance concern? (action produced unexpected scope, or sensitive data exposed?) If yes: approved=false.
 3. What memory action is needed? If store: build memory_payload with collection + lesson + outcome.
 4. Construct result_for_translator from the specialist outcome. Use the specialist's "outcome" as the
-   foundation. Add detail if useful. If success=false: populate error field with plain description.
+   foundation. Add detail if useful. If success=false: populate error field with plain description of
+   what actually failed — do NOT invent reasons, do NOT reference build processes, deployments, or
+   infrastructure unless those words appear in the specialist outcome.
 
 IRON RULE: If specialist.success=false — result_for_translator.success must be false.
 Never fabricate success. Never invent what was done. Report only what the specialist returned.
@@ -695,6 +722,10 @@ def translate_from_orchestrator(translator_persona: str, result_for_translator: 
     iron_rule = (
         "IRON RULE — FAILURE: This action FAILED. Report failure clearly. "
         "Do NOT claim it succeeded. Do NOT invent a positive outcome. "
+        "Do NOT invent a reason for failure — only state what is in the result.error or outcome field. "
+        "Do NOT reference build processes, deployments, retries, queues, or infrastructure unless those exact words appear in the result. "
+        "Do NOT suggest the action can be retried at a higher tier or with elevated permissions. "
+        "Do NOT say 'confirmation required to proceed' — governance blocks are hard stops, not invitations to escalate. "
         "State what failed and, if next_action is provided, what Rex will do about it."
         if (has_error or not success) else
         "IRON RULE — ACCURACY: Only report success. Do not add caveats or invent follow-up actions not present."
@@ -721,6 +752,10 @@ Rules:
 - If next_action is present and non-null, append it naturally as a final sentence.
 - No preamble ("Here is the message:", "Translation:", etc.).
 - No trailing meta-commentary.
+- If detail contains raw output fields (output, content, stdout, logs, containers, lines, items,
+  files, events, messages, stats, hardware, text): render that data directly. Present multi-line
+  text verbatim. Present lists as concise bullets. Do NOT collapse into a summary sentence —
+  the Director asked for the actual output.
 
 Respond with ONLY the plain English message for the Director."""
 

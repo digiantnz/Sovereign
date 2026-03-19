@@ -75,6 +75,12 @@ INTENT_ACTION_MAP = {
     # Nanobot intents — delegated execution sidecar (MID tier minimum)
     "nanobot_run":    {"domain": "nanobot", "operation": "run",    "name": "nanobot_run"},
     "nanobot_health": {"domain": "nanobot", "operation": "health", "name": "nanobot_health"},
+    # Self-diagnostic intents — all LOW, all read-only
+    "read_audit_log":          {"domain": "docker", "operation": "read", "name": "host_file_read",
+                                 "path": "/home/sovereign/audit/security-ledger.jsonl"},
+    "memory_promotion_status": {"domain": "docker", "operation": "read", "name": "host_file_read",
+                                 "path": "/home/sovereign/audit/memory-promotions.jsonl"},
+    "soul_checksum_status":    {"domain": "docker", "operation": "read", "name": "docker_stats"},
     # System examination intents — devops_agent scope (all LOW, all read-only via broker)
     "inspect_container":  {"domain": "docker", "operation": "read", "name": "inspect_container"},
     "get_compose":        {"domain": "docker", "operation": "read", "name": "get_compose"},
@@ -148,6 +154,10 @@ INTENT_TIER_MAP = {
     # Nanobot tiers — nanobot_run is MID (shell access), nanobot_health is LOW (read-only check)
     "nanobot_run":    "MID",
     "nanobot_health": "LOW",
+    # Self-diagnostic read intents — LOW
+    "read_audit_log":          "LOW",
+    "memory_promotion_status": "LOW",
+    "soul_checksum_status":    "LOW",
     # GitHub — tiers enforced per governance policy
     "github_read":          "LOW",   # monitoring, releases, pending updates
     "github_push_doc":      "MID",   # standard docs and as-built updates
@@ -332,6 +342,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "governance file":     "/home/sovereign/governance/governance.json",
         "audit log":           "/home/sovereign/audit/security-ledger.jsonl",
         "security ledger":     "/home/sovereign/audit/security-ledger.jsonl",
+        "memory promotions":   "/home/sovereign/audit/memory-promotions.jsonl",
+        "memory-promotions":   "/home/sovereign/audit/memory-promotions.jsonl",
+        "promotion log":       "/home/sovereign/audit/memory-promotions.jsonl",
+        "promotions log":      "/home/sovereign/audit/memory-promotions.jsonl",
         "skill dir":           "/home/sovereign/skills/",
         "skills directory":    "/home/sovereign/skills/",
     }
@@ -386,6 +400,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "every day at", "every week at", "every hour",
         "list tasks", "show tasks", "scheduled tasks", "active tasks",
         "what's scheduled", "whats scheduled",
+        # One-shot reminder phrases — stored as PROSPECTIVE tasks in Qdrant
+        "set a reminder", "set reminder", "remind me at", "remind me in",
+        "remind me to", "reminder for", "add a reminder", "create a reminder",
+        "schedule a reminder", "set an alarm", "remind me on",
     )
     for _sk in _sched_early:
         if _sk in u:
@@ -519,14 +537,29 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _is_pronoun_ref = any(w in u for w in _pronouns) and len(u.split()) <= 12
 
     # Email — explicit keyword or pronoun ref when prior domain was email
-    _mail_kw = ("email", "emails", "inbox", "my mail", "any mail", "any emails", "messages", "unread")
+    _mail_kw = ("email", "emails", "inbox", "my mail", "any mail", "any emails", "messages", "unread", "mailbox", "mailboxes")
     _send_kw = ("send an", "send a", "reply to", "forward this", "write an email", "draft an email", "compose")
+    _search_kw = ("search", "find", "look for", "filter", "from ", "containing", "subject:")
     _delete_kw = ("delete", "remove", "trash", "clear", "get rid")
-    _move_kw = ("move", "archive", "file away")
+    # Require "move" to be followed by email-related context, not standalone ("move on", "lets move")
+    _move_kw = ("archive", "file away", "move to ", "move them", "move it", "move these", "move those", "move the email")
+    _folder_kw = ("mailbox", "mailboxes", "mail folder", "mail folders", "imap folder", "what folders", "list folders")
 
     email_context = any(w in u for w in _mail_kw) or (_is_pronoun_ref and prior_domain == "email")
-    if email_context and not any(w in u for w in _send_kw):
+    if email_context:
         account = "business" if "business" in u else "personal" if "personal" in u else None
+        if any(w in u for w in _folder_kw):
+            return {
+                "delegate_to": "business_agent", "intent": "list_folders",
+                "target": account, "tier": "LOW",
+                "reasoning_summary": "Email folder list — deterministic pre-classifier",
+            }
+        if any(w in u for w in _send_kw):
+            return {
+                "delegate_to": "business_agent", "intent": "send_email",
+                "target": account, "tier": "MID",
+                "reasoning_summary": "Email send — deterministic pre-classifier",
+            }
         if any(w in u for w in _delete_kw):
             return {
                 "delegate_to": "business_agent", "intent": "delete_email",
@@ -538,6 +571,12 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "delegate_to": "business_agent", "intent": "move_email",
                 "target": account, "tier": "MID",
                 "reasoning_summary": "Email move/archive — deterministic pre-classifier (pronoun resolved from context)",
+            }
+        if any(w in u for w in _search_kw):
+            return {
+                "delegate_to": "business_agent", "intent": "search_email",
+                "target": account, "tier": "LOW",
+                "reasoning_summary": "Email search — deterministic pre-classifier",
             }
         return {
             "delegate_to": "business_agent", "intent": "fetch_email",
@@ -760,6 +799,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
 # web_search is only triggered by explicit internet/web references in the routing rules.
 _AGENT_DEFAULT_INTENT = {
     "docker_agent":   "list_containers",
+    "devops_agent":   "get_stats",    # was missing — fallthrough caused query→fabrication
     "research_agent": "query",
     "business_agent": "list_files",
 }
@@ -787,6 +827,8 @@ class ExecutionEngine:
         self._skill_lifecycle = None
         # Task scheduler — injected post-init from main.py to avoid circular imports
         self.task_scheduler = None
+        # FastAPI app.state — injected post-init so collect_all() can include soul_checksum
+        self.app_state = None
 
     # ── Direct structured query (/query endpoint) ────────────────────────
     async def handle_request(self, payload):
@@ -895,7 +937,8 @@ class ExecutionEngine:
                 from monitoring.metrics import collect_all
                 from monitoring.scheduler import evaluate_metrics
                 import asyncio as _asyncio
-                metrics = await _asyncio.wait_for(collect_all(), timeout=15.0)
+                metrics = await _asyncio.wait_for(
+                    collect_all(getattr(self, 'app_state', None)), timeout=15.0)
                 anomalies = evaluate_metrics(metrics)
                 health_result = {
                     "status": "ok",
@@ -1065,10 +1108,16 @@ class ExecutionEngine:
         try:
             rules = self.gov.validate(action, tier)
         except ValueError as e:
-            _rft = {"success": False, "outcome": str(e), "detail": {},
-                    "error": str(e), "next_action": None}
+            # Normalize governance errors before passing to translator.
+            # Raw text like "not in allowed_actions for tier LOW" causes the LLM to
+            # hallucinate tier escalation ("available at higher tiers — Rex will allow it").
+            # Hard block: governance failure is a hard stop, not an invitation to escalate.
+            _gov_msg = "That action isn't permitted under the current governance policy."
+            _rft = {"success": False, "outcome": _gov_msg, "detail": {},
+                    "error": _gov_msg, "next_action": None}
             dm = await self.cog.translator_pass(_rft, tier=tier)
-            return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
+            return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps,
+                    "_governance_block": str(e)}
 
         # Confirmation gate
         if not confirmed:
@@ -1450,6 +1499,44 @@ class ExecutionEngine:
         # ── PASS 5 — Translator (receives ONLY result_for_translator) ─────────
         _rft = (orch_eval.get("result_for_translator")
                 or self._build_result_for_translator(intent, execution_result))
+
+        # Diagnostic passthrough: the specialist_inbound and orchestrator_evaluate LLMs
+        # both discard raw output from detail (schema shows {} and "keep it small").
+        # For read/diagnostic intents the Director needs the actual output, not a summary.
+        # Inject execution_result data deterministically — no LLM reliance.
+        _DIAGNOSTIC_INTENTS = frozenset({
+            "list_containers", "get_logs", "get_stats", "get_hardware", "list_processes",
+            "read_host_file", "get_compose", "inspect_container", "systemctl_status",
+            "journalctl", "apt_check", "github_read",
+            "list_files", "read_file", "navigate", "search_files",
+            "list_events", "list_calendars", "list_tasks", "recall_last_briefing",
+            "fetch_email", "search_email", "fetch_message",
+            "skill_audit", "skill_search",
+        })
+        if intent in _DIAGNOSTIC_INTENTS and execution_result:
+            _raw = {k: v for k, v in execution_result.items()
+                    if not k.startswith("_")
+                    and k not in ("status", "success", "error", "execution_confirmed",
+                                  "request_id", "run_id", "elapsed_s", "node")}
+            if _raw:
+                _rft = dict(_rft)
+                # Raw execution output takes precedence; preserve any LLM metadata
+                _rft["detail"] = {**(_rft.get("detail") or {}), **_raw}
+                # Clear LLM-generated outcome — it may contain wrong counts from the
+                # truncated specialist_inbound view (lists capped at 5 items). Translator
+                # renders detail directly via rule 8; empty outcome avoids misleading preamble.
+                _rft["outcome"] = ""
+
+        # Sanitise LLM-generated detail: strip internal keys before translator sees them
+        _DETAIL_STRIP = frozenset({
+            "success", "next_action", "approved", "feedback", "memory_action",
+            "outcome", "agent", "delegate_to", "tier", "intent",
+        })
+        if isinstance(_rft.get("detail"), dict):
+            _rft["detail"] = {
+                k: v for k, v in _rft["detail"].items()
+                if not k.startswith("_") and k not in _DETAIL_STRIP
+            }
         _t5_start = _time_mod.monotonic()
         try:
             director_msg = await _asyncio.wait_for(
@@ -1720,7 +1807,7 @@ class ExecutionEngine:
                 if not container:
                     # Self-diagnostic — no specific container: return full system metrics
                     from monitoring.metrics import collect_all
-                    metrics = await collect_all()
+                    metrics = await collect_all(getattr(self, 'app_state', None))
                     return {"status": "ok", "domain": "health", "metrics": metrics}
                 stats = await self.broker.get_stats(container)
                 return {"status": "ok", "container": container, "stats": stats}
@@ -1944,7 +2031,7 @@ class ExecutionEngine:
             if op == "read":
                 if name == "mail_list_folders":
                     nb = await self.nanobot.run(_skill, "list_mailboxes", {})
-                    return nb.get("result", nb)
+                    return nb.get("result") if nb.get("result") is not None else nb
                 # Specialist may escalate a generic fetch_email to a targeted fetch_message
                 # when they can identify the sender/subject from the user request.
                 if sp.get("operation") == "fetch_message":
@@ -1963,7 +2050,7 @@ class ExecutionEngine:
                 else:
                     count = int(sp.get("count") or action.get("count", 10))
                     nb = await self.nanobot.run(_skill, f"fetch_unread{_suf}", {"limit": count})
-                return nb.get("result", nb)
+                return nb.get("result") if nb.get("result") is not None else nb
 
             if op == "fetch":
                 uid       = sp.get("uid")       or action.get("uid", "")
@@ -1986,7 +2073,12 @@ class ExecutionEngine:
                 query_parts = [str(v) for v in criteria.values() if v]
                 query = " ".join(query_parts) if query_parts else (sp.get("query") or action.get("query", ""))
                 nb = await self.nanobot.run(_skill, f"search{_suf}", {"query": query, "limit": 10})
-                return nb.get("result", nb)
+                result = nb.get("result") if nb.get("result") is not None else nb
+                # Empty search is a valid result — stamp it so specialist_inbound doesn't mark failure
+                if isinstance(result, dict) and result.get("messages") == [] and not result.get("error"):
+                    result["_empty_search"] = True
+                    result["status"] = "ok"
+                return result
 
             if op == "flag":
                 uid = sp.get("uid") or action.get("uid", "")
@@ -1996,7 +2088,7 @@ class ExecutionEngine:
                     nb = await self.nanobot.run(_skill, "mark_read", {"uid": uid})
                 else:
                     nb = await self.nanobot.run(_skill, "mark_unread", {"uid": uid})
-                return nb.get("result", nb)
+                return nb.get("result") if nb.get("result") is not None else nb
 
             if op == "move":
                 return {"status": "error", "error": "Email move not available — no broker command. Use mark_read to flag instead."}
@@ -2010,12 +2102,12 @@ class ExecutionEngine:
                 nb = await self.nanobot.run(
                     _skill, f"send_email{_suf}",
                     {
-                        "to": action.get("to", ""),
-                        "subject": action.get("subject", delegation.get("intent", "") if delegation else ""),
-                        "body": draft or action.get("body", ""),
+                        "to": s.get("to") or action.get("to", ""),
+                        "subject": s.get("subject") or action.get("subject", ""),
+                        "body": draft or s.get("body") or action.get("body", ""),
                     }
                 )
-                return nb.get("result", nb)
+                return nb.get("result") if nb.get("result") is not None else nb
 
             return {"status": "error", "error": f"Unhandled mail operation: op={op!r} name={name!r}"}
 
@@ -2488,6 +2580,11 @@ class ExecutionEngine:
             if name == "schedule_task":
                 # Parse the NL request into a structured TaskDefinition
                 # prompt carries the original user text in short-circuit dispatch path
+                import logging as _sched_log
+                _sched_log.getLogger("sovereign.scheduler").info(
+                    "[scheduler] schedule_task dispatch hit — tier=LOW, no security ledger write; prompt=%r",
+                    (prompt or "")[:120],
+                )
                 parsed = await self.task_scheduler.parse_task_nl(prompt or "")
                 if parsed.get("error"):
                     return {"status": "error", "error": parsed["error"]}

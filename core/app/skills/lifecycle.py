@@ -313,6 +313,7 @@ class SkillLifecycleManager:
                     search_error = fb_err
 
         result_out: dict = {
+            "status": "ok" if candidates else "no_results",
             "query": query,
             "certified_only": certified_only,
             "candidates": candidates,

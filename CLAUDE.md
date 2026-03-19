@@ -1,9 +1,9 @@
 # Sovereign AI — Claude Code Context
 
 ## Design Documents
-- Full architecture: `/docker/sovereign/docs/Sovereign-v2.md`
-- Phase 3 detail: `/docker/sovereign/docs/Sovereign-Phase_3.md`
-- Cognitive loop rework: `/docker/sovereign/docs/Sovereign-CognitiveLoopRework.md`
+- Full architecture: `/home/sovereign/sovereign/docs/Sovereign-v2.md`
+- Phase 3 detail: `/home/sovereign/sovereign/docs/Sovereign-Phase_3.md`
+- Cognitive loop rework: `/home/sovereign/sovereign/docs/Sovereign-CognitiveLoopRework.md`
 - Always consult before making architectural decisions.
 
 ---
@@ -21,10 +21,10 @@
 ## Container Architecture
 
 ### Networks
-- `ai_net`: ollama, whisper, sovereign-core, docker-broker, qdrant, a2a-browser, gateway
+- `ai_net`: ollama, whisper, sovereign-core, docker-broker, qdrant, gateway, nanobot-01
 - `business_net`: nextcloud, nc-redis, nc-db, nextcloud-rp, sovereign-core (dual-homed)
-- `browser_net`: a2a-browser only (internet egress; compose-managed; no route to ai_net or business_net)
-- sovereign-core dual-homed (ai_net + business_net); a2a-browser dual-homed (ai_net + browser_net)
+- `browser_net`: (no local container; compose-managed for future use)
+- sovereign-core dual-homed (ai_net + business_net); a2a-browser on node04 (172.16.201.4:8001, external)
 
 ### Security Boundaries (hard rules — do not violate)
 - `docker.sock` → broker container only
