@@ -18,7 +18,14 @@
         "memory_read",
         "mail_fetch_unread",
         "calendar_read",
-        "system_status"
+        "system_status",
+        "list_tasks",
+        "schedule_task",
+        "pause_task",
+        "cancel_task",
+        "recall_last_briefing",
+        "systemctl_status",
+        "journalctl"
       ]
     },
     "MID": {
@@ -75,8 +82,8 @@
     }
   },
   "meta": {
-    "version": "1.0",
-    "description": "Sovereign governance policy — Phase 0/1/2",
+    "version": "1.15",
+    "description": "Sovereign governance policy — Phase 0/1/2 schedule_task/pause_task/cancel_task moved to LOW allowed_actions + recall_last_briefing/systemctl_status/journalctl",
     "raid_path": "/home/sovereign/governance/governance.json",
     "specialists_can_override_tier": false,
     "specialists_can_write_memory": false,

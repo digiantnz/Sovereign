@@ -9,6 +9,10 @@ RUN apt-get update && \
 RUN git clone --depth 1 https://github.com/HKUDS/nanobot.git /opt/nanobot && \
     pip install --no-cache-dir -e "/opt/nanobot[all]"
 
+# Install sovereign-a2a from vendored source (no network dependency at build time)
+COPY sovereign-a2a /sovereign-a2a
+RUN pip install --no-cache-dir /sovereign-a2a
+
 # Install bridge + skill runtime deps from requirements.txt
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt

@@ -16,45 +16,9 @@ secrets:
     file: /home/sovereign/keys/sovereign.key
 
 services:
-  searxng:
-    image: searxng/searxng:latest
-    container_name: searxng
-    restart: unless-stopped
-    networks:
-      - browser_net   # internet egress; a2a-browser reaches it here
-    volumes:
-      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
-    env_file:
-      - ./secrets/searxng.env
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-  a2a-browser:
-    build:
-      context: ./a2a-browser
-      dockerfile: Dockerfile
-    container_name: a2a-browser
-    restart: unless-stopped
-    depends_on:
-      searxng:
-        condition: service_healthy
-    networks:
-      - ai_net      # sovereign-core + Ollama reachable here
-      - browser_net # internet egress + searxng reachable here
-    env_file:
-      - ./secrets/browser.env
-    environment:
-      - SEARXNG_URL=http://searxng:8080
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 60s   # Playwright Chromium init
+  # searxng and a2a-browser removed 2026-03-19 — replaced by node04 instance
+  # (172.16.201.4:8001). A2A_BROWSER_URL in secrets/browser.env points to node04.
+  # Local searxng/a2a-browser-deploy/ directories kept for reference only.
 
   docker-broker:
     build:

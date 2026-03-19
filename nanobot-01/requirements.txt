@@ -4,8 +4,7 @@
 fastapi
 uvicorn
 httpx
-# A2A JSON-RPC 3.0 wire protocol — single source of truth for agent communications
-git+https://github.com/digiantnz/sovereign-a2a.git
+# sovereign-a2a installed from vendored source in Dockerfile (before this requirements.txt)
 
 # Skill script runtime — OpenClaw/ClawhHub community skill execution
 feedparser          # RSS/Atom feed parsing (openclaw-feeds)

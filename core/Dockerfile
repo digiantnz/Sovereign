@@ -5,7 +5,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
+    git \
     && rm -rf /var/lib/apt/lists/*
+
+COPY sovereign-a2a /sovereign-a2a
+RUN pip install --no-cache-dir /sovereign-a2a
 
 COPY app/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt

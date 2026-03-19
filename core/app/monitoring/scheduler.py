@@ -26,8 +26,8 @@ THRESHOLDS = {
 
 SOVEREIGN_CONTAINERS = {
     "sovereign-core", "ollama", "whisper", "qdrant",
-    "docker-broker", "gateway", "a2a-browser", "searxng",
-}
+    "docker-broker", "gateway", "nanobot-01",
+}  # a2a-browser + searxng removed 2026-03-19 (replaced by node04 172.16.201.4:8001)
 
 SELF_CHECK_INTERVAL = 6 * 3600   # 6 hours in seconds
 

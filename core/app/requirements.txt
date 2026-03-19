@@ -9,5 +9,5 @@ cryptography
 eth-account
 python-gnupg
 embit
-# A2A JSON-RPC 3.0 wire protocol — single source of truth for agent communications
-git+https://github.com/digiantnz/sovereign-a2a.git
+# sovereign-a2a installed from vendored source in Dockerfile (before this requirements.txt)
+# To update: cp -r sovereign-a2a core/sovereign-a2a && nanobot-01/sovereign-a2a

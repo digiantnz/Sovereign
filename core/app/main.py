@@ -91,6 +91,8 @@ async def lifespan(app: FastAPI):
     app.state.soul_checksum = soul_checksum
     # Inject guardian into execution engine's lifecycle manager
     app.state.exec.set_guardian(guardian)
+    # Inject app.state so collect_all() can surface soul_checksum in metrics
+    app.state.exec.app_state = app.state
 
     # ── Step 2b: Sign governance snapshot on startup
     if signer:

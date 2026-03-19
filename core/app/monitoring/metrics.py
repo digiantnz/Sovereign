@@ -22,9 +22,10 @@ GROK_URL      = "https://api.x.ai/v1"
 AUDIT_PATH    = "/home/sovereign/audit/security-ledger.jsonl"
 SOVEREIGN_CONTAINERS = [
     "sovereign-core", "ollama", "whisper", "qdrant",
-    "docker-broker", "gateway", "a2a-browser", "searxng",
+    "docker-broker", "gateway",
     "nextcloud", "nc-db", "nc-redis", "nextcloud-rp",
-]
+    "nanobot-01",
+]  # a2a-browser + searxng removed 2026-03-19 (replaced by node04 172.16.201.4:8001)
 
 
 async def _reachable(url: str, timeout: float = 5.0) -> tuple[bool, float]:
