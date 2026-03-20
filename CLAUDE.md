@@ -21,7 +21,7 @@
 ## Container Architecture
 
 ### Networks
-- `ai_net`: ollama, whisper, sovereign-core, docker-broker, qdrant, gateway, nanobot-01
+- `ai_net`: ollama, sovereign-core, docker-broker, qdrant, gateway, nanobot-01
 - `business_net`: nextcloud, nc-redis, nc-db, nextcloud-rp, sovereign-core (dual-homed)
 - `browser_net`: (no local container; compose-managed for future use)
 - sovereign-core dual-homed (ai_net + business_net); a2a-browser on node04 (172.16.201.4:8001, external)
@@ -122,15 +122,15 @@ PASS 5  Translator              → plain English director_message (always local
 
 ## Installed Skills
 
-| Skill | Executor | Specialists |
-|-------|----------|-------------|
-| `imap-smtp-email` | python3_exec → nanobot-01 | business_agent |
-| `openclaw-nextcloud` | python3_exec → nanobot-01 | business_agent |
-| `rss-digest` | python3_exec → nanobot-01 | research_agent, business_agent |
-| `deep-research` | browser+ollama | research_agent |
-| `security-audit` | ollama | security_agent |
-| `session-wrap-up` | ollama | all 5 specialists |
-| `memory-curate` | ollama+qdrant | memory_agent |
+| Skill | Executor | Specialists | Operations |
+|-------|----------|-------------|------------|
+| `imap-smtp-email` | python3_exec → nanobot-01 | business_agent | |
+| `openclaw-nextcloud` | python3_exec → nanobot-01 | business_agent | calendar_list/create/delete/update, tasks_list/create/complete/delete, files_list/search/read/write/delete/mkdir (14 ops) |
+| `rss-digest` | python3_exec → nanobot-01 | research_agent, business_agent | |
+| `deep-research` | browser+ollama | research_agent | |
+| `security-audit` | ollama | security_agent | |
+| `session-wrap-up` | ollama | all 5 specialists | |
+| `memory-curate` | ollama+qdrant | memory_agent | |
 
 Skills live at `/home/sovereign/skills/<name>/SKILL.md` (RAID, mounted :ro). See `core/app/CLAUDE.md` for SKILL.md format and integrity model.
 
@@ -144,14 +144,35 @@ Skills live at `/home/sovereign/skills/<name>/SKILL.md` (RAID, mounted :ro). See
 
 ---
 
-## Search Backend
+## node04 — External Services Host (172.16.201.4, VLAN 172.16.201.0/24)
 
-- **a2a-browser**: node04 (172.16.201.4:8001) — external service, internet egress via browser_net; auth X-API-Key
+node04 hosts all external-facing AI services that sovereign-core cannot run locally (internet egress, GPU-optional, independent scaling). sovereign-core has **no direct internet egress** — all external calls route through node04 services.
+
+### Port convention (design decision — follow for all future node04 services)
+
+| Port | Service | Status |
+|------|---------|--------|
+| 8001 | a2a-browser | Running |
+| 8003 | a2a-whisper | Planned — pending CC deployment |
+
+**Deployment rules for node04 services:**
+- `BIND_ADDRESS` = loopback-only by default during setup
+- Promote to VLAN (`172.16.201.x`) explicitly on go-live
+- Auth via `X-API-Key` shared secret pattern (same as a2a-browser)
+- Port mapping and healthcheck pattern: follow a2a-browser `docker-compose.yml` as template
+- Assign next sequential port — never reuse or skip
+
+### Services
+
+- **a2a-browser** (8001): browser fetch + SearXNG search; internet egress; `AUTH_PROFILES` in `browser.py` attach credentials per host; all nanobot browsing also routes through here
+- **a2a-whisper** (8003): faster-whisper-server; replaces local whisper container (removed 2026-03-20); `WHISPER_URL=http://172.16.201.4:8003` in `secrets/whisper.env`
+
+### Search backend
+
 - **GitHub Search API**: primary for skill search — `browser.fetch("https://api.github.com/search/code?...")` with PAT headers from AUTH_PROFILES
-- **SearXNG** (on node04): secondary — DDG CAPTCHA-blocked, Google 403-blocked as of 2026-03-19; used as fallback only
+- **SearXNG** (via a2a-browser): secondary — DDG CAPTCHA-blocked, Google 403-blocked as of 2026-03-19; fallback only
 - **Brave / Bing**: dead letters — both retired 2025/2026
-- sovereign-core has no direct internet egress — all external fetches go through `browser.fetch()` → node04
-- `AUTH_PROFILES` in `execution/adapters/browser.py`: host-keyed header sets, auto-attached in `fetch()` — `GITHUB_PAT` env var from `secrets/browser.env`
+- `AUTH_PROFILES` in `execution/adapters/browser.py`: host-keyed header sets, auto-attached in `fetch()` — loaded from `secrets/browser.env` + `/home/sovereign/governance/browser-auth-profiles.yaml` at startup
 
 ---
 
@@ -196,6 +217,8 @@ Skills live at `/home/sovereign/skills/<name>/SKILL.md` (RAID, mounted :ro). See
 | OC-S5 | **COMPLETE** | nanobot-01 as primary executor, CredentialProxy single-use token delegation |
 | OC-S6 | **COMPLETE** | python3_exec cutover, imap/smtp/nextcloud/feeds.py scripts, rss-digest skill, route_cognition PASS 2 wiring |
 | CL-Rework | **COMPLETE** | 5-pass cognitive loop, InternalMessage envelope, nanobot protocol contract, untrusted tagging |
+| E2E-S1 | **COMPLETE** | End-to-end Telegram routing hardening: RSS feeds, skill search, clawhub routing, translator leakage, morning briefing serialisation, enrichment truncation fix |
+| OC-S7 | **COMPLETE** | openclaw-nextcloud +6 ops (files_read/write/delete/mkdir, calendar_update, tasks_delete); SKILL.md + checksums updated |
 
 Full phase history: `docs/CLAUDE-archive.md`
 

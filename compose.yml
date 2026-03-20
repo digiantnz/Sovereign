@@ -8,7 +8,7 @@ networks:
 
 volumes:
   compose_ollama_models:  # Maps to RAID per §2 — a2a-browser has no persistent volumes (stateless)
-  whisper_models:         # HuggingFace model cache (faster-whisper-medium ~769 MB)
+  # whisper_models removed — whisper migrated to node04 (172.16.201.4)
   # nc_db, nc_html, nc_data, nc_config, nc_apps, nc_themes, redis_data migrated to RAID bind mounts at /home/nextcloud/
 
 secrets:
@@ -63,7 +63,7 @@ services:
     networks:
       - ai_net
     volumes:
-      - /home/sovereign/vector:/qdrant/storage
+      - /docker/runtime/qdrant:/qdrant/storage  # NVMe — IO-intensive random writes; RAID would cause parity overhead
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/6333"]
@@ -83,16 +83,16 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
-      whisper:
-        condition: service_healthy
       qdrant:
         condition: service_healthy
+      # whisper removed from depends_on — migrated to node04
     networks:
       - ai_net
       - business_net  # Dual-homed per §3
     ports:
       - "127.0.0.1:8000:8000"  # Loopback-only API
     volumes:
+      - /home/sovereign/sovereign/core/app:/app:ro  # Source on RAID — restart picks up changes, no rebuild
       - /home/sovereign/governance/governance.json:/app/governance/governance.json:ro
       - /home/sovereign/governance:/home/sovereign/governance:ro
       - /home/sovereign/governance/wallet-config.json:/home/sovereign/governance/wallet-config.json:rw
@@ -146,28 +146,8 @@ services:
       timeout: 5s
       retries: 5
 
-  whisper:
-    image: fedirz/faster-whisper-server:latest-cuda
-    container_name: whisper
-    restart: unless-stopped
-    networks: [ai_net]
-    env_file: ./secrets/whisper.env
-    environment:
-      - WHISPER_MODEL=Systran/faster-whisper-medium
-    volumes:
-      - whisper_models:/root/.cache/huggingface
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-              count: all
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+  # whisper removed 2026-03-20 — migrated to node04 (172.16.201.4)
+  # Update WHISPER_URL in secrets/whisper.env to the node04 service URL when ready.
 
   # Nextcloud stack (per Phase 2 integration; from P3-NextCloud-Implementation_v1.1.md §4)
   db:
@@ -270,7 +250,7 @@ services:
       - business_net  # required: nextcloud.py connects to http://nextcloud (business_net)
     volumes:
       - /home/sovereign/skills:/skills:ro          # Read-only skill definitions
-      - /docker/sovereign/nanobot-01/workspace:/workspace  # Task workspace
+      - /home/sovereign/sovereign/nanobot-01/workspace:/workspace  # Task workspace (RAID)
       - /home/sovereign/nanobot-01/memory:/memory  # Durable nanobot memory (RAID)
     # No docker.sock, no privileged, no extra capabilities, no host ports
     # Phase 1 credential delegation: static env var mounts (ai_net only, contained risk)

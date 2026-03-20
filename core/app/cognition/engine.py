@@ -355,9 +355,20 @@ class CognitionEngine:
                 text = self._URGENT_STRIP_RE.sub("", text).strip()
             # Strip preamble the model adds despite instructions
             import re as _re2
+            # Catches any "Here is/Here's <up to 80 chars>:" opener at start of response
             text = _re2.sub(
-                r"^(Here(?:'s| is) the (?:Director message|translated message|message)[^:]*:\s*"
-                r"|Translation:\s*|Translated message:\s*|Plain English(?:\s+message)?:\s*)",
+                r"^(Here(?:'s| is)\b[^:]{0,80}:\s*\n?"
+                r"|Translation:\s*|Translated message:\s*|Plain English(?:\s+\w+)?:\s*)",
+                "", text, flags=_re2.IGNORECASE,
+            ).strip()
+            # Strip trailing meta-commentary the model appends (system prompt leakage)
+            # Catches: "\n\nNote: ...", "\n\n(Note: ...)", "No further action is required.", etc.
+            text = _re2.sub(
+                r"\n*\(?Note:\s+[^\n]{10,}\)?$",
+                "", text, flags=_re2.IGNORECASE,
+            ).strip()
+            text = _re2.sub(
+                r"\n*(No further action (?:is )?required\.?)$",
                 "", text, flags=_re2.IGNORECASE,
             ).strip()
             return text

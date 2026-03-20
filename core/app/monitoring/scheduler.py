@@ -25,9 +25,10 @@ THRESHOLDS = {
 }
 
 SOVEREIGN_CONTAINERS = {
-    "sovereign-core", "ollama", "whisper", "qdrant",
+    "sovereign-core", "ollama", "qdrant",
     "docker-broker", "gateway", "nanobot-01",
-}  # a2a-browser + searxng removed 2026-03-19 (replaced by node04 172.16.201.4:8001)
+}  # whisper removed 2026-03-20 — migrated to node04 as a2a-whisper (172.16.201.4:8003)
+   # a2a-browser + searxng removed 2026-03-19 (replaced by node04 172.16.201.4:8001)
 
 SELF_CHECK_INTERVAL = 6 * 3600   # 6 hours in seconds
 

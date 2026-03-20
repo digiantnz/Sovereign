@@ -214,7 +214,11 @@ async def _dispatch_and_reply(
 
 
 async def _flush_buffer(chat_id: int, bot, session: Session) -> None:
-    """Debounce timer: wait CHUNK_TIMEOUT seconds then assemble and forward."""
+    """Debounce timer: wait CHUNK_TIMEOUT seconds then assemble and forward.
+
+    Acquires a per-session lock before dispatching so concurrent messages
+    are serialised — responses arrive in the order they were asked.
+    """
     try:
         await asyncio.sleep(CHUNK_TIMEOUT)
     except asyncio.CancelledError:
@@ -235,11 +239,14 @@ async def _flush_buffer(chat_id: int, bot, session: Session) -> None:
             chat_id, chunk_count, len(assembled),
         )
 
-    payload = {"input": assembled}
-    if session.history:
-        payload["context_window"] = session.history
-
-    await _dispatch_and_reply(payload, assembled, chat_id, bot, session, chunk_count=chunk_count)
+    lock = store.get_lock(chat_id)
+    async with lock:
+        # Snapshot context_window INSIDE the lock — previous message's push_turn()
+        # completes before we acquire the lock, so history is correct here.
+        payload = {"input": assembled}
+        if session.history:
+            payload["context_window"] = session.history
+        await _dispatch_and_reply(payload, assembled, chat_id, bot, session, chunk_count=chunk_count)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -5,15 +5,21 @@ Commands (calendar):
   calendar_list    -- PROPFIND calendars, list names + URLs
   calendar_create  -- PUT VEVENT to a calendar
   calendar_delete  -- DELETE event by UID
+  calendar_update  -- Fetch + patch + re-PUT VEVENT
 
 Commands (tasks):
   tasks_list       -- PROPFIND VTODO items from tasks calendar
   tasks_create     -- PUT VTODO to tasks calendar
   tasks_complete   -- PATCH VTODO status to COMPLETED
+  tasks_delete     -- DELETE VTODO by UID
 
 Commands (files):
   files_list       -- PROPFIND WebDAV directory
   files_search     -- Nextcloud full-text search (SEARCH endpoint)
+  files_read       -- GET file content
+  files_write      -- PUT file content (--path, --content)
+  files_delete     -- DELETE file
+  files_mkdir      -- MKCOL create directory
 
 Env vars (from nextcloud.env static mount):
   NEXTCLOUD_ADMIN_USER     (e.g. digiant)
@@ -560,6 +566,135 @@ def _files_search_propfind_fallback(query, path):
     return {"status": "ok", "files": files[:50], "count": len(files)}
 
 
+def cmd_files_read(path):
+    """Read (GET) file content from WebDAV."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{_WEBDAV_BASE}{path}"
+    r = requests.get(url, auth=_auth(), timeout=30)
+    if r.status_code != 200:
+        return {"status": "error", "error": f"GET file failed: HTTP {r.status_code}",
+                "url": url, "body": r.text[:300]}
+    return {"status": "ok", "path": path, "content": r.text, "size": len(r.content)}
+
+
+def cmd_files_write(path, content):
+    """Write (PUT) content to a file via WebDAV."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{_WEBDAV_BASE}{path}"
+    r = requests.put(
+        url,
+        headers={"Content-Type": "application/octet-stream"},
+        data=content.encode("utf-8") if isinstance(content, str) else content,
+        auth=_auth(), timeout=30,
+    )
+    if r.status_code not in (200, 201, 204):
+        return {"status": "error", "error": f"PUT file failed: HTTP {r.status_code}",
+                "url": url, "body": r.text[:300]}
+    return {"status": "ok", "path": path, "http_status": r.status_code}
+
+
+def cmd_files_delete(path):
+    """Delete a file via WebDAV."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{_WEBDAV_BASE}{path}"
+    r = requests.delete(url, auth=_auth(), timeout=15)
+    if r.status_code not in (200, 204):
+        return {"status": "error", "error": f"DELETE file failed: HTTP {r.status_code}",
+                "url": url, "body": r.text[:200]}
+    return {"status": "ok", "path": path, "http_status": r.status_code}
+
+
+def cmd_files_mkdir(path):
+    """Create a directory via WebDAV MKCOL."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{_WEBDAV_BASE}{path}"
+    r = requests.request("MKCOL", url, auth=_auth(), timeout=15)
+    if r.status_code not in (200, 201):
+        return {"status": "error", "error": f"MKCOL failed: HTTP {r.status_code}",
+                "url": url, "body": r.text[:200]}
+    return {"status": "ok", "path": path, "http_status": r.status_code}
+
+
+def cmd_calendar_update(uid, calendar="personal", title=None, start=None, end=None, description=None):
+    """Update a calendar event: fetch existing ICS, patch fields, re-PUT."""
+    if not uid or not uid.strip():
+        return {"status": "error", "step": "uid_guard", "error": "uid is required"}
+
+    cal_url, err = _caldav_discover_calendar(calendar)
+    if err:
+        return {"status": "error", **err}
+
+    event_url = f"{cal_url.rstrip('/')}/{uid.strip()}.ics"
+    if event_url.startswith("/"):
+        origin = re.match(r"https?://[^/]+", _NC_URL)
+        event_url = (origin.group(0) if origin else _NC_URL) + event_url
+
+    r_get = requests.get(event_url, auth=_auth(), timeout=15)
+    if r_get.status_code != 200:
+        return {"status": "error", "error": f"GET event failed: HTTP {r_get.status_code}",
+                "url": event_url}
+
+    ics = r_get.text
+    if title:
+        ics = re.sub(r"^SUMMARY:.*$", f"SUMMARY:{title}", ics, flags=re.MULTILINE)
+    if start:
+        start_str = start.replace("-", "").replace(":", "").replace(" ", "T")
+        if "T" not in start_str:
+            start_str += "T000000"
+        ics = re.sub(r"^DTSTART[^:]*:.*$", f"DTSTART:{start_str}", ics, flags=re.MULTILINE)
+    if end:
+        end_str = end.replace("-", "").replace(":", "").replace(" ", "T")
+        if "T" not in end_str:
+            end_str += "T010000"
+        ics = re.sub(r"^DTEND[^:]*:.*$", f"DTEND:{end_str}", ics, flags=re.MULTILINE)
+    if description is not None:
+        if re.search(r"^DESCRIPTION:", ics, re.MULTILINE):
+            ics = re.sub(r"^DESCRIPTION:.*$", f"DESCRIPTION:{description}", ics, flags=re.MULTILINE)
+        else:
+            ics = ics.replace("END:VEVENT", f"DESCRIPTION:{description}\nEND:VEVENT")
+
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ics = re.sub(r"^LAST-MODIFIED:.*$", f"LAST-MODIFIED:{now}", ics, flags=re.MULTILINE)
+    if "LAST-MODIFIED:" not in ics:
+        ics = ics.replace("END:VEVENT", f"LAST-MODIFIED:{now}\nEND:VEVENT")
+
+    r_put = requests.put(
+        event_url,
+        headers={"Content-Type": "text/calendar; charset=utf-8"},
+        data=ics.encode("utf-8"),
+        auth=_auth(), timeout=15,
+    )
+    if r_put.status_code not in (200, 201, 204):
+        return {"status": "error", "error": f"PUT event update failed: HTTP {r_put.status_code}",
+                "body": r_put.text[:200]}
+    return {"status": "ok", "uid": uid, "http_status": r_put.status_code}
+
+
+def cmd_tasks_delete(uid, calendar="tasks"):
+    """Delete a VTODO task by UID."""
+    if not uid or not uid.strip():
+        return {"status": "error", "step": "uid_guard", "error": "uid is required"}
+
+    cal_url, err = _caldav_discover_calendar(calendar)
+    if err:
+        return {"status": "error", **err}
+
+    task_url = f"{cal_url.rstrip('/')}/{uid.strip()}.ics"
+    if task_url.startswith("/"):
+        origin = re.match(r"https?://[^/]+", _NC_URL)
+        task_url = (origin.group(0) if origin else _NC_URL) + task_url
+
+    r = requests.delete(task_url, auth=_auth(), timeout=15)
+    if r.status_code not in (200, 204):
+        return {"status": "error", "error": f"DELETE task failed: HTTP {r.status_code}",
+                "url": task_url, "body": r.text[:200]}
+    return {"status": "ok", "uid": uid, "http_status": r.status_code}
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -568,8 +703,10 @@ def main():
     parser = argparse.ArgumentParser(description="Nextcloud CalDAV + WebDAV operations")
     parser.add_argument("--command", required=True,
                         choices=["calendar_list", "calendar_create", "calendar_delete",
-                                 "tasks_list", "tasks_create", "tasks_complete",
-                                 "files_list", "files_search"])
+                                 "calendar_update",
+                                 "tasks_list", "tasks_create", "tasks_complete", "tasks_delete",
+                                 "files_list", "files_search", "files_read", "files_write",
+                                 "files_delete", "files_mkdir"])
     # Calendar / event params
     parser.add_argument("--title", default="")
     parser.add_argument("--start", default="")
@@ -583,6 +720,7 @@ def main():
     # File params
     parser.add_argument("--path", default="/")
     parser.add_argument("--query", default="")
+    parser.add_argument("--content", default="")
     args = parser.parse_args()
 
     if not _NC_PASS:
@@ -605,10 +743,28 @@ def main():
                                       args.description or None, args.calendar or "tasks")
         elif args.command == "tasks_complete":
             result = cmd_tasks_complete(args.uid, args.calendar or "tasks")
+        elif args.command == "tasks_delete":
+            result = cmd_tasks_delete(args.uid, args.calendar or "tasks")
         elif args.command == "files_list":
             result = cmd_files_list(args.path or "/")
         elif args.command == "files_search":
             result = cmd_files_search(args.query, args.path or "/")
+        elif args.command == "files_read":
+            result = cmd_files_read(args.path)
+        elif args.command == "files_write":
+            result = cmd_files_write(args.path, args.content)
+        elif args.command == "files_delete":
+            result = cmd_files_delete(args.path)
+        elif args.command == "files_mkdir":
+            result = cmd_files_mkdir(args.path)
+        elif args.command == "calendar_update":
+            result = cmd_calendar_update(
+                args.uid, args.calendar,
+                title=args.title or None,
+                start=args.start or None,
+                end=args.end or None,
+                description=args.description or None,
+            )
         else:
             result = {"status": "error", "error": f"Unknown command: {args.command}"}
     except Exception as e:

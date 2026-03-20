@@ -14,9 +14,12 @@ RUN pip install --no-cache-dir /sovereign-a2a
 COPY core/app/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY core/app/. /app/
+# Source code is NOT baked into the image.
+# /app is volume-mounted from RAID at runtime (see compose.yml sovereign-core volumes).
+# Only rebuild when requirements.txt or sovereign-a2a changes.
+# sovereign user uid=999 matches existing RAID audit/security file ownership.
 
-RUN useradd -r -s /bin/false sovereign && chown -R sovereign:sovereign /app
+RUN useradd -r -u 999 -s /bin/false sovereign
 USER sovereign
 
 EXPOSE 8000

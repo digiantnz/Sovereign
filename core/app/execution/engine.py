@@ -59,6 +59,7 @@ INTENT_ACTION_MAP = {
     "research":           {"domain": "ollama", "operation": "query"},
     "web_search":         {"domain": "browser", "operation": "search", "name": "browser_search"},
     "fetch_url":          {"domain": "browser", "operation": "fetch",  "name": "browser_fetch"},
+    "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
     # Memory intents
     "remember_fact":      {"domain": "memory",  "operation": "write"},
     # GitHub intents — devops_agent scope (read also available to research_agent)
@@ -131,6 +132,7 @@ INTENT_TIER_MAP = {
     "list_files": "LOW", "navigate": "LOW", "read_file": "LOW", "search_files": "LOW",
     "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
     "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
+    "read_feed": "LOW",
     "move_email": "MID",
     "list_calendars": "LOW", "list_events": "LOW",
     "delete_event": "MID", "update_event": "MID",
@@ -273,10 +275,24 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     import re as _re
     _url_match = _re.search(r'https?://[^\s"\']+', user_input)
     if _url_match:
-        # If the URL appears alongside a skill install verb, route to skill_install
+        # If the URL appears alongside a skill install/search verb, route to skill_install
         # so lifecycle.search() can fetch the SKILL.md directly from the URL.
+        # Also catches "find/look for/search for skills...check here https://..." patterns.
+        _raw_url = _url_match.group(0).rstrip(".,)")
+        # clawhub.ai is always skill_search — it's a registry/browse page, never a direct SKILL.md
+        # Check this BEFORE _has_skill_verb so "find skill ... clawhub.ai/..." doesn't misroute to install
+        if "clawhub.ai" in _raw_url:
+            _sk_q = user_input[:_url_match.start()].strip()
+            return {
+                "delegate_to": "devops_agent", "intent": "skill_search",
+                "target": _sk_q or user_input, "tier": "LOW",
+                "reasoning_summary": "clawhub.ai URL detected — route to skill_search (JS page, not fetchable)",
+            }
         import re as _re_url_sk
-        _has_skill_verb = _re_url_sk.search(r'\b(install|load|add)\b', u) and "skill" in u
+        _has_skill_verb = (
+            (_re_url_sk.search(r'\b(install|load|add)\b', u) and "skill" in u)
+            or ("skill" in u and _re_url_sk.search(r'\b(find|look|search|browse|candidate)\b', u))
+        )
         if _has_skill_verb:
             return {
                 "delegate_to": "devops_agent", "intent": "skill_install",
@@ -285,7 +301,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             }
         return {
             "delegate_to": "research_agent", "intent": "fetch_url",
-            "target": _url_match.group(0).rstrip(".,)"), "tier": "LOW",
+            "target": _raw_url, "tier": "LOW",
             "reasoning_summary": "Explicit URL detected — deterministic fetch_url",
         }
 
@@ -487,6 +503,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "os update", "system update", "apt", "kernel", "package",
         "as-built", "as built", "memory.md", "governance",
         "browser auth", "auth profile", "auth for", "credentials for",
+        "rss", "rss feed", "feed", "feeds", "news feed", "news stories",
     )
     prior_has_system = prior_domain is not None
 
@@ -505,6 +522,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "right now", "at the moment", "live", "real-time", "real time",
         "current", "currently", "today", "latest", "what is it at", "what's it at",
         "how much is it", "what's the", "what is the", "how is the",
+        "2025", "2026",  # explicit year reference → current-info query
     )
     # Explicit web-search phrases always route direct-to-browser, regardless of time signals.
     # Time signal guard only applies below for implicit live-data queries (no explicit search verb).
@@ -531,13 +549,40 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         }
 
     if not prior_has_system and any(sig in u for sig in _time_signals):
-        return None  # fall through to CEO LLM — likely web_search
+        # Time-sensitive query with no prior system context — route direct to browser/Grok.
+        # DO NOT fall through to CEO LLM: the 8b model misroutes these when email/docker
+        # history is present in context_window.
+        return {
+            "delegate_to": "research_agent", "intent": "web_search",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Time-sensitive query, no prior system context — direct to browser/Grok",
+        }
 
     if not prior_has_system and not any(sig in u for sig in _system_signals):
         return {
             "delegate_to": "research_agent", "intent": "query",
             "target": None, "tier": "LOW",
             "reasoning_summary": "No system domain signals — conversational query",
+        }
+
+    # ── RSS feed — identified as system domain, must reach CEO LLM + PASS 3 ──
+    # DO NOT short-circuit: "research" intent maps to ollama/query (short-circuit path),
+    # which bypasses PASS 3 and the specialist that selects rss-digest via nanobot.
+    # "rss" is already in _system_signals so the conversational guard won't fire.
+    # The safety net below is also exempted for RSS so it falls through to CEO LLM.
+    _rss_kw = (
+        "rss feed", "rss feeds", "my feeds", "my rss", "news feed", "news feeds",
+        "news stories from", "stories from the rss", "latest from my feeds",
+        "what's in my feeds", "whats in my feeds", "from my feeds",
+        "add a feed", "add feed", "subscribe to", "unsubscribe from",
+        "list my feeds", "show my feeds",
+    )
+    _is_rss = "rss" in u or any(w in u for w in _rss_kw)
+    if _is_rss:
+        return {
+            "delegate_to": "research_agent", "intent": "read_feed",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "RSS/feed query — direct nanobot rss-digest dispatch",
         }
 
     # Pronoun-only inputs — resolve against prior domain before pattern matching
@@ -822,6 +867,27 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "target": None, "tier": "LOW",
             "reasoning_summary": "Task pause — deterministic pre-classifier",
         }
+
+    # Safety net: prior context active but no domain keywords matched the current query.
+    # Don't fall through to CEO LLM — the small 8b model re-uses prior context and misroutes.
+    # Exceptions:
+    #   - RSS queries: must reach CEO LLM + PASS 3 so specialist selects rss-digest via nanobot
+    #   - Time signals: route to web_search (browser/Grok) not Ollama
+    if prior_has_system:
+        if _is_rss:
+            pass  # fall through to CEO LLM — PASS 3 needed for rss-digest skill selection
+        elif any(sig in u for sig in _time_signals):
+            return {
+                "delegate_to": "research_agent", "intent": "web_search",
+                "target": user_input, "tier": "LOW",
+                "reasoning_summary": "Time-sensitive query after system context — direct to browser/Grok, bypass CEO LLM",
+            }
+        else:
+            return {
+                "delegate_to": "research_agent", "intent": "query",
+                "target": None, "tier": "LOW",
+                "reasoning_summary": "Prior context active but no domain keywords — safe fallback to conversational query",
+            }
 
     return None   # fall through to CEO LLM
 
@@ -1219,7 +1285,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config"):
+        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds"):
             if action.get("domain") == "ollama":
                 conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
                 conv_text = conv_result.get("response", "")
@@ -1255,6 +1321,12 @@ class ExecutionEngine:
                 # Ollama response is already in Rex's voice — wrap as-is for translator
                 _rft = {"success": True, "outcome": conv_text, "detail": {},
                         "error": None, "next_action": None}
+            elif action.get("domain") == "feeds":
+                # RSS/feed read — direct nanobot dispatch, no LLM planning needed
+                exec_result = await self.nanobot.run("rss-digest", "get_entries", {"limit": 10})
+                if exec_result is None:
+                    exec_result = {"status": "error", "error": "nanobot returned None for rss-digest"}
+                _rft = self._build_result_for_translator(intent, exec_result)
             else:
                 exec_result = await self._dispatch(action, user_input,
                                                    payload={"confirmed": confirmed},
@@ -1545,6 +1617,8 @@ class ExecutionEngine:
             "fetch_email", "search_email", "fetch_message",
             "skill_audit", "skill_search",
             "configure_browser_auth",
+            "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
+            "research",
         })
         # skill_search with no candidates — deterministic result, bypass translator invention
         if intent == "skill_search" and execution_result is not None:
