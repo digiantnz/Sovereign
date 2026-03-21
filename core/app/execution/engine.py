@@ -719,7 +719,21 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "what files", "show me my files",
         "show me the files", "what's on nextcloud", "whats on nextcloud",
         # "what's in" and "whats in" removed — too broad (matches "what's in my fridge" etc.)
+        "how many files", "how many templates", "how many documents", "how many items",
+        "count files", "count templates", "count the files", "count the templates",
+        "recount", "re-count",
     )
+    # "how many X in /path/" — extract path deterministically
+    import re as _re_lk
+    _how_many_path_m = _re_lk.search(r'how many\s+\w+(?:\s+\w+)?\s+(?:are\s+)?(?:in|inside|under)\s+(/[/\w_.\- ]+)', u)
+    if _how_many_path_m:
+        _hm_path = _how_many_path_m.group(1).rstrip().rstrip('/')
+        return {
+            "delegate_to": "business_agent", "intent": "list_files",
+            "target": (_hm_path if _hm_path.startswith("/") else f"/{_hm_path}"),
+            "tier": "LOW",
+            "reasoning_summary": "File count query — deterministic pre-classifier",
+        }
 
     # GitHub — deterministic fast-path for clear read/push intents
     _github_read_kw = (
@@ -1694,6 +1708,11 @@ class ExecutionEngine:
                 "memory_payload": {},
                 "result_for_translator": self._build_result_for_translator(intent, execution_result),
             }
+        # When user has explicitly confirmed (esp. HIGH-tier double-confirm), the orchestrator
+        # LLM cannot override that decision — confirmed=True IS the governance gate.
+        # Prevents spurious PASS 4 rejections on email delete / HIGH-tier ops.
+        if confirmed and orch_eval.get("approved") is False:
+            orch_eval["approved"] = True
         _p4_dur = (_time_mod.monotonic() - _t4_start) * 1000
         self._log_pass(4, "orchestrator_evaluate", sp_in, orch_eval,
                        _p4_dur / 1000)
@@ -1831,6 +1850,25 @@ class ExecutionEngine:
                 _rft["detail"]["count"] = len(_lines)
                 if _uid_index:
                     _rft["detail"]["uid_index"] = _uid_index
+
+        # Pre-format file listings deterministically so the translator cannot miscount.
+        # Items is a list of dicts {name, type, size, last_modified} — convert to numbered string.
+        if intent in ("list_files", "navigate", "list_files_recursive") and isinstance(_rft.get("detail"), dict):
+            _items = _rft["detail"].get("items", [])
+            if isinstance(_items, list):
+                _fl_lines = []
+                for _fi, _it in enumerate(_items, 1):
+                    if isinstance(_it, dict):
+                        _fn  = _it.get("name", "")
+                        _ft  = _it.get("type", "")
+                        _tag = " (folder)" if _ft in ("directory", "folder", "collection") else ""
+                        _fl_lines.append(f"{_fi}. {_fn}{_tag}")
+                    elif isinstance(_it, str):
+                        _fl_lines.append(f"{_fi}. {_it}")
+                _rft = dict(_rft)
+                _rft["detail"] = dict(_rft["detail"])
+                _rft["detail"]["items"] = "\n".join(_fl_lines) if _fl_lines else "(empty)"
+                _rft["detail"]["count"] = len(_fl_lines)
 
         # Sanitise LLM-generated detail: strip internal keys before translator sees them
         _DETAIL_STRIP = frozenset({
@@ -2349,7 +2387,7 @@ class ExecutionEngine:
                     return nb.get("result") if nb.get("result") is not None else nb
                 # Specialist may escalate a generic fetch_email to a targeted fetch_message
                 # when they can identify the sender/subject from the user request.
-                if sp.get("operation") in ("fetch_message", "fetch_message_personal"):
+                if str(sp.get("operation", "")).startswith("fetch_message"):
                     uid       = sp.get("uid", "")
                     from_addr = sp.get("from_addr", "")
                     subject   = sp.get("subject", "")

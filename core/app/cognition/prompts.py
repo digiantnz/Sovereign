@@ -623,6 +623,17 @@ REQUIRED OUTPUT FIELDS for this email MOVE:
   "target_folder": "<IMAP folder name — 'Archive' for archive requests>"
 RULES: target_folder is REQUIRED. uid is the number inside [uid:XXXX] in the email list."""
 
+    elif intent in ("list_files", "navigate", "read_file", "delete_file",
+                    "create_folder", "write_file", "list_files_recursive", "read_files_recursive"):
+        _schema_hint = """REQUIRED OUTPUT FIELD for this file operation:
+  "path": "<EXACT path as stated by the user>"
+RULES:
+- Use EXACTLY the path the user mentioned (e.g. user said "/Templates/" → path = "/Templates/")
+- Do NOT prepend company names, account names, or any other prefix
+- Do NOT assume "/Digiant/", "/home/", "/Projects/", or any other base directory
+- If no specific path was stated, use "/"
+- path MUST start with "/" """
+
     return f"""{agent_persona}
 
 ---
@@ -878,6 +889,10 @@ Rules:
 - EXCEPTION: if detail.messages is already a pre-formatted numbered list string (lines starting
   with "1.", "2.", etc.), output it EXACTLY as-is — do NOT convert to bullets, do NOT reorder,
   do NOT reformat. Prepend only a brief intro line if helpful (e.g. "You have N new messages:").
+- EXCEPTION: if detail.items is already a pre-formatted numbered list string (lines starting
+  with "1.", "2.", etc.), output it EXACTLY as-is with the exact count from detail.count.
+  Do NOT invent file names. Do NOT change the count. Prepend a brief intro line
+  (e.g. "There are N items in /path/:") using the count and path from detail.
 
 Respond with ONLY the plain English message for the Director."""
 
