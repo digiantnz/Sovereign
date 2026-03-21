@@ -318,17 +318,28 @@ def translate_for_director(ceo_agent_persona: str, user_input: str, result: dict
     elif "containers" in r:
         r_summary = {"containers": r["containers"]}
     elif "messages" in r:
+        def _short_date(raw: str) -> str:
+            """Extract readable date from RFC2822 string, e.g. 'Fri, 20 Mar 2026 ...' → '20 Mar'."""
+            import re as _re
+            m = _re.search(r'(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', raw or "")
+            return f"{m.group(1)} {m.group(2)}" if m else (raw[:10] if raw else "")
+        msgs = r["messages"][:10]
+        # Pre-format as numbered lines so the translator includes verbatim without reformatting.
+        # UIDs kept separately for specialist follow-up (fetch by index or subject).
+        lines = []
+        uid_index = {}
+        for i, m in enumerate(msgs, 1):
+            sender  = m.get("from", m.get("sender", "unknown"))
+            subject = m.get("subject", "(no subject)")
+            date    = _short_date(m.get("date", ""))
+            uid     = m.get("uid", "")
+            lines.append(f"{i}. {sender} — {subject} ({date})")
+            if uid:
+                uid_index[str(i)] = uid
         r_summary = {
-            "message_count": len(r["messages"]),
-            # uid + subject preserved — Rex needs uid to fetch body in follow-up turns
-            # Cap raised to 10 so "list all subjects" queries work end-to-end
-            "messages": [
-                {"uid": m.get("uid", ""),
-                 "from": m.get("from", m.get("sender", "unknown")),
-                 "subject": m.get("subject", "(no subject)"),
-                 "date": m.get("date", "")}
-                for m in r["messages"][:10]
-            ],
+            "message_count": len(msgs),
+            "messages": "\n".join(lines),
+            "uid_index": uid_index,  # {list_number: uid} — for follow-up fetch requests
         }
     elif "content" in r:
         # File read result — send path + truncated content (avoid 12KB dumps)
@@ -378,17 +389,6 @@ def translate_for_director(ceo_agent_persona: str, user_input: str, result: dict
         "HIGH": "Urgency language is only appropriate if the result is an error or security block. Otherwise, keep tone calm.",
     }.get(tier, "Do NOT use words like URGENT, ALERT, or WARNING.")
 
-    # Email list format rule — injected only when result contains a messages array.
-    # Prevents the LLM from grouping all senders, then all subjects, then all dates.
-    email_format_rule = (
-        "EMAIL FORMAT RULE: The result contains a list of email messages. "
-        "Present each message on its own line with ALL its details together, in this exact format:\n"
-        "sender — subject (date)\n"
-        "List all messages this way. Do NOT group all senders together, then all subjects, then all dates. "
-        "Each message is one line: sender, then subject, then date — together.\n"
-        if isinstance(r_summary.get("messages"), list) else ""
-    )
-
     iron_rule = (
         "IRON RULE — FAILURE REPORTING: The execution result shows this action FAILED or was not confirmed. "
         "You MUST report this as a failure. Do NOT claim the action succeeded. Do NOT invent a positive outcome. "
@@ -426,7 +426,7 @@ Sovereign Core execution result:
 
 {source_rule}
 {iron_rule}
-{email_format_rule}URGENCY RULE: {urgency_instruction}
+URGENCY RULE: {urgency_instruction}
 Translate this into a single plain English message for the Director.
 Never mention agent names, adapter names, domain names, HTTP codes, or any technical internals — including source tag names like "imap_live" or "qdrant_memory".
 If memory context is present and directly relevant, you may weave it in as background context — clearly as something you already know, not as a live result.
