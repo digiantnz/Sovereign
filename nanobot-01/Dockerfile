@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 RUN mkdir -p /app /workspace /memory /skills
 
 COPY nanobot-01/server.py /app/server.py
+COPY nanobot-01/security.py /app/security.py
 
 WORKDIR /workspace
 
