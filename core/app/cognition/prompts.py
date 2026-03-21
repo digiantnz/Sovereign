@@ -378,6 +378,17 @@ def translate_for_director(ceo_agent_persona: str, user_input: str, result: dict
         "HIGH": "Urgency language is only appropriate if the result is an error or security block. Otherwise, keep tone calm.",
     }.get(tier, "Do NOT use words like URGENT, ALERT, or WARNING.")
 
+    # Email list format rule — injected only when result contains a messages array.
+    # Prevents the LLM from grouping all senders, then all subjects, then all dates.
+    email_format_rule = (
+        "EMAIL FORMAT RULE: The result contains a list of email messages. "
+        "Present each message on its own line with ALL its details together, in this exact format:\n"
+        "sender — subject (date)\n"
+        "List all messages this way. Do NOT group all senders together, then all subjects, then all dates. "
+        "Each message is one line: sender, then subject, then date — together.\n"
+        if isinstance(r_summary.get("messages"), list) else ""
+    )
+
     iron_rule = (
         "IRON RULE — FAILURE REPORTING: The execution result shows this action FAILED or was not confirmed. "
         "You MUST report this as a failure. Do NOT claim the action succeeded. Do NOT invent a positive outcome. "
@@ -415,7 +426,7 @@ Sovereign Core execution result:
 
 {source_rule}
 {iron_rule}
-URGENCY RULE: {urgency_instruction}
+{email_format_rule}URGENCY RULE: {urgency_instruction}
 Translate this into a single plain English message for the Director.
 Never mention agent names, adapter names, domain names, HTTP codes, or any technical internals — including source tag names like "imap_live" or "qdrant_memory".
 If memory context is present and directly relevant, you may weave it in as background context — clearly as something you already know, not as a live result.
