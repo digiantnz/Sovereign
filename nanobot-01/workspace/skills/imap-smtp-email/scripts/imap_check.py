@@ -30,7 +30,11 @@ import sys
 
 
 def _decode_header(value):
-    """Decode a MIME-encoded header value to plain UTF-8 string."""
+    """Decode a MIME-encoded header value to plain UTF-8 string.
+
+    Strips surrogate characters that appear in some emoji-containing subjects
+    and would cause JSON serialisation failures or raw \uXXXX output.
+    """
     if not value:
         return ""
     parts = email.header.decode_header(value)
@@ -40,7 +44,9 @@ def _decode_header(value):
             decoded.append(part.decode(charset or "utf-8", errors="replace"))
         else:
             decoded.append(str(part))
-    return " ".join(decoded).strip()
+    text = " ".join(decoded).strip()
+    # Remove surrogate characters (lone surrogates from malformed UTF-16 email subjects)
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def _strip_html(text):

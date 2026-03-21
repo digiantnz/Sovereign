@@ -414,6 +414,17 @@ def translate_for_director(ceo_agent_persona: str, user_input: str, result: dict
         "Never merge qdrant_memory content with live_adapter content as if they are the same source."
     )
 
+    # Extract pre-formatted email message block before JSON dump so it renders
+    # as literal lines in the prompt rather than a \n-escaped JSON string.
+    email_block = ""
+    if isinstance(r_summary.get("messages"), str):
+        email_block = r_summary.pop("messages")
+
+    email_section = (
+        f"\nEmail messages ({r_summary.get('message_count', '')} total):\n{email_block}\n"
+        if email_block else ""
+    )
+
     return f"""{ceo_agent_persona}
 
 ---
@@ -422,12 +433,13 @@ TASK — DIRECTOR TRANSLATION
 Original request from Director: {_json.dumps(user_input)}
 
 Sovereign Core execution result:
-{_json.dumps(r_summary, indent=2)}{mem_section}
+{_json.dumps(r_summary, indent=2)}{email_section}{mem_section}
 
 {source_rule}
 {iron_rule}
 URGENCY RULE: {urgency_instruction}
 Translate this into a single plain English message for the Director.
+If email messages are listed above, include all of them VERBATIM — do not summarise, reorder, or reformat them.
 Never mention agent names, adapter names, domain names, HTTP codes, or any technical internals — including source tag names like "imap_live" or "qdrant_memory".
 If memory context is present and directly relevant, you may weave it in as background context — clearly as something you already know, not as a live result.
 Apply your communication preferences silently — do NOT explain, list, or reference them.
