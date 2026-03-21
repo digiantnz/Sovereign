@@ -116,6 +116,7 @@ services:
       - ./secrets/browser.env
       - ./secrets/github.env
       - ./secrets/wallet.env
+      - ./secrets/nanobot.env
     environment:
       - SOVEREIGN_KEY_PATH=/run/secrets/sovereign_key
     healthcheck:
@@ -258,6 +259,7 @@ services:
     # Phase 1 credential delegation: static env var mounts (ai_net only, contained risk)
     # Phase 2 will replace these with session-scoped token proxy via sovereign-core
     env_file:
+      - ./secrets/nanobot.env
       - ./secrets/imap-business.env
       - ./secrets/imap-personal.env
       - ./secrets/nextcloud.env

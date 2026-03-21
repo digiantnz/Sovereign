@@ -211,6 +211,7 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | `imap-personal.env` | Personal IMAP/SMTP credentials |
 | `imap-business.env` | Business IMAP/SMTP credentials |
 | `browser.env` | a2a-browser shared secret |
+| `nanobot.env` | nanobot-01 shared secret (X-API-Key) |
 | `wallet.env` | SAFE_ADDRESS, CHAIN_ID, ETH_RPC_*, BTC_RPC_* |
 
 ---
@@ -236,6 +237,7 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | MIP-Fix+S4 | **COMPLETE** | MIP routing hardening (memory_index short-circuit, delegation passthrough, _system_signals); canonical key backfill: 13 keys across wallet/networking/infrastructure/governance domains; tag_high_value_entries() for no-re-embed patching |
 | NC-E2E | **COMPLETE** | Nextcloud end-to-end testing T1→T12 all passing: LAN port binding, trusted domain fix, Grok model update, routing hardening, delete fast-path, PASS 2 skip on confirmed, recursive list/read (T12) |
 | Skill-Search | **COMPLETE** | Full skill search stack fixed: direct httpx for GitHub API, A2A double-nesting, query extraction, translator isolation (skill_md stripped), prior-domain install routing |
+| Skill-Install-Fix | **COMPLETE** | confirmed-continuation bypass fixed: `confirmed=True` now passed via `payload={"confirmed": confirmed}` to `_dispatch_inner`; short-circuit to `lifecycle.load()` works correctly |
 
 Full phase history: `docs/CLAUDE-archive.md`
 

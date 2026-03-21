@@ -973,11 +973,14 @@ class SkillLifecycleManager:
         Advisory is also logged to audit ledger so the Director has a record.
         """
         nanobot_url = os.environ.get("NANOBOT_01_URL", "http://nanobot-01:8080")
+        _nanobot_secret = os.environ.get("NANOBOT_SHARED_SECRET", "")
+        _headers = {"X-API-Key": _nanobot_secret} if _nanobot_secret else {}
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.post(
                     f"{nanobot_url}/translate",
                     json={"content": skill_md_content, "name": name},
+                    headers=_headers,
                 )
             if r.status_code == 200:
                 body = r.json()

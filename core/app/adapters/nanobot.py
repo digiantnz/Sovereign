@@ -39,6 +39,16 @@ NANOBOT_NODES = {
     "nanobot-01": os.environ.get("NANOBOT_01_URL", "http://nanobot-01:8080"),
 }
 
+# Shared secret — must match NANOBOT_SHARED_SECRET in nanobot-01 (secrets/nanobot.env)
+_NANOBOT_SECRET: str = os.environ.get("NANOBOT_SHARED_SECRET", "")
+
+
+def _auth_headers() -> dict:
+    """Return X-API-Key header dict if secret is configured, else empty."""
+    if _NANOBOT_SECRET:
+        return {"X-API-Key": _NANOBOT_SECRET}
+    return {}
+
 # Cached agent cards per node — populated at startup and refreshed on each _forward() response
 _agent_card_cache: dict[str, dict] = {}
 
@@ -285,7 +295,7 @@ class NanobotAdapter:
 
         try:
             async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT) as client:
-                r = await client.get(f"{url}/health")
+                r = await client.get(f"{url}/health", headers=_auth_headers())
             if r.status_code == 200:
                 return {"status": "ok", "node": node, "http_status": r.status_code, **r.json()}
             return {
@@ -415,7 +425,7 @@ class NanobotAdapter:
             return None
         try:
             async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT) as client:
-                r = await client.get(f"{base_url}/capabilities")
+                r = await client.get(f"{base_url}/capabilities", headers=_auth_headers())
             if r.status_code == 200:
                 body = r.json()
                 card = A2AResponse.get_agent_card(body)
@@ -471,7 +481,7 @@ class NanobotAdapter:
 
         try:
             async with httpx.AsyncClient(timeout=TASK_TIMEOUT) as client:
-                r = await client.post(f"{base_url}/run", json=a2a_request)
+                r = await client.post(f"{base_url}/run", json=a2a_request, headers=_auth_headers())
 
             elapsed = round(time.monotonic() - t0, 2)
 

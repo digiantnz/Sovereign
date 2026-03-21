@@ -27,10 +27,12 @@ from typing import Any
 
 import httpx
 import yaml
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sovereign_a2a import A2AMessage, A2AErrorCodes, A2AResponse
+
+import security
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [nanobot-01] %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -1131,7 +1133,7 @@ def _normalise_to_contract(result: dict, request_id: str, skill: str, operation:
 # ---------------------------------------------------------------------------
 
 @app.post("/translate")
-async def translate_skill(req: TranslateRequest):
+async def translate_skill(req: TranslateRequest, _: None = Depends(security.verify_secret)):
     """Translate an external community skill (e.g. OpenClaw format) into Sovereign DSL format.
 
     Called by SkillLifecycleManager.load() when incoming SKILL.md lacks a sovereign: block.
@@ -1211,7 +1213,7 @@ async def health():
 
 
 @app.get("/capabilities")
-async def capabilities():
+async def capabilities(_: None = Depends(security.verify_secret)):
     """Return agent card — sovereign-core calls this on startup to discover loaded skills.
 
     Response is a standard A2A 3.0 success envelope with agent_card in metadata.
@@ -1225,7 +1227,7 @@ async def capabilities():
 
 
 @app.post("/run")
-async def run_task(request: Request):
+async def run_task(request: Request, _: None = Depends(security.verify_secret)):
     """Execute a sovereign skill task.
 
     Accepts both A2A JSON-RPC 3.0 format and legacy flat format:
