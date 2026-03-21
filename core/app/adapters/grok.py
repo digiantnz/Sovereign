@@ -8,7 +8,7 @@ import os
 import httpx
 
 GROK_BASE_URL = "https://api.x.ai/v1"
-DEFAULT_MODEL  = "grok-2-latest"
+DEFAULT_MODEL  = "grok-3"
 TIMEOUT        = 60.0
 
 

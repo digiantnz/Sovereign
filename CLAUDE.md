@@ -174,6 +174,19 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 - **Brave / Bing**: dead letters — both retired 2025/2026
 - `AUTH_PROFILES` in `execution/adapters/browser.py`: host-keyed header sets, auto-attached in `fetch()` — loaded from `secrets/browser.env` + `/home/sovereign/governance/browser-auth-profiles.yaml` at startup
 
+### Nextcloud access
+- LAN direct: `http://172.16.201.25` (port 80, no reverse proxy) — `nextcloud` service, `business_net`
+- Tailscale: `https://sovereign.tail887d2b.ts.net` (via `nextcloud-rp` nginx, ports 80/8443 on 100.111.130.60)
+- `nextcloud` Docker hostname is a trusted domain (added 2026-03-21) — required for nanobot-01 WebDAV access
+- `nextcloud.env` is NOT in sovereign-core env_file — CredentialProxy reads `NEXTCLOUD_ADMIN_USER`/`NEXTCLOUD_ADMIN_PASSWORD` from nanobot-01's static env; `NEXTCLOUD_URL` defaults to `http://nextcloud` in the script
+
+### `_quick_classify` invariants (do not regress)
+- File path guard: `_has_file_path` regex prevents year strings inside paths/content from tripping `_time_signals` → web_search
+- `_infer_prior_domain`: uses word-boundary regex — substring `"mail"` in `"gmail"` must NOT set prior_domain="email"
+- `_is_pronoun_ref`: uses word-boundary regex — substring `"it"` in `"with"` must NOT trigger pronoun resolution
+- File delete fast-path (`_file_delete_kw` + slash-path regex) must remain BEFORE safety-net at line ~935 — without it, delete falls through to `intent: query` and Ollama hallucinates success
+- PASS 2 security skipped when `confirmed=True` — double-confirmation IS the security gate for HIGH tier
+
 ---
 
 ## Sovereign Wallet (Built — Pending First Boot)
@@ -221,6 +234,7 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | OC-S7 | **COMPLETE** | openclaw-nextcloud +6 ops (files_read/write/delete/mkdir, calendar_update, tasks_delete); SKILL.md + checksums updated |
 | MIP-S1+S2 | **COMPLETE** | Memory Index Protocol (ContextKeep v1.2): deterministic key/title generation, two-step retrieve protocol, session audit trail |
 | MIP-Fix+S4 | **COMPLETE** | MIP routing hardening (memory_index short-circuit, delegation passthrough, _system_signals); canonical key backfill: 13 keys across wallet/networking/infrastructure/governance domains; tag_high_value_entries() for no-re-embed patching |
+| NC-E2E | **COMPLETE** | Nextcloud end-to-end testing (NC-T1→T9 all passing): LAN port binding, trusted domain fix, Grok model update, file path guard on time signals, "create a file" write_kw, word-boundary fixes for _infer_prior_domain + _is_pronoun_ref, delete_file fast-path (was hallucinating), PASS 2 skip on confirmed |
 
 Full phase history: `docs/CLAUDE-archive.md`
 

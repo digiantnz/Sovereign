@@ -190,6 +190,8 @@ services:
       redis:
         condition: service_healthy
     networks: [business_net]
+    ports:
+      - "172.16.201.25:80:80"   # Direct LAN access (no reverse proxy)
     env_file: ./secrets/nextcloud.env
     volumes:
       - /home/nextcloud/html:/var/www/html

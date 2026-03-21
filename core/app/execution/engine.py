@@ -251,17 +251,18 @@ def _infer_prior_domain(context_window) -> str | None:
         return None
     turns = context_window if isinstance(context_window, list) else [context_window]
     # Check last 2 turns (most recent signal wins)
+    import re as _re_pd
     for turn in reversed(turns[-2:]):
         combined = (turn.get("user", "") + " " + turn.get("assistant", "")).lower()
-        if any(w in combined for w in ("email", "inbox", "subject", "unread", "sender", "mail")):
+        if _re_pd.search(r'\b(email|inbox|subject|unread|sender|mail)\b', combined):
             return "email"
-        if any(w in combined for w in ("container", "docker", "service", "restarted", "logs")):
+        if _re_pd.search(r'\b(container|docker|service|restarted|logs)\b', combined):
             return "docker"
-        if any(w in combined for w in ("file", "nextcloud", "document", "folder", "webdav")):
+        if _re_pd.search(r'\b(file|nextcloud|document|folder|webdav)\b', combined):
             return "file"
-        if any(w in combined for w in ("calendar", "event", "schedule", "appointment")):
+        if _re_pd.search(r'\b(calendar|event|schedule|appointment)\b', combined):
             return "calendar"
-        if any(w in combined for w in ("skill", "clawhub", "no skills found", "skill search", "candidates")):
+        if _re_pd.search(r'\b(skill|clawhub)\b|no skills found|skill search|candidates', combined):
             return "skills"
     return None
 
@@ -559,10 +560,13 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Explicit web search phrase — deterministic direct-to-browser",
         }
 
-    if not prior_has_system and any(sig in u for sig in _time_signals):
+    import re as _re_fp
+    _has_file_path = bool(_re_fp.search(r"(?:^|\s)/[A-Za-z0-9_./-]+", user_input))
+    if not prior_has_system and any(sig in u for sig in _time_signals) and not _has_file_path:
         # Time-sensitive query with no prior system context — route direct to browser/Grok.
         # DO NOT fall through to CEO LLM: the 8b model misroutes these when email/docker
         # history is present in context_window.
+        # Exception: inputs containing a file path (e.g. /Notes/file.md) are never web searches.
         return {
             "delegate_to": "research_agent", "intent": "web_search",
             "target": user_input, "tier": "LOW",
@@ -597,8 +601,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         }
 
     # Pronoun-only inputs — resolve against prior domain before pattern matching
-    _pronouns = ("they", "them", "those", "these", "it", "that", "all of them", "all of those")
-    _is_pronoun_ref = any(w in u for w in _pronouns) and len(u.split()) <= 12
+    # Use word-boundary regex to avoid substring matches (e.g. "it" inside "with", "that" inside "that's")
+    import re as _re_pr
+    _is_pronoun_ref = bool(_re_pr.search(
+        r'\b(they|them|those|these|it|that|all of them|all of those)\b', u
+    )) and len(u.split()) <= 12
 
     # Email — explicit keyword or pronoun ref when prior domain was email
     _mail_kw = ("email", "emails", "inbox", "my mail", "any mail", "any emails", "messages", "unread", "mailbox", "mailboxes")
@@ -683,7 +690,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
 
     # Nextcloud file operations — deterministic fast-path before LLM
     _write_kw = (
-        "write file", "write a file", "create note", "create a note",
+        "write file", "write a file", "create file", "create a file",
+        "create note", "create a note",
         "create document", "create a document", "save to nextcloud",
         "save a file", "write to nextcloud", "put a file", "new note",
         "new document", "add a note", "make a note", "write note",
@@ -877,6 +885,23 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "business_agent", "intent": "list_files",
             "target": "/", "tier": "LOW",
             "reasoning_summary": "File list — deterministic pre-classifier",
+        }
+
+    _file_delete_kw = (
+        "delete file", "delete the file", "delete a file",
+        "remove file", "remove the file", "remove a file",
+        "delete this file", "delete that file",
+    )
+    # Also catch "delete /path" or "remove /path" patterns (slash-prefixed path)
+    import re as _re_fd
+    _file_delete_path = bool(_re_fd.search(r'\b(delete|remove)\s+/[A-Za-z0-9_./-]+', u))
+    if any(w in u for w in _file_delete_kw) or _file_delete_path or (
+        prior_domain == "file" and any(w in u for w in ("delete", "remove", "trash"))
+    ):
+        return {
+            "delegate_to": "business_agent", "intent": "delete_file",
+            "target": None, "tier": "HIGH",
+            "reasoning_summary": "File delete — deterministic pre-classifier",
         }
 
     # Scheduler — remaining task management intents
@@ -1284,7 +1309,8 @@ class ExecutionEngine:
         # PASS 2 — Conditional security (tier=HIGH only; scanner path already evaluated above)
         # The pre-LLM scanner fires before PASS 1 (injection detection).
         # PASS 2 adds a second LLM-based evaluation for HIGH-tier actions regardless of scanner.
-        if tier == "HIGH" and not _scanner_evaluated and not security_confirmed:
+        # Skip PASS 2 when confirmed=True — explicit user double-confirmation IS the security gate.
+        if tier == "HIGH" and not _scanner_evaluated and not security_confirmed and not confirmed:
             _t_p2 = _time_mod.monotonic()
             try:
                 # Build a minimal scan result for the security agent
