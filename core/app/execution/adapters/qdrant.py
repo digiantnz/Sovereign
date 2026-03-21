@@ -15,12 +15,18 @@ Write permissions enforced per collection. All sovereign writes audited to JSONL
 """
 import asyncio
 import json
+import logging
 import os
 import uuid
 import httpx
 from datetime import datetime, timezone
+
+_log = logging.getLogger(__name__)
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, HnswConfigDiff
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct, HnswConfigDiff,
+    Filter, FieldCondition, MatchValue,
+)
 
 # Collection names
 WORKING      = "working_memory"
@@ -100,6 +106,75 @@ class QdrantAdapter:
                                 json={"model": EMBED_MODEL, "prompt": text})
             r.raise_for_status()
             return r.json()["embedding"]
+
+    async def _generate_key_and_title(
+        self, content: str, mem_type: str, domain: str
+    ) -> tuple[str | None, str | None]:
+        """Generate a deterministic _key and title for a memory entry via a single Ollama call.
+
+        Key format: {type}:{domain}:{slug} — the type and domain prefix is assembled here from
+        known fields so Ollama cannot deviate from it. Only the slug is LLM-generated.
+        Returns (key, title) on success, (None, None) on any failure or timeout.
+        Never raises — promotion must never block on key generation failure.
+        """
+        # Build safe prefix from known fields — strip anything non-alphanumeric/hyphen
+        _type = "".join(c if c.isalnum() or c == "-" else "-" for c in mem_type.lower())[:20].strip("-") or "memory"
+        _dom  = "".join(c if c.isalnum() or c == "-" else "-" for c in domain.lower())[:20].strip("-") or "general"
+        _prefix = f"{_type}:{_dom}:"
+
+        _prompt = (
+            f"Given the memory item below, respond with ONLY valid JSON containing two fields:\n"
+            f"- \"slug\": 2-5 lowercase hyphen-separated words that uniquely and specifically "
+            f"identify this memory item's content (not the category — the specific subject). "
+            f"Only use a-z, 0-9, and hyphens.\n"
+            f"- \"title\": one sentence (max 15 words) summarising the content.\n\n"
+            f"Content: {content[:400]}"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                r = await http.post(
+                    f"{self._ollama_url}/api/generate",
+                    json={
+                        "model": "llama3.1:8b-instruct-q4_K_M",
+                        "prompt": _prompt,
+                        "stream": False,
+                        "format": "json",
+                    },
+                )
+                r.raise_for_status()
+                raw = r.json().get("response", "{}")
+                parsed = json.loads(raw)
+                # Sanitise slug: lowercase, only a-z 0-9 hyphens, collapse multiples
+                _raw_slug = str(parsed.get("slug", "")).lower().strip()
+                slug = "".join(c if c.isalnum() or c == "-" else "-" for c in _raw_slug)
+                # Collapse consecutive hyphens and trim
+                while "--" in slug:
+                    slug = slug.replace("--", "-")
+                slug = slug.strip("-")
+                title = str(parsed.get("title", "")).strip()
+                if slug and 3 <= len(slug) <= 60:
+                    return f"{_prefix}{slug}", title or content[:80]
+                _log.warning(
+                    "key_generation_invalid: Ollama returned unusable slug %r "
+                    "(prefix=%r content_preview=%r)",
+                    slug, _prefix, content[:60],
+                )
+                self._log_audit(
+                    "key_generation_invalid", _prefix.rstrip(":"), "—",
+                    "sovereign-core", content[:120],
+                )
+                return None, None
+        except Exception as _exc:
+            _log.warning(
+                "key_generation_failed: %s — entry will be stored with _no_key=True "
+                "(prefix=%r content_preview=%r)",
+                type(_exc).__name__, _prefix, content[:60],
+            )
+            self._log_audit(
+                "key_generation_failed", _prefix.rstrip(":"), "—",
+                "sovereign-core", content[:120],
+            )
+            return None, None
 
     async def setup(self):
         """Called at startup. Recreates working_memory (ephemeral RAM).
@@ -253,6 +328,25 @@ class QdrantAdapter:
 
         vector = await self._embed(content)
         point_id = str(uuid.uuid4())
+        _now = datetime.now(timezone.utc).isoformat()
+
+        # Key + title generation — sovereign collections only (working_memory is ephemeral)
+        _key_fields: dict = {}
+        if collection in SOVEREIGN_COLLECTIONS:
+            if metadata.get("_key"):
+                # Canonical key explicitly provided — skip LLM, just stamp timestamps
+                _key_fields = {"last_updated": _now}
+            else:
+                _key, _title = await self._generate_key_and_title(
+                    content,
+                    metadata.get("type", collection),
+                    metadata.get("domain", "general"),
+                )
+                if _key:
+                    _key_fields = {"_key": _key, "title": _title, "last_updated": _now}
+                else:
+                    _key_fields = {"_no_key": True, "last_updated": _now}
+
         await self.client.upsert(
             collection_name=collection,
             points=[PointStruct(
@@ -260,8 +354,9 @@ class QdrantAdapter:
                 vector=vector,
                 payload={
                     "content": content,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": _now,
                     **metadata,
+                    **_key_fields,
                 },
             )],
         )
@@ -371,6 +466,20 @@ class QdrantAdapter:
             return False
 
         new_id = str(uuid.uuid4())
+        _now = datetime.now(timezone.utc).isoformat()
+        _key, _title = await self._generate_key_and_title(
+            payload.get("content", ""),
+            payload.get("type", target_collection),
+            payload.get("domain", "general"),
+        )
+        if _key:
+            payload["_key"] = _key
+            payload["title"] = _title
+            payload["last_updated"] = _now
+        else:
+            payload["_no_key"] = True
+            payload["last_updated"] = _now
+
         await self.client.upsert(
             collection_name=target_collection,
             points=[PointStruct(id=new_id, vector=vec, payload=payload)],
@@ -407,6 +516,19 @@ class QdrantAdapter:
                 continue
 
             new_id = str(uuid.uuid4())
+            _now = datetime.now(timezone.utc).isoformat()
+            _key, _title = await self._generate_key_and_title(
+                payload.get("content", ""),
+                mem_type,
+                payload.get("domain", "general"),
+            )
+            if _key:
+                payload["_key"] = _key
+                payload["title"] = _title
+                payload["last_updated"] = _now
+            else:
+                payload["_no_key"] = True
+                payload["last_updated"] = _now
             try:
                 await self.client.upsert(
                     collection_name=mem_type,
@@ -538,6 +660,228 @@ class QdrantAdapter:
             return True
         except Exception:
             return False
+
+    # ── Memory Index Protocol (MIP) ───────────────────────────────────────
+
+    async def startup_migration(self) -> int:
+        """One-time migration: stamp _no_key=True on any sovereign entry missing a _key field.
+
+        Scrolls all 7 sovereign collections, patches payload only — no re-embedding.
+        Idempotent: entries already carrying _key or _no_key are skipped.
+        Returns count of entries patched.
+        """
+        patched = 0
+        for coll in SOVEREIGN_COLLECTIONS:
+            try:
+                offset = None
+                while True:
+                    result, next_offset = await self.client.scroll(
+                        collection_name=coll,
+                        limit=100,
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    for r in result:
+                        payload = dict(r.payload or {})
+                        if "_key" not in payload and not payload.get("_no_key"):
+                            await self.client.set_payload(
+                                collection_name=coll,
+                                payload={"_no_key": True},
+                                points=[r.id],
+                            )
+                            patched += 1
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+            except Exception:
+                pass  # swallow per-collection errors; never crash startup
+        return patched
+
+    async def list_all_keys(self) -> list[dict]:
+        """Return a structured directory of all sovereign memory entries.
+
+        Scrolls all 7 collections. Returns index fields only — no full content.
+        Use retrieve_by_key() for the complete payload.
+        """
+        directory: list[dict] = []
+        for coll in SOVEREIGN_COLLECTIONS:
+            try:
+                offset = None
+                while True:
+                    result, next_offset = await self.client.scroll(
+                        collection_name=coll,
+                        limit=100,
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    for r in result:
+                        payload = dict(r.payload or {})
+                        _raw_key = payload.get("_key")
+                        if payload.get("_no_key"):
+                            key_display = "NO_KEY"
+                        elif _raw_key:
+                            key_display = _raw_key
+                        else:
+                            key_display = None
+                        directory.append({
+                            "collection":   coll,
+                            "point_id":     str(r.id),
+                            "key":          key_display,
+                            "type":         payload.get("type"),
+                            "title":        payload.get("title") or payload.get("content", "")[:120],
+                            "last_updated": payload.get("last_updated") or payload.get("timestamp"),
+                        })
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+            except Exception:
+                pass
+        return directory
+
+    async def retrieve_by_key(self, key: str) -> dict | None:
+        """Exact-key lookup across all 7 sovereign collections.
+
+        Never uses vector search — pure Qdrant payload filter on _key == key.
+        Returns full payload + collection and point_id, or None if not found.
+        """
+        for coll in SOVEREIGN_COLLECTIONS:
+            try:
+                result, _ = await self.client.scroll(
+                    collection_name=coll,
+                    scroll_filter=Filter(
+                        must=[FieldCondition(key="_key", match=MatchValue(value=key))]
+                    ),
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if result:
+                    payload = dict(result[0].payload or {})
+                    return {"collection": coll, "point_id": str(result[0].id), **payload}
+            except Exception:
+                continue
+        return None
+
+    async def seed_static_facts(self, facts: list[dict]) -> int:
+        """Seed high-value static facts into semantic memory with MIP keys.
+
+        Each fact dict: {seed_id, content, domain, key, title, extra_meta (optional)}.
+        - key/title: canonical hardcoded values — passed in metadata so store() skips LLM.
+        - Idempotent via _backfill_seed_id field.
+        - If an existing entry's _key doesn't match the canonical key exactly, deletes and reseeds.
+        Returns count of new or replaced entries written.
+        """
+        written = 0
+        for fact in facts:
+            seed_id = fact.get("seed_id", "")
+            content = fact.get("content", "")
+            domain = fact.get("domain", "general")
+            canonical_key = fact.get("key", "")
+            canonical_title = fact.get("title", content[:80])
+            if not content or not seed_id:
+                continue
+            try:
+                existing, _ = await self.client.scroll(
+                    collection_name=SEMANTIC,
+                    scroll_filter=Filter(
+                        must=[FieldCondition(
+                            key="_backfill_seed_id", match=MatchValue(value=seed_id)
+                        )]
+                    ),
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if existing:
+                    pay = dict(existing[0].payload or {})
+                    stored_key = pay.get("_key", "")
+                    if stored_key == canonical_key:
+                        continue  # Already seeded with correct canonical key — skip
+                    # Wrong key (old generator or prefix change) — delete and re-seed
+                    await self.client.delete(
+                        collection_name=SEMANTIC,
+                        points_selector=[existing[0].id],
+                    )
+
+                metadata = {
+                    "type": "semantic",
+                    "domain": domain,
+                    "source": "static_backfill",
+                    "_backfill_seed_id": seed_id,
+                    "_key": canonical_key,
+                    "title": canonical_title,
+                    **(fact.get("extra_meta") or {}),
+                }
+                await self.store(
+                    content=content,
+                    metadata=metadata,
+                    collection=SEMANTIC,
+                    writer="sovereign-core",
+                )
+                written += 1
+            except Exception:
+                pass  # never block startup on backfill failure
+        return written
+
+    async def tag_high_value_entries(self, patterns: list[dict]) -> int:
+        """Assign canonical MIP keys to existing semantic entries via set_payload().
+
+        No re-embedding — existing vectors are preserved. Idempotent: entries that
+        already have a _key are skipped. Entries are matched by content substring.
+
+        Each pattern dict: {match, key, title}
+        - match: substring that must appear in entry content (case-sensitive)
+        - key:   canonical key to assign (e.g. 'semantic:governance:confirmation_tiers')
+        - title: short title to assign
+        Returns count of entries tagged.
+        """
+        _now = datetime.now(timezone.utc).isoformat()
+        tagged = 0
+        offset = None
+        while True:
+            try:
+                pts, nxt = await self.client.scroll(
+                    collection_name=SEMANTIC,
+                    limit=100,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception as exc:
+                _log.warning("tag_high_value_entries scroll failed: %s", exc)
+                break
+            for p in pts:
+                pay = dict(p.payload or {})
+                if pay.get("_key"):
+                    continue  # already has a valid canonical key — skip
+                content = pay.get("content", "")
+                for pattern in patterns:
+                    if pattern["match"] in content:
+                        try:
+                            await self.client.set_payload(
+                                collection_name=SEMANTIC,
+                                payload={
+                                    "_key": pattern["key"],
+                                    "title": pattern["title"],
+                                    "last_updated": _now,
+                                    "_no_key": None,  # clear migration tombstone if present
+                                },
+                                points=[p.id],
+                            )
+                            self._log_audit(
+                                "tag_high_value", SEMANTIC, str(p.id),
+                                "sovereign-core", f"→ {pattern['key']}"
+                            )
+                            tagged += 1
+                        except Exception as exc:
+                            _log.warning("tag_high_value set_payload failed: %s", exc)
+                        break  # only match first pattern per entry
+            offset = nxt
+            if not nxt:
+                break
+        return tagged
 
     def _can_write(self, writer: str, collection: str) -> bool:
         return writer in WRITE_PERMISSIONS.get(collection, {"sovereign-core"})

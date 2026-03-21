@@ -62,6 +62,9 @@ INTENT_ACTION_MAP = {
     "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
     # Memory intents
     "remember_fact":      {"domain": "memory",  "operation": "write"},
+    # Memory Index Protocol — deterministic directory + exact-key retrieval (MIP v1.2)
+    "memory_list_keys":    {"domain": "memory_index", "operation": "list_keys"},
+    "memory_retrieve_key": {"domain": "memory_index", "operation": "retrieve_key"},
     # GitHub intents — devops_agent scope (read also available to research_agent)
     # Protected operations (PAT modification, repo creation, visibility change) NOT exposed.
     "github_read":          {"domain": "github", "operation": "read",      "name": "github_read"},
@@ -141,6 +144,8 @@ INTENT_TIER_MAP = {
     "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
     "delete_file": "HIGH", "delete_email": "HIGH", "delete_task": "HIGH",
     "remember_fact": "LOW",
+    "memory_list_keys": "LOW",
+    "memory_retrieve_key": "LOW",
     # NOTE: skill_* tiers are governed by governance.json intent_tiers — not hardcoded here
     # Wallet tiers
     "wallet_read_config":     "LOW",
@@ -504,6 +509,12 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "as-built", "as built", "memory.md", "governance",
         "browser auth", "auth profile", "auth for", "credentials for",
         "rss", "rss feed", "feed", "feeds", "news feed", "news stories",
+        "memory index", "memory keys", "memory directory", "list my memories",
+        "list all memories", "show my memories", "show memory",
+        "retrieve memory", "fetch memory key", "get memory key",
+        "what do you remember", "what's in memory", "what is in memory",
+        "eth address", "wallet address", "safe address", "tailscale",
+        "recall", "look up in memory", "retrieve from memory",
     )
     prior_has_system = prior_domain is not None
 
@@ -808,6 +819,36 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Memory/reminder request — deterministic pre-classifier",
         }
 
+    # Memory Index Protocol — list all keys (directory scan, no vector search)
+    _mem_list_kw = (
+        "list my memories", "list all memories", "show my memories",
+        "show memory", "memory keys", "memory index", "memory directory",
+        "what do you remember", "what's in memory", "what is in memory",
+        "eth address", "wallet address", "safe address",
+        "look up in memory", "retrieve from memory",
+    )
+    if any(w in u for w in _mem_list_kw):
+        return {
+            "delegate_to": "memory_agent", "intent": "memory_list_keys",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Memory directory request — MIP deterministic pre-classifier",
+        }
+
+    # Memory Index Protocol — retrieve by exact key
+    _mem_retrieve_kw = (
+        "retrieve memory", "fetch memory key", "get memory key", "retrieve memory key",
+    )
+    if any(w in u for w in _mem_retrieve_kw):
+        # Extract key if present — look for {type}:{domain}:{slug} pattern
+        import re as _re_mip
+        _mip_key_re = _re_mip.search(r"\b([a-z]+:[a-z]+:[a-z][\w-]*)\b", u)
+        _mip_key = _mip_key_re.group(1) if _mip_key_re else None
+        return {
+            "delegate_to": "memory_agent", "intent": "memory_retrieve_key",
+            "target": _mip_key, "tier": "LOW",
+            "reasoning_summary": "Memory key retrieval — MIP deterministic pre-classifier",
+        }
+
     _mkdir_kw = (
         "create a folder", "create folder", "make a folder", "make folder",
         "new folder", "mkdir", "create a directory", "make a directory",
@@ -900,6 +941,7 @@ _AGENT_DEFAULT_INTENT = {
     "devops_agent":   "get_stats",    # was missing — fallthrough caused query→fabrication
     "research_agent": "query",
     "business_agent": "list_files",
+    "memory_agent":   "memory_list_keys",
 }
 
 AUDIT_PATH = "/home/sovereign/audit/memory-promotions.jsonl"
@@ -927,6 +969,9 @@ class ExecutionEngine:
         self.task_scheduler = None
         # FastAPI app.state — injected post-init so collect_all() can include soul_checksum
         self.app_state = None
+        # MIP session tracking — True once memory_list_keys has been dispatched this boot.
+        # Used to flag retrieve_key calls that skipped the mandatory list-first step.
+        self._mip_listed_this_session = False
 
     # ── Direct structured query (/query endpoint) ────────────────────────
     async def handle_request(self, payload):
@@ -1285,7 +1330,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds"):
+        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index"):
             if action.get("domain") == "ollama":
                 conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
                 conv_text = conv_result.get("response", "")
@@ -1329,6 +1374,7 @@ class ExecutionEngine:
                 _rft = self._build_result_for_translator(intent, exec_result)
             else:
                 exec_result = await self._dispatch(action, user_input,
+                                                   delegation={**delegation, "intent": intent},
                                                    payload={"confirmed": confirmed},
                                                    security_confirmed=security_confirmed)
                 _rft = self._build_result_for_translator(intent, exec_result)
@@ -1619,6 +1665,7 @@ class ExecutionEngine:
             "configure_browser_auth",
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "research",
+            "memory_list_keys", "memory_retrieve_key",  # MIP — pass structured index directly
         })
         # skill_search with no candidates — deterministic result, bypass translator invention
         if intent == "skill_search" and execution_result is not None:
@@ -2657,6 +2704,55 @@ class ExecutionEngine:
                 return {"status": "ok", "message": f"Stored: {fact}", "point_id": point_id}
 
             return {"error": f"Unknown memory operation: {op}"}
+
+        if domain == "memory_index":
+            if not self.qdrant:
+                return {"status": "error", "message": "Qdrant not available"}
+            op = action.get("operation")
+
+            if op == "list_keys":
+                directory = await self.qdrant.list_all_keys()
+                self._mip_listed_this_session = True  # Step 1 of MIP completed
+                return {
+                    "status": "ok",
+                    "count": len(directory),
+                    "directory": directory,
+                }
+
+            if op == "retrieve_key":
+                # MIP protocol check: retrieve_key should always follow memory_list_keys.
+                # Log a warning if the list-first step was skipped — do NOT block.
+                if not self._mip_listed_this_session:
+                    import logging as _mip_log
+                    _mip_log.getLogger(__name__).warning(
+                        "MIP protocol: memory_retrieve_key called without a prior "
+                        "memory_list_keys this session — key may be guessed"
+                    )
+                    if self.ledger:
+                        self.ledger.append("mip_protocol_warning", "memory_retrieve_key", {
+                            "warning": "retrieve_key called without prior list_keys this session",
+                            "key_requested": (action.get("key")
+                                              or (delegation or {}).get("target", "")
+                                              or (specialist or {}).get("key", "")),
+                        })
+
+                # Key from action field (set by _quick_classify target extraction),
+                # specialist output, or raw prompt as last resort
+                key = (action.get("key")
+                       or (delegation or {}).get("target")
+                       or (specialist or {}).get("key")
+                       or (prompt or "").strip())
+                if not key:
+                    return {"status": "error", "message": "key required for memory_retrieve_key"}
+                entry = await self.qdrant.retrieve_by_key(key)
+                if entry is None:
+                    return {
+                        "status": "not_found",
+                        "message": f"No memory entry with key '{key}' — use memory_list_keys to browse.",
+                    }
+                return {"status": "ok", "entry": entry}
+
+            return {"error": f"Unknown memory_index operation: {op}"}
 
         if domain == "wallet":
             if name == "wallet_read_config":

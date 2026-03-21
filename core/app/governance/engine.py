@@ -81,6 +81,10 @@ class GovernanceEngine:
                 return rules
             elif operation == 'promote' and rules.get('memory_promote', False):
                 return rules
+        elif domain == 'memory_index':
+            # MIP — directory listing and exact-key retrieval are read-only at LOW tier
+            if operation in ('list_keys', 'retrieve_key') and rules.get('memory_search', False):
+                return rules
         elif domain == 'scheduler':
             # list + recall are read-only (memory_write suffices at LOW tier)
             if operation in ('list', 'recall') and rules.get('memory_write', False):

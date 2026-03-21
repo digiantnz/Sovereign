@@ -65,6 +65,10 @@ devops_agent:
   pause_task          — pause a running scheduled task (MID; target: task_id)
   cancel_task         — cancel and remove a scheduled task (MID; target: task_id)
 
+memory_agent:
+  memory_list_keys    — list ALL entries in sovereign memory as a structured directory (key, type, title, collection, last_updated); ALWAYS call this FIRST before any memory retrieval
+  memory_retrieve_key — fetch the full content of a specific memory entry by its exact key; ONLY call AFTER memory_list_keys has been used to confirm the key exists
+
 research_agent:
   web_search       — search the internet / web for current information, news, or facts requiring live data
   query            — answer, explain, summarise, write up, draft, describe, or discuss using internal knowledge; also greetings, casual conversation, and any meta-instructions about Sovereign itself
@@ -134,6 +138,18 @@ ROUTING RULES:
 - "list tasks", "show tasks", "scheduled tasks", "active tasks", "what's scheduled" → devops_agent, intent=list_tasks (LOW)
 - "pause task", "suspend task" → devops_agent, intent=pause_task (MID; target=task_id)
 - "cancel task", "stop task", "delete task", "remove task" → devops_agent, intent=cancel_task (MID; target=task_id)
+
+MEMORY RETRIEVAL PROTOCOL — MANDATORY:
+When a request requires retrieving a specific known fact from sovereign memory:
+  Step 1: Route to memory_agent, intent=memory_list_keys to get the complete key directory.
+  Step 2: Route to memory_agent, intent=memory_retrieve_key with the exact key from Step 1.
+Rules:
+- NEVER guess or construct a memory key — always list first, then retrieve by exact key.
+- Only use remember_fact / vector search (research_agent, intent=query) for exploratory or
+  associative queries where no specific stored fact is targeted.
+- "what do you know about X", "do you remember X", "look up X in memory", "what's stored about X",
+  "recall X", "retrieve X from memory" → memory_agent, intent=memory_list_keys (Step 1 of 2).
+- After listing, "retrieve memory key <key>" → memory_agent, intent=memory_retrieve_key, target=<key>.
 
 Respond with ONLY this JSON and nothing else:
 {{

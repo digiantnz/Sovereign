@@ -48,6 +48,27 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - `validate()` pass_num check uses `pass_num > 0` guard (avoids false failures on PASS 1 construction)
 - `set_security_clearance()` only accepts: `"cleared"` | `"conditional"` | `"blocked"`
 
+### Memory Index Protocol (MIP)
+- `execution/adapters/qdrant.py` implements ContextKeep v1.2 two-step retrieve pattern
+- Every sovereign collection write (not working_memory) calls `_generate_key_and_title()` → single Ollama call (10s timeout) → stores `_key`, `title`, `last_updated` in payload
+- Key format: `{type}:{domain}:{slug}` — prefix assembled from known fields, only slug is LLM-derived; LLM cannot override type or domain
+- Fallback: Ollama timeout/failure → `_no_key: True` + `last_updated` stored; Python WARNING logged to container logs; `key_generation_failed` entry written to `memory-promotions.jsonl` — never blocks promotion
+- `startup_migration()`: called at boot after `startup_load()`; scrolls all 7 sovereign collections, patches `_no_key: True` on pre-MIP entries (no re-embedding); idempotent
+- `seed_static_facts()`: idempotent high-value backfill; checks `_backfill_seed_id` before writing; if existing entry has wrong key (exact mismatch), deletes and reseeds
+- `tag_high_value_entries(patterns)`: startup scan of semantic collection; matches entries by content substring; assigns `_key`+`title`+`last_updated` via `set_payload()` (no re-embedding); idempotent (already-keyed entries skipped)
+- Soul checksum seed is dynamic — computed from `guardian.get_checksum()` at startup; seed_id `backfill_v1_soul_checksum` is recreated if the checksum changes
+- `list_all_keys()`: scrolls all 7 collections, returns index fields only (`collection`, `point_id`, `key`, `type`, `title`, `last_updated`) — no content, no vector search
+- `retrieve_by_key(key)`: Qdrant payload filter `_key == key` across all 7 collections in order; never touches vector index; returns full payload + collection/point_id, or None
+- Two intents: `memory_list_keys` (LOW, memory_agent) and `memory_retrieve_key` (LOW, memory_agent) — both in `_DIAGNOSTIC_INTENTS`, both in `_system_signals`
+- `_AGENT_DEFAULT_INTENT["memory_agent"] = "memory_list_keys"`
+- Governance: `memory_index` domain added to `governance/engine.py`; gates on `memory_search` permission (already true at LOW)
+- Session tracking: `self._mip_listed_this_session` (bool) on ExecutionEngine; set True on `list_keys` dispatch; checked on `retrieve_key` — violation logs Python WARNING + signed ledger entry (`mip_protocol_warning`), never blocks
+- PASS 1 prompt: `memory_agent` block + `MEMORY RETRIEVAL PROTOCOL — MANDATORY` rule added to `cognition/prompts.py:classify()`
+- MIP payload totals (first boot): 723 legacy entries → `_no_key=True`, 22 new entries → proper `_key`
+- `"eth address"`, `"wallet address"`, `"safe address"`, `"tailscale"` added to both `_system_signals` (passes conversational guard) and `_mem_list_kw` (short-circuits to `memory_list_keys`); "what is my ETH address" now routes correctly
+- `memory_index` domain added to short-circuit tuple at line 1333; full 5-pass loop caused PASS 4 rejection (same pattern as `browser_config`)
+- Short-circuit `else:` branch passes `delegation` to `_dispatch` so `retrieve_key` key extraction works (target field carries the extracted key from `_quick_classify`)
+
 ### Memory dispatch
 - Async memory write via `asyncio.create_task()` — never blocks return path
 - Prospective memory confirmation gate: for mutating intents (`create_event`, `create_task`, `write_file`, `send_email`, `delete_file`, `delete_email`, `delete_task`, `restart_container`, `create_folder`) — `execution_confirmed` stamped from actual HTTP status code; never from LLM assertion

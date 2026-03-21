@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from governance.engine import GovernanceEngine
@@ -73,6 +74,171 @@ async def lifespan(app: FastAPI):
     qdrant = QdrantAdapter()
     await qdrant.setup()
     await qdrant.startup_load()
+
+    # ── Step 2a: Memory Index Protocol — startup migration
+    # Stamps _no_key=True on any pre-MIP sovereign entry lacking a _key field.
+    # Idempotent — already-tagged entries are skipped. No re-embedding.
+    _mip_migrated = await qdrant.startup_migration()
+    if _mip_migrated:
+        logger.info("MIP startup_migration: patched %d legacy entries with _no_key=True", _mip_migrated)
+    else:
+        logger.info("MIP startup_migration: all sovereign entries already tagged")
+
+    # ── Step 2b: High-value static fact backfill (idempotent — checks _backfill_seed_id)
+    _sovereign_lan_ip = os.environ.get("SOVEREIGN_LAN_IP", "")
+    _static_facts = [
+        {
+            "seed_id": "backfill_v1_wallet_eth_address",
+            "key": "semantic:wallet:eth_address",
+            "title": "Sovereign ETH wallet owner address (EOA)",
+            "content": (
+                "Sovereign ETH wallet owner address: 0x50BF8f009ECC10DB65262c65d729152e989A9323. "
+                "This is the externally-owned account (EOA) that owns the Safe multisig."
+            ),
+            "domain": "wallet",
+        },
+        {
+            "seed_id": "backfill_v1_safe_contract",
+            "key": "semantic:wallet:safe_contract_address",
+            "title": "Safe multisig contract address (2-of-3)",
+            "content": (
+                "Safe multisig contract address: 0x50BF8f009ECC10DB65262c65d729152e989A9323. "
+                "Threshold 2-of-3. Used for all significant on-chain transactions requiring "
+                "multi-party approval."
+            ),
+            "domain": "wallet",
+        },
+        {
+            "seed_id": "backfill_v1_tailscale_ip",
+            "key": "semantic:networking:tailscale_ip",
+            "title": "Sovereign host Tailscale IP address",
+            "content": (
+                "Sovereign host Tailscale IP: 100.111.130.60. "
+                "This is the Tailscale network address for secure remote access."
+            ),
+            "domain": "networking",
+        },
+        {
+            "seed_id": "backfill_v1_tailscale_hostname",
+            "key": "semantic:networking:tailscale_hostname",
+            "title": "Sovereign Tailscale hostname for Nextcloud and admin access",
+            "content": (
+                "Sovereign Tailscale hostname: sovereign.tail887d2b.ts.net. "
+                "This is the external DNS hostname used to access Nextcloud and admin operations."
+            ),
+            "domain": "networking",
+        },
+        {
+            "seed_id": "backfill_v1_node04_ip",
+            "key": "semantic:networking:node04_ip",
+            "title": "node04 external services host IP and ports",
+            "content": (
+                "node04 IP: 172.16.201.4 (VLAN 172.16.201.0/24). "
+                "Hosts a2a-browser (port 8001) and a2a-whisper (port 8003). "
+                "All external web egress from sovereign-core routes through node04."
+            ),
+            "domain": "networking",
+        },
+        {
+            "seed_id": "backfill_v1_nextcloud_url",
+            "key": "semantic:networking:nextcloud_url",
+            "title": "Nextcloud URL and access endpoints",
+            "content": (
+                "Nextcloud URL: https://sovereign.tail887d2b.ts.net (Tailscale, port 443/8443). "
+                "Internal service name: nextcloud (business_net). "
+                "WebDAV and CalDAV are the primary interfaces used by sovereign-core."
+            ),
+            "domain": "networking",
+        },
+        {
+            "seed_id": "backfill_v1_ollama_endpoint",
+            "key": "semantic:infrastructure:ollama_endpoint",
+            "title": "Ollama endpoint and active models",
+            "content": (
+                "Ollama endpoint: http://ollama:11434 (ai_net). "
+                "Primary model: llama3.1:8b-instruct-q4_K_M on RTX 3060 Ti (8 GB VRAM). "
+                "Also has mistral:7b installed. Embedding model: nomic-embed-text (768-dim)."
+            ),
+            "domain": "infrastructure",
+        },
+        {
+            "seed_id": "backfill_v1_qdrant_endpoint",
+            "key": "semantic:infrastructure:qdrant_endpoint",
+            "title": "Qdrant endpoint and sovereign collections",
+            "content": (
+                "Qdrant endpoint: http://qdrant:6333 (ai_net). "
+                "7 sovereign RAID-backed collections + ephemeral working_memory. "
+                "Vector dimensions: 768 (nomic-embed-text). "
+                "Collections: semantic, episodic, prospective, procedural, "
+                "associative, relational, meta."
+            ),
+            "domain": "infrastructure",
+        },
+    ]
+    if _sovereign_lan_ip:
+        _static_facts.append({
+            "seed_id": "backfill_v1_sovereign_lan_ip",
+            "key": "semantic:networking:sovereign_lan_ip",
+            "title": "Sovereign host LAN IP address",
+            "content": (
+                f"Sovereign host LAN IP: {_sovereign_lan_ip}. "
+                "Primary internal network address of the machine running Docker Compose."
+            ),
+            "domain": "networking",
+        })
+    # Governance — soul checksum (dynamic: updated each boot if changed)
+    if soul_checksum:
+        _static_facts.append({
+            "seed_id": "backfill_v1_soul_checksum",
+            "key": "semantic:governance:soul_checksum",
+            "title": "Sovereign soul document SHA256 checksum",
+            "content": (
+                f"Sovereign-soul.md SHA256 checksum: {soul_checksum}. "
+                "This is the integrity fingerprint of the sovereign identity document. "
+                "The soul-guardian verifies this on every boot. "
+                "If the checksum changes, a governance alert is raised."
+            ),
+            "domain": "governance",
+        })
+    # Wallet — BTC xpub placeholder (wallet pending first-boot key derivation)
+    _static_facts.append({
+        "seed_id": "backfill_v1_btc_xpub",
+        "key": "semantic:wallet:btc_xpub",
+        "title": "Bitcoin BIP-32 xpub (pending wallet first boot)",
+        "content": (
+            "Bitcoin BIP-32 xpub key: not yet derived. "
+            "The sov-wallet container derives the xpub from the BIP-39 seed on first boot. "
+            "Run `docker compose up sov-wallet` to initialise. "
+            "The xpub will be available via `get_btc_xpub` intent after initialisation."
+        ),
+        "domain": "wallet",
+    })
+    _backfilled = await qdrant.seed_static_facts(_static_facts)
+    if _backfilled:
+        logger.info("MIP static backfill: %d high-value facts seeded with proper keys", _backfilled)
+
+    # ── Step 2c: Tag existing high-value semantic entries with canonical MIP keys
+    # Uses set_payload() — no re-embedding. Idempotent (already-keyed entries skipped).
+    _tag_patterns = [
+        {
+            "match": "Governance tiers enforce confirmation gates:",
+            "key": "semantic:governance:confirmation_tiers",
+            "title": "Sovereign governance tier confirmation gate definitions (LOW/MID/HIGH)",
+        },
+        {
+            "match": "Implementation of Sovereign Secure Signing",
+            "key": "semantic:governance:ed25519_signing",
+            "title": "Ed25519 keypair and signing adapter implementation",
+        },
+        {
+            "match": "Sovereign-soul.md (identity document) is distinct from CEO_SOUL.md",
+            "key": "semantic:governance:soul_document",
+            "title": "Sovereign-soul.md identity document vs CEO_SOUL.md persona document",
+        },
+    ]
+    _tagged = await qdrant.tag_high_value_entries(_tag_patterns)
+    if _tagged:
+        logger.info("MIP stage-4 tagging: %d existing entries assigned canonical keys", _tagged)
 
     # Seed durable procedural entries (idempotent — no-op if already present)
     _skill_seeded = await qdrant.seed_skill_install_procedure()
