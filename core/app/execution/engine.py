@@ -1513,6 +1513,7 @@ class ExecutionEngine:
                     action, None,
                     delegation={**delegation, "intent": intent},
                     specialist=sp_out,
+                    payload={"confirmed": confirmed},
                     security_confirmed=security_confirmed,
                 ),
                 timeout=_PASS_TIMEOUT * 3,  # nanobot scripts can be slow
