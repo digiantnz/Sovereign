@@ -752,6 +752,9 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _skill_install_match = (
         any(w in u for w in _skill_install_kw)
         or bool(_re_sk_pre.search(r"\b(install|load|add)\b.{0,40}\bskill\b", u))
+        # After a skill search, "install <name>" / "load <name>" routes to skill_install
+        # even without the word "skill" — the prior_domain context makes the intent clear.
+        or (prior_domain == "skills" and bool(_re_sk_pre.search(r"\b(install|load|add)\b\s+\S", u)))
     )
     if _skill_install_match:
         import re as _re_sk_i
@@ -793,7 +796,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             r"(clawhub|skill registry|search for skills?|find a? ?skills?|look for skills?|browse skills?)",
             "", u, flags=_re_sk.IGNORECASE
         ).strip(" :,")
-        # Strip leading filler words: "on", "for", "about", "a", "an", "the", "me", "some"
+        # Strip action verb phrases left after removing trigger keywords
+        _q = _re_sk.sub(r"^\s*(search\s+for|look\s+for|find|browse|get|show\s+me)\s+", "", _q, flags=_re_sk.IGNORECASE).strip()
+        # Strip trailing source refs: "on clawhub", "from clawhub", "on the registry"
+        _q = _re_sk.sub(r"\s+(on|from|at|in)\s+(clawhub|the\s+registry|github).*$", "", _q, flags=_re_sk.IGNORECASE).strip()
+        # Strip leading/trailing filler words
         _q = _re_sk.sub(r"^\s*(on|for|about|a|an|the|me|some)\s+", "", _q).strip()
         return {
             "delegate_to": "devops_agent", "intent": "skill_search",
