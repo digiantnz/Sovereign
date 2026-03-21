@@ -629,6 +629,21 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     email_context = any(w in u for w in _mail_kw) or (_is_pronoun_ref and prior_domain == "email")
     if email_context:
         account = "business" if "business" in u else "personal" if "personal" in u else None
+        # If account not explicit in user_input, infer from context_window (e.g. user just
+        # checked business email → follow-up "delete X" / "read X" should use business).
+        if account is None and context_window:
+            for _cw_turn in reversed((context_window or [])[-6:]):
+                _cw_text = ""
+                if isinstance(_cw_turn, dict):
+                    _cw_text = (_cw_turn.get("user", "") + " " + _cw_turn.get("assistant", "")).lower()
+                elif isinstance(_cw_turn, str):
+                    _cw_text = _cw_turn.lower()
+                if any(s in _cw_text for s in ("business email", "business inbox", "check my business", "my business")):
+                    account = "business"
+                    break
+                if any(s in _cw_text for s in ("personal email", "personal inbox", "check my personal", "my personal")):
+                    account = "personal"
+                    break
         if any(w in u for w in _folder_kw):
             return {
                 "delegate_to": "business_agent", "intent": "list_folders",
@@ -658,6 +673,22 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "delegate_to": "business_agent", "intent": "search_email",
                 "target": account, "tier": "LOW",
                 "reasoning_summary": "Email search — deterministic pre-classifier",
+            }
+        # Specific email read — "read the email from X", "open the email from X", etc.
+        # Must come BEFORE fetch_email fallback or the LLM defaults to inbox listing.
+        _read_specific_kw = (
+            "read the email from", "read the message from",
+            "open the email from", "open the message from",
+            "show me the email from", "show the email from",
+            "what does the email from", "what did the email from",
+            "read that email from", "read an email from",
+            "read the email about", "open the email about",
+        )
+        if any(kw in u for kw in _read_specific_kw):
+            return {
+                "delegate_to": "business_agent", "intent": "fetch_message",
+                "target": account, "tier": "LOW",
+                "reasoning_summary": "Specific email read — deterministic pre-classifier",
             }
         return {
             "delegate_to": "business_agent", "intent": "fetch_email",
@@ -1357,7 +1388,10 @@ class ExecutionEngine:
             if rules.get("requires_double_confirmation"):
                 return {
                     "requires_double_confirmation": True,
-                    "pending_delegation": {**delegation, "intent": intent},
+                    # _original_request preserved so specialist_outbound on confirmed
+                    # continuation gets the real request ("delete X"), not "yes".
+                    "pending_delegation": {**delegation, "intent": intent,
+                                           "_original_request": user_input},
                     "summary": user_input,
                     "confidence": round(confidence, 3),
                     "gaps": gaps,
@@ -1365,7 +1399,8 @@ class ExecutionEngine:
             if rules.get("requires_confirmation"):
                 return {
                     "requires_confirmation": True,
-                    "pending_delegation": {**delegation, "intent": intent},
+                    "pending_delegation": {**delegation, "intent": intent,
+                                           "_original_request": user_input},
                     "summary": user_input,
                     "confidence": round(confidence, 3),
                     "gaps": gaps,
@@ -1491,9 +1526,13 @@ class ExecutionEngine:
         if _confirmed_continuation:
             sp_out = {}
         else:
+            # When the user confirmed a pending action (e.g. said "yes" to delete),
+            # use the original request text — not "yes" — so the specialist has enough
+            # context to build uid/from_addr/subject etc.
+            _sp_user_input = delegation.get("_original_request") or user_input
             try:
                 sp_out = await _asyncio.wait_for(
-                    self.cog.specialist_outbound(agent, delegation, user_input,
+                    self.cog.specialist_outbound(agent, delegation, _sp_user_input,
                                                  context_window=context_window),
                     timeout=_PASS_TIMEOUT,
                 )
