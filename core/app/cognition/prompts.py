@@ -594,7 +594,11 @@ REQUIRED OUTPUT FIELDS for this email operation:
   "operation": "fetch_unread_personal" / "fetch_unread" (list inbox) or "fetch_message_personal" / "fetch_message" (specific)
   "account": "personal" or "business"
 - Use personal/business suffix on operation to match account.
-- For fetch_message: also include "from_addr" (sender display name) and/or "subject" keyword.
+- Use "fetch_message_personal" (or "fetch_message" for business) when Director asks about a SPECIFIC email
+  (e.g. "read the X email", "what does Y say", "show me the email from Z").
+- Use "fetch_unread_personal" only when Director wants to list/check the inbox with no specific email in mind.
+- For fetch_message: include "from_addr" (sender display name only — e.g. "Metalheadz", "AliExpress")
+  and/or "subject" keyword. Also extract uid from [uid:XXXX] tag in context if present.
 - Never output a file/Nextcloud operation for email intents."""
 
     elif intent == "delete_email":
@@ -602,21 +606,22 @@ REQUIRED OUTPUT FIELDS for this email operation:
 REQUIRED OUTPUT FIELDS for this email DELETE:
   "operation": "delete_message_personal" (personal) or "delete_message" (business)
   "account": "personal" or "business" — infer from context; if not stated use "personal"
-  "uid": "<UID from uid_index in recent context if available, else empty string>"
-  "from_addr": "<sender DISPLAY NAME as shown in the email list — e.g. 'AliExpress', 'Uber Receipts'>. Do NOT invent an email address."
-  "subject": "<keyword from subject — e.g. 'You have messages', 'Your receipt'>"
-RULES: Use uid from uid_index when available (most reliable). from_addr is the display name, NOT a guessed email address."""
+  "uid": "<extract from [uid:XXXX] tag in the email list context — this is the IMAP UID>"
+  "from_addr": "<sender DISPLAY NAME only — e.g. 'Ladbrokes', 'AliExpress'. NOT the email address.>"
+  "subject": "<keyword from subject — e.g. 'everyone will be a winner', 'Your receipt'>"
+RULES: uid is the number inside [uid:XXXX] in the email list. If uid is available, from_addr/subject
+are backup only. from_addr is the name before the dash in the list, NOT a guessed email address."""
 
     elif intent == "move_email":
         _schema_hint = """
 REQUIRED OUTPUT FIELDS for this email MOVE:
   "operation": "move_message_personal" (personal) or "move_message" (business)
   "account": "personal" or "business" — infer from context; if not stated use "personal"
-  "uid": "<UID from uid_index in recent context if available, else empty string>"
-  "from_addr": "<sender DISPLAY NAME as shown in the email list>"
+  "uid": "<extract from [uid:XXXX] tag in the email list context>"
+  "from_addr": "<sender DISPLAY NAME only — e.g. 'Uber Receipts', 'Trade Me'>"
   "subject": "<keyword from subject>"
   "target_folder": "<IMAP folder name — 'Archive' for archive requests>"
-RULES: target_folder is REQUIRED. Use uid from uid_index when available."""
+RULES: target_folder is REQUIRED. uid is the number inside [uid:XXXX] in the email list."""
 
     return f"""{agent_persona}
 
@@ -867,9 +872,12 @@ Rules:
 - No preamble ("Here is the message:", "Translation:", etc.).
 - No trailing meta-commentary. No parenthetical notes. No "(Note: ...)" or "(I've followed...)" or any self-referential commentary about your own output.
 - If detail contains raw output fields (output, content, stdout, logs, containers, lines, items,
-  files, events, messages, stats, hardware, text): render that data directly. Present multi-line
-  text verbatim. Present lists as concise bullets. Do NOT collapse into a summary sentence —
-  the Director asked for the actual output.
+  files, events, messages, stats, hardware, text, body): render that data directly. Present
+  multi-line text verbatim. Present lists as concise bullets. Do NOT collapse into a summary
+  sentence — the Director asked for the actual output.
+- EXCEPTION: if detail.messages is already a pre-formatted numbered list string (lines starting
+  with "1.", "2.", etc.), output it EXACTLY as-is — do NOT convert to bullets, do NOT reorder,
+  do NOT reformat. Prepend only a brief intro line if helpful (e.g. "You have N new messages:").
 
 Respond with ONLY the plain English message for the Director."""
 

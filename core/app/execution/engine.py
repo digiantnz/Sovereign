@@ -1808,14 +1808,21 @@ class ExecutionEngine:
                     )
                     return f"{_m.group(1)} {_m.group(2)}" if _m else (raw[:10] if raw else "")
 
+                def _display_name(full_from: str) -> str:
+                    """Extract 'Name' from 'Name <email@addr>'; return full string if no brackets."""
+                    _mn = _re_date.match(r'^"?([^"<]+?)"?\s*<[^>]+>$', (full_from or "").strip())
+                    return _mn.group(1).strip() if _mn else (full_from or "unknown")
+
                 _lines = []
                 _uid_index: dict[str, str] = {}
                 for _i, _em in enumerate(_msgs[:10], 1):
-                    _sender  = _em.get("from", _em.get("sender", "unknown"))
+                    _sender  = _display_name(_em.get("from", _em.get("sender", "")))
                     _subject = _em.get("subject", "(no subject)")
                     _date    = _short_date(_em.get("date", ""))
                     _uid     = str(_em.get("uid", ""))
-                    _lines.append(f"{_i}. {_sender} — {_subject} ({_date})")
+                    # Embed UID in the line so specialist_outbound can read it from context_window
+                    _uid_tag = f" [uid:{_uid}]" if _uid else ""
+                    _lines.append(f"{_i}. {_sender} — {_subject} ({_date}){_uid_tag}")
                     if _uid:
                         _uid_index[str(_i)] = _uid
                 _rft = dict(_rft)
@@ -2342,7 +2349,7 @@ class ExecutionEngine:
                     return nb.get("result") if nb.get("result") is not None else nb
                 # Specialist may escalate a generic fetch_email to a targeted fetch_message
                 # when they can identify the sender/subject from the user request.
-                if sp.get("operation") == "fetch_message":
+                if sp.get("operation") in ("fetch_message", "fetch_message_personal"):
                     uid       = sp.get("uid", "")
                     from_addr = sp.get("from_addr", "")
                     subject   = sp.get("subject", "")

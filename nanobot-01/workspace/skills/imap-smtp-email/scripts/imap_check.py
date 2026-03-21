@@ -345,14 +345,36 @@ def cmd_mark(mail, mailbox, uid, flag, add):
             "action": "added" if add else "removed"}
 
 
+def _parse_from_addr(from_addr):
+    """Parse 'Display Name <email@addr>' into (display_name, email_addr).
+
+    Returns the original string as display_name if not in RFC2822 format.
+    Also strips [uid:XXXX] tags that specialist may pass from context.
+    """
+    # Strip [uid:...] tags that specialist might accidentally include
+    from_addr = re.sub(r'\[uid:\d+\]', '', from_addr).strip()
+    m = re.match(r'^"?([^"<]*?)"?\s*<([^>]+)>\s*$', from_addr)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return from_addr, ""
+
+
 def _resolve_uid(mail, mailbox, uid, from_addr, subject):
     """Resolve a UID from direct uid or search-then-resolve via from_addr/subject.
+
+    Tries multiple IMAP search strategies when from_addr is in 'Name <email>' format:
+    1. Display name only (FROM "Ladbrokes")
+    2. Email address only (FROM "info@email.ladbrokes.com")
+    3. Subject keyword fallback
 
     Returns (uid_str, error_dict_or_None).
     """
     uid = (uid or "").strip()
     if uid:
         return uid, None
+
+    from_addr = (from_addr or "").strip()
+    subject   = (subject or "").strip()
 
     if not from_addr and not subject:
         return None, {"status": "error", "error": "uid, from_addr, or subject required"}
@@ -371,22 +393,38 @@ def _resolve_uid(mail, mailbox, uid, from_addr, subject):
             return []
         return d[0].decode("ascii", errors="replace").split() if d[0] else []
 
-    criteria = []
-    if from_addr:
-        criteria += ["FROM", _q(from_addr)]
-    if subject:
-        criteria += ["SUBJECT", _q(subject)]
+    display_name, email_addr = _parse_from_addr(from_addr) if from_addr else ("", "")
 
-    uid_list = _search(criteria)
-    if not uid_list and subject and not from_addr:
-        uid_list = _search(["FROM", _q(subject)])
-    if not uid_list and from_addr and subject:
+    uid_list = []
+
+    # Strategy 1: display name + subject (most specific)
+    if display_name and subject:
+        uid_list = _search(["FROM", _q(display_name), "SUBJECT", _q(subject)])
+
+    # Strategy 2: display name only
+    if not uid_list and display_name:
+        uid_list = _search(["FROM", _q(display_name)])
+
+    # Strategy 3: email address only (when Name <addr> parsing succeeded)
+    if not uid_list and email_addr:
+        uid_list = _search(["FROM", _q(email_addr)])
+
+    # Strategy 4: full original from_addr string (last resort before subject-only)
+    if not uid_list and from_addr and from_addr not in (display_name, email_addr):
         uid_list = _search(["FROM", _q(from_addr)])
-        if not uid_list:
-            uid_list = _search(["SUBJECT", _q(subject)])
+
+    # Strategy 5: subject only
+    if not uid_list and subject:
+        uid_list = _search(["SUBJECT", _q(subject)])
 
     if not uid_list:
-        return None, {"status": "error", "error": "No message found matching the search criteria"}
+        return None, {
+            "status": "error",
+            "error": (
+                f"No message found matching from_addr={from_addr!r} subject={subject!r}. "
+                "Verify the sender name matches the inbox listing."
+            ),
+        }
 
     return uid_list[-1], None
 
