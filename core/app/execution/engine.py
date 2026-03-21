@@ -40,11 +40,13 @@ INTENT_ACTION_MAP = {
     "get_stats":          {"domain": "docker", "operation": "read",    "name": "docker_stats"},
     "restart_container":  {"domain": "docker", "operation": "restart", "name": "docker_restart"},
     # Business agent intents
-    "list_files":         {"domain": "webdav", "operation": "read",    "name": "file_list"},
-    "read_file":          {"domain": "webdav", "operation": "read",    "name": "file_read"},
-    "write_file":         {"domain": "webdav", "operation": "write",   "name": "file_write"},
-    "delete_file":        {"domain": "webdav", "operation": "delete",  "name": "file_delete"},
-    "create_folder":      {"domain": "webdav", "operation": "mkdir",   "name": "folder_create"},
+    "list_files":           {"domain": "webdav", "operation": "read",    "name": "file_list"},
+    "read_file":            {"domain": "webdav", "operation": "read",    "name": "file_read"},
+    "write_file":           {"domain": "webdav", "operation": "write",   "name": "file_write"},
+    "delete_file":          {"domain": "webdav", "operation": "delete",  "name": "file_delete"},
+    "create_folder":        {"domain": "webdav", "operation": "mkdir",   "name": "folder_create"},
+    "list_files_recursive": {"domain": "webdav", "operation": "read",    "name": "file_list_recursive"},
+    "read_files_recursive": {"domain": "webdav", "operation": "read",    "name": "file_read_recursive"},
     "fetch_email":        {"domain": "mail",   "operation": "read",    "name": "mail_fetch_unread"},
     "search_email":       {"domain": "mail",   "operation": "search",  "name": "mail_search"},
     "move_email":         {"domain": "mail",   "operation": "move",    "name": "mail_move"},
@@ -133,6 +135,7 @@ INTENT_TIER_MAP = {
     "apt_check": "LOW", "systemctl_status": "LOW", "journalctl": "LOW",
     "list_containers": "LOW", "get_logs": "LOW", "get_stats": "LOW",
     "list_files": "LOW", "navigate": "LOW", "read_file": "LOW", "search_files": "LOW",
+    "list_files_recursive": "LOW", "read_files_recursive": "LOW",
     "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
     "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
     "read_feed": "LOW",
@@ -885,6 +888,33 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "business_agent", "intent": "list_files",
             "target": "/", "tier": "LOW",
             "reasoning_summary": "File list — deterministic pre-classifier",
+        }
+
+    _recursive_list_kw = (
+        "list files recursively", "list all files", "list recursively",
+        "recursive list", "recursive file list", "all files in",
+        "show all files", "show files recursively",
+    )
+    _recursive_read_kw = (
+        "read all files", "read files recursively", "read recursively",
+        "read the folder", "read all notes", "read everything in",
+        "ingest all files", "ingest folder", "read all files in",
+    )
+    if any(w in u for w in _recursive_read_kw) or (
+        ("read" in u or "ingest" in u) and "recursive" in u
+    ):
+        return {
+            "delegate_to": "business_agent", "intent": "read_files_recursive",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Recursive file read — deterministic pre-classifier",
+        }
+    if any(w in u for w in _recursive_list_kw) or (
+        ("list" in u or "show" in u) and "recursive" in u
+    ):
+        return {
+            "delegate_to": "business_agent", "intent": "list_files_recursive",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Recursive file list — deterministic pre-classifier",
         }
 
     _file_delete_kw = (
@@ -1685,6 +1715,7 @@ class ExecutionEngine:
             "read_host_file", "get_compose", "inspect_container", "systemctl_status",
             "journalctl", "apt_check", "github_read",
             "list_files", "read_file", "navigate", "search_files",
+            "list_files_recursive", "read_files_recursive",
             "list_events", "list_calendars", "list_tasks", "recall_last_briefing",
             "fetch_email", "search_email", "fetch_message",
             "skill_audit", "skill_search",
@@ -2086,6 +2117,14 @@ class ExecutionEngine:
                 return await self.webdav.write(path, content)
             if name == "file_delete":
                 return await self.webdav.delete(path)
+            if name == "file_list_recursive":
+                return await self.nanobot.run(
+                    "openclaw-nextcloud", "files_list_recursive", {"path": path}
+                )
+            if name == "file_read_recursive":
+                return await self.nanobot.run(
+                    "openclaw-nextcloud", "files_read_recursive", {"path": path}
+                )
 
         if domain == "caldav":
             if name == "calendar_read":

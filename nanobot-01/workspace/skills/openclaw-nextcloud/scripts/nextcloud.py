@@ -36,6 +36,7 @@ import re
 import sys
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -473,10 +474,10 @@ def cmd_files_list(path="/"):
             base_path = re.sub(r"^https?://[^/]+", "", url).rstrip("/")
             if webdav_path.rstrip("/") == base_path:
                 continue
-            name = name_m.group(1).strip() if name_m else href.rstrip("/").rsplit("/", 1)[-1]
+            name = unquote(name_m.group(1).strip() if name_m else href.rstrip("/").rsplit("/", 1)[-1])
             files.append({
                 "name": name,
-                "path": webdav_path,
+                "path": unquote(webdav_path),
                 "type": "dir" if is_dir else "file",
                 "size": int(size_m.group(1)) if size_m and size_m.group(1) else 0,
                 "content_type": type_m.group(1).strip() if type_m else "",
@@ -619,6 +620,110 @@ def cmd_files_mkdir(path):
     return {"status": "ok", "path": path, "http_status": r.status_code}
 
 
+def cmd_files_list_recursive(path="/"):
+    """List all files and folders under a WebDAV path (Depth: infinity)."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{_WEBDAV_BASE}{path}"
+
+    r = requests.request(
+        "PROPFIND", url,
+        headers={**_headers(), "Depth": "infinity"},
+        data=_PROPFIND_FILES,
+        auth=_auth(), timeout=30,
+    )
+    if r.status_code not in (207,):
+        return {"status": "error", "error": f"PROPFIND recursive failed: HTTP {r.status_code}",
+                "url": url, "body": r.text[:300]}
+
+    responses = re.findall(r"<d:response[^>]*>(.*?)</d:response>", r.text, re.DOTALL | re.IGNORECASE)
+    if not responses:
+        responses = re.findall(r"<[a-z]+:response[^>]*>(.*?)</[a-z]+:response>", r.text, re.DOTALL | re.IGNORECASE)
+
+    files = []
+    for resp in responses:
+        href_m = re.search(r"<[^:>]*:href[^>]*>([^<]+)</[^:>]*:href>", resp)
+        size_m = re.search(r"<[^:>]*:getcontentlength[^>]*>([^<]*)</[^:>]*:getcontentlength>", resp)
+        type_m = re.search(r"<[^:>]*:getcontenttype[^>]*>([^<]*)</[^:>]*:getcontenttype>", resp)
+        is_dir = "<d:collection" in resp or "<collection" in resp
+        if not href_m:
+            continue
+        href = href_m.group(1).strip()
+        webdav_path = re.sub(r"^https?://[^/]+", "", href)
+        base_path = re.sub(r"^https?://[^/]+", "", url).rstrip("/")
+        if webdav_path.rstrip("/") == base_path:
+            continue
+        # Strip WebDAV prefix to get logical path, then URL-decode
+        dav_prefix = f"/remote.php/dav/files/{_NC_USER}"
+        logical = webdav_path[len(dav_prefix):] if webdav_path.startswith(dav_prefix) else webdav_path
+        logical = unquote(logical)
+        files.append({
+            "path": logical,
+            "type": "dir" if is_dir else "file",
+            "size": int(size_m.group(1)) if size_m and size_m.group(1) else 0,
+            "content_type": type_m.group(1).strip() if type_m else "",
+        })
+
+    return {"status": "ok", "path": path, "files": files, "count": len(files)}
+
+
+_READ_RECURSIVE_MAX_BYTES = 512 * 1024   # 512 KB total content cap
+_READ_RECURSIVE_MAX_FILE  = 64  * 1024   # 64 KB per file cap
+
+
+def cmd_files_read_recursive(path="/"):
+    """List all files under a WebDAV path and return the content of each text file.
+
+    Skips binary files (non text/* content-type). Hard caps: 512 KB total, 64 KB per file.
+    Returns {status, path, files: [{path, content, size}], total_bytes, skipped}.
+    """
+    listing = cmd_files_list_recursive(path)
+    if listing.get("status") == "error":
+        return listing
+
+    results = []
+    total_bytes = 0
+    skipped = []
+
+    for entry in listing["files"]:
+        if entry["type"] == "dir":
+            continue
+        ct = entry.get("content_type", "")
+        # Skip obvious binaries
+        if ct and not ct.startswith("text/") and ct not in (
+            "application/json", "application/xml", "application/javascript",
+            "application/x-yaml", "application/yaml", "",
+        ):
+            skipped.append({"path": entry["path"], "reason": f"binary ({ct})"})
+            continue
+        if total_bytes >= _READ_RECURSIVE_MAX_BYTES:
+            skipped.append({"path": entry["path"], "reason": "total cap reached"})
+            continue
+
+        url = f"{_WEBDAV_BASE}{entry['path']}"
+        try:
+            r = requests.get(url, auth=_auth(), timeout=30)
+        except Exception as e:
+            skipped.append({"path": entry["path"], "reason": str(e)})
+            continue
+        if r.status_code != 200:
+            skipped.append({"path": entry["path"], "reason": f"HTTP {r.status_code}"})
+            continue
+
+        content = r.text[:_READ_RECURSIVE_MAX_FILE]
+        total_bytes += len(content.encode("utf-8"))
+        results.append({"path": entry["path"], "content": content, "size": len(r.content)})
+
+    return {
+        "status": "ok",
+        "path": path,
+        "files": results,
+        "count": len(results),
+        "total_bytes": total_bytes,
+        "skipped": skipped,
+    }
+
+
 def cmd_calendar_update(uid, calendar="personal", title=None, start=None, end=None, description=None):
     """Update a calendar event: fetch existing ICS, patch fields, re-PUT."""
     if not uid or not uid.strip():
@@ -706,7 +811,8 @@ def main():
                                  "calendar_update",
                                  "tasks_list", "tasks_create", "tasks_complete", "tasks_delete",
                                  "files_list", "files_search", "files_read", "files_write",
-                                 "files_delete", "files_mkdir"])
+                                 "files_delete", "files_mkdir",
+                                 "files_list_recursive", "files_read_recursive"])
     # Calendar / event params
     parser.add_argument("--title", default="")
     parser.add_argument("--start", default="")
@@ -757,6 +863,10 @@ def main():
             result = cmd_files_delete(args.path)
         elif args.command == "files_mkdir":
             result = cmd_files_mkdir(args.path)
+        elif args.command == "files_list_recursive":
+            result = cmd_files_list_recursive(args.path or "/")
+        elif args.command == "files_read_recursive":
+            result = cmd_files_read_recursive(args.path or "/")
         elif args.command == "calendar_update":
             result = cmd_calendar_update(
                 args.uid, args.calendar,
