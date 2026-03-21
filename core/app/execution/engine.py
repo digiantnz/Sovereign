@@ -1516,7 +1516,7 @@ class ExecutionEngine:
                     payload={"confirmed": confirmed},
                     security_confirmed=security_confirmed,
                 ),
-                timeout=_PASS_TIMEOUT * 3,  # nanobot scripts can be slow
+                timeout=_PASS_TIMEOUT * 6 if action.get("domain") == "skills" else _PASS_TIMEOUT * 3,  # skill search+review is slow; nanobot scripts are slow
             )
         except _asyncio.TimeoutError:
             execution_result = {"status": "error", "error": "execution_timeout"}
