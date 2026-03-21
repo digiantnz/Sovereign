@@ -63,7 +63,21 @@ services:
     networks:
       - ai_net
     volumes:
-      - /docker/runtime/qdrant:/qdrant/storage  # NVMe — IO-intensive random writes; RAID would cause parity overhead
+      - /docker/runtime/qdrant:/qdrant/storage  # NVMe — conscious/hot working set (fast random IO)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/6333"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  qdrant-archive:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-archive
+    networks:
+      - ai_net
+    volumes:
+      - /home/sovereign/vector:/qdrant/storage  # RAID — subconscious/long-term durable memory
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/6333"]
@@ -77,6 +91,7 @@ services:
       dockerfile: core/Dockerfile
     container_name: sovereign-core
     restart: unless-stopped
+    stop_grace_period: 30s
     secrets: [sovereign_key]
     depends_on:
       docker-broker:
@@ -84,6 +99,8 @@ services:
       ollama:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+      qdrant-archive:
         condition: service_healthy
       # whisper removed from depends_on — migrated to node04
     networks:

@@ -32,6 +32,7 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - Reasoning already happened before confirmation prompt; re-running is pure overhead (~80s saved)
 - Stash carry-forward state in `pending_delegation._pending_load` to get this bypass
 - Remaining work: PASS 4 dispatch + translate only (~45s)
+- **CRITICAL**: `confirmed` must be passed to `_dispatch_inner` via `payload={"confirmed": confirmed}` in the central `_dispatch()` call in `handle_chat`. Without this, `confirmed = payload.get("confirmed", False)` is always False inside `_dispatch_inner` and the short-circuit never fires (confirmed-continuation bypass is silently bypassed)
 
 ### Untrusted nanobot content
 - All nanobot results stamped `_trust: "untrusted_external"` in `nanobot.py _forward()`
@@ -47,6 +48,19 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - `translator_slice()` returns only `result.get("result_for_translator")`
 - `validate()` pass_num check uses `pass_num > 0` guard (avoids false failures on PASS 1 construction)
 - `set_security_clearance()` only accepts: `"cleared"` | `"conditional"` | `"blocked"`
+
+### Two-tier Qdrant memory architecture
+- `self.client` → NVMe Qdrant (`http://qdrant:6333`) — conscious/hot layer; all 7 sovereign collection writes go here
+- `self.archive_client` → RAID Qdrant (`http://qdrant-archive:6333`, `/home/sovereign/vector`) — subconscious/durable store; additive-only sync
+- `self.wm_client` → `AsyncQdrantClient(location=":memory:")` — truly ephemeral; `working_memory` only; zero disk IO; never touches either Qdrant server
+- `_client_for(collection)` helper — routes `WORKING` → `wm_client`, everything else → `self.client`
+- `setup()` deletes stale `working_memory` from both NVMe and RAID Qdrant servers on startup (do not store session data on RAID)
+- `sync_from_archive()` — startup: RAID → NVMe delta sync by UUID; skips `working_memory`
+- `sync_to_archive()` — shutdown + hourly: NVMe → RAID delta sync by UUID; skips `working_memory`
+- Lifecycle: `sync_from_archive` → `startup_load` (NVMe→wm_client, top-2/collection) → session → `shutdown_promote` (wm_client→NVMe) → `sync_to_archive`
+- Hourly sync wired in `monitoring/scheduler.py` via `start_archive_sync(qdrant, ledger)`; audited at LOW tier
+- Graceful shutdown: `stop_grace_period: 30s` (compose.yml), uvicorn `--timeout-graceful-shutdown 25` (Dockerfile)
+- `on_disk=False` in Qdrant VectorParams does NOT mean truly in-memory — Qdrant still writes WAL/segments to disk; use `location=":memory:"` for true ephemeral
 
 ### Memory Index Protocol (MIP)
 - `execution/adapters/qdrant.py` implements ContextKeep v1.2 two-step retrieve pattern
@@ -136,7 +150,14 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 ### Community skill routing (execution/engine.py)
 - Mail domain calls `self.nanobot.run("imap-smtp-email", action, params)` — NOT IMAPAdapter/SMTPAdapter
 - Account suffix: `_suf = "" if account == "business" else "_personal"` selects personal vs business command
+- Account resolution order: `sp.get("account")` → `delegation.get("target")` → `action.get("account")` → `"personal"` (never default to business)
 - CalDAV/WebDAV still use Python adapters
+- Email list pre-formatter in `execution/engine.py`: runs after EXEC on `fetch_email/search_email/list_inbox` intents; produces numbered `sender — subject (date)` lines; builds `uid_index` dict for subsequent delete/move
+- Loop variable MUST be `_em` (not `_msg`) — `_msg` is the InternalMessage envelope; shadowing it causes a 500 on the next pass
+- `delete_message` / `move_message` operations: defined in SKILL.md frontmatter (not server.py `_translate_imap_smtp`); `imap_check.py` `cmd_delete` + `cmd_move` use `_resolve_uid()` helper
+- SKILL.md body checksum: use SkillLoader's exact regex `^---\n(.*?)\n---\n(.*)` group(2), NOT `split('---', 2)[2]` — they differ when body starts with newline
+- `specialist_outbound` receives `context_window` (last 4 turns) so delete/move can infer account and UIDs from prior list results without repeating them
+- Schema hints for `delete_email`/`move_email` in `prompts.specialist_outbound()` — `from_addr` is display name, NOT a guessed email address
 
 ---
 

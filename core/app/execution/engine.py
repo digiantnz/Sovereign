@@ -1344,7 +1344,7 @@ class ExecutionEngine:
                 return {
                     "requires_double_confirmation": True,
                     "pending_delegation": {**delegation, "intent": intent},
-                    "summary": delegation.get("reasoning_summary", ""),
+                    "summary": user_input,
                     "confidence": round(confidence, 3),
                     "gaps": gaps,
                 }
@@ -1352,7 +1352,7 @@ class ExecutionEngine:
                 return {
                     "requires_confirmation": True,
                     "pending_delegation": {**delegation, "intent": intent},
-                    "summary": delegation.get("reasoning_summary", ""),
+                    "summary": user_input,
                     "confidence": round(confidence, 3),
                     "gaps": gaps,
                 }
@@ -1479,7 +1479,8 @@ class ExecutionEngine:
         else:
             try:
                 sp_out = await _asyncio.wait_for(
-                    self.cog.specialist_outbound(agent, delegation, user_input),
+                    self.cog.specialist_outbound(agent, delegation, user_input,
+                                                 context_window=context_window),
                     timeout=_PASS_TIMEOUT,
                 )
             except _asyncio.TimeoutError:
@@ -1789,6 +1790,40 @@ class ExecutionEngine:
                 # truncated specialist_inbound view (lists capped at 5 items). Translator
                 # renders detail directly via rule 8; empty outcome avoids misleading preamble.
                 _rft["outcome"] = ""
+
+        # Pre-format email message lists so the translator renders them correctly.
+        # Without this the LLM renders each dict field as a separate bullet
+        # (• From: ... • Subject: ... • Date: ... • Message-ID: ...) instead of
+        # one line per message.  message_id is stripped — it's internal plumbing.
+        if intent in ("fetch_email", "search_email", "list_inbox") and isinstance(_rft.get("detail"), dict):
+            _msgs = _rft["detail"].get("messages")
+            if isinstance(_msgs, list) and _msgs:
+                import re as _re_date
+
+                def _short_date(raw: str) -> str:
+                    _m = _re_date.search(
+                        r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)",
+                        raw or "",
+                        _re_date.IGNORECASE,
+                    )
+                    return f"{_m.group(1)} {_m.group(2)}" if _m else (raw[:10] if raw else "")
+
+                _lines = []
+                _uid_index: dict[str, str] = {}
+                for _i, _em in enumerate(_msgs[:10], 1):
+                    _sender  = _em.get("from", _em.get("sender", "unknown"))
+                    _subject = _em.get("subject", "(no subject)")
+                    _date    = _short_date(_em.get("date", ""))
+                    _uid     = str(_em.get("uid", ""))
+                    _lines.append(f"{_i}. {_sender} — {_subject} ({_date})")
+                    if _uid:
+                        _uid_index[str(_i)] = _uid
+                _rft = dict(_rft)
+                _rft["detail"] = dict(_rft["detail"])
+                _rft["detail"]["messages"] = "\n".join(_lines)
+                _rft["detail"]["count"] = len(_lines)
+                if _uid_index:
+                    _rft["detail"]["uid_index"] = _uid_index
 
         # Sanitise LLM-generated detail: strip internal keys before translator sees them
         _DETAIL_STRIP = frozenset({
@@ -2294,7 +2329,9 @@ class ExecutionEngine:
             # All mail ops route through imap-smtp-email community skill → broker_exec (DSL path).
             # Python IMAPAdapter / SMTPAdapter are bypassed — community Node.js scripts are authoritative.
             sp = specialist or {}
-            account = sp.get("account") or action.get("account", "personal")
+            # Account resolution order: specialist output → pre-classifier target → action default → personal
+            _delegation_account = (delegation or {}).get("target")
+            account = sp.get("account") or _delegation_account or action.get("account", "personal")
             _suf = "" if account == "business" else "_personal"
             op = action.get("operation")
             _skill = "imap-smtp-email"
@@ -2362,10 +2399,26 @@ class ExecutionEngine:
                 return nb.get("result") if nb.get("result") is not None else nb
 
             if op == "move":
-                return {"status": "error", "error": "Email move not available — no broker command. Use mark_read to flag instead."}
+                uid           = sp.get("uid")           or action.get("uid", "")
+                from_addr     = sp.get("from_addr")     or action.get("from_addr", "")
+                subject       = sp.get("subject")       or action.get("subject", "")
+                target_folder = sp.get("target_folder") or action.get("target_folder", "") or sp.get("folder", "") or action.get("folder", "Archive")
+                nb = await self.nanobot.run(
+                    _skill, f"move_message{_suf}",
+                    {"uid": uid, "from_addr": from_addr,
+                     "subject": subject, "target_folder": target_folder},
+                )
+                return nb.get("result") if nb.get("result") is not None else nb
 
             if op == "delete":
-                return {"status": "error", "error": "Email delete not available via community skill — no broker command yet."}
+                uid       = sp.get("uid")       or action.get("uid", "")
+                from_addr = sp.get("from_addr") or action.get("from_addr", "")
+                subject   = sp.get("subject")   or action.get("subject", "")
+                nb = await self.nanobot.run(
+                    _skill, f"delete_message{_suf}",
+                    {"uid": uid, "from_addr": from_addr, "subject": subject},
+                )
+                return nb.get("result") if nb.get("result") is not None else nb
 
             if op == "send":
                 s = specialist or {}

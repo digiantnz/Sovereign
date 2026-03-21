@@ -201,6 +201,39 @@ REQUIRED OUTPUT FIELDS for this calendar operation:
   "risk": "MID"
   "confidence": 0.9"""
 
+    elif intent == "delete_email":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this email delete operation:
+  "operation": "delete_message_personal" or "delete_message" (business)
+  "account": "<personal or business — match the Director's request; if not explicitly stated, use 'personal'>"
+  "from_addr": "<sender name or address — e.g. 'AliExpress', 'noreply@uber.com'>"
+  "subject": "<keyword from the subject line — e.g. 'You have messages'>"
+  "uid": "<UID if known from a prior list or uid_index, else empty string>"
+  "risk": "HIGH"
+  "confidence": 0.9
+
+RULES:
+- At least one of uid, from_addr, or subject must be non-empty.
+- If the Director referred to a specific email from the prior context (e.g. "delete the Uber email"),
+  extract from_addr and/or subject from that context.
+- If a uid_index is available from context, use the UID directly."""
+
+    elif intent == "move_email":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this email move operation:
+  "operation": "move_message_personal" or "move_message" (business)
+  "account": "<personal or business — match the Director's request; if not explicitly stated, use 'personal'>"
+  "from_addr": "<sender name or address>"
+  "subject": "<keyword from the subject line>"
+  "uid": "<UID if known from a prior list or uid_index, else empty string>"
+  "target_folder": "<destination IMAP folder name — e.g. 'Archive', 'INBOX.Archive', 'Spam'>"
+  "risk": "MID"
+  "confidence": 0.9
+
+RULES:
+- target_folder is REQUIRED. Use 'Archive' as default if Director says 'archive'.
+- At least one of uid, from_addr, or subject must be non-empty."""
+
     elif intent in ("fetch_email", "search_email", "fetch_message"):
         _schema_hint = """
 REQUIRED OUTPUT FIELDS for this email operation:
@@ -503,7 +536,7 @@ Respond with ONLY this JSON (include only fields relevant to the chosen collecti
 
 
 def specialist_outbound(agent_persona: str, delegation: dict, user_input: str,
-                        routing_history: str = "") -> str:
+                        routing_history: str = "", context_window=None) -> str:
     """PASS 3 outbound: specialist selects skill and builds execution payload.
 
     The specialist outputs a flat dict — payload fields at top level, plus
@@ -516,6 +549,24 @@ def specialist_outbound(agent_persona: str, delegation: dict, user_input: str,
     history_section = ""
     if routing_history:
         history_section = f"\nROUTING HISTORY (use to inform skill selection):\n{routing_history}\n"
+
+    # Recent conversation context — helps specialist infer account, uid_index, etc.
+    context_section = ""
+    if context_window:
+        _turns = context_window if isinstance(context_window, list) else [context_window]
+        _recent = _turns[-4:]  # last 4 turns is enough
+        _ctx_lines = []
+        for _t in _recent:
+            if isinstance(_t, dict):
+                # Gateway format: {"user": "...", "assistant": "..."}
+                if "user" in _t:
+                    _ctx_lines.append(f"USER: {str(_t['user'])[:200]}")
+                if "assistant" in _t:
+                    _ctx_lines.append(f"ASSISTANT: {str(_t['assistant'])[:400]}")
+            elif isinstance(_t, str):
+                _ctx_lines.append(_t[:300])
+        if _ctx_lines:
+            context_section = "\nRECENT CONVERSATION (use to infer account, prior UIDs, context):\n" + "\n".join(_ctx_lines) + "\n"
 
     # Intent-specific field anchors (same as current specialist() function)
     _schema_hint = ""
@@ -539,17 +590,39 @@ REQUIRED FIELDS for create_task (today is {_date.today().isoformat()}):
   "due": "<ISO 8601 or empty>"""
     elif intent in ("fetch_email", "search_email", "fetch_message"):
         _schema_hint = """
-EMAIL OPERATION SELECTION:
-- "fetch_email" or "search_email" (list inbox) → operation: imap_business_check or imap_personal_check
-- "fetch_message" (read specific email) → operation: imap_business_check with from_addr or subject
-- Include "account": "business" or "personal"
+REQUIRED OUTPUT FIELDS for this email operation:
+  "operation": "fetch_unread_personal" / "fetch_unread" (list inbox) or "fetch_message_personal" / "fetch_message" (specific)
+  "account": "personal" or "business"
+- Use personal/business suffix on operation to match account.
+- For fetch_message: also include "from_addr" (sender display name) and/or "subject" keyword.
 - Never output a file/Nextcloud operation for email intents."""
+
+    elif intent == "delete_email":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this email DELETE:
+  "operation": "delete_message_personal" (personal) or "delete_message" (business)
+  "account": "personal" or "business" — infer from context; if not stated use "personal"
+  "uid": "<UID from uid_index in recent context if available, else empty string>"
+  "from_addr": "<sender DISPLAY NAME as shown in the email list — e.g. 'AliExpress', 'Uber Receipts'>. Do NOT invent an email address."
+  "subject": "<keyword from subject — e.g. 'You have messages', 'Your receipt'>"
+RULES: Use uid from uid_index when available (most reliable). from_addr is the display name, NOT a guessed email address."""
+
+    elif intent == "move_email":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this email MOVE:
+  "operation": "move_message_personal" (personal) or "move_message" (business)
+  "account": "personal" or "business" — infer from context; if not stated use "personal"
+  "uid": "<UID from uid_index in recent context if available, else empty string>"
+  "from_addr": "<sender DISPLAY NAME as shown in the email list>"
+  "subject": "<keyword from subject>"
+  "target_folder": "<IMAP folder name — 'Archive' for archive requests>"
+RULES: target_folder is REQUIRED. Use uid from uid_index when available."""
 
     return f"""{agent_persona}
 
 ---
 TASK — PASS 3 OUTBOUND: SKILL SELECTION AND PAYLOAD CONSTRUCTION
-{history_section}{_schema_hint}
+{history_section}{context_section}{_schema_hint}
 
 Orchestrator delegation:
 {json.dumps(delegation, indent=2)}

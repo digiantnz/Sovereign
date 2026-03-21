@@ -12,7 +12,7 @@ from security.soul_guardian import SoulGuardian, load_soul_md
 from security.scanner import SecurityScanner
 from security.guardrail import GuardrailEngine
 from monitoring.metrics import collect_all
-from monitoring.scheduler import start_scheduler
+from monitoring.scheduler import start_scheduler, start_archive_sync
 from monitoring.eth_watcher import start_eth_watcher
 from skills.loader import scan_all_skills
 from skills.lifecycle import load_skill_watchlist
@@ -73,6 +73,16 @@ async def lifespan(app: FastAPI):
     # ── Step 2: Core services
     qdrant = QdrantAdapter()
     await qdrant.setup()
+    # Sync subconscious (RAID archive) → conscious (NVMe) before startup_load.
+    # Ensures any points persisted to RAID in a previous session are present on NVMe.
+    try:
+        _archive_synced = await qdrant.sync_from_archive()
+        if _archive_synced:
+            logger.info("Qdrant archive sync: %d points loaded from RAID → NVMe", _archive_synced)
+        else:
+            logger.info("Qdrant archive sync: NVMe already up to date with RAID archive")
+    except Exception as _e:
+        logger.warning("Qdrant archive sync (startup) failed — proceeding with NVMe-only state: %s", _e)
     await qdrant.startup_load()
 
     # ── Step 2a: Memory Index Protocol — startup migration
@@ -164,13 +174,15 @@ async def lifespan(app: FastAPI):
         {
             "seed_id": "backfill_v1_qdrant_endpoint",
             "key": "semantic:infrastructure:qdrant_endpoint",
-            "title": "Qdrant endpoint and sovereign collections",
+            "title": "Qdrant two-tier memory: NVMe conscious layer + RAID subconscious archive",
             "content": (
-                "Qdrant endpoint: http://qdrant:6333 (ai_net). "
-                "7 sovereign RAID-backed collections + ephemeral working_memory. "
-                "Vector dimensions: 768 (nomic-embed-text). "
-                "Collections: semantic, episodic, prospective, procedural, "
-                "associative, relational, meta."
+                "Qdrant conscious layer (hot): http://qdrant:6333 (NVMe, /docker/runtime/qdrant). "
+                "Qdrant subconscious archive (durable): http://qdrant-archive:6333 (RAID, /home/sovereign/vector). "
+                "7 sovereign collections: semantic, episodic, prospective, procedural, associative, relational, meta. "
+                "Ephemeral working_memory on NVMe only. "
+                "At startup: RAID → NVMe sync populates conscious layer. "
+                "At shutdown: NVMe → RAID sync persists session memories to long-term store. "
+                "Vector dimensions: 768 (nomic-embed-text)."
             ),
             "domain": "infrastructure",
         },
@@ -314,9 +326,10 @@ async def lifespan(app: FastAPI):
         logger.info("WalletAdapter: wallet already initialized — address: %s", wallet.get_address())
     app.state.wallet = wallet
 
-    # ── Step 3: Start self-check scheduler + ETH watcher
-    _scheduler_task  = start_scheduler(app.state)
-    _eth_watcher_task = start_eth_watcher(ledger=ledger)
+    # ── Step 3: Start self-check scheduler + ETH watcher + hourly RAID archive sync
+    _scheduler_task      = start_scheduler(app.state)
+    _eth_watcher_task    = start_eth_watcher(ledger=ledger)
+    _archive_sync_task   = start_archive_sync(qdrant, ledger)
 
     # ── Step 3b: Task scheduler — data-driven recurring tasks ────────────
     task_scheduler = TaskScheduler(qdrant=qdrant, cog=app.state.cog)
@@ -354,7 +367,18 @@ async def lifespan(app: FastAPI):
     _scheduler_task.cancel()
     _eth_watcher_task.cancel()
     _task_scheduler_task.cancel()
+    _archive_sync_task.cancel()
     await qdrant.shutdown_promote()
+    # Sync conscious (NVMe) → subconscious (RAID archive) on shutdown.
+    # Persists any new session memories to durable long-term store.
+    try:
+        _pushed = await qdrant.sync_to_archive()
+        if _pushed:
+            logger.info("Qdrant archive sync: %d new points persisted NVMe → RAID", _pushed)
+        else:
+            logger.info("Qdrant archive sync: RAID archive already up to date")
+    except Exception as _e:
+        logger.warning("Qdrant archive sync (shutdown) failed — RAID archive may be stale: %s", _e)
 
 
 app = FastAPI(lifespan=lifespan)

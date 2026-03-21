@@ -228,7 +228,8 @@ class CognitionEngine:
         return result
 
     # ── Pass 3 outbound: Specialist selects skill and builds payload ──────
-    async def specialist_outbound(self, agent_name: str, delegation: dict, user_input: str) -> dict:
+    async def specialist_outbound(self, agent_name: str, delegation: dict, user_input: str,
+                                  context_window=None) -> dict:
         """PASS 3 outbound: specialist plans execution — skill, operation, payload.
 
         Externally routable (same routing logic as specialist_reason).
@@ -250,6 +251,7 @@ class CognitionEngine:
             delegation=delegation,
             user_input=user_input,
             routing_history=routing_history,
+            context_window=context_window,
         )
 
         # External routing applies to outbound (research may use Claude/Grok)

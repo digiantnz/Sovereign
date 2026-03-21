@@ -9,8 +9,8 @@
 ---
 
 ## Core Philosophy
-- **NVMe (`/docker`)** — fast ephemeral AI runtime; nothing critical stored here long-term
-- **RAID5 (`/home/sovereign`)** — durable truth; governance, memory, audit, backups
+- **NVMe (`/docker`)** — conscious/hot AI runtime; fast IO for active sovereign collections + ephemeral scratch
+- **RAID5 (`/home/sovereign`)** — subconscious/durable truth; governance, memory, audit, backups; full vector archive
 - **Broker** — sole holder of `docker.sock`; sovereign-core never has direct Docker access
 - **Sovereign-core** — reasoning engine and orchestration brain; enforces governance before any action
 - **Ollama** — local GPU-accelerated cognition only; never executes actions
@@ -21,7 +21,7 @@
 ## Container Architecture
 
 ### Networks
-- `ai_net`: ollama, sovereign-core, docker-broker, qdrant, gateway, nanobot-01
+- `ai_net`: ollama, sovereign-core, docker-broker, qdrant, qdrant-archive, gateway, nanobot-01
 - `business_net`: nextcloud, nc-redis, nc-db, nextcloud-rp, sovereign-core (dual-homed)
 - `browser_net`: (no local container; compose-managed for future use)
 - sovereign-core dual-homed (ai_net + business_net); a2a-browser on node04 (172.16.201.4:8001, external)
@@ -238,6 +238,8 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | NC-E2E | **COMPLETE** | Nextcloud end-to-end testing T1→T12 all passing: LAN port binding, trusted domain fix, Grok model update, routing hardening, delete fast-path, PASS 2 skip on confirmed, recursive list/read (T12) |
 | Skill-Search | **COMPLETE** | Full skill search stack fixed: direct httpx for GitHub API, A2A double-nesting, query extraction, translator isolation (skill_md stripped), prior-domain install routing |
 | Skill-Install-Fix | **COMPLETE** | confirmed-continuation bypass fixed: `confirmed=True` now passed via `payload={"confirmed": confirmed}` to `_dispatch_inner`; short-circuit to `lifecycle.load()` works correctly |
+| Email-E2E | **COMPLETE** | delete + move operations (SKILL.md + imap_check.py); email list format (numbered, `sender — subject (date)`); context_window passed to specialist_outbound; account defaulting fixed; `_msg` envelope shadowing fixed |
+| Qdrant-2tier | **COMPLETE** | Two-tier memory: NVMe conscious hot layer + RAID subconscious archive (`qdrant-archive`); truly ephemeral `working_memory` via `AsyncQdrantClient(location=":memory:")`; startup/shutdown sync + hourly `sync_to_archive`; graceful shutdown guarantee (`stop_grace_period: 30s`, uvicorn `--timeout-graceful-shutdown 25`) |
 
 Full phase history: `docs/CLAUDE-archive.md`
 

@@ -96,9 +96,17 @@ WRITE_PERMISSIONS = {
 
 
 class QdrantAdapter:
-    def __init__(self, qdrant_url="http://qdrant:6333", ollama_url="http://ollama:11434"):
-        self.client = AsyncQdrantClient(url=qdrant_url)
+    def __init__(self, qdrant_url="http://qdrant:6333",
+                 qdrant_archive_url="http://qdrant-archive:6333",
+                 ollama_url="http://ollama:11434"):
+        self.client = AsyncQdrantClient(url=qdrant_url)                       # NVMe — conscious hot layer
+        self.archive_client = AsyncQdrantClient(url=qdrant_archive_url)       # RAID — subconscious durable store
+        self.wm_client = AsyncQdrantClient(location=":memory:")               # RAM — truly ephemeral, never touches disk
         self._ollama_url = ollama_url
+
+    def _client_for(self, collection: str) -> "AsyncQdrantClient":
+        """Route working_memory to the in-process RAM client; everything else to NVMe Qdrant."""
+        return self.wm_client if collection == WORKING else self.client
 
     async def _embed(self, text: str) -> list[float]:
         async with httpx.AsyncClient(timeout=30.0) as http:
@@ -181,18 +189,28 @@ class QdrantAdapter:
         Creates each sovereign collection only if absent (preserves RAID data).
         Does NOT touch old sovereign_memory collection.
         """
-        existing = {c.name for c in (await self.client.get_collections()).collections}
-
-        # working_memory: always wipe on startup (ephemeral)
-        if WORKING in existing:
-            await self.client.delete_collection(WORKING)
-        await self.client.create_collection(
+        # working_memory: in-process RAM only — create on wm_client, never on the server
+        await self.wm_client.create_collection(
             collection_name=WORKING,
             vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE, on_disk=False),
             hnsw_config=HnswConfigDiff(on_disk=False),
         )
 
-        # 7 sovereign collections: create if absent (RAID-backed, preserve existing)
+        # Remove any stale working_memory from the NVMe Qdrant server (now lives in wm_client only)
+        existing = {c.name for c in (await self.client.get_collections()).collections}
+        if WORKING in existing:
+            await self.client.delete_collection(WORKING)
+
+        # Remove stale working_memory from RAID archive — it should never persist there
+        try:
+            archive_existing = {c.name for c in (await self.archive_client.get_collections()).collections}
+            if WORKING in archive_existing:
+                await self.archive_client.delete_collection(WORKING)
+                _log.info("setup: removed stale working_memory from RAID archive")
+        except Exception as _e:
+            _log.warning("setup: could not clean working_memory from archive: %s", _e)
+
+        # 7 sovereign collections: create if absent (NVMe hot layer; RAID archive in sync_from/to_archive)
         for coll in SOVEREIGN_COLLECTIONS:
             if coll not in existing:
                 await self.client.create_collection(
@@ -228,7 +246,7 @@ class QdrantAdapter:
                     payload = dict(r.payload or {})
                     payload["startup_load"] = True
                     payload["source_collection"] = coll
-                    await self.client.upsert(
+                    await self.wm_client.upsert(                # RAM only — subconscious → conscious seed
                         collection_name=WORKING,
                         points=[PointStruct(
                             id=str(uuid.uuid4()),
@@ -347,7 +365,7 @@ class QdrantAdapter:
                 else:
                     _key_fields = {"_no_key": True, "last_updated": _now}
 
-        await self.client.upsert(
+        await self._client_for(collection).upsert(
             collection_name=collection,
             points=[PointStruct(
                 id=point_id,
@@ -370,7 +388,7 @@ class QdrantAdapter:
                      top_k: int = 5, score_threshold: float = 0.4) -> list[dict]:
         """Single-collection semantic search. Returns list of payload dicts with score."""
         vector = await self._embed(query)
-        response = await self.client.query_points(
+        response = await self._client_for(collection).query_points(
             collection_name=collection,
             query=vector,
             limit=top_k,
@@ -436,7 +454,7 @@ class QdrantAdapter:
 
         target_collection inferred from payload.type if not provided; defaults to episodic.
         """
-        points = await self.client.retrieve(
+        points = await self.wm_client.retrieve(
             collection_name=WORKING,
             ids=[point_id],
             with_payload=True,
@@ -480,11 +498,11 @@ class QdrantAdapter:
             payload["_no_key"] = True
             payload["last_updated"] = _now
 
-        await self.client.upsert(
+        await self.client.upsert(                   # sovereign collection → NVMe hot layer
             collection_name=target_collection,
             points=[PointStruct(id=new_id, vector=vec, payload=payload)],
         )
-        await self.client.delete(collection_name=WORKING, points_selector=[point_id])
+        await self.wm_client.delete(collection_name=WORKING, points_selector=[point_id])
         self._log_audit("promote", target_collection, new_id, writer,
                         payload.get("content", "")[:120])
         return True
@@ -544,12 +562,134 @@ class QdrantAdapter:
 
         return promoted
 
+    async def sync_from_archive(self) -> int:
+        """Startup: pull any sovereign collection points from RAID Qdrant that are absent on NVMe.
+
+        Scrolls each of the 7 sovereign collections on both instances; upserts RAID points
+        whose UUID is not already present on NVMe. working_memory is always ephemeral — skipped.
+        Returns total count of points copied RAID → NVMe.
+        """
+        copied = 0
+        for coll in SOVEREIGN_COLLECTIONS:
+            try:
+                # Ensure collection exists on NVMe (setup() should have created it, but be safe)
+                existing_colls = {c.name for c in (await self.client.get_collections()).collections}
+                if coll not in existing_colls:
+                    await self.client.create_collection(
+                        collection_name=coll,
+                        vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE, on_disk=True),
+                        hnsw_config=HnswConfigDiff(on_disk=True),
+                    )
+
+                # Collect all existing NVMe point IDs for this collection
+                nvme_ids: set = set()
+                offset = None
+                while True:
+                    result, next_offset = await self.client.scroll(
+                        collection_name=coll, limit=200, offset=offset,
+                        with_payload=False, with_vectors=False,
+                    )
+                    for r in result:
+                        nvme_ids.add(str(r.id))
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+
+                # Scroll RAID archive and upsert missing points to NVMe
+                offset = None
+                while True:
+                    try:
+                        result, next_offset = await self.archive_client.scroll(
+                            collection_name=coll, limit=100, offset=offset,
+                            with_payload=True, with_vectors=True,
+                        )
+                    except Exception:
+                        break  # collection may not exist on archive yet
+                    for r in result:
+                        if str(r.id) not in nvme_ids:
+                            vec = r.vector if isinstance(r.vector, list) else None
+                            if vec is None:
+                                continue
+                            await self.client.upsert(
+                                collection_name=coll,
+                                points=[PointStruct(id=r.id, vector=vec, payload=dict(r.payload or {}))],
+                            )
+                            copied += 1
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+            except Exception as exc:
+                _log.warning("sync_from_archive: error on collection %s: %s", coll, exc)
+        return copied
+
+    async def sync_to_archive(self) -> int:
+        """Shutdown: push any sovereign collection points from NVMe Qdrant absent on RAID archive.
+
+        Ensures RAID is always a superset of NVMe — the durable long-term store.
+        Returns total count of points copied NVMe → RAID.
+        """
+        pushed = 0
+        for coll in SOVEREIGN_COLLECTIONS:
+            try:
+                # Ensure collection exists on archive
+                try:
+                    archive_colls = {c.name for c in (await self.archive_client.get_collections()).collections}
+                except Exception:
+                    archive_colls = set()
+                if coll not in archive_colls:
+                    await self.archive_client.create_collection(
+                        collection_name=coll,
+                        vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE, on_disk=True),
+                        hnsw_config=HnswConfigDiff(on_disk=True),
+                    )
+
+                # Collect all existing RAID point IDs for this collection
+                raid_ids: set = set()
+                offset = None
+                while True:
+                    try:
+                        result, next_offset = await self.archive_client.scroll(
+                            collection_name=coll, limit=200, offset=offset,
+                            with_payload=False, with_vectors=False,
+                        )
+                        for r in result:
+                            raid_ids.add(str(r.id))
+                        if next_offset is None:
+                            break
+                        offset = next_offset
+                    except Exception:
+                        break
+
+                # Scroll NVMe and upsert missing points to RAID
+                offset = None
+                while True:
+                    result, next_offset = await self.client.scroll(
+                        collection_name=coll, limit=100, offset=offset,
+                        with_payload=True, with_vectors=True,
+                    )
+                    for r in result:
+                        if str(r.id) not in raid_ids:
+                            vec = r.vector if isinstance(r.vector, list) else None
+                            if vec is None:
+                                continue
+                            await self.archive_client.upsert(
+                                collection_name=coll,
+                                points=[PointStruct(id=r.id, vector=vec, payload=dict(r.payload or {}))],
+                            )
+                            pushed += 1
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+            except Exception as exc:
+                _log.warning("sync_to_archive: error on collection %s: %s", coll, exc)
+        return pushed
+
     async def _get_all_working_memory(self) -> list[dict]:
-        """Scroll all working_memory items (with vectors)."""
+        """Scroll all working_memory items (with vectors). Uses in-memory wm_client."""
         items = []
         offset = None
         while True:
-            result, next_offset = await self.client.scroll(
+            result, next_offset = await self.wm_client.scroll(
                 collection_name=WORKING,
                 limit=100,
                 offset=offset,

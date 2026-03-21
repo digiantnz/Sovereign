@@ -33,7 +33,7 @@ def _decode_header(value):
     """Decode a MIME-encoded header value to plain UTF-8 string.
 
     Strips surrogate characters that appear in some emoji-containing subjects
-    and would cause JSON serialisation failures or raw \uXXXX output.
+    and would cause JSON serialisation failures or raw unicode escape output.
     """
     if not value:
         return ""
@@ -345,6 +345,102 @@ def cmd_mark(mail, mailbox, uid, flag, add):
             "action": "added" if add else "removed"}
 
 
+def _resolve_uid(mail, mailbox, uid, from_addr, subject):
+    """Resolve a UID from direct uid or search-then-resolve via from_addr/subject.
+
+    Returns (uid_str, error_dict_or_None).
+    """
+    uid = (uid or "").strip()
+    if uid:
+        return uid, None
+
+    if not from_addr and not subject:
+        return None, {"status": "error", "error": "uid, from_addr, or subject required"}
+
+    typ, _ = mail.select(mailbox, readonly=True)
+    if typ != "OK":
+        return None, {"status": "error", "error": f"SELECT {mailbox!r} failed"}
+
+    def _q(s):
+        s = s.strip()
+        return f'"{s}"' if " " in s and not (s.startswith('"') and s.endswith('"')) else s
+
+    def _search(crit):
+        t, d = mail.uid("SEARCH", None, *crit)
+        if t != "OK":
+            return []
+        return d[0].decode("ascii", errors="replace").split() if d[0] else []
+
+    criteria = []
+    if from_addr:
+        criteria += ["FROM", _q(from_addr)]
+    if subject:
+        criteria += ["SUBJECT", _q(subject)]
+
+    uid_list = _search(criteria)
+    if not uid_list and subject and not from_addr:
+        uid_list = _search(["FROM", _q(subject)])
+    if not uid_list and from_addr and subject:
+        uid_list = _search(["FROM", _q(from_addr)])
+        if not uid_list:
+            uid_list = _search(["SUBJECT", _q(subject)])
+
+    if not uid_list:
+        return None, {"status": "error", "error": "No message found matching the search criteria"}
+
+    return uid_list[-1], None
+
+
+def cmd_delete(mail, mailbox, uid, from_addr, subject):
+    """Delete a message by UID (or search-then-delete via from_addr/subject).
+
+    Marks the message \\Deleted then expunges.
+    """
+    uid, err = _resolve_uid(mail, mailbox, uid, from_addr, subject)
+    if err:
+        return err
+
+    typ, _ = mail.select(mailbox, readonly=False)
+    if typ != "OK":
+        return {"status": "error", "error": f"SELECT {mailbox!r} failed"}
+
+    typ, data = mail.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
+    if typ != "OK":
+        return {"status": "error", "error": f"STORE +FLAGS \\Deleted failed: {data}"}
+
+    mail.expunge()
+    return {"status": "ok", "uid": uid, "action": "deleted"}
+
+
+def cmd_move(mail, mailbox, uid, from_addr, subject, target_folder):
+    """Move a message to target_folder by UID (or search-then-move).
+
+    Uses IMAP COPY + mark \\Deleted + EXPUNGE (no server-side MOVE extension needed).
+    """
+    if not target_folder or not target_folder.strip():
+        return {"status": "error", "error": "move: target_folder is required"}
+
+    target_folder = target_folder.strip()
+
+    uid, err = _resolve_uid(mail, mailbox, uid, from_addr, subject)
+    if err:
+        return err
+
+    typ, _ = mail.select(mailbox, readonly=False)
+    if typ != "OK":
+        return {"status": "error", "error": f"SELECT {mailbox!r} failed"}
+
+    # Wrap folder name in quotes if it contains spaces
+    folder_arg = f'"{target_folder}"' if " " in target_folder else target_folder
+    typ, data = mail.uid("COPY", uid, folder_arg)
+    if typ != "OK":
+        return {"status": "error", "error": f"COPY to {target_folder!r} failed: {data}"}
+
+    mail.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
+    mail.expunge()
+    return {"status": "ok", "uid": uid, "action": "moved", "destination": target_folder}
+
+
 def cmd_list_mailboxes(mail):
     """List all IMAP folders."""
     typ, data = mail.list()
@@ -374,7 +470,7 @@ def main():
     parser = argparse.ArgumentParser(description="IMAP email operations")
     parser.add_argument("--command", required=True,
                         choices=["check", "fetch", "search", "mark-read", "mark-unread",
-                                 "list-mailboxes"])
+                                 "list-mailboxes", "delete", "move"])
     parser.add_argument("--account", default="business", choices=["business", "personal"])
     parser.add_argument("--mailbox", default="INBOX")
     parser.add_argument("--limit", type=int, default=10)
@@ -384,6 +480,7 @@ def main():
     parser.add_argument("--subject", default="")
     parser.add_argument("--since", default="")
     parser.add_argument("--unseen", action="store_true")
+    parser.add_argument("--target_folder", default="")
     args = parser.parse_args()
 
     try:
@@ -407,6 +504,11 @@ def main():
             result = cmd_mark(mail, args.mailbox, args.uid, r"\Seen", add=False)
         elif args.command == "list-mailboxes":
             result = cmd_list_mailboxes(mail)
+        elif args.command == "delete":
+            result = cmd_delete(mail, args.mailbox, args.uid, args.from_addr, args.subject)
+        elif args.command == "move":
+            result = cmd_move(mail, args.mailbox, args.uid, args.from_addr, args.subject,
+                              args.target_folder)
         else:
             result = {"status": "error", "error": f"Unknown command: {args.command}"}
     except Exception as e:

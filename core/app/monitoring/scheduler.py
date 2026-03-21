@@ -187,3 +187,41 @@ def start_scheduler(app_state) -> asyncio.Task:
     task = asyncio.create_task(self_check_loop(app_state))
     logger.info("Scheduler: self-check loop started (interval: %dh)", SELF_CHECK_INTERVAL // 3600)
     return task
+
+
+# ── Hourly RAID archive sync ───────────────────────────────────────────────────
+
+ARCHIVE_SYNC_INTERVAL = 3600  # 1 hour
+
+
+async def archive_sync_loop(qdrant, ledger) -> None:
+    """Asyncio background task — syncs NVMe sovereign collections → RAID archive every hour.
+
+    Runs independently of the shutdown sync. The shutdown sync remains as the final flush.
+    Each run is audited at LOW tier to the security ledger.
+    """
+    await asyncio.sleep(ARCHIVE_SYNC_INTERVAL)
+    while True:
+        try:
+            pushed = await qdrant.sync_to_archive()
+            ts = datetime.now(timezone.utc).isoformat()
+            if pushed:
+                logger.info("Archive sync: %d new points persisted NVMe → RAID", pushed)
+            else:
+                logger.info("Archive sync: RAID already up to date (no delta)")
+            if ledger:
+                ledger.append("archive_sync", "scheduled", {
+                    "tier": "LOW",
+                    "points_pushed": pushed,
+                    "timestamp": ts,
+                })
+        except Exception as e:
+            logger.error("Archive sync loop error: %s", e)
+        await asyncio.sleep(ARCHIVE_SYNC_INTERVAL)
+
+
+def start_archive_sync(qdrant, ledger) -> asyncio.Task:
+    """Start the hourly RAID archive sync task. Call from lifespan after qdrant is ready."""
+    task = asyncio.create_task(archive_sync_loop(qdrant, ledger))
+    logger.info("Archive sync: hourly NVMe → RAID sync loop started")
+    return task
