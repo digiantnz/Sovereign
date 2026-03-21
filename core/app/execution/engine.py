@@ -308,6 +308,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "target": user_input, "tier": "MID",
                 "reasoning_summary": "Skill install from direct URL — deterministic pre-classifier",
             }
+        # "remember/store/note this URL" — memory write, not a fetch
+        _mem_url_kw = ("remember", "store", "note that", "don't forget", "memoris", "memoriz", "save this")
+        if any(w in u for w in _mem_url_kw):
+            return None  # fall through to CEO LLM — memory_agent will handle it
         return {
             "delegate_to": "research_agent", "intent": "fetch_url",
             "target": _raw_url, "tier": "LOW",
