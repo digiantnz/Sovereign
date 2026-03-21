@@ -300,6 +300,11 @@ async def fetch(req: FetchRequest, _: None = Depends(security.verify_secret)):
     try:
         page = await context.new_page()
         await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+        # For JS-rendered pages, wait for network to settle so content is populated
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass  # Best-effort — proceed with whatever is rendered
         title = await page.title()
         if extract == "html":
             content = await page.content()

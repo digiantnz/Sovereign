@@ -101,9 +101,29 @@ def _github_url_to_raw(url: str) -> Optional[str]:
         return None
     user, repo, branch, path = m.groups()
     if not path.endswith("SKILL.md"):
-        # If URL points to a directory, guess SKILL.md is inside it
+        if path.lower().endswith(".md"):
+            return None  # Some other .md file — not a SKILL.md
+        # Likely a directory — guess SKILL.md is inside it
         path = path.rstrip("/") + "/SKILL.md"
     return f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}"
+
+
+def _candidate_meta(fm: dict, content: str) -> dict:
+    """Extract display metadata from parsed SKILL.md frontmatter.
+
+    Returns a dict of human-readable fields safe to send to the translator
+    without including the full skill body.
+    """
+    sv = fm.get("sovereign", {}) or {}
+    ops = sv.get("operations", {}) or {}
+    return {
+        "version": fm.get("version", ""),
+        "tier": sv.get("tier_required", ""),
+        "specialists": sv.get("specialists", []),
+        "adapter_deps": sv.get("adapter_deps", []),
+        "operations": list(ops.keys()) if isinstance(ops, dict) else [],
+        "operation_count": len(ops) if isinstance(ops, dict) else 0,
+    }
 
 
 def _sha256_text(text: str) -> str:
@@ -245,8 +265,17 @@ class SkillLifecycleManager:
             import urllib.parse as _urlparse
             _gh_query = _urlparse.quote(f'filename:SKILL.md {query}')
             _gh_api_url = f"https://api.github.com/search/code?q={_gh_query}&per_page={min(limit * 2, 30)}"
-            _gh_result = await self.browser.fetch(_gh_api_url, extract="text")
-            _gh_text = (_gh_result.get("data") or {}).get("text", "") or ""
+            # Use direct httpx — browser.fetch() goes through Playwright which renders
+            # api.github.com as HTML, not raw JSON. sovereign-core has internet egress.
+            _gh_pat = os.environ.get("GITHUB_PAT", "")
+            _gh_headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+            if _gh_pat:
+                _gh_headers["Authorization"] = f"Bearer {_gh_pat}"
+            async with httpx.AsyncClient(timeout=30.0) as _gh_client:
+                _gh_resp = await _gh_client.get(_gh_api_url, headers=_gh_headers)
+            _gh_text = _gh_resp.text if _gh_resp.status_code == 200 else ""
+            if _gh_resp.status_code != 200:
+                logger.warning("SkillLifecycle.search: GitHub API %s: %s", _gh_resp.status_code, _gh_resp.text[:200])
             if _gh_text:
                 import json as _json
                 try:
@@ -273,6 +302,7 @@ class SkillLifecycleManager:
                             "raw_url": raw_url,
                             "certified": None,
                             "skill_md": content,
+                            "meta": _candidate_meta(fm, content),
                             "WARNING": "Source: GitHub API — review required before loading",
                         })
                         if len(candidates) >= limit:
@@ -289,7 +319,7 @@ class SkillLifecycleManager:
             try:
                 search_q = f'sovereign skill {query} "SKILL.md" site:github.com'
                 result = await self.browser.search(search_q)
-                raw_items = (result.get("data", {}).get("results", []) or [])
+                raw_items = ((result.get("data") or {}).get("data") or {}).get("results", []) or []
 
                 for item in raw_items[:limit * 3]:  # overscan to account for non-SKILL.md hits
                     url = item.get("url", "")
@@ -313,6 +343,7 @@ class SkillLifecycleManager:
                         "raw_url": raw_url,
                         "certified": None,
                         "skill_md": content,
+                        "meta": _candidate_meta(fm, content),
                         "WARNING": "Source: GitHub — review required before loading",
                     }
                     candidates.append(candidate)
@@ -328,7 +359,7 @@ class SkillLifecycleManager:
             try:
                 fallback_q = f"sovereign AI skill {query} SKILL.md github"
                 result = await self.browser.search(fallback_q)
-                raw_items = (result.get("data", {}).get("results", []) or [])
+                raw_items = ((result.get("data") or {}).get("data") or {}).get("results", []) or []
                 for item in raw_items[:limit]:
                     url = item.get("url", "")
                     raw_url = _github_url_to_raw(url)
@@ -400,7 +431,7 @@ class SkillLifecycleManager:
             try:
                 result = await self.browser.fetch(url, extract="text")
                 if result.get("status") == "ok":
-                    content = result.get("data", {}).get("content", "")
+                    content = ((result.get("data") or {}).get("data") or {}).get("content", "")
                     if content:
                         logger.info("SkillLifecycle._fetch_raw_url: browser fallback succeeded for %s", url)
                         return content

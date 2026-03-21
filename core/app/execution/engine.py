@@ -479,8 +479,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "target": None, "tier": "LOW",
             "reasoning_summary": "OS update check — deterministic pre-classifier",
         }
-    _systemctl_kw = ("systemctl", "service status", "systemd", "is docker running", "is ssh running")
-    if any(kw in u for kw in _systemctl_kw):
+    # Guard: if the input is about skills/clawhub, don't misfire on "systemd" in a wish-list
+    _is_skill_context = any(w in u for w in ("skill", "clawhub", "openclaw"))
+    _systemctl_kw = ("systemctl", "service status", "is docker running", "is ssh running")
+    _systemd_match = "systemd" in u and not _is_skill_context
+    if any(kw in u for kw in _systemctl_kw) or _systemd_match:
         return {
             "delegate_to": "devops_agent", "intent": "systemctl_status",
             "target": None, "tier": "LOW",
@@ -790,6 +793,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             r"(clawhub|skill registry|search for skills?|find a? ?skills?|look for skills?|browse skills?)",
             "", u, flags=_re_sk.IGNORECASE
         ).strip(" :,")
+        # Strip leading filler words: "on", "for", "about", "a", "an", "the", "me", "some"
+        _q = _re_sk.sub(r"^\s*(on|for|about|a|an|the|me|some)\s+", "", _q).strip()
         return {
             "delegate_to": "devops_agent", "intent": "skill_search",
             "target": _q or user_input, "tier": "LOW",
@@ -1203,6 +1208,11 @@ class ExecutionEngine:
         _t_total = _time_mod.monotonic()
         _PASS_TIMEOUT  = float(os.environ.get("PASS_TIMEOUT_SECONDS",  "30"))
         _TOTAL_TIMEOUT = float(os.environ.get("TOTAL_TIMEOUT_SECONDS", "120"))
+        # Skill search/install involves GitHub API + multiple SKILL.md fetches + security review
+        # — give it extra headroom beyond the default 120s
+        _u_lower = user_input.lower()
+        if any(w in _u_lower for w in ("skill", "clawhub", "openclaw")):
+            _TOTAL_TIMEOUT = max(_TOTAL_TIMEOUT, 240.0)
 
         # Track whether the pre-LLM scanner already evaluated security
         _scanner_evaluated = False
@@ -1741,9 +1751,17 @@ class ExecutionEngine:
                     "next_action": None,
                 }
             else:
-                # Candidates found — pass raw list directly, no LLM summarisation
+                # Candidates found — strip skill_md bodies before translator sees them.
+                # Full SKILL.md content confuses the small LLM (it reads the skill body
+                # as instructions and hallucinates results). Pass metadata only.
+                _slim = [
+                    {k: v for k, v in c.items() if k not in ("skill_md", "raw_url")}
+                    for c in candidates
+                ]
                 _rft = dict(_rft)
-                _rft["detail"] = {"candidates": candidates}
+                _rft["success"] = True
+                _rft["error"] = None
+                _rft["detail"] = {"candidates": _slim}
                 _rft["outcome"] = f"Found {len(candidates)} candidate skill(s)."
 
         elif intent in _DIAGNOSTIC_INTENTS and execution_result:
@@ -2532,6 +2550,7 @@ class ExecutionEngine:
                 query = (
                     sp.get("search_query")
                     or action.get("query")
+                    or (delegation or {}).get("target")  # fallback: _quick_classify extracted query
                     or prompt
                     or ""
                 )
