@@ -234,7 +234,8 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | OC-S7 | **COMPLETE** | openclaw-nextcloud +6 ops (files_read/write/delete/mkdir, calendar_update, tasks_delete); SKILL.md + checksums updated |
 | MIP-S1+S2 | **COMPLETE** | Memory Index Protocol (ContextKeep v1.2): deterministic key/title generation, two-step retrieve protocol, session audit trail |
 | MIP-Fix+S4 | **COMPLETE** | MIP routing hardening (memory_index short-circuit, delegation passthrough, _system_signals); canonical key backfill: 13 keys across wallet/networking/infrastructure/governance domains; tag_high_value_entries() for no-re-embed patching |
-| NC-E2E | **COMPLETE** | Nextcloud end-to-end testing (NC-T1→T9 all passing): LAN port binding, trusted domain fix, Grok model update, file path guard on time signals, "create a file" write_kw, word-boundary fixes for _infer_prior_domain + _is_pronoun_ref, delete_file fast-path (was hallucinating), PASS 2 skip on confirmed |
+| NC-E2E | **COMPLETE** | Nextcloud end-to-end testing T1→T12 all passing: LAN port binding, trusted domain fix, Grok model update, routing hardening, delete fast-path, PASS 2 skip on confirmed, recursive list/read (T12) |
+| Skill-Search | **COMPLETE** | Full skill search stack fixed: direct httpx for GitHub API, A2A double-nesting, query extraction, translator isolation (skill_md stripped), prior-domain install routing |
 
 Full phase history: `docs/CLAUDE-archive.md`
 
