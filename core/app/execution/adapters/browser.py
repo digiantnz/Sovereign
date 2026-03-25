@@ -221,7 +221,11 @@ class BrowserAdapter:
                 if A2AResponse.is_error(body):
                     err = A2AResponse.get_error(body) or {}
                     return {"status": "error", "message": err.get("message", "a2a-browser error")}
-                return {"status": "ok", "data": A2AResponse.get_result(body)}
+                # A2AResponse.get_result() returns {success, status_code, data: {url, title, content}}
+                # Unwrap the inner "data" field so callers get a flat {url, title, content} dict.
+                _a2a_result = A2AResponse.get_result(body)
+                _inner = _a2a_result.get("data", _a2a_result) if isinstance(_a2a_result, dict) else {}
+                return {"status": "ok", "data": _inner}
         except httpx.HTTPStatusError as e:
             return {"status": "error", "message": f"a2a-browser HTTP {e.response.status_code}"}
         except Exception as e:

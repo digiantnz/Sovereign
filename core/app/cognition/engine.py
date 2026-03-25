@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import re as _re_fab
 from adapters.ollama import OllamaAdapter
 from adapters.grok import GrokAdapter
 from adapters.claude import ClaudeAdapter
@@ -21,6 +23,9 @@ AGENT_FILE_MAP = {
     # Legacy aliases — kept for backward compat during transition
     "docker_agent":   "devops_agent.md",
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 class CognitionEngine:
@@ -335,12 +340,78 @@ class CognitionEngine:
         return result
 
     # ── Pass 5: Translator (restricted input — result_for_translator only) ─
+    # ── Translator fabrication guard ─────────────────────────────────────
+    @staticmethod
+    def _is_result_empty(rft: dict) -> bool:
+        """True when result_for_translator carries no reportable factual data."""
+        detail = rft.get("detail") or {}
+        has_detail = bool(
+            (isinstance(detail, str) and detail.strip())
+            or (isinstance(detail, dict) and any(
+                v for v in detail.values()
+                if v is not None and v != "" and v != [] and v != {}
+            ))
+        )
+        has_outcome  = bool(str(rft.get("outcome",  "")).strip())
+        has_response = bool(str(rft.get("response", "")).strip())
+        return not (has_detail or has_outcome or has_response)
+
+    @staticmethod
+    def _check_fabrication(text: str, rft: dict) -> str | None:
+        """Post-translation fabrication check.
+
+        Extracts integers ≥ 4 from translator output and verifies each appears
+        in the JSON-serialised result_for_translator.  A number invented by the
+        LLM (not present in the result) is a fabrication violation.
+
+        Returns None if clean, or a fallback string if fabrication is detected.
+        Numbers 0-3 are ubiquitous (versions, bullets) and skipped to avoid FPs.
+        """
+        result_text = json.dumps(rft)
+        for num in set(_re_fab.findall(r'\b([4-9]\d*|\d{2,})\b', text)):
+            if num not in result_text:
+                logger.warning(
+                    "translator_pass FABRICATION: number '%s' not in result. "
+                    "Blocking output. result=%s output=%s",
+                    num, result_text[:300], text[:300],
+                )
+                fallback = (rft.get("outcome") or rft.get("response") or "").strip()
+                return fallback if fallback else "I don't have that information in memory or current context."
+        return None
+
     async def translator_pass(self, result_for_translator: dict, tier: str = "LOW") -> str:
         """PASS 5: Translator receives ONLY result_for_translator — nothing else.
 
-        Uses local Ollama. Returns plain English string.
-        Restricted input prevents fabrication from raw adapter internals.
+        Hard pre-check: empty/failed results bypass the LLM entirely — deterministic
+        Python messages are returned immediately, eliminating the hallucination risk.
+        Post-check: after LLM translation, verify all numbers in output exist in the
+        result.  Any invented number is a fabrication violation → block + fallback.
         """
+        success  = result_for_translator.get("success", True)
+        has_error = bool(result_for_translator.get("error"))
+
+        # ── Hard pre-check A: failure path — deterministic, no LLM ────────────
+        # Exception: awaiting_confirmation is not a failure — it's a confirmation prompt.
+        # Pass these through to the LLM so the translator can phrase the ask clearly.
+        _is_awaiting = (
+            result_for_translator.get("next_action") == "confirm_or_deny"
+            or result_for_translator.get("outcome") == "awaiting_confirmation"
+        )
+        if (has_error or not success) and not _is_awaiting:
+            error_detail = (
+                result_for_translator.get("error")
+                or result_for_translator.get("outcome")
+                or "unspecified error"
+            )
+            logger.info("translator_pass: failure result — bypassing LLM")
+            return f"That action failed: {error_detail}"
+
+        # ── Hard pre-check B: empty result — deterministic, no LLM ───────────
+        if self._is_result_empty(result_for_translator):
+            logger.warning("translator_pass: empty result_for_translator — bypassing LLM (integrity guard)")
+            return "I don't have that information in memory or current context."
+
+        # ── Has data — call translator LLM ────────────────────────────────────
         try:
             prompt = prompts.translate_from_orchestrator(
                 translator_persona=self.load_translator(),
@@ -349,29 +420,32 @@ class CognitionEngine:
             )
             raw = await self.ollama.generate(prompt, model=MODEL)
             text = raw.get("response", "").strip()
+
+            # ── Post-check: fabrication detection (numbers) ───────────────────
+            fabrication_fallback = self._check_fabrication(text, result_for_translator)
+            if fabrication_fallback is not None:
+                return fabrication_fallback
+
             # Strip spurious urgency unless HIGH-tier error
-            has_error = bool(result_for_translator.get("error") or
-                             not result_for_translator.get("success", True))
-            allow_urgent = tier == "HIGH" and has_error
+            allow_urgent = tier == "HIGH"  # error already handled above
             if not allow_urgent:
                 text = self._URGENT_STRIP_RE.sub("", text).strip()
             # Strip preamble the model adds despite instructions
-            import re as _re2
             # Catches any "Here is/Here's <up to 80 chars>:" opener at start of response
-            text = _re2.sub(
+            text = _re_fab.sub(
                 r"^(Here(?:'s| is)\b[^:]{0,80}:\s*\n?"
                 r"|Translation:\s*|Translated message:\s*|Plain English(?:\s+\w+)?:\s*)",
-                "", text, flags=_re2.IGNORECASE,
+                "", text, flags=_re_fab.IGNORECASE,
             ).strip()
             # Strip trailing meta-commentary the model appends (system prompt leakage)
             # Catches: "\n\nNote: ...", "\n\n(Note: ...)", "No further action is required.", etc.
-            text = _re2.sub(
+            text = _re_fab.sub(
                 r"\n*\(?Note:\s+[^\n]{10,}\)?$",
-                "", text, flags=_re2.IGNORECASE,
+                "", text, flags=_re_fab.IGNORECASE,
             ).strip()
-            text = _re2.sub(
+            text = _re_fab.sub(
                 r"\n*(No further action (?:is )?required\.?)$",
-                "", text, flags=_re2.IGNORECASE,
+                "", text, flags=_re_fab.IGNORECASE,
             ).strip()
             return text
         except Exception:

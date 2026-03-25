@@ -52,7 +52,7 @@ def _auth_headers() -> dict:
 # Cached agent cards per node — populated at startup and refreshed on each _forward() response
 _agent_card_cache: dict[str, dict] = {}
 
-TASK_TIMEOUT = 30.0  # seconds — must exceed nanobot's internal 25s timeout
+TASK_TIMEOUT = 65.0  # seconds — personal inbox IMAP sync can take 55s+; must exceed nanobot subprocess timeout
 HEALTH_TIMEOUT = 5.0
 
 _SKILLS_DIR = os.environ.get("SKILLS_DIR", "/home/sovereign/skills")

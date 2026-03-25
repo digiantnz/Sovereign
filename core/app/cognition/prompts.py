@@ -26,8 +26,15 @@ def classify(ceo_persona: str, user_input: str, memory_context: str,
             "---",
         ]
         context_section = "\n".join(lines)
+    from datetime import datetime as _dt, timezone as _tz
+    _now = _dt.now(_tz.utc)
+    _ts = _now.strftime("%Y-%m-%d %H:%M UTC (%A)")  # e.g. "2026-03-23 09:15 UTC (Monday)"
+
     return f"""{ceo_persona}
 
+---
+SYSTEM CONTEXT:
+Current time: {_ts}
 ---
 RECENT MEMORY CONTEXT:
 {memory_context}
@@ -234,6 +241,60 @@ RULES:
 - target_folder is REQUIRED. Use 'Archive' as default if Director says 'archive'.
 - At least one of uid, from_addr, or subject must be non-empty."""
 
+    elif intent == "read_note":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this notes read operation:
+  "operation": "notes_read"
+  "note_id": "<numeric ID if Director provided one, else empty string>"
+  "search_title": "<exact note title if Director referred to note by name, else empty string>"
+  "risk": "LOW"
+  "confidence": 0.9
+
+RULES:
+- If Director gave a number (e.g. "read note 1478"), set note_id: 1478, search_title: "".
+- If Director referred to the note by title (e.g. "read the NextCloud API note"), set search_title to that title, note_id: "".
+- Never guess a number. If unsure, use search_title."""
+
+    elif intent == "create_note":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this notes create operation:
+  "operation": "notes_create"
+  "title": "<note title — required>"
+  "content": "<note body text — may be empty>"
+  "category": "<category string — may be empty>"
+  "risk": "MID"
+  "confidence": 0.9"""
+
+    elif intent == "update_note":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this notes update operation:
+  "operation": "notes_update"
+  "note_id": "<numeric ID if Director provided one, else empty string>"
+  "search_title": "<current title of the note to find if no ID given, else empty string>"
+  "title": "<NEW title to set — only if Director wants to rename the note, else empty string>"
+  "content": "<new content to set, else empty string>"
+  "category": "<new category to set, else empty string>"
+  "risk": "MID"
+  "confidence": 0.9
+
+RULES:
+- search_title is the EXISTING note name (what to find). title is the NEW name (what to change it to).
+- Example: "rename the 'CC has the gay' note to 'CC does not'" → search_title: "CC has the gay", title: "CC does not"
+- If Director gave a numeric ID, set note_id and leave search_title empty."""
+
+    elif intent == "delete_note":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this notes delete operation:
+  "operation": "notes_delete"
+  "note_id": "<numeric ID if Director provided one, else empty string>"
+  "search_title": "<title of the note to delete if no ID given, else empty string>"
+  "risk": "HIGH"
+  "confidence": 0.9
+
+RULES:
+- If Director gave a number, set note_id. Otherwise set search_title to the note's title.
+- Never guess a number. If unsure, use search_title."""
+
     elif intent in ("fetch_email", "search_email", "fetch_message"):
         _schema_hint = """
 REQUIRED OUTPUT FIELDS for this email operation:
@@ -248,9 +309,9 @@ OPERATION SELECTION RULES:
   When using fetch_message, also include:
     "from_addr": "<the SENDER name or email — e.g. 'UptimeRobot', 'support@example.com'. Use this for service names like UptimeRobot, GitHub, Stripe etc.>"
     "subject": "<a keyword from the subject line — only if the Director names a specific subject>"
-    "uid": "<UID if known from a prior list, else empty string>"
+    "database_id": "<numeric databaseId if the Director gives a number (e.g. 'email 3474' → '3474'); also shown as [id:XXXX] in prior lists. Else empty string>"
   IMPORTANT: Service/tool names (UptimeRobot, GitHub, Stripe, Trade Me) go in from_addr, NOT subject.
-  At least one of uid, from_addr, or subject must be non-empty for fetch_message.
+  At least one of database_id, from_addr, or subject must be non-empty for fetch_message.
 
 THIS IS AN EMAIL OPERATION. Do NOT output a file/Nextcloud operation. Do NOT set operation to "list_files" or "read_file"."""
 
@@ -598,7 +659,7 @@ REQUIRED OUTPUT FIELDS for this email operation:
   (e.g. "read the X email", "what does Y say", "show me the email from Z").
 - Use "fetch_unread_personal" only when Director wants to list/check the inbox with no specific email in mind.
 - For fetch_message: include "from_addr" (sender display name only — e.g. "Metalheadz", "AliExpress")
-  and/or "subject" keyword. Also extract uid from [uid:XXXX] tag in context if present.
+  and/or "subject" keyword. Also extract "database_id" from [id:XXXX] tag in context if present, or from a number the Director gives (e.g. "email 3474" → "3474").
 - Never output a file/Nextcloud operation for email intents."""
 
     elif intent == "delete_email":
@@ -606,10 +667,10 @@ REQUIRED OUTPUT FIELDS for this email operation:
 REQUIRED OUTPUT FIELDS for this email DELETE:
   "operation": "delete_message_personal" (personal) or "delete_message" (business)
   "account": "personal" or "business" — infer from context; if not stated use "personal"
-  "uid": "<extract from [uid:XXXX] tag in the email list context — this is the IMAP UID>"
+  "database_id": "<extract from [id:XXXX] tag in the email list context — this is the stable databaseId>"
   "from_addr": "<sender DISPLAY NAME only — e.g. 'Ladbrokes', 'AliExpress'. NOT the email address.>"
   "subject": "<keyword from subject — e.g. 'everyone will be a winner', 'Your receipt'>"
-RULES: uid is the number inside [uid:XXXX] in the email list. If uid is available, from_addr/subject
+RULES: database_id is the number inside [id:XXXX] in the email list. If database_id is available, from_addr/subject
 are backup only. from_addr is the name before the dash in the list, NOT a guessed email address."""
 
     elif intent == "move_email":
@@ -617,11 +678,24 @@ are backup only. from_addr is the name before the dash in the list, NOT a guesse
 REQUIRED OUTPUT FIELDS for this email MOVE:
   "operation": "move_message_personal" (personal) or "move_message" (business)
   "account": "personal" or "business" — infer from context; if not stated use "personal"
-  "uid": "<extract from [uid:XXXX] tag in the email list context>"
+  "database_id": "<extract from [id:XXXX] tag in the email list context — the stable databaseId>"
   "from_addr": "<sender DISPLAY NAME only — e.g. 'Uber Receipts', 'Trade Me'>"
   "subject": "<keyword from subject>"
-  "target_folder": "<IMAP folder name — 'Archive' for archive requests>"
-RULES: target_folder is REQUIRED. uid is the number inside [uid:XXXX] in the email list."""
+  "target_folder": "<folder name — 'Archive' for archive requests>"
+RULES: target_folder is REQUIRED. database_id is the number inside [id:XXXX] in the email list."""
+
+    elif intent == "send_email":
+        _schema_hint = """
+REQUIRED OUTPUT FIELDS for this email SEND:
+  "operation": "send_personal" (personal) or "send" (business)
+  "account": "personal" or "business" — infer from context; if not stated use "business"
+  "to": "<recipient email address(es), comma-separated>"
+  "subject": "<email subject line>"
+  "body": "<email body text>"
+RULES: All three fields (to, subject, body) are REQUIRED. Extract them verbatim from the Director's request.
+Extract 'to' as the email address the Director specified (e.g. "to matt@example.com" → "matt@example.com").
+Extract 'subject' as the subject line specified. Extract 'body' as the body content specified.
+Do NOT use draft_content — use 'body' directly."""
 
     elif intent in ("list_files", "navigate", "read_file", "delete_file",
                     "create_folder", "write_file", "list_files_recursive", "read_files_recursive"):
@@ -849,6 +923,22 @@ def translate_from_orchestrator(translator_persona: str, result_for_translator: 
         "HIGH": "Urgency only if success=false and this is a security block or service down. Otherwise calm.",
     }.get(tier, "Do NOT use URGENT, ALERT, or WARNING.")
 
+    # Detect empty/null result — no factual data to report
+    _detail = result_for_translator.get("detail") or {}
+    _has_data = bool(
+        _detail and (
+            isinstance(_detail, str) and _detail.strip()
+        ) or (
+            isinstance(_detail, dict) and any(
+                v for v in _detail.values()
+                if v is not None and v != "" and v != [] and v != {}
+            )
+        )
+    )
+    _outcome = str(result_for_translator.get("outcome", "")).strip()
+    _response = str(result_for_translator.get("response", "")).strip()
+    _empty_result = success and not has_error and not _has_data and not _outcome and not _response
+
     iron_rule = (
         "IRON RULE — FAILURE: This action FAILED. Report failure clearly. "
         "Do NOT claim it succeeded. Do NOT invent a positive outcome. "
@@ -858,7 +948,14 @@ def translate_from_orchestrator(translator_persona: str, result_for_translator: 
         "Do NOT say 'confirmation required to proceed' — governance blocks are hard stops, not invitations to escalate. "
         "State what failed and, if next_action is provided, what Rex will do about it."
         if (has_error or not success) else
-        "IRON RULE — ACCURACY: Only report success. Do not add caveats or invent follow-up actions not present."
+        "IRON RULE — KNOWLEDGE GAPS: If this result contains no specific factual data to answer "
+        "the Director's question (empty detail, null fields, or a response that only expresses "
+        "uncertainty), output exactly: \"I don't have that information in memory or current context.\" "
+        "Do NOT fill in from general knowledge. Do NOT infer from partial data. "
+        "Do NOT offer plausible explanations or educated guesses. "
+        "The soul integrity requirement is absolute: an explicit admission is always better than a confident wrong answer."
+        if _empty_result else
+        "IRON RULE — ACCURACY: Only report what is in the result. Do not add caveats or invent follow-up actions not present."
     )
 
     return f"""{translator_persona}
@@ -875,24 +972,29 @@ result_for_translator:
 {iron_rule}
 URGENCY RULE: {urgency_rule}
 
+ABSOLUTE CONSTRAINT: result_for_translator is the SOLE source of truth.
+Do NOT generate, invent, or infer any content that is not present in the result above.
+If a field is absent, null, empty string, or empty list — it contains nothing and you must not fill it in.
+Do NOT use your training knowledge to answer the Director's question. Only report what is in the result.
+
 Rules:
 - Lead with the answer, not the reasoning.
 - Plain English. No JSON. No HTTP codes. No adapter names. No technical internals.
 - If outcome is already plain English in Rex's voice, return it substantially unchanged.
 - If next_action is present and non-null, append it naturally as a final sentence.
 - No preamble ("Here is the message:", "Translation:", etc.).
-- No trailing meta-commentary. No parenthetical notes. No "(Note: ...)" or "(I've followed...)" or any self-referential commentary about your own output.
+- No trailing meta-commentary. No parenthetical notes. No self-referential commentary about your own output.
 - If detail contains raw output fields (output, content, stdout, logs, containers, lines, items,
   files, events, messages, stats, hardware, text, body): render that data directly. Present
   multi-line text verbatim. Present lists as concise bullets. Do NOT collapse into a summary
   sentence — the Director asked for the actual output.
 - EXCEPTION: if detail.messages is already a pre-formatted numbered list string (lines starting
   with "1.", "2.", etc.), output it EXACTLY as-is — do NOT convert to bullets, do NOT reorder,
-  do NOT reformat. Prepend only a brief intro line if helpful (e.g. "You have N new messages:").
+  do NOT reformat. Prepend only a brief intro line stating the count from detail.count.
 - EXCEPTION: if detail.items is already a pre-formatted numbered list string (lines starting
   with "1.", "2.", etc.), output it EXACTLY as-is with the exact count from detail.count.
-  Do NOT invent file names. Do NOT change the count. Prepend a brief intro line
-  (e.g. "There are N items in /path/:") using the count and path from detail.
+  Do NOT invent file names. Do NOT change the count. Prepend one intro line stating the count
+  and path from detail — use only values that are actually in the result, not placeholders.
 
 Respond with ONLY the plain English message for the Director."""
 
@@ -918,8 +1020,11 @@ def task_intent_parser(user_input: str) -> str:
         "query", "research",
         "list_containers", "get_stats",
     ]
+    from datetime import datetime as _dt, timezone as _tz
+    _now_ts = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC (%A)")
     return f"""You are Sovereign's task-scheduling parser. Extract a structured task definition from the user's request.
 
+Current time: {_now_ts}
 User request: {json.dumps(user_input)}
 
 Your job:

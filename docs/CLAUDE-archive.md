@@ -82,3 +82,6 @@ Skills from community formats (e.g. OpenClaw registry) can be translated by mapp
 | OC-S5 | nanobot-01 as primary skill executor. CredentialProxy single-use token delegation. Confirmed-continuation bypass |
 | OC-S6 | python3_exec cutover. imap_check.py, smtp_send.py, nextcloud.py, feeds.py deployed. rss-digest skill. route_cognition PASS 2 wiring |
 | CL-Rework | 5-pass cognitive loop, InternalMessage envelope, nanobot protocol contract, untrusted tagging, translator firewall |
+| Skill-Harness | Stateful multi-step skill lifecycle harness (search→list→review→install→clear). Working_memory checkpointing. HIGH confirm on install. E2E tested 2026-03-23 |
+| NC-Mail | `nc-mail` python3_exec skill (9 ops). Stable databaseId. `_unwrap_nb`, `_DIAGNOSTIC_INTENTS` for write ops, outcome stamps. T-M1–T-M7 passing 2026-03-25 |
+| NC-Notes | 5 ops (notes_list/read/create/update/delete) in openclaw-nextcloud. Notes-Index title→ID lookup (5 min TTL). T1–T6 passing 2026-03-24 |

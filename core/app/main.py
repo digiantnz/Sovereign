@@ -12,7 +12,7 @@ from security.soul_guardian import SoulGuardian, load_soul_md
 from security.scanner import SecurityScanner
 from security.guardrail import GuardrailEngine
 from monitoring.metrics import collect_all
-from monitoring.scheduler import start_scheduler, start_archive_sync
+from monitoring.scheduler import start_scheduler, start_archive_sync, start_observe_loop
 from monitoring.eth_watcher import start_eth_watcher
 from skills.loader import scan_all_skills
 from skills.lifecycle import load_skill_watchlist
@@ -330,6 +330,10 @@ async def lifespan(app: FastAPI):
     _scheduler_task      = start_scheduler(app.state)
     _eth_watcher_task    = start_eth_watcher(ledger=ledger)
     _archive_sync_task   = start_archive_sync(qdrant, ledger)
+    # Self-improvement harness — daily observe loop (baseline + anomaly detection)
+    # Inject qdrant onto app.state so observe_loop() can access it
+    app.state.qdrant = qdrant
+    _si_observe_task = start_observe_loop(app.state)
 
     # ── Step 3b: Task scheduler — data-driven recurring tasks ────────────
     task_scheduler = TaskScheduler(qdrant=qdrant, cog=app.state.cog)
@@ -368,6 +372,7 @@ async def lifespan(app: FastAPI):
     _eth_watcher_task.cancel()
     _task_scheduler_task.cancel()
     _archive_sync_task.cancel()
+    _si_observe_task.cancel()
     await qdrant.shutdown_promote()
     # Sync conscious (NVMe) → subconscious (RAID archive) on shutdown.
     # Persists any new session memories to durable long-term store.

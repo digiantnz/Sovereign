@@ -518,8 +518,17 @@ class TaskScheduler:
             action = dict(base_action)
             action.update(params)   # merge step params (account, query, path, etc.)
 
+            # Merge top-level step target/url into action (params nesting not required in step DSL)
+            _step_target = step.get("target") or step.get("url")
+            if _step_target:
+                _op = action.get("operation", "")
+                if _op == "fetch" and "url" not in action:
+                    action["url"] = _step_target
+                elif _op == "search" and "query" not in action:
+                    action["query"] = _step_target
+
             # Prompt is used for ollama/browser queries
-            prompt = params.get("query") or params.get("prompt") or ""
+            prompt = params.get("query") or params.get("prompt") or step.get("prompt") or _step_target or ""
 
             try:
                 result = await self._dispatch_fn(
@@ -600,7 +609,11 @@ class TaskScheduler:
                 new_status = "completed" if not stop_triggered else "completed"
                 await self.qdrant.client.set_payload(
                     collection_name=PROSPECTIVE,
-                    payload={"status": new_status, "last_run": now.isoformat()},
+                    payload={
+                        "status": new_status,
+                        "last_run": now.isoformat(),
+                        "run_count": (prospective.get("run_count") or 0) + 1,
+                    },
                     points=[point_id],
                 )
 

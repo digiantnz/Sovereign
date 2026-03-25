@@ -49,9 +49,10 @@ _NC_URL = os.environ.get("NEXTCLOUD_URL", "http://nextcloud").rstrip("/")
 _NC_USER = os.environ.get("NEXTCLOUD_ADMIN_USER", "digiant")
 _NC_PASS = os.environ.get("NEXTCLOUD_ADMIN_PASSWORD", "")
 
-_DAV_BASE   = f"{_NC_URL}/remote.php/dav"
+_DAV_BASE    = f"{_NC_URL}/remote.php/dav"
 _CALDAV_BASE = f"{_DAV_BASE}/calendars/{_NC_USER}"
 _WEBDAV_BASE = f"{_DAV_BASE}/files/{_NC_USER}"
+_NOTES_API   = f"{_NC_URL}/apps/notes/api/v1"
 
 
 def _auth():
@@ -801,6 +802,103 @@ def cmd_tasks_delete(uid, calendar="tasks"):
 
 
 # ---------------------------------------------------------------------------
+# Notes commands (Nextcloud Notes REST API)
+# ---------------------------------------------------------------------------
+
+def cmd_notes_list():
+    """List all notes."""
+    r = requests.get(f"{_NOTES_API}/notes", auth=_auth(), timeout=15)
+    if r.status_code != 200:
+        return {"status": "error", "error": f"GET notes failed: HTTP {r.status_code}",
+                "body": r.text[:300]}
+    notes = r.json()
+    return {
+        "status": "ok",
+        "notes": [
+            {"id": n.get("id"), "title": n.get("title"), "category": n.get("category", ""),
+             "favorite": n.get("favorite", False), "modified": n.get("modified")}
+            for n in notes
+        ],
+        "count": len(notes),
+    }
+
+
+def cmd_notes_read(note_id):
+    """Read a single note by ID."""
+    if not note_id:
+        return {"status": "error", "step": "id_guard", "error": "note-id is required"}
+    r = requests.get(f"{_NOTES_API}/notes/{note_id}", auth=_auth(), timeout=15)
+    if r.status_code != 200:
+        return {"status": "error", "error": f"GET note failed: HTTP {r.status_code}",
+                "body": r.text[:300]}
+    n = r.json()
+    return {
+        "status": "ok",
+        "id": n.get("id"),
+        "title": n.get("title"),
+        "content": n.get("content", ""),
+        "category": n.get("category", ""),
+        "favorite": n.get("favorite", False),
+        "modified": n.get("modified"),
+    }
+
+
+def cmd_notes_create(title, content="", category=""):
+    """Create a new note."""
+    payload = {"title": title, "content": content, "category": category}
+    r = requests.post(
+        f"{_NOTES_API}/notes",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        auth=_auth(), timeout=15,
+    )
+    if r.status_code not in (200, 201):
+        return {"status": "error", "error": f"POST note failed: HTTP {r.status_code}",
+                "body": r.text[:300]}
+    n = r.json()
+    return {"status": "ok", "id": n.get("id"), "title": n.get("title"), "http_status": r.status_code}
+
+
+def cmd_notes_update(note_id, title=None, content=None, category=None, favorite=None):
+    """Update an existing note (partial update via PUT)."""
+    if not note_id:
+        return {"status": "error", "step": "id_guard", "error": "note-id is required"}
+    # Fetch current state first
+    r_get = requests.get(f"{_NOTES_API}/notes/{note_id}", auth=_auth(), timeout=15)
+    if r_get.status_code != 200:
+        return {"status": "error", "error": f"GET note failed: HTTP {r_get.status_code}"}
+    current = r_get.json()
+    payload = {
+        "title":    title    if title    is not None else current.get("title", ""),
+        "content":  content  if content  is not None else current.get("content", ""),
+        "category": category if category is not None else current.get("category", ""),
+        "favorite": favorite if favorite is not None else current.get("favorite", False),
+    }
+    r = requests.put(
+        f"{_NOTES_API}/notes/{note_id}",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        auth=_auth(), timeout=15,
+    )
+    if r.status_code != 200:
+        return {"status": "error", "error": f"PUT note failed: HTTP {r.status_code}",
+                "body": r.text[:300]}
+    n = r.json()
+    return {"status": "ok", "id": n.get("id"), "title": n.get("title"), "http_status": r.status_code}
+
+
+def cmd_notes_delete(note_id):
+    """Delete a note by ID."""
+    if not note_id:
+        return {"status": "error", "step": "id_guard", "error": "note-id is required"}
+    r = requests.delete(f"{_NOTES_API}/notes/{note_id}", auth=_auth(), timeout=15)
+    if r.status_code not in (200, 204):
+        return {"status": "error", "error": f"DELETE note failed: HTTP {r.status_code}",
+                "body": r.text[:200]}
+    return {"status": "ok", "id": note_id, "http_status": r.status_code}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -812,7 +910,9 @@ def main():
                                  "tasks_list", "tasks_create", "tasks_complete", "tasks_delete",
                                  "files_list", "files_search", "files_read", "files_write",
                                  "files_delete", "files_mkdir",
-                                 "files_list_recursive", "files_read_recursive"])
+                                 "files_list_recursive", "files_read_recursive",
+                                 "notes_list", "notes_read", "notes_create",
+                                 "notes_update", "notes_delete"])
     # Calendar / event params
     parser.add_argument("--title", default="")
     parser.add_argument("--start", default="")
@@ -827,6 +927,10 @@ def main():
     parser.add_argument("--path", default="/")
     parser.add_argument("--query", default="")
     parser.add_argument("--content", default="")
+    # Notes params
+    parser.add_argument("--note-id", default="")
+    parser.add_argument("--category", default="")
+    parser.add_argument("--favorite", type=str, default="false")
     args = parser.parse_args()
 
     if not _NC_PASS:
@@ -875,6 +979,22 @@ def main():
                 end=args.end or None,
                 description=args.description or None,
             )
+        elif args.command == "notes_list":
+            result = cmd_notes_list()
+        elif args.command == "notes_read":
+            result = cmd_notes_read(args.note_id)
+        elif args.command == "notes_create":
+            result = cmd_notes_create(args.title, args.content or "", args.category or "")
+        elif args.command == "notes_update":
+            result = cmd_notes_update(
+                args.note_id,
+                title=args.title or None,
+                content=args.content or None,
+                category=args.category or None,
+                favorite=True if str(args.favorite).lower() in ("true", "1", "yes") else None,
+            )
+        elif args.command == "notes_delete":
+            result = cmd_notes_delete(args.note_id)
         else:
             result = {"status": "error", "error": f"Unknown command: {args.command}"}
     except Exception as e:

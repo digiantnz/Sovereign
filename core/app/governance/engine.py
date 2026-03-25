@@ -49,7 +49,7 @@ class GovernanceEngine:
             elif operation == 'delete' and rules.get('file_delete', False):
                 return rules
         elif domain == 'mail':
-            if operation in ('read', 'search') and rules.get('mail_read', False):
+            if operation in ('read', 'search', 'fetch', 'flag') and rules.get('mail_read', False):
                 return rules
             elif operation == 'move' and rules.get('mail_move', False):
                 return rules
@@ -95,6 +95,9 @@ class GovernanceEngine:
         elif domain == 'skills':
             if operation in ('search', 'review', 'audit') and rules.get('skill_read', False):
                 return rules
+            # Harness read operations (LOW tier): list candidates, review candidate, clear session
+            if operation in ('list_candidates', 'review_candidate', 'clear_harness') and rules.get('skill_read', False):
+                return rules
             if operation in ('load', 'unload') and rules.get('skill_load', False):
                 return rules
             # install = composite (search+review+load); search/review are LOW read ops.
@@ -131,6 +134,13 @@ class GovernanceEngine:
             elif operation == 'sign' and rules.get('wallet_sign', False):
                 return rules
             elif operation == 'propose' and rules.get('wallet_propose', False):
+                return rules
+        elif domain == 'notes':
+            if operation == 'read' and rules.get('notes_read', False):
+                return rules
+            elif operation == 'write' and rules.get('notes_write', False):
+                return rules
+            elif operation == 'delete' and rules.get('notes_delete', False):
                 return rules
 
         raise ValueError(f"Action {action} not allowed under tier {tier}")

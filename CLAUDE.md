@@ -240,8 +240,143 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | Skill-Install-Fix | **COMPLETE** | confirmed-continuation bypass fixed: `confirmed=True` now passed via `payload={"confirmed": confirmed}` to `_dispatch_inner`; short-circuit to `lifecycle.load()` works correctly |
 | Email-E2E | **COMPLETE** | delete + move operations (SKILL.md + imap_check.py); email list format (numbered, `sender — subject (date)`); context_window passed to specialist_outbound; account defaulting fixed; `_msg` envelope shadowing fixed |
 | Qdrant-2tier | **COMPLETE** | Two-tier memory: NVMe conscious hot layer + RAID subconscious archive (`qdrant-archive`); truly ephemeral `working_memory` via `AsyncQdrantClient(location=":memory:")`; startup/shutdown sync + hourly `sync_to_archive`; graceful shutdown guarantee (`stop_grace_period: 30s`, uvicorn `--timeout-graceful-shutdown 25`) |
+| Email-Fix | **COMPLETE** | Delete + move ops; numbered email list pre-formatter (`N. Sender — Subject (Date) [uid:XXXX]`); `_original_request` preservation for confirmed-continuation; account carry-forward from context_window; `fetch_message` fast-path; file listing post-formatter |
+| NC-Mail | **COMPLETE** | `nc-mail` python3_exec skill (9 ops). Stable `databaseId` integers. Personal inbox graceful timeout (57s cap, `status:"ok"` with note). Client-side filter for search. Deterministic ID extraction in `_quick_classify`. `_DIAGNOSTIC_INTENTS` for delete/move/send with outcome stamps. `_unwrap_nb` preserves status/success for `execution_confirmed`. T-M1–T-M7 all passing 2026-03-25. |
+| NC-Notes | **COMPLETE** | 5 ops (notes_list/read/create/update/delete) added to nextcloud.py + SKILL.md + governance.json (v1.16) + engine.py. All 6 tests T1–T6 passing 2026-03-24. |
+| Notes-Index | **BUILT — PENDING UAT** | Session-scoped title→ID index on ExecutionEngine (5 min TTL). `_notes_get_or_build_index()` + `_notes_find_by_title()` (exact→substring→reverse-substring match). Index built on `list_notes`; auto-fetched cold on read/update/delete by title. Note-suffix classifier: "read/delete/update the [title] note" → deterministic regex extracts title → stored in `delegation["target"]`. `_resolve_note_id()` handles numeric vs title strings. Routing fixes: "list all the notes", "list the notes from nextcloud" → list_notes. `create/update/delete_note` added to `_DIAGNOSTIC_INTENTS` — IDs now shown in response. Delete fast-path now extracts numeric ID; `_original_request` regex fallback in delete dispatch. Matt live-tested 2026-03-24: list ✓ create ✓ update-by-ID ✓ delete-by-ID needs UAT. |
+| NC-Index-Universal | **PROPOSAL** | Extend the title→ID index pattern to all Nextcloud item types (calendar events, tasks, mail). Each item type has its own scoped index (notes_index, calendar_index, mail_index) built on list operations. Disambiguation is NOT a problem — intent routing already separates "read the dentist note" (read_note) from "cancel the dentist appointment" (delete_event). Item type is determined by the verb+noun pattern before the title lookup. Calendar index is harder: events can have duplicate titles (multiple "dentist" entries on different dates) — index entry would need to include date + title. Mail already has sender/subject/date as natural keys; a title index is less useful. Priority: Notes-Index UAT first, then assess. |
+| Skill-Harness | **COMPLETE** | Stateful multi-step skill lifecycle harness in engine.py + working_memory. search→list→review→install→clear. Pre-scan gate, WM checkpoint, HIGH-tier confirm gate. E2E tested 2026-03-23. |
+| SI-Harness | **COMPLETE** | Self-improvement harness (monitoring/self_improvement.py). Daily observe loop, baseline+anomaly detection, proposal generation with Director approval gate. Primary autonomy boundary. 2026-03-23. |
+| Dev-Harness | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Structured code change harness (dev_intake→read→diff→review→write→test→reconcile). Proposal in prospective memory. |
+| PM-Harness | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Full SDLC project management harness against sovereign semantic memory. Proposal in prospective memory. Requires Dev-Harness first. |
+| Retry-Logic | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Exponential backoff (max 3) for all harnesses, surface failure to Director. Proposal in prospective memory. |
 
 Full phase history: `docs/CLAUDE-archive.md`
+
+---
+
+## Architectural Principles — Multi-Step Skill Execution
+
+These principles apply to ALL multi-step skill execution (harnesses, lifecycle, scheduler tasks). Mandatory from 2026-03-23.
+
+### 1. Mandatory Validation Gates
+
+Every skill involving more than one sequential action MUST validate success before proceeding to the next step. No step may proceed on an unvalidated prior result.
+
+**Per-step validation must confirm:**
+- Expected response schema present (required fields non-null)
+- Non-empty result (no empty list/dict where data is expected)
+- No `error` flag or `success: false`
+- Any domain-specific invariants (e.g. manifest has ≥1 candidate, file hash matches)
+
+**On gate failure:**
+- Halt immediately — do not proceed to next step
+- Log failing step + reason to audit ledger AND episodic memory
+- Return structured failure: `{"success": false, "failed_step": "...", "reason": "...", "last_checkpoint": "..."}`
+- Never silently skip or retry without logging
+
+### 2. Working Memory Checkpointing
+
+Multi-step skills MUST write a checkpoint to `working_memory` at each validation gate.
+
+**Checkpoint schema:**
+```json
+{
+  "skill_name": "skill-harness",
+  "session_id": "<uuid>",
+  "current_step": "review",
+  "step_results": {
+    "search": {"candidates": [...], "ts": "..."},
+    "fetch": {"candidate_id": 2, "slug": "...", "ts": "..."},
+    "review": {"verdict": "approve", "risk_level": "low", "ts": "..."}
+  },
+  "last_checkpoint_ts": "...",
+  "_harness_checkpoint": true
+}
+```
+
+**Invariants:**
+- Checkpoint is written AFTER validation passes, BEFORE responding to Director
+- Checkpoint is read at the start of each step to verify prerequisites
+- If checkpoint is missing when a non-first step is invoked → fail with "run X first"
+- Checkpoint persists for the session (working_memory lifetime); wiped on `clear` command
+
+### 3. Prospective Task Approval Flow
+
+Any new prospective memory entry representing a **recurring scheduled task** must be surfaced to the Director for explicit approval before becoming `active`.
+
+**Flow:**
+1. Rex proposes task → writes `status: "pending_approval"` to prospective memory
+2. Rex presents proposal to Director: title, schedule, steps, stop_condition
+3. Director confirms → Rex sets `status: "active"` → scheduler picks it up
+4. Director rejects → Rex sets `status: "cancelled"`
+
+**Implementation:** `task_scheduler.create_task()` must default to `status: "pending_approval"` for all new recurring tasks. One-time reminders may activate immediately. Director approval changes status to `"active"`.
+
+**Note:** Tasks created directly (e.g. programmatically by Claude Code) are exempt — this applies to tasks created by Rex in response to Director natural language requests.
+
+---
+
+## Harness Pattern — Standard Structure for All Multi-Step Capabilities
+
+All future multi-step capabilities in sovereign-core follow this pattern. A harness is a **stateful step orchestrator** implemented in `execution/engine.py` (or a dedicated module imported by it), backed by `working_memory` session keys.
+
+### Session key naming convention
+
+```
+{capability}:session      # e.g. skill_harness:session, self_improvement:session
+```
+
+The session payload flag (`_harness_checkpoint`, `_si_session`, etc.) distinguishes the record type in working_memory scrolls. All session keys are ephemeral — they live in working_memory (NVMe in-process RAM) and are re-established on demand.
+
+### Standard checkpoint format
+
+```json
+{
+  "{flag_key}": true,
+  "session_id": "<uuid>",
+  "current_step": "<step_name>",
+  "step_results": {
+    "<step_a>": {"<result_fields>": "...", "ts": "<iso>"},
+    "<step_b>": {"<result_fields>": "...", "ts": "<iso>"}
+  },
+  "last_checkpoint_ts": "<iso>"
+}
+```
+
+`{flag_key}` is the unique bool field used to identify this checkpoint type when scrolling working_memory (e.g. `_harness_checkpoint`, `_si_session`).
+
+### Step sequence rules
+
+1. **First step** — writes initial checkpoint to working_memory after validation gate passes
+2. **Each subsequent step** — reads checkpoint at entry, verifies prerequisites, executes, updates checkpoint
+3. **If checkpoint missing on non-first step** → return `{"status": "no_checkpoint", "message": "Run <first_step> first"}`
+4. **Clear step** — deletes all working_memory points with the flag key set; no side effects
+
+### Validation gate requirements
+
+Every gate must confirm before writing checkpoint and proceeding:
+- Required fields present and non-null
+- No `error` field set; no `success: false`
+- Domain-specific invariants (e.g. ≥1 candidate found, verdict is not `block`, file hash matches)
+
+On gate failure: halt, log to audit + episodic, return `{success: false, failed_step, reason, last_checkpoint}`.
+
+### Intent registration
+
+Each harness step maps to an intent in `INTENT_ACTION_MAP` and `INTENT_TIER_MAP`:
+- All read/observe steps: LOW tier
+- Destructive/commit steps: MID or HIGH tier (requires Director confirmation)
+- Clear step: LOW tier
+
+All harness intents are added to the translator bypass list so structured output reaches Director directly.
+
+### Implemented harnesses
+
+| Harness | Session key flag | Steps | Notes |
+|---------|-----------------|-------|-------|
+| Skill-Harness | `_harness_checkpoint` | search → list → review → install → clear | HIGH confirm on install |
+| SI-Harness | `_si_session` | observe (daily auto) → propose (auto-triggered) | Director approves proposals; never self-modifies |
 
 ---
 

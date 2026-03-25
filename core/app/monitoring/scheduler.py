@@ -225,3 +225,12 @@ def start_archive_sync(qdrant, ledger) -> asyncio.Task:
     task = asyncio.create_task(archive_sync_loop(qdrant, ledger))
     logger.info("Archive sync: hourly NVMe → RAID sync loop started")
     return task
+
+
+# ── Re-export self-improvement observe loop ───────────────────────────────────
+# Keeps main.py import surface narrow — all scheduling starts from this module.
+
+def start_observe_loop(app_state) -> asyncio.Task:
+    """Start the daily self-improvement observe loop. Call from lifespan."""
+    from monitoring.self_improvement import start_observe_loop as _start
+    return _start(app_state)
