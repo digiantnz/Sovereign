@@ -833,7 +833,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "show me the document", "get the document",
     )
     _list_kw = (
-        "list files", "list my files", "list nextcloud", "show files",
+        "list files", "list the files", "list my files", "list nextcloud", "show files",
         "what files", "show me my files",
         "show me the files", "what's on nextcloud", "whats on nextcloud",
         "list my nextcloud files", "show my nextcloud files", "my nextcloud files",
