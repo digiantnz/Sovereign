@@ -1626,10 +1626,9 @@ class ExecutionEngine:
                         "ollama_ok": metrics.get("ollama", {}).get("inference_ok"),
                     },
                 }
-                health_brief = await self.cog.ceo_translate(
-                    "health status summary for morning briefing — plain English, first person, "
-                    "no bullet lists; one sentence if healthy; only mention issues if present",
-                    health_result,
+                health_brief = await self.cog.translator_pass(
+                    self._build_result_for_translator("health_status", health_result),
+                    tier="LOW",
                 )
                 if health_brief:
                     if morning_briefing:

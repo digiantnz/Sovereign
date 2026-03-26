@@ -14,6 +14,27 @@ SECURITY_AGENT_PATH = os.path.join(PERSONAS_DIR, "SECURITY_AGENT.md")
 
 TRANSLATOR_PATH = os.path.join(PERSONAS_DIR, "translator.md")
 
+# ---------------------------------------------------------------------------
+# Translator output sanitiser — deterministic post-processing (no LLM calls)
+#
+# Phrases that indicate the model leaked its internal reasoning or the raw
+# result_for_translator schema into the Director-facing output.  Any sentence
+# or bullet that contains one of these strings is stripped before delivery.
+#
+# NOTE: This tuple is the authoritative list.  The boundary scanner B5 rule
+# flags any OTHER string literal in the translator output path that contains
+# these phrases — so this definition line is explicitly excluded from B5 scope.
+# ---------------------------------------------------------------------------
+_TRANSLATOR_LEAK_PHRASES: tuple[str, ...] = (
+    "I followed the rules",
+    "Led with the answer",
+    "per the instructions",
+    "as instructed",
+)
+
+_SENTENCE_SPLIT_RE = _re_fab.compile(r'(?<=[.!?])\s+')
+_BULLET_LINE_RE    = _re_fab.compile(r'^\s*(?:[*\-•+]|\d+[.):])\s+')
+
 AGENT_FILE_MAP = {
     # Current names (used in classify prompt)
     "devops_agent":   "devops_agent.md",
@@ -26,6 +47,84 @@ AGENT_FILE_MAP = {
 
 
 logger = logging.getLogger(__name__)
+
+
+def _translator_sanitise(text: str) -> tuple[str, int, int]:
+    """Strip sentences/bullets containing translator meta-commentary leak phrases.
+
+    Deterministic — no LLM calls.
+
+    Returns:
+        (cleaned_text, units_stripped, total_units)
+
+    Algorithm:
+    - Split on newlines first to respect bullet/paragraph structure.
+    - Within each non-bullet paragraph, further split on sentence boundaries.
+    - A unit is stripped if it contains any _TRANSLATOR_LEAK_PHRASES entry
+      (case-insensitive match).
+    - Blank lines between paragraphs are preserved as structural separators.
+    - Collapsed consecutive blank lines after stripping to single blank line.
+    """
+    lines = text.splitlines()
+    units: list[tuple[str, str]] = []  # (raw_unit, paragraph_key)
+
+    # First pass: collect all units (bullets stay as lines; prose is
+    # sentence-split within its paragraph block)
+    para_buf: list[str] = []
+
+    def _flush_para() -> None:
+        if not para_buf:
+            return
+        para_text = " ".join(para_buf)
+        sentences = _SENTENCE_SPLIT_RE.split(para_text)
+        for s in sentences:
+            s = s.strip()
+            if s:
+                units.append((s, "prose"))
+        para_buf.clear()
+
+    for line in lines:
+        if not line.strip():
+            _flush_para()
+            units.append(("", "blank"))
+        elif _BULLET_LINE_RE.match(line):
+            _flush_para()
+            units.append((line.rstrip(), "bullet"))
+        else:
+            para_buf.append(line.strip())
+    _flush_para()
+
+    # Second pass: strip leak phrases
+    kept: list[tuple[str, str]] = []
+    stripped_count = 0
+    total_count = sum(1 for u, k in units if k != "blank")
+
+    for unit_text, kind in units:
+        if kind == "blank":
+            kept.append((unit_text, kind))
+            continue
+        lower = unit_text.lower()
+        if any(phrase.lower() in lower for phrase in _TRANSLATOR_LEAK_PHRASES):
+            stripped_count += 1
+            logger.warning(
+                "translator_sanitise: stripped leak unit: %r", unit_text[:120]
+            )
+        else:
+            kept.append((unit_text, kind))
+
+    # Third pass: reassemble — collapse consecutive blanks to one
+    out_lines: list[str] = []
+    last_was_blank = False
+    for unit_text, kind in kept:
+        if kind == "blank":
+            if not last_was_blank and out_lines:
+                out_lines.append("")
+            last_was_blank = True
+        else:
+            out_lines.append(unit_text)
+            last_was_blank = False
+
+    return "\n".join(out_lines).strip(), stripped_count, total_count
 
 
 class CognitionEngine:
@@ -553,9 +652,70 @@ class CognitionEngine:
                 r"\n*(No further action (?:is )?required\.?)$",
                 "", text, flags=_re_fab.IGNORECASE,
             ).strip()
+
+            # ── Deterministic leak sanitiser ──────────────────────────────
+            text, n_stripped, n_total = _translator_sanitise(text)
+
+            if n_total > 0 and n_stripped / n_total > 0.30:
+                # >30% stripped → violation: log to episodic and retry once
+                logger.warning(
+                    "translator_pass: VIOLATION — %d/%d units stripped (%.0f%%). "
+                    "Retrying once.",
+                    n_stripped, n_total, 100 * n_stripped / n_total,
+                )
+                import asyncio as _asyncio
+                _asyncio.create_task(self._log_translator_violation(
+                    result_for_translator, n_stripped, n_total
+                ))
+                # Retry — same prompt, one more attempt
+                try:
+                    raw2 = await self.ollama.generate(prompt, model=MODEL)
+                    text2 = raw2.get("response", "").strip()
+                    # Apply all same deterministic strips to retry output
+                    if not allow_urgent:
+                        text2 = self._URGENT_STRIP_RE.sub("", text2).strip()
+                    text2, _, _ = _translator_sanitise(text2)
+                    if text2:
+                        return text2
+                except Exception:
+                    pass
+                # Retry failed or empty — use the already-sanitised first attempt
+
             return text
         except Exception:
-            return result_for_translator.get("outcome", "")
+            return result_for_translator.get("detail", {}).get("outcome", "")
+
+    async def _log_translator_violation(
+        self, result_for_translator: dict, n_stripped: int, n_total: int
+    ) -> None:
+        """Write a translator boundary violation to episodic memory (async, non-blocking)."""
+        if not self.qdrant:
+            return
+        from datetime import datetime, timezone
+        from execution.adapters.qdrant import EPISODIC
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            await self.qdrant.store(
+                content=(
+                    f"Translator boundary violation at {ts}: "
+                    f"{n_stripped}/{n_total} output units contained "
+                    "internal reasoning leak phrases and were stripped. "
+                    "Percentage exceeded 30% threshold — output retried."
+                ),
+                metadata={
+                    "type": "translator_violation",
+                    "event_type": "translator_leak",
+                    "n_stripped": n_stripped,
+                    "n_total": n_total,
+                    "pct_stripped": round(100 * n_stripped / n_total, 1),
+                    "ts": ts,
+                    "_key": f"episodic:translator_violation:{ts}",
+                },
+                collection=EPISODIC,
+                writer="sovereign-core",
+            )
+        except Exception as e:
+            logger.warning("translator_pass: could not write violation to episodic: %s", e)
 
     # ── Pass 3: CEO Evaluation ────────────────────────────────────────────
     async def ceo_evaluate(self, user_input: str, delegation: dict, specialist_output: dict) -> dict:

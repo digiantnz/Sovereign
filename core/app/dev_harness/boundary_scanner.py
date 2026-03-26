@@ -8,6 +8,8 @@ Rules enforced (ref: dev-harness-assessment.md §9):
   B3  Freeform string literal passed to translator_pass() instead of typed envelope
   B4  Specialist agent writing directly to a restricted Qdrant collection
       (semantic | associative | relational | meta)
+  B5  Translator output path string literal containing a meta-commentary leak phrase
+      (any phrase from _TRANSLATOR_LEAK_PHRASES baked into translator prompt/output code)
 
 Design constraints:
   - No imports from sovereign-core. Fully standalone.
@@ -324,6 +326,121 @@ def scan_b4(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Rule B5 — Translator output path string literal containing a leak phrase
+#
+# The _TRANSLATOR_LEAK_PHRASES list in cognition/engine.py defines the set of
+# meta-commentary strings the sanitiser strips at runtime.  If any of those
+# phrases appear as string LITERALS (not comments, not the definition tuple
+# itself) inside the translator output path, it means the phrase has been baked
+# into a prompt, a hardcoded fallback, or a return value — and will appear in
+# the Director's output even if the runtime sanitiser is bypassed.
+#
+# Translator output path files:
+#   cognition/engine.py   — translator_pass() + _log_translator_violation()
+#   cognition/prompts.py  — translate_from_orchestrator() (PASS 5 prompt)
+#   gateway/main.py       — Telegram dispatch (final output hop)
+#
+# Exclusions (line-level):
+#   - Lines that define or reference _TRANSLATOR_LEAK_PHRASES (the authoritative
+#     list itself; it MUST contain these strings by design).
+#   - Comment lines (leading #).
+# ---------------------------------------------------------------------------
+
+_B5_LEAK_PHRASES: tuple[str, ...] = (
+    "I followed the rules",
+    "Led with the answer",
+    "per the instructions",
+    "as instructed",
+)
+
+# Pre-compile case-insensitive phrase patterns
+_B5_PATTERNS = [
+    (_re.compile(_re.escape(phrase), _re.IGNORECASE), phrase)
+    for phrase in _B5_LEAK_PHRASES
+]
+
+# String-literal detector: matches content inside single/double/triple quotes
+# We only flag when the match falls within a quoted region on the line.
+_B5_STRING_RE = _re.compile(
+    r'(?:'
+    r'"""(?:[^"\\]|\\.)*?"""'           # triple double
+    r"|'''(?:[^'\\]|\\.)*?'''"          # triple single
+    r'|"(?:[^"\\]|\\.)*?"'              # double
+    r"|'(?:[^'\\]|\\.)*?'"              # single
+    r')'
+)
+
+# Files excluded from B5 by filename (the definitions themselves)
+_B5_EXCLUSION_NAMES = {"boundary_scanner.py"}
+# Line-level skip: lines that reference the canonical definition
+_B5_SKIP_LINE_RE = _re.compile(
+    r'_TRANSLATOR_LEAK_PHRASES|_B5_LEAK_PHRASES|_translator_sanitise\s*=|_translator_sanitise\s*\('
+)
+
+# Translator output path directories/files relative to root
+_B5_PATHS = [
+    ("cognition", None),     # all .py in cognition/
+    ("gateway", None),       # all .py in gateway/
+]
+
+
+def scan_b5(root: Path) -> None:
+    targets: list[Path] = []
+    for dirname, fname in _B5_PATHS:
+        d = root / dirname
+        if not d.exists():
+            # gateway/ may be a sibling of core/app — try two levels up
+            d = root.parent.parent / dirname
+        if not d.exists():
+            continue
+        if fname:
+            p = d / fname
+            if p.exists():
+                targets.append(p)
+        else:
+            targets.extend(sorted(d.rglob("*.py")))
+
+    for py_file in targets:
+        if py_file.name in _B5_EXCLUSION_NAMES:
+            continue
+        lines = _read(py_file, root)
+        if lines is None:
+            continue
+        in_skip_block = False  # True while inside _TRANSLATOR_LEAK_PHRASES / _B5_LEAK_PHRASES tuple body
+        for lineno, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if _B5_SKIP_LINE_RE.search(line):
+                # Entering the canonical definition block — skip until closing paren
+                in_skip_block = True
+                continue
+            if in_skip_block:
+                if stripped.startswith(")"):
+                    in_skip_block = False
+                continue
+            # Collect only the string literal portions of this line
+            string_portions = "".join(m.group() for m in _B5_STRING_RE.finditer(line))
+            if not string_portions:
+                continue
+            for pattern, phrase in _B5_PATTERNS:
+                if pattern.search(string_portions):
+                    _emit(Finding(
+                        file=_rel(py_file, root),
+                        line=lineno,
+                        message=(
+                            f"B5: translator output path string literal contains "
+                            f"leak phrase {phrase!r}. Baking meta-commentary phrases "
+                            "into prompts or fallback strings causes logic bleed into "
+                            "Director output. Move to _TRANSLATOR_LEAK_PHRASES or remove."
+                        ),
+                        severity="high",
+                        rule_id="B5",
+                    ))
+                    break  # one Finding per line
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -354,6 +471,7 @@ def main() -> None:
     scan_b2(root)
     scan_b3(root)
     scan_b4(root)
+    scan_b5(root)
 
 
 if __name__ == "__main__":
