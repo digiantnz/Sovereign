@@ -23,6 +23,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import httpx
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from execution.adapters.qdrant import PROSPECTIVE, PROCEDURAL, EPISODIC, WORKING
 
@@ -347,6 +348,110 @@ class TaskScheduler:
             "capabilities": capabilities_needed,
         }
 
+    # ── Nightly dev-harness seed ──────────────────────────────────────────
+
+    async def seed_nightly_dev_task(self) -> bool:
+        """Seed the nightly dev-harness analysis task at startup. Idempotent.
+
+        Registers a cron task (0 14 * * * — 14:00 UTC = 02:00 NZST) that runs
+        dev_analyse with trigger="nightly" explicitly in the step params.
+
+        The trigger value is NOT inferred at run time — it is baked into the
+        step definition here. Removing trigger="nightly" from the step would
+        require an explicit code change, preventing accidental Phase 3 auto-chain.
+
+        Idempotency: checks both working_memory and RAID PROSPECTIVE for an
+        existing entry with title="Dev-Harness Nightly Analysis" before writing.
+
+        notify_when="never": the dev-harness sends its own Telegram on
+        block/escalate (inside Phase 3). The scheduler must not double-notify.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Dev-Harness Nightly Analysis"
+
+        # ── Idempotency check: look for any active task_procedure with dev_analyse step ─
+        # Title-based check is unreliable because qdrant.store() overwrites the title
+        # field with an LLM-generated value. Instead, check PROCEDURAL for a task that
+        # has intent=dev_analyse with params.trigger=nightly, then verify its PROSPECTIVE
+        # status is active.  Idempotent regardless of how the title was stored.
+        try:
+            proc_items, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROCEDURAL,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="type", match=MatchValue(value="task_procedure")),
+                ]),
+                limit=50,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for _pi in proc_items:
+                _pp = dict(_pi.payload or {})
+                _existing_tid = _pp.get("task_id")
+                if not _existing_tid:
+                    continue
+                for _step in _pp.get("steps", []):
+                    if (_step.get("intent") == "dev_analyse"
+                            and _step.get("params", {}).get("trigger") == "nightly"):
+                        # Found a nightly dev_analyse task — check if PROSPECTIVE status is active
+                        prosp_items, _ = await self.qdrant.archive_client.scroll(
+                            collection_name=PROSPECTIVE,
+                            scroll_filter=Filter(must=[
+                                FieldCondition(key="task_id", match=MatchValue(value=_existing_tid)),
+                                FieldCondition(key="status",  match=MatchValue(value="active")),
+                            ]),
+                            limit=2,
+                            with_payload=False,
+                            with_vectors=False,
+                        )
+                        if prosp_items:
+                            logger.info(
+                                "TaskScheduler: nightly dev_analyse task already active (task_id=%s) — skipping seed",
+                                _existing_tid[:8],
+                            )
+                            return False
+        except Exception as _e:
+            logger.debug("seed_nightly_dev_task: idempotency check failed: %s", _e)
+
+        # ── Write task ─────────────────────────────────────────────────────
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                "cron": "0 14 * * *",   # 14:00 UTC = 02:00 NZST (fixed offset, no tz lib)
+            },
+            "steps": [
+                {
+                    "intent": "dev_analyse",
+                    # trigger="nightly" is EXPLICIT in the step params —
+                    # never inferred from context. Phase 3 gates on this flag.
+                    # A change here is required to alter nightly Phase 3 behaviour.
+                    "params": {"trigger": "nightly"},
+                    "description": (
+                        "Run dev-harness Phase 1 + 2 analysis (pylint + semgrep + "
+                        "boundary_scanner + LLM classification). Phase 3 fires only "
+                        "on block/escalate — Director notified via Telegram."
+                    ),
+                }
+            ],
+            # harness sends its own Telegram on block/escalate; scheduler must not double-notify
+            "notify_when": "never",
+            "stop_condition": None,
+        }
+
+        result = await self.store_task(task_def, human_confirmed=True)
+        if result.get("status") in ("ok", "partial"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s next_due=%s",
+                _TASK_TITLE, result.get("task_id"), result.get("next_due"),
+            )
+            return True
+        else:
+            logger.warning(
+                "TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result
+            )
+            return False
+
     # ── Task listing ──────────────────────────────────────────────────────
 
     async def list_tasks(self, status_filter: str = "active") -> dict:
@@ -355,7 +460,7 @@ class TaskScheduler:
         status_filter: "active" | "paused" | "cancelled" | "all"
         """
         try:
-            all_items, _ = await self.qdrant.client.scroll(
+            all_items, _ = await self.qdrant.archive_client.scroll(
                 collection_name=PROSPECTIVE,
                 limit=200,
                 with_payload=True,
@@ -396,7 +501,7 @@ class TaskScheduler:
         if not point_id:
             return {"status": "error", "error": f"Task {task_id} not found in PROSPECTIVE"}
         try:
-            await self.qdrant.client.set_payload(
+            await self.qdrant.archive_client.set_payload(
                 collection_name=PROSPECTIVE,
                 payload={"status": new_status},
                 points=[point_id],
@@ -413,7 +518,7 @@ class TaskScheduler:
         Matches any task whose title contains "briefing" (case-insensitive).
         """
         try:
-            result = await self.qdrant.client.scroll(
+            result = await self.qdrant.archive_client.scroll(
                 collection_name=EPISODIC,
                 scroll_filter=None,
                 limit=200,
@@ -599,15 +704,16 @@ class TaskScheduler:
 
         # Advance next_due (recurring tasks only — not one_time)
         now = datetime.now(timezone.utc)
+        current_run_count = prospective.get("run_count", 0)
         if schedule.get("type") != "one_time" and not stop_triggered:
             next_due = compute_next_due(schedule, after=now)
-            await self._update_prospective_after_run(task_id, next_due, now.isoformat())
+            await self._update_prospective_after_run(task_id, next_due, now.isoformat(), current_run_count)
         elif schedule.get("type") == "one_time" or stop_triggered:
             # Mark completed
             point_id = await self._find_point_id(PROSPECTIVE, task_id)
             if point_id:
                 new_status = "completed" if not stop_triggered else "completed"
-                await self.qdrant.client.set_payload(
+                await self.qdrant.archive_client.set_payload(
                     collection_name=PROSPECTIVE,
                     payload={
                         "status": new_status,
@@ -644,7 +750,7 @@ class TaskScheduler:
         """Scroll PROSPECTIVE for active scheduled tasks with next_due <= now(UTC)."""
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
-            items, _ = await self.qdrant.client.scroll(
+            items, _ = await self.qdrant.archive_client.scroll(
                 collection_name=PROSPECTIVE,
                 limit=200,
                 with_payload=True,
@@ -667,11 +773,18 @@ class TaskScheduler:
         return due
 
     async def _get_procedure(self, task_id: str) -> dict | None:
-        """Find the PROCEDURAL entry for a given task_id by payload scroll."""
+        """Find the PROCEDURAL entry for a given task_id using a payload filter.
+
+        Uses a filtered scroll to avoid the limit=200 ceiling on large collections.
+        """
         try:
-            items, _ = await self.qdrant.client.scroll(
+            items, _ = await self.qdrant.archive_client.scroll(
                 collection_name=PROCEDURAL,
-                limit=200,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="task_id", match=MatchValue(value=task_id)),
+                    FieldCondition(key="type",    match=MatchValue(value="task_procedure")),
+                ]),
+                limit=5,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -686,50 +799,36 @@ class TaskScheduler:
         return None
 
     async def _find_point_id(self, collection: str, task_id: str) -> str | None:
-        """Scroll collection to find the Qdrant point ID for a given task_id."""
+        """Find the Qdrant point ID for a given task_id using a payload filter."""
         try:
-            items, _ = await self.qdrant.client.scroll(
+            items, _ = await self.qdrant.archive_client.scroll(
                 collection_name=collection,
-                limit=200,
-                with_payload=True,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="task_id", match=MatchValue(value=task_id)),
+                ]),
+                limit=5,
+                with_payload=False,
                 with_vectors=False,
             )
         except Exception:
             return None
-        for item in items:
-            payload = dict(item.payload or {})
-            if payload.get("task_id") == task_id:
-                return str(item.id)
+        if items:
+            return str(items[0].id)
         return None
 
     async def _update_prospective_after_run(self, task_id: str,
                                              next_due: str | None,
-                                             last_run: str) -> None:
+                                             last_run: str,
+                                             run_count: int = 0) -> None:
         """Update next_due, last_run, run_count in the PROSPECTIVE entry."""
         point_id = await self._find_point_id(PROSPECTIVE, task_id)
         if not point_id:
             return
-        # Fetch current run_count
-        try:
-            items, _ = await self.qdrant.client.scroll(
-                collection_name=PROSPECTIVE,
-                limit=200,
-                with_payload=True,
-                with_vectors=False,
-            )
-            run_count = 0
-            for item in items:
-                if str(item.id) == point_id:
-                    run_count = (item.payload or {}).get("run_count", 0)
-                    break
-        except Exception:
-            run_count = 0
-
         updates = {"last_run": last_run, "run_count": run_count + 1}
         if next_due:
             updates["next_due"] = next_due
         try:
-            await self.qdrant.client.set_payload(
+            await self.qdrant.archive_client.set_payload(
                 collection_name=PROSPECTIVE,
                 payload=updates,
                 points=[point_id],

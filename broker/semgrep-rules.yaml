@@ -1,0 +1,240 @@
+rules:
+
+  # ── B1: LLM invocation in forbidden zones ─────────────────────────────────
+  # governance/ and execution/adapters/ must never call an LLM.
+  # Exclusions (ollama.py, grok.py, claude.py, qdrant.py) are handled by
+  # path patterns — these files ARE the LLM boundary layer.
+
+  - id: sovereign-b1-call-llm-governance
+    patterns:
+      - pattern: call_llm(...)
+    paths:
+      include:
+        - "governance/**"
+      exclude:
+        - "governance/ollama.py"
+        - "governance/grok.py"
+        - "governance/claude.py"
+        - "governance/qdrant.py"
+    message: >
+      B1: call_llm() invocation inside governance/. Governance must be
+      deterministic — no LLM calls permitted.
+    languages: [python]
+    severity: ERROR
+
+  - id: sovereign-b1-call-llm-adapters
+    patterns:
+      - pattern: call_llm(...)
+    paths:
+      include:
+        - "execution/adapters/**"
+      exclude:
+        - "execution/adapters/ollama.py"
+        - "execution/adapters/grok.py"
+        - "execution/adapters/claude.py"
+        - "execution/adapters/qdrant.py"
+    message: >
+      B1: call_llm() invocation inside execution/adapters/. Adapters must not
+      invoke an LLM — they are called by the cognitive loop, not the other way.
+    languages: [python]
+    severity: ERROR
+
+  - id: sovereign-b1-ollama-adapter-governance
+    patterns:
+      - pattern: ollama_adapter.$METHOD(...)
+    paths:
+      include:
+        - "governance/**"
+      exclude:
+        - "governance/ollama.py"
+        - "governance/grok.py"
+        - "governance/claude.py"
+        - "governance/qdrant.py"
+    message: >
+      B1: ollama_adapter attribute access inside governance/. Governance must
+      remain deterministic.
+    languages: [python]
+    severity: ERROR
+
+  - id: sovereign-b1-ollama-adapter-adapters
+    patterns:
+      - pattern: ollama_adapter.$METHOD(...)
+    paths:
+      include:
+        - "execution/adapters/**"
+      exclude:
+        - "execution/adapters/ollama.py"
+        - "execution/adapters/grok.py"
+        - "execution/adapters/claude.py"
+        - "execution/adapters/qdrant.py"
+    message: >
+      B1: ollama_adapter attribute access inside execution/adapters/ (outside
+      the LLM boundary files). Adapters must not invoke an LLM.
+    languages: [python]
+    severity: ERROR
+
+  # ── B2: call_llm inside gate/validate functions ────────────────────────────
+  # Gate and validate functions are deterministic decision points.
+  # They must never call an LLM. Semgrep pattern: function def whose name ends
+  # in _gate or _validate, containing a call_llm() call.
+
+  - id: sovereign-b2-call-llm-in-gate
+    patterns:
+      - pattern: |
+          def $GATE(...):
+              ...
+              call_llm(...)
+              ...
+      - metavariable-regex:
+          metavariable: $GATE
+          regex: ".+_gate$"
+    message: >
+      B2: call_llm() inside gate function '$GATE'. Gate functions must be
+      deterministic — the LLM/deterministic boundary is enforced here.
+    languages: [python]
+    severity: ERROR
+
+  - id: sovereign-b2-call-llm-in-validate
+    patterns:
+      - pattern: |
+          def $VALIDATE(...):
+              ...
+              call_llm(...)
+              ...
+      - metavariable-regex:
+          metavariable: $VALIDATE
+          regex: ".+_validate$"
+    message: >
+      B2: call_llm() inside validate function '$VALIDATE'. Validate functions
+      must be deterministic — no LLM calls permitted.
+    languages: [python]
+    severity: ERROR
+
+  # Async variants
+
+  - id: sovereign-b2-call-llm-in-async-gate
+    patterns:
+      - pattern: |
+          async def $GATE(...):
+              ...
+              call_llm(...)
+              ...
+      - metavariable-regex:
+          metavariable: $GATE
+          regex: ".+_gate$"
+    message: >
+      B2: call_llm() inside async gate function '$GATE'. Gate functions must
+      be deterministic — no LLM calls permitted.
+    languages: [python]
+    severity: ERROR
+
+  - id: sovereign-b2-call-llm-in-async-validate
+    patterns:
+      - pattern: |
+          async def $VALIDATE(...):
+              ...
+              call_llm(...)
+              ...
+      - metavariable-regex:
+          metavariable: $VALIDATE
+          regex: ".+_validate$"
+    message: >
+      B2: call_llm() inside async validate function '$VALIDATE'. Validate
+      functions must be deterministic — no LLM calls permitted.
+    languages: [python]
+    severity: ERROR
+
+  # ── B3: string literal passed directly to translator_pass() ───────────────
+  # translator_pass() must always receive a typed result envelope (dict).
+  # Bare strings bypass the envelope schema and governance wrapping.
+
+  - id: sovereign-b3-string-to-translator-pass
+    patterns:
+      - pattern: translator_pass("...")
+    message: >
+      B3: String literal passed directly to translator_pass(). Must use a
+      typed result envelope dict. Raw strings bypass governance wrapping and
+      schema validation.
+    languages: [python]
+    severity: WARNING
+
+  - id: sovereign-b3-fstring-to-translator-pass
+    patterns:
+      - pattern: translator_pass(f"...")
+    message: >
+      B3: F-string passed directly to translator_pass(). Must use a typed
+      result envelope dict.
+    languages: [python]
+    severity: WARNING
+
+  # ── B4: specialist agent writing to restricted Qdrant collections ──────────
+  # Only execution/adapters/qdrant.py may write to semantic, associative,
+  # relational, or meta collections via archive_client.
+
+  - id: sovereign-b4-restricted-collection-write-cognition
+    patterns:
+      - pattern: archive_client.store(..., collection="$COL", ...)
+      - metavariable-regex:
+          metavariable: $COL
+          regex: "^(semantic|associative|relational|meta)$"
+    paths:
+      include:
+        - "cognition/**"
+    message: >
+      B4: archive_client.store() writing to restricted collection '$COL'
+      inside cognition/. Only execution/adapters/qdrant.py may write to
+      semantic, associative, relational, or meta collections.
+    languages: [python]
+    severity: ERROR
+
+  - id: sovereign-b4-restricted-collection-upsert-cognition
+    patterns:
+      - pattern: archive_client.upsert(..., collection="$COL", ...)
+      - metavariable-regex:
+          metavariable: $COL
+          regex: "^(semantic|associative|relational|meta)$"
+    paths:
+      include:
+        - "cognition/**"
+    message: >
+      B4: archive_client.upsert() writing to restricted collection '$COL'
+      inside cognition/. Only execution/adapters/qdrant.py may write to these
+      collections.
+    languages: [python]
+    severity: ERROR
+
+  - id: sovereign-b4-restricted-collection-write-execution
+    patterns:
+      - pattern: archive_client.store(..., collection="$COL", ...)
+      - metavariable-regex:
+          metavariable: $COL
+          regex: "^(semantic|associative|relational|meta)$"
+    paths:
+      include:
+        - "execution/**"
+      exclude:
+        - "execution/adapters/qdrant.py"
+    message: >
+      B4: archive_client.store() writing to restricted collection '$COL'
+      inside execution/ (outside qdrant adapter). Only
+      execution/adapters/qdrant.py is the legitimate writer.
+    languages: [python]
+    severity: ERROR
+
+  - id: sovereign-b4-restricted-collection-upsert-execution
+    patterns:
+      - pattern: archive_client.upsert(..., collection="$COL", ...)
+      - metavariable-regex:
+          metavariable: $COL
+          regex: "^(semantic|associative|relational|meta)$"
+    paths:
+      include:
+        - "execution/**"
+      exclude:
+        - "execution/adapters/qdrant.py"
+    message: >
+      B4: archive_client.upsert() writing to restricted collection '$COL'
+      inside execution/ (outside qdrant adapter). Only
+      execution/adapters/qdrant.py is the legitimate writer.
+    languages: [python]
+    severity: ERROR

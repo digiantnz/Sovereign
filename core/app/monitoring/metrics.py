@@ -173,11 +173,22 @@ async def collect_external_reachability() -> dict:
     """Probe external services that sovereign-core depends on."""
     checks = {}
 
-    ok, lat = await _reachable(f"{GROK_URL}/models", timeout=6.0)
-    checks["grok_api"] = {"reachable": ok, "latency_ms": lat}
+    grok_key = os.environ.get("GROK_API_KEY", "")
+    try:
+        t0 = time.monotonic()
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            gr = await client.head(
+                f"{GROK_URL}/models",
+                headers={"Authorization": f"Bearer {grok_key}"} if grok_key else {},
+            )
+        grok_ok = gr.status_code < 500
+        checks["grok_api"] = {"reachable": grok_ok, "status_code": gr.status_code,
+                               "latency_ms": round((time.monotonic() - t0) * 1000, 1)}
+    except Exception as e:
+        checks["grok_api"] = {"reachable": False, "error": str(e)}
 
-    webdav_user = os.environ.get("WEBDAV_USERNAME", "")
-    webdav_pass = os.environ.get("WEBDAV_PASSWORD", "")
+    webdav_user = os.environ.get("WEBDAV_USER", "")
+    webdav_pass = os.environ.get("WEBDAV_PASS", "")
     try:
         async with httpx.AsyncClient(timeout=6.0) as client:
             r = await client.request("PROPFIND", WEBDAV_URL,

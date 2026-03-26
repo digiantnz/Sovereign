@@ -122,7 +122,14 @@ class BrokerAdapter:
             r.raise_for_status()
             return r.json()
 
-    async def exec_command(self, command_name: str, params: dict | None = None) -> dict:
+    async def exec_command(
+        self,
+        command_name: str,
+        params: dict | None = None,
+        *,
+        trust_override: str = "",
+        timeout: float = 20.0,
+    ) -> dict:
         """Run an allowlisted CLI command via POST /exec/{command_name}.
 
         Returns structured dict with status, return_code, stdout, stderr.
@@ -130,12 +137,20 @@ class BrokerAdapter:
         HTTP 503 → command disabled (infra change required).
         HTTP 400 → shell metacharacter or param validation failure.
         Never raises — all errors returned as structured dicts.
+
+        trust_override: explicit X-Trust-Level header value; if empty, derived from command name.
+        timeout: httpx request timeout in seconds (default 20s; increase for long-running commands).
         """
         params = params or {}
-        # Determine tier from the command name — low by default; scripts need medium
-        trust = "medium" if command_name == "script" else "low"
+        # Derive trust from command name when not explicitly overridden.
+        # Dev-Harness analysis commands require medium tier.
+        _MEDIUM_COMMANDS = frozenset({
+            "script",
+            "dev_analyse", "dev_pylint", "dev_semgrep", "dev_boundary_scan", "dev_git_diff",
+        })
+        trust = trust_override or ("medium" if command_name in _MEDIUM_COMMANDS else "low")
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.post(
                     f"{BROKER_URL}/exec/{command_name}",
                     headers={"X-Trust-Level": trust},

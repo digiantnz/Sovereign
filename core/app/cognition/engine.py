@@ -64,13 +64,105 @@ class CognitionEngine:
                 return f.read()
         return "You are the Director interface. Translate results to plain English. No JSON. No jargon."
 
+    # Domain keyword sets that signal a canonical key lookup is worthwhile.
+    # Keys are the domain slug used in MIP key prefixes; values are the trigger phrases.
+    _CANONICAL_DOMAIN_SIGNALS: dict[str, frozenset[str]] = {
+        "wallet": frozenset({
+            "eth", "ethereum", "address", "wallet", "safe", "multisig", "btc",
+            "bitcoin", "xpub", "crypto",
+        }),
+        "networking": frozenset({
+            "tailscale", "vpn", "node04", "nextcloud", "url", "http", "https",
+            "hostname", "ip address", "ip", "domain",
+        }),
+        "infrastructure": frozenset({
+            "ollama", "qdrant", "endpoint", "port", "6333", "11434",
+        }),
+        "governance": frozenset({
+            "tier", "confirmation", "governance", "soul", "ed25519", "signing",
+            "checksum", "low tier", "mid tier", "high tier",
+        }),
+    }
+
+    async def _load_canonical_context(self, query: str) -> str:
+        """MIP canonical key lookup for PASS 1 context.
+
+        Runs before search_all_weighted when the user input touches known key-mapped
+        domains.  Calls list_all_keys() to get the live directory, filters to keys
+        whose domain segment matches the triggered domains, then calls retrieve_by_key()
+        for each match (cap: 4 keys).
+
+        Returns a labelled block of confirmed facts, or "" if nothing matches.
+        Results are injected into PASS 1 context separately from vector results so
+        the LLM can distinguish deterministic key lookups from similarity results.
+        """
+        if not self.qdrant:
+            return ""
+        try:
+            q_lower = query.lower()
+            q_words = set(_re_fab.split(r"\W+", q_lower))
+
+            # Determine which domains are signalled by the query
+            triggered_domains: set[str] = set()
+            for domain, signals in self._CANONICAL_DOMAIN_SIGNALS.items():
+                if q_words & signals:
+                    triggered_domains.add(domain)
+
+            # Also trigger on bare URL presence
+            if _re_fab.search(r"https?://", query):
+                triggered_domains.add("networking")
+
+            if not triggered_domains:
+                return ""
+
+            # Get live key directory (pure payload scroll — no embedding)
+            directory = await self.qdrant.list_all_keys()
+
+            # Filter to keys whose domain segment matches a triggered domain
+            # Key format: {type}:{domain}:{slug} — domain is the second segment
+            matched_keys: list[str] = []
+            for entry in directory:
+                key = entry.get("key") or ""
+                if not key or key == "NO_KEY":
+                    continue
+                parts = key.split(":")
+                if len(parts) >= 2 and parts[1] in triggered_domains:
+                    matched_keys.append(key)
+
+            if not matched_keys:
+                return ""
+
+            # Retrieve up to 4 matched keys (most specific first — longer slug = more specific)
+            matched_keys.sort(key=lambda k: len(k), reverse=True)
+            lines: list[str] = []
+            for key in matched_keys[:4]:
+                entry = await self.qdrant.retrieve_by_key(key)
+                if entry:
+                    content = entry.get("content", "")
+                    title = entry.get("title", "")
+                    lines.append(f"- [CANONICAL|{key}] {title}: {content}")
+
+            if not lines:
+                return ""
+            return "Confirmed facts (exact key lookup — high confidence):\n" + "\n".join(lines)
+
+        except Exception:
+            return ""
+
     async def load_memory_context(self, query: str,
                                    query_type: str = "knowledge") -> tuple[str, float, list[str]]:
         """Search all 7 sovereign collections with context-aware weighting.
         query_type: action | knowledge | session_start — controls collection score weights.
         On very low confidence (< 0.5), ensures a gap entry exists in meta.
+
+        Prepends canonical key lookups (MIP) when the query touches known key-mapped
+        domains — wallet, networking, infrastructure, governance.  These are labelled
+        as high-confidence confirmed facts, separate from vector similarity results.
         """
         try:
+            # MIP canonical lookup — runs before vector search; empty string if no match
+            canonical = await self._load_canonical_context(query)
+
             results = await self.qdrant.search_all_weighted(
                 query, query_type=query_type, top_k=3
             )
@@ -81,14 +173,28 @@ class CognitionEngine:
             if confidence < 0.5:
                 await self.qdrant.ensure_gap_entry(query)
 
-            if not results:
-                return "", confidence, gaps
-            lines = [
-                f"- [{r.get('_collection', '?')}|{r.get('timestamp', '')[:10]}|"
-                f"{r['score']:.2f}(w={r.get('_weight', 1.0):.1f})] {r.get('content', '')}"
-                for r in results
-            ]
-            return "Relevant memories:\n" + "\n".join(lines), confidence, gaps
+            sim_block = ""
+            if results:
+                lines = [
+                    f"- [{r.get('_collection', '?')}|{r.get('timestamp', '')[:10]}|"
+                    f"{r['score']:.2f}(w={r.get('_weight', 1.0):.1f})] {r.get('content', '')}"
+                    for r in results
+                ]
+                sim_block = "Relevant memories:\n" + "\n".join(lines)
+
+            # Canonical facts prepended — LLM sees confirmed facts before similarity results
+            if canonical and sim_block:
+                context = canonical + "\n\n" + sim_block
+            elif canonical:
+                context = canonical
+            else:
+                context = sim_block
+
+            # Bump confidence to 1.0 when canonical facts were found — they are exact matches
+            if canonical:
+                confidence = 1.0
+
+            return context, confidence, gaps
         except Exception:
             return "", 0.0, []
 

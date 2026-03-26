@@ -29,8 +29,9 @@ _DOMAIN_SOURCE = {
     "wallet":     "wallet_live",
     "scheduler":  "scheduler_live",
     "nanobot":    "nanobot_live",
-    "monitoring": "monitoring_live",
-    "notes":      "nanobot_live",
+    "monitoring":  "monitoring_live",
+    "notes":       "nanobot_live",
+    "dev_harness": "dev_harness_live",
 }
 
 # Maps CEO delegation intent → execution action dict
@@ -140,6 +141,15 @@ INTENT_ACTION_MAP = {
     "wallet_propose_safe_tx": {"domain": "wallet", "operation": "propose", "name": "wallet_propose_safe_tx"},
     "wallet_get_proposals":   {"domain": "wallet", "operation": "read",    "name": "wallet_get_proposals"},
     "wallet_get_btc_xpub":    {"domain": "wallet", "operation": "read",    "name": "wallet_get_btc_xpub"},
+    # Dev-Harness intents — devops_agent scope
+    # Phase 1 (Analyse) and Phase 2→3 auto-chain are triggered by dev_analyse.
+    # Phase 4 (Execute) is triggered by dev_approve after Director reviews Phase 3 plan.
+    "dev_analyse": {"domain": "dev_harness", "operation": "analyse"},
+    "dev_status":  {"domain": "dev_harness", "operation": "status"},
+    "dev_approve": {"domain": "dev_harness", "operation": "approve"},  # triggers Phase 4
+    "dev_reject":  {"domain": "dev_harness", "operation": "reject"},
+    "dev_verify":  {"domain": "dev_harness", "operation": "verify"},
+    "dev_clear":   {"domain": "dev_harness", "operation": "clear"},
 }
 
 # Tier required for each operation — deterministic, never from LLM
@@ -204,6 +214,17 @@ INTENT_TIER_MAP = {
     "github_push_doc":      "MID",   # standard docs and as-built updates
     "github_push_soul":     "HIGH",  # soul/constitution/governance docs — double confirmation
     "github_push_security": "HIGH",  # security pattern files — double confirmation
+    # Dev-Harness tiers
+    # dev_analyse/status/reject/verify/clear: LOW — deterministic, no Director confirmation
+    # dev_approve: MID — Director confirms before Phase 4 (CC runsheet generation + prospective write)
+    # NOTE: dev_approve is NOT HIGH — Phase 4 never self-modifies; it generates a runsheet for CC.
+    # The broker trust level (medium for analysis scripts) is a separate concern from these tiers.
+    "dev_analyse": "LOW",
+    "dev_status":  "LOW",
+    "dev_approve": "MID",
+    "dev_reject":  "LOW",
+    "dev_verify":  "LOW",
+    "dev_clear":   "LOW",
 }
 
 def _normalise_dt(value: str, default_year: int = 2026) -> str:
@@ -568,6 +589,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "what do you remember", "what's in memory", "what is in memory",
         "eth address", "wallet address", "safe address", "tailscale",
         "recall", "look up in memory", "retrieve from memory",
+        # Dev-Harness
+        "dev analyse", "dev analysis", "dev harness", "dev status",
+        "approve dev", "reject dev", "verify dev", "dev clear",
+        "code analysis", "code quality", "run analysis", "harness analyse",
     )
     prior_has_system = prior_domain is not None
 
@@ -1248,6 +1273,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "run observe", "observe cycle", "self improve", "self-improve",
         "run self-check improvement", "si observe", "improvement harness observe",
         "check for improvements", "run improvement check",
+        "run si harness", "run the si harness", "si harness", "start si harness",
+        "run self improvement harness", "self improvement harness",
     )
     if any(w in u for w in _si_observe_kw):
         return {
@@ -1277,6 +1304,83 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "self_improve_baseline",
             "target": None, "tier": "LOW",
             "reasoning_summary": "Self-improvement baseline report — deterministic pre-classifier",
+        }
+
+    # ── Dev-Harness fast-paths ─────────────────────────────────────────────
+    # All dev_* intents are deterministic — bypass CEO LLM + PASS 3.
+    # "approve/reject/verify dev fix {id}" carry an 8-char hex session_id_short
+    # extracted via regex; harness.py validates the session match.
+    import re as _re_dh
+    _dev_id_m = _re_dh.search(r'\b([0-9a-f]{8})\b', u)
+    _dev_id   = _dev_id_m.group(1) if _dev_id_m else None
+
+    _dev_analyse_kw = (
+        "dev analyse", "dev analyze", "dev analysis", "run dev analysis",
+        "dev harness analyse", "dev harness analyze", "dev harness run",
+        "run dev harness", "run the dev harness", "start dev harness",
+        "run harness", "analyse codebase", "analyze codebase",
+        "run code analysis", "code quality check", "harness analyse",
+    )
+    if any(w in u for w in _dev_analyse_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "dev_analyse",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Dev-Harness Phase 1 trigger — deterministic pre-classifier",
+        }
+
+    _dev_status_kw = (
+        "dev status", "dev harness status", "dev session", "harness status",
+        "dev analysis status", "current dev session",
+    )
+    if any(w in u for w in _dev_status_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "dev_status",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Dev-Harness status — deterministic pre-classifier",
+        }
+
+    _dev_approve_kw = (
+        "approve dev fix", "approve dev", "approve the dev fix",
+        "approve harness fix", "confirm dev fix",
+    )
+    if any(w in u for w in _dev_approve_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "dev_approve",
+            "target": _dev_id, "tier": "MID",
+            "reasoning_summary": "Dev-Harness approve (Phase 4) — deterministic pre-classifier",
+        }
+
+    _dev_reject_kw = (
+        "reject dev fix", "reject dev", "reject the dev fix",
+        "reject harness fix", "cancel dev fix",
+    )
+    if any(w in u for w in _dev_reject_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "dev_reject",
+            "target": _dev_id, "tier": "LOW",
+            "reasoning_summary": "Dev-Harness reject — deterministic pre-classifier",
+        }
+
+    _dev_verify_kw = (
+        "verify dev fix", "verify dev", "verify the dev fix",
+        "verify harness fix", "recheck dev fix", "re-run dev analysis",
+    )
+    if any(w in u for w in _dev_verify_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "dev_verify",
+            "target": _dev_id, "tier": "LOW",
+            "reasoning_summary": "Dev-Harness verify (Phase 1 re-run) — deterministic pre-classifier",
+        }
+
+    _dev_clear_kw = (
+        "dev clear", "clear dev", "clear dev harness", "clear dev session",
+        "dev harness clear", "reset dev harness",
+    )
+    if any(w in u for w in _dev_clear_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "dev_clear",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Dev-Harness clear — deterministic pre-classifier",
         }
 
     # Safety net: prior context active but no domain keywords matched the current query.
@@ -1335,6 +1439,8 @@ class ExecutionEngine:
         self.wallet_control = WalletControlAdapter(ledger=ledger)
         # Skill lifecycle manager — instantiated lazily to avoid circular imports
         self._skill_lifecycle = None
+        # Dev-Harness — instantiated lazily; broker + qdrant injected at construction time
+        self._dev_harness = None
         # Task scheduler — injected post-init from main.py to avoid circular imports
         self.task_scheduler = None
         # FastAPI app.state — injected post-init so collect_all() can include soul_checksum
@@ -2124,6 +2230,8 @@ class ExecutionEngine:
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "research",
             "memory_list_keys", "memory_retrieve_key",  # MIP — pass structured index directly
+            # Dev-Harness — all phases return structured dicts; bypass LLM summarisation
+            "dev_analyse", "dev_status", "dev_approve", "dev_reject", "dev_verify", "dev_clear",
         })
         # skill_search with no candidates — deterministic result, bypass translator invention
         if intent == "skill_search" and execution_result is not None:
@@ -2400,6 +2508,19 @@ class ExecutionEngine:
         if self._skill_lifecycle is not None:
             self._skill_lifecycle.guardian = guardian
 
+    def _get_dev_harness(self):
+        """Lazy init DevHarness — avoids import at module load time."""
+        if self._dev_harness is None:
+            from dev_harness.harness import DevHarness
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+            self._dev_harness = DevHarness(
+                broker=self.broker,
+                qdrant=self.qdrant,
+                github_token=github_token,
+                cog=self.cog,  # required for DCL-gated Claude escalation in Phase 2
+            )
+        return self._dev_harness
+
     def set_task_scheduler(self, scheduler) -> None:
         """Inject TaskScheduler post-lifespan init."""
         self.task_scheduler = scheduler
@@ -2417,7 +2538,7 @@ class ExecutionEngine:
         try:
             offset = None
             while True:
-                result, next_offset = await self.qdrant.wm_client.scroll(
+                result, next_offset = await self.qdrant.client.scroll(
                     collection_name=WORKING,
                     limit=100,
                     offset=offset,
@@ -2442,7 +2563,7 @@ class ExecutionEngine:
             offset = None
             to_delete: list = []
             while True:
-                result, next_offset = await self.qdrant.wm_client.scroll(
+                result, next_offset = await self.qdrant.client.scroll(
                     collection_name=WORKING,
                     limit=100,
                     offset=offset,
@@ -2456,7 +2577,7 @@ class ExecutionEngine:
                     break
                 offset = next_offset
             if to_delete:
-                await self.qdrant.wm_client.delete(
+                await self.qdrant.client.delete(
                     collection_name=WORKING,
                     points_selector=to_delete,
                 )
@@ -2541,9 +2662,16 @@ class ExecutionEngine:
                 for f in ("item_a_id", "item_b_id", "link_type"):
                     if memory_payload.get(f):
                         extra_meta[f] = memory_payload[f]
+            # Route to the collection PASS 4 actually decided on.
+            # coll_decision is read from memory_payload above; previously it was used only
+            # for mem_type (metadata type field) while collection=WORKING was hardcoded,
+            # causing every PASS 4 memory decision to land in ephemeral working_memory
+            # regardless of the LLM's collection choice.  Fix: write directly to the
+            # sovereign RAID collection when PASS 4 specifies one.
+            _target_coll = coll_decision if coll_decision in SOVEREIGN_COLLECTIONS else WORKING
             await self.cog.save_lesson(
                 memory_payload["lesson"], user_input,
-                collection=WORKING,
+                collection=_target_coll,
                 memory_type=mem_type,
                 writer="sovereign-core",
                 extra_metadata=extra_meta,
@@ -3550,7 +3678,7 @@ class ExecutionEngine:
                     _offset_cl = None
                     _to_del: list = []
                     while True:
-                        _cl_res, _cl_next = await self.qdrant.wm_client.scroll(
+                        _cl_res, _cl_next = await self.qdrant.client.scroll(
                             collection_name=WORKING,
                             limit=100,
                             offset=_offset_cl,
@@ -3564,7 +3692,7 @@ class ExecutionEngine:
                             break
                         _offset_cl = _cl_next
                     if _to_del:
-                        await self.qdrant.wm_client.delete(
+                        await self.qdrant.client.delete(
                             collection_name=WORKING,
                             points_selector=_to_del,
                         )
@@ -3874,8 +4002,12 @@ class ExecutionEngine:
                 ).strip(" .,")
                 if not fact:
                     return {"status": "error", "message": "Nothing to remember — fact was empty."}
-                coll = action.get("collection", WORKING)
-                mem_type = action.get("type", "lesson")
+                # Default to SEMANTIC for explicit remember_fact writes — facts and URLs
+                # committed by the Director should be durable RAID entries, not ephemeral
+                # working_memory.  Action dict may override (e.g. prospective for commitments).
+                _raw_coll = action.get("collection", SEMANTIC)
+                coll = _raw_coll if _raw_coll in SOVEREIGN_COLLECTIONS else SEMANTIC
+                mem_type = action.get("type", SEMANTIC)
                 writer = action.get("writer", "sovereign-core")
                 try:
                     point_id = await self.cog.save_lesson(
@@ -4196,6 +4328,7 @@ class ExecutionEngine:
         # before any corrective action is routed to another harness.
 
         if domain == "monitoring":
+            op = action.get("operation", "")
             from monitoring.self_improvement import (
                 run_manual_observe, list_pending_proposals, get_baseline_report,
             )
@@ -4207,6 +4340,94 @@ class ExecutionEngine:
             if op == "baseline":
                 return await get_baseline_report(self.qdrant)
             return {"error": f"Unknown monitoring operation: {op}"}
+
+        if domain == "dev_harness":
+            op = action.get("operation", "")
+            # ── Dev-Harness phases ─────────────────────────────────────────────
+            # Phase 1 (analyse) auto-chains Phase 2→3 when gate != APPROVE.
+            # Phase 4 (approve) generates CC runsheet; Director pastes to CC.
+            # Sovereign never self-modifies — runsheet is the execution artefact.
+            dh = self._get_dev_harness()
+            _dh_target = (delegation or {}).get("target") or ""
+            if op == "analyse":
+                # trigger comes from the action dict — set by the scheduler step's
+                # params field ({"trigger": "nightly"}) or defaulted to "explicit"
+                # for Director-initiated runs. Never inferred from message content.
+                _trigger = action.get("trigger", "explicit")
+                return await dh.run_phase1(trigger=_trigger)
+            if op == "status":
+                return await dh.run_status()
+            if op == "approve":
+                # ── Pre-flight validation before Phase 4 ──────────────────────
+                # _quick_classify only extracts the 8-char hex session_id_short from
+                # the message — it cannot do async Qdrant lookups. Validation happens
+                # here (async context) before the runsheet is generated.
+                # Two checks:
+                #   1. WM checkpoint exists for this session_id_short (source of truth)
+                #   2. Prospective plan entry exists with status=pending_director_approval
+                #      (belt-and-suspenders — guards against stale/typo IDs)
+                if not _dh_target:
+                    return {
+                        "success": False,
+                        "error": "No session ID provided. Usage: 'approve dev fix {id}'",
+                    }
+                _cp_pre = await dh._load_checkpoint_by_session(_dh_target)
+                if _cp_pre is None:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"No active dev harness session found matching '{_dh_target}'. "
+                            "Run 'dev analyse' to start a new session, "
+                            "or 'dev status' to check current state."
+                        ),
+                    }
+                # Prospective plan check — session must be at pending_director_approval
+                _prospective_valid = False
+                try:
+                    from execution.adapters.qdrant import PROSPECTIVE
+                    from qdrant_client.models import Filter, FieldCondition, MatchValue
+                    _p_res, _ = await dh.qdrant.archive_client.scroll(
+                        collection_name=PROSPECTIVE,
+                        scroll_filter=Filter(must=[
+                            FieldCondition(key="_dev_plan",        match=MatchValue(value=True)),
+                            FieldCondition(key="session_id_short", match=MatchValue(value=_dh_target)),
+                            FieldCondition(key="status",           match=MatchValue(value="pending_director_approval")),
+                        ]),
+                        limit=1,
+                        with_payload=False,
+                        with_vectors=False,
+                    )
+                    _prospective_valid = len(_p_res) > 0
+                except Exception as _pf_err:
+                    # Qdrant archive unavailable — log and fall through on WM checkpoint alone
+                    logger.warning(
+                        "dev_harness approve: prospective pre-flight query failed: %s — "
+                        "proceeding on WM checkpoint only",
+                        _pf_err,
+                    )
+                    _prospective_valid = True  # degrade gracefully; run_phase4 re-validates
+                if not _prospective_valid:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Session '{_dh_target}' has no pending approval in prospective memory. "
+                            "It may have already been approved or rejected, "
+                            "or Phase 3 did not complete. Run 'dev status' to check."
+                        ),
+                    }
+                return await dh.run_phase4(_dh_target)
+            if op == "reject":
+                return await dh.run_reject(_dh_target)
+            if op == "verify":
+                return await dh.run_verify(_dh_target)
+            if op == "clear":
+                _cleared = await dh.clear_checkpoint()
+                return {
+                    "success": True,
+                    "deleted": _cleared,
+                    "message": f"Dev harness session cleared ({_cleared} point(s) removed).",
+                }
+            return {"error": f"Unknown dev_harness operation: {op}"}
 
         return {"error": f"Unknown domain: {domain}"}
 

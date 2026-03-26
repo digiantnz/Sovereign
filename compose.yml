@@ -7,7 +7,14 @@ networks:
     name: browser_net   # Isolated internet-egress network — a2a-browser only
 
 volumes:
-  compose_ollama_models:  # Maps to RAID per §2 — a2a-browser has no persistent volumes (stateless)
+  compose_ollama_models:      # GPU inference models — RAID-bound per §2 (llama3.1:8b, mistral:7b)
+  compose_ollama_embed_models: # CPU embed models — separate volume for ollama-embed (nomic-embed-text)
+  sovereign_runtime:          # tmpfs — 4GB RAM-backed ephemeral scratch shared by qdrant + sovereign-core
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=4g,mode=1777"
   # whisper_models removed — whisper migrated to node04 (172.16.201.4)
   # nc_db, nc_html, nc_data, nc_config, nc_apps, nc_themes, redis_data migrated to RAID bind mounts at /home/nextcloud/
 
@@ -56,6 +63,12 @@ services:
       timeout: 3s
       start_period: 20s
       retries: 10
+    mem_limit: 512m
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    cpuset: "8-11,20-23"   # adapter cores — last 4 physical cores (both threads each)
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -63,13 +76,19 @@ services:
     networks:
       - ai_net
     volumes:
-      - /docker/runtime/qdrant:/qdrant/storage  # NVMe — conscious/hot working set (fast random IO)
+      - sovereign_runtime:/qdrant/storage  # tmpfs — working_memory in-RAM storage; ephemeral by design
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/6333"]
       interval: 30s
       timeout: 10s
       retries: 3
+    mem_limit: 4g
+    deploy:
+      resources:
+        limits:
+          memory: 4g  # Hosts working_memory in-memory collection (on_disk=False); 4GB cap
+    cpuset: "0-7,12-19"   # perf cores — memory queries are on critical path of cognitive loop
 
   qdrant-archive:
     image: qdrant/qdrant:latest
@@ -77,13 +96,19 @@ services:
     networks:
       - ai_net
     volumes:
-      - /home/sovereign/vector:/qdrant/storage  # RAID — subconscious/long-term durable memory
+      - /home/sovereign/vector:/qdrant/storage  # RAID — all 7 sovereign collections (semantic, procedural, episodic, prospective, associative, relational, meta)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/6333"]
       interval: 30s
       timeout: 10s
       retries: 3
+    mem_limit: 4g
+    deploy:
+      resources:
+        limits:
+          memory: 4g  # RAID collections accessed via mmap; 4GB covers working set + page cache
+    cpuset: "0-7,12-19"   # perf cores — archive queries serve PASS 4 memory retrieval
 
   sovereign-core:
     build:
@@ -97,6 +122,8 @@ services:
       docker-broker:
         condition: service_healthy
       ollama:
+        condition: service_healthy
+      ollama-embed:
         condition: service_healthy
       qdrant:
         condition: service_healthy
@@ -120,11 +147,13 @@ services:
       - /home/sovereign/docs:/home/sovereign/docs
       - /home/sovereign/keys:/home/sovereign/keys:rw
       - /home/sovereign/skills:/home/sovereign/skills:rw
+      - sovereign_runtime:/docker/sovereign/runtime  # tmpfs — session-ephemeral scratch (4GB, shared with qdrant)
     env_file:
       - ./secrets/grok.env
       - ./secrets/claude.env
       - ./secrets/telegram.env
       - ./secrets/ollama.env
+      - ./secrets/ollama-embed.env  # CPU embed service URL injected via OLLAMA_EMBED_URL
       - ./secrets/whisper.env
       - ./secrets/openclaw.env
       - ./secrets/webdav.env
@@ -136,11 +165,18 @@ services:
       - ./secrets/nanobot.env
     environment:
       - SOVEREIGN_KEY_PATH=/run/secrets/sovereign_key
+      - OLLAMA_EMBED_URL=http://ollama-embed:11434  # CPU-only nomic-embed-text instance
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 5s
       retries: 5
+    mem_limit: 2g
+    deploy:
+      resources:
+        limits:
+          memory: 2g  # Python process + all in-process adapters (IMAP/SMTP/WebDAV/CalDAV/etc.)
+    cpuset: "0-7,12-19"   # performance cores — first 8 physical cores (both threads each)
 
   ollama:
     image: ollama/ollama:latest
@@ -151,6 +187,7 @@ services:
     env_file: ./secrets/ollama.env
     volumes:
       - compose_ollama_models:/root/.ollama  # RAID-bound per §2
+    mem_limit: 6g
     deploy:
       resources:
         reservations:
@@ -158,11 +195,40 @@ services:
             - driver: nvidia
               capabilities: [gpu]
               count: all
+        limits:
+          memory: 6g  # llama3.1:8b-q4_K_M ~4.4GB VRAM + CPU overhead
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 5s
       retries: 5
+    # NOTE — Sequential GPU constraint:
+    # llama3.1:8b (this container) and Whisper (node04:8003) must NOT run concurrently
+    # on the RTX 3060 Ti (8GB VRAM). The whisper adapter evicts Ollama via keep_alive=0
+    # before transcription. See secrets/ollama.env for OLLAMA_KEEP_ALIVE.
+    # ollama-embed (below) is CPU-only and has no VRAM constraint.
+
+  ollama-embed:
+    image: ollama/ollama:latest
+    container_name: ollama-embed
+    restart: unless-stopped
+    networks: [ai_net]
+    # No host port — only reachable from ai_net (sovereign-core, qdrant)
+    env_file: ./secrets/ollama-embed.env
+    volumes:
+      - compose_ollama_embed_models:/root/.ollama  # Separate model store for nomic-embed-text
+    # No GPU deploy section — CPU-only by design (OLLAMA_NUM_GPU=0 in ollama-embed.env)
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    mem_limit: 2g
+    deploy:
+      resources:
+        limits:
+          memory: 2g  # nomic-embed-text is ~274MB; 2GB headroom for CPU inference batching
+    cpuset: "8-11,20-23"   # adapter cores — CPU-only, no GPU contention
 
   # whisper removed 2026-03-20 — migrated to node04 (172.16.201.4)
   # Update WHISPER_URL in secrets/whisper.env to the node04 service URL when ready.
@@ -182,6 +248,12 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
+    mem_limit: 512m
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    cpuset: "8-11,20-23"
 
   redis:
     image: redis:alpine
@@ -197,6 +269,12 @@ services:
       interval: 30s
       timeout: 3s
       retries: 5
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    cpuset: "8-11,20-23"
 
   nextcloud:
     image: nextcloud:apache
@@ -222,10 +300,12 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
+    mem_limit: 2g
     deploy:
       resources:
         limits:
           memory: 2g
+    cpuset: "8-11,20-23"
 
   sov-wallet:
     build:
@@ -243,6 +323,12 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    cpuset: "8-11,20-23"
 
   gateway:
     build:
@@ -258,6 +344,12 @@ services:
       - ./secrets/telegram.env
     environment:
       - SOVEREIGN_CORE_URL=http://sovereign-core:8000
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    cpuset: "8-11,20-23"
 
   nanobot-01:
     build:
@@ -292,6 +384,12 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s   # nanobot-ai install may be slow on first boot
+    mem_limit: 512m
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    cpuset: "8-11,20-23"
 
   nextcloud-rp:
     image: nginx:alpine
@@ -306,10 +404,16 @@ services:
     volumes:
       - ./nginx/nextcloud.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/sovereign.tail887d2b.ts.net.crt:/etc/nginx/certs/sovereign.tail887d2b.ts.net.crt:ro
-      - ./nginx/sovereign.tail887d2b.ts.net.key:/etc/nginx/certs/sovereign.tail887d2b.ts.net.key:ro    
+      - ./nginx/sovereign.tail887d2b.ts.net.key:/etc/nginx/certs/sovereign.tail887d2b.ts.net.key:ro
 
     healthcheck:
       test: ["CMD", "wget", "-T", "4", "-qO-", "http://127.0.0.1/status.php"]
       interval: 30s
       timeout: 5s
       retries: 5
+    mem_limit: 128m
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    cpuset: "8-11,20-23"

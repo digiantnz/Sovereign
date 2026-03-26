@@ -25,10 +25,12 @@ THRESHOLDS = {
 }
 
 SOVEREIGN_CONTAINERS = {
-    "sovereign-core", "ollama", "qdrant",
+    "sovereign-core", "ollama", "ollama-embed", "qdrant", "qdrant-archive",
     "docker-broker", "gateway", "nanobot-01",
 }  # whisper removed 2026-03-20 — migrated to node04 as a2a-whisper (172.16.201.4:8003)
    # a2a-browser + searxng removed 2026-03-19 (replaced by node04 172.16.201.4:8001)
+   # ollama-embed added 2026-03-25 — CPU-only nomic-embed-text embedding service
+   # qdrant-archive added 2026-03-25 — RAID-only sovereign collections (new architecture)
 
 SELF_CHECK_INTERVAL = 6 * 3600   # 6 hours in seconds
 
@@ -195,25 +197,24 @@ ARCHIVE_SYNC_INTERVAL = 3600  # 1 hour
 
 
 async def archive_sync_loop(qdrant, ledger) -> None:
-    """Asyncio background task — syncs NVMe sovereign collections → RAID archive every hour.
+    """Asyncio background task — retained for API compatibility; sync is now a no-op.
 
-    Runs independently of the shutdown sync. The shutdown sync remains as the final flush.
-    Each run is audited at LOW tier to the security ledger.
+    In the RAID-only architecture, sovereign collections live exclusively in qdrant-archive.
+    sync_to_archive() returns 0. Durable writes happen at store() time (direct to archive_client).
+    Promotion of working_memory entries happens via shutdown_promote() on clean exit.
     """
     await asyncio.sleep(ARCHIVE_SYNC_INTERVAL)
     while True:
         try:
-            pushed = await qdrant.sync_to_archive()
+            pushed = await qdrant.sync_to_archive()  # no-op in RAID-only architecture
             ts = datetime.now(timezone.utc).isoformat()
-            if pushed:
-                logger.info("Archive sync: %d new points persisted NVMe → RAID", pushed)
-            else:
-                logger.info("Archive sync: RAID already up to date (no delta)")
+            logger.debug("Archive sync: no-op in RAID-only architecture (pushed=%d)", pushed)
             if ledger:
                 ledger.append("archive_sync", "scheduled", {
                     "tier": "LOW",
                     "points_pushed": pushed,
                     "timestamp": ts,
+                    "note": "no-op: sovereign collections are RAID-only",
                 })
         except Exception as e:
             logger.error("Archive sync loop error: %s", e)

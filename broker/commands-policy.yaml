@@ -482,3 +482,90 @@ commands:
         required: true
     tier: low
     enabled: true
+
+  # ── Dev-Harness Phase 1 commands ──────────────────────────────────────────
+  # These commands run static analysis tools against the sovereign-core source
+  # tree on the host filesystem (/hostfs/home/sovereign/sovereign/core/app).
+  #
+  # Production path: harness.py dispatches dev_analyse (full run) OR the
+  # individual tool commands for targeted re-scans.
+  # Test path: run_local_analysis() in analyser.py (direct subprocess, not
+  # via broker — see production assert guard in that function).
+  #
+  # All dev commands: tier=medium (analysis reads codebase; Director intent
+  # required) and enabled=false until broker is rebuilt with Python toolchain.
+
+  dev_analyse:
+    description: >
+      Dev-Harness Phase 1 full analysis run. Executes pylint, semgrep, and
+      boundary_scanner in sequence against /hostfs/home/sovereign/sovereign/core/app.
+      Returns NDJSON tool-envelope lines (one per tool). Always exits 0.
+      Runs dev_analyse.sh — all three tools run even if one fails.
+    binary: /bin/sh
+    fixed_args: ["/scripts/dev_analyse.sh"]
+    params: {}
+    tier: medium
+    enabled: true
+
+  dev_pylint:
+    description: >
+      Run pylint --output-format=json against sovereign-core app directory.
+      Returns raw JSON array (empty if no findings). Non-zero exit is normal
+      when findings exist — treat any output as valid JSON.
+      Scan target: /hostfs/home/sovereign/sovereign/core/app
+    binary: /usr/bin/python3
+    fixed_args:
+      - "-m"
+      - "pylint"
+      - "--output-format=json"
+      - "/hostfs/home/sovereign/sovereign/core/app"
+    params: {}
+    tier: medium
+    enabled: true
+
+  dev_semgrep:
+    description: >
+      Run semgrep --json with the local custom ruleset (semgrep-rules.yaml)
+      against sovereign-core app directory. No internet egress required.
+      Returns semgrep JSON object with results[]. Exit 1 if findings.
+      Scan target: /hostfs/home/sovereign/sovereign/core/app
+    binary: /usr/bin/semgrep
+    fixed_args:
+      - "--config"
+      - "/app/semgrep-rules.yaml"
+      - "--json"
+      - "/hostfs/home/sovereign/sovereign/core/app"
+    params: {}
+    tier: medium
+    enabled: true
+
+  dev_boundary_scan:
+    description: >
+      Run boundary_scanner.py against sovereign-core app directory.
+      Emits NDJSON Finding objects to stdout. Always exits 0.
+      Rules: B1 (LLM in forbidden zones), B2 (LLM in gate/validate),
+      B3 (string literal to translator_pass), B4 (restricted collection write).
+      Scan target: /hostfs/home/sovereign/sovereign/core/app
+    binary: /usr/bin/python3
+    fixed_args:
+      - "/scripts/boundary_scanner.py"
+      - "/hostfs/home/sovereign/sovereign/core/app"
+    params: {}
+    tier: medium
+    enabled: true
+
+  dev_git_diff:
+    description: >
+      Get the git diff of uncommitted changes in the sovereign-core source tree.
+      Output used by Dev-Harness Phase 2 (classifier) and Phase 3 (plan) to
+      provide context for LLM classification and CC runsheet generation.
+      Repo root: /hostfs/home/sovereign/sovereign
+    binary: /usr/bin/git
+    fixed_args:
+      - "-C"
+      - "/hostfs/home/sovereign/sovereign"
+      - "diff"
+      - "--unified=5"
+    params: {}
+    tier: medium
+    enabled: true

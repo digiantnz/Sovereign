@@ -9,11 +9,12 @@
 ---
 
 ## Core Philosophy
-- **NVMe (`/docker`)** — conscious/hot AI runtime; fast IO for active sovereign collections + ephemeral scratch
-- **RAID5 (`/home/sovereign`)** — subconscious/durable truth; governance, memory, audit, backups; full vector archive
+- **tmpfs (`sovereign_runtime` Docker volume, 4GB)** — ephemeral RAM scratch; qdrant working_memory storage + sovereign-core session data; lost on restart by design
+- **RAID5 (`/home/sovereign`)** — subconscious/durable truth; governance, memory, audit, backups; all 7 sovereign Qdrant collections
 - **Broker** — sole holder of `docker.sock`; sovereign-core never has direct Docker access
 - **Sovereign-core** — reasoning engine and orchestration brain; enforces governance before any action
-- **Ollama** — local GPU-accelerated cognition only; never executes actions
+- **Ollama** — local GPU-accelerated inference only; never executes actions
+- **Ollama-embed** — CPU-only nomic-embed-text embedding service; no VRAM; `http://ollama-embed:11434`
 - **Nextcloud** — business memory (WebDAV/CalDAV)
 
 ---
@@ -21,7 +22,7 @@
 ## Container Architecture
 
 ### Networks
-- `ai_net`: ollama, sovereign-core, docker-broker, qdrant, qdrant-archive, gateway, nanobot-01
+- `ai_net`: ollama, ollama-embed, sovereign-core, docker-broker, qdrant, qdrant-archive, gateway, nanobot-01
 - `business_net`: nextcloud, nc-redis, nc-db, nextcloud-rp, sovereign-core (dual-homed)
 - `browser_net`: (no local container; compose-managed for future use)
 - sovereign-core dual-homed (ai_net + business_net); a2a-browser on node04 (172.16.201.4:8001, external)
@@ -35,9 +36,45 @@
 
 ### GPU (RTX 3060 Ti, 8GB VRAM)
 - Ollama uses ~4.4 GB (llama3.1:8b-instruct-q4_K_M); also has mistral:7b installed
-- Whisper medium uses ~769 MB — cannot run simultaneously with Ollama
+- Whisper medium uses ~769 MB — cannot run simultaneously with Ollama (RTX 3060 Ti is shared)
 - Whisper adapter evicts Ollama via `keep_alive=0` before transcription
 - Never load models exceeding ~7.5 GB combined
+- **ollama-embed runs CPU-only (OLLAMA_NUM_GPU=0) — no VRAM constraint**
+
+### Sequential GPU constraint (RTX 3060 Ti)
+- llama3.1:8b (ollama container) and Whisper (node04:8003, a2a-whisper) MUST NOT run concurrently
+- ollama-embed is CPU-only and has NO VRAM constraint — can run at any time
+- The whisper adapter evicts Ollama via `keep_alive=0` before each transcription request
+- Future: when Whisper moves back on-host, enforce mutual exclusion at the adapter layer
+
+### Container memory limits (32GB RAM host — AMD Ryzen 9 9900X)
+| Container | Limit | Notes |
+|-----------|-------|-------|
+| sovereign-core | 2g | Python process + all in-process adapters |
+| ollama | 6g | llama3.1:8b ~4.4GB VRAM + CPU overhead |
+| ollama-embed | 2g | nomic-embed-text CPU inference |
+| qdrant | 4g | working_memory in-RAM (on_disk=False) |
+| qdrant-archive | 4g | RAID collections, mmap'd access |
+| nanobot-01 | 512m | |
+| docker-broker | 512m | |
+| gateway | 256m | |
+| sov-wallet | 256m | |
+| nextcloud | 2g | |
+| nc-db | 512m | |
+| nc-redis | 256m | |
+| nextcloud-rp | 128m | |
+**Total ~22.5GB** — leaves ~9.5GB for OS (4GB target) + page cache.
+
+### 64GB RAM upgrade path
+- Upgrade target: 2× 32GB DDR5 (matching existing sticks)
+- Enables: expand working_memory qdrant limit from 4g → 8g+; increase sovereign-core to 4g; add periodic background flush to reduce crash-loss risk for working_memory entries
+- working_memory collection's `on_disk=False` config persists — only the container memory limit changes
+
+### CPU pinning (AMD Ryzen 9 9900X — 12 physical cores, 24 logical CPUs)
+- Core-to-CPU mapping: Core N → CPU N, CPU N+12 (e.g. Core 0 → CPU 0,12; Core 11 → CPU 11,23)
+- **sovereign-core, qdrant, qdrant-archive**: cpuset `0-7,12-19` — first 8 physical cores (both threads each); memory queries are on the critical path of the cognitive loop
+- **adapter services** (broker, gateway, nanobot-01, sov-wallet, ollama-embed, nc-db, nc-redis, nextcloud, nextcloud-rp): cpuset `8-11,20-23` — last 4 physical cores
+- ollama: no cpuset (GPU-bound; CPU threads used for tokenisation and KV cache management)
 
 ---
 
@@ -247,7 +284,8 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | NC-Index-Universal | **PROPOSAL** | Extend the title→ID index pattern to all Nextcloud item types (calendar events, tasks, mail). Each item type has its own scoped index (notes_index, calendar_index, mail_index) built on list operations. Disambiguation is NOT a problem — intent routing already separates "read the dentist note" (read_note) from "cancel the dentist appointment" (delete_event). Item type is determined by the verb+noun pattern before the title lookup. Calendar index is harder: events can have duplicate titles (multiple "dentist" entries on different dates) — index entry would need to include date + title. Mail already has sender/subject/date as natural keys; a title index is less useful. Priority: Notes-Index UAT first, then assess. |
 | Skill-Harness | **COMPLETE** | Stateful multi-step skill lifecycle harness in engine.py + working_memory. search→list→review→install→clear. Pre-scan gate, WM checkpoint, HIGH-tier confirm gate. E2E tested 2026-03-23. |
 | SI-Harness | **COMPLETE** | Self-improvement harness (monitoring/self_improvement.py). Daily observe loop, baseline+anomaly detection, proposal generation with Director approval gate. Primary autonomy boundary. 2026-03-23. |
-| Dev-Harness | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Structured code change harness (dev_intake→read→diff→review→write→test→reconcile). Proposal in prospective memory. |
+| Dev-Harness | **COMPLETE** | 4-phase code quality harness (Analyse→Classify→Plan→Execute). pylint+semgrep+boundary_scanner+GitHub Actions. LLM advisory (Ollama+Claude escalation via DCL). CC runsheet HITL handoff. Memory integration: episodic/meta/semantic/prospective. Nightly cron 14:00 UTC. Self-scan: 0 findings. 2026-03-25. |
+| Scheduler+SI-Fixes | **COMPLETE** | `_get_procedure`/`_find_point_id` limit=200 ceiling replaced with filtered Qdrant queries. `seed_nightly_dev_task` idempotency via PROCEDURAL step check (title-based unreliable — `qdrant.store()` overwrites title). SI proposal dedup gate (`_existing_pending_proposal`). Task data cleanup (5 cancelled). 2026-03-26. |
 | PM-Harness | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Full SDLC project management harness against sovereign semantic memory. Proposal in prospective memory. Requires Dev-Harness first. |
 | Retry-Logic | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Exponential backoff (max 3) for all harnesses, surface failure to Director. Proposal in prospective memory. |
 

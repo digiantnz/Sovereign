@@ -73,16 +73,9 @@ async def lifespan(app: FastAPI):
     # ── Step 2: Core services
     qdrant = QdrantAdapter()
     await qdrant.setup()
-    # Sync subconscious (RAID archive) → conscious (NVMe) before startup_load.
-    # Ensures any points persisted to RAID in a previous session are present on NVMe.
-    try:
-        _archive_synced = await qdrant.sync_from_archive()
-        if _archive_synced:
-            logger.info("Qdrant archive sync: %d points loaded from RAID → NVMe", _archive_synced)
-        else:
-            logger.info("Qdrant archive sync: NVMe already up to date with RAID archive")
-    except Exception as _e:
-        logger.warning("Qdrant archive sync (startup) failed — proceeding with NVMe-only state: %s", _e)
+    # Pre-warm working_memory from RAID sovereign collections (up to 2GB).
+    # Sovereign collections are RAID-only (qdrant-archive); startup_load() seeds
+    # working_memory (qdrant, tmpfs) with recent/high-confidence entries.
     await qdrant.startup_load()
 
     # ── Step 2a: Memory Index Protocol — startup migration
@@ -174,15 +167,16 @@ async def lifespan(app: FastAPI):
         {
             "seed_id": "backfill_v1_qdrant_endpoint",
             "key": "semantic:infrastructure:qdrant_endpoint",
-            "title": "Qdrant two-tier memory: NVMe conscious layer + RAID subconscious archive",
+            "title": "Qdrant memory: tmpfs working_memory + RAID sovereign collections",
             "content": (
-                "Qdrant conscious layer (hot): http://qdrant:6333 (NVMe, /docker/runtime/qdrant). "
-                "Qdrant subconscious archive (durable): http://qdrant-archive:6333 (RAID, /home/sovereign/vector). "
-                "7 sovereign collections: semantic, episodic, prospective, procedural, associative, relational, meta. "
-                "Ephemeral working_memory on NVMe only. "
-                "At startup: RAID → NVMe sync populates conscious layer. "
-                "At shutdown: NVMe → RAID sync persists session memories to long-term store. "
-                "Vector dimensions: 768 (nomic-embed-text)."
+                "Qdrant working_memory: http://qdrant:6333 (tmpfs, on_disk=False, ephemeral). "
+                "Qdrant sovereign archive: http://qdrant-archive:6333 (RAID, /home/sovereign/vector, durable). "
+                "7 RAID collections: semantic, episodic, prospective, procedural, associative, relational, meta. "
+                "working_memory pre-warmed at startup from RAID (top-50/collection, 2GB limit). "
+                "Promotions: Rex instruction, PASS 4 decision, or clean shutdown → working_memory → RAID. "
+                "Crash without clean shutdown: un-promoted working_memory entries are lost (known risk). "
+                "Embeddings: nomic-embed-text (768-dim) via CPU-only ollama-embed (http://ollama-embed:11434). "
+                "Inference/key generation: llama3.1:8b via GPU ollama (http://ollama:11434)."
             ),
             "domain": "infrastructure",
         },
@@ -341,6 +335,9 @@ async def lifespan(app: FastAPI):
     app.state.exec.set_task_scheduler(task_scheduler)
     app.state.task_scheduler = task_scheduler
     _task_scheduler_task = task_scheduler.start()
+    # Seed nightly dev-harness task (idempotent — no-op if already registered).
+    # Runs at 14:00 UTC (02:00 NZST) with trigger="nightly" explicit in step params.
+    await task_scheduler.seed_nightly_dev_task()
 
     # ── Step 3c: Credential proxy — session-scoped token delegation for nanobot-01
     credential_proxy = CredentialProxy(default_ttl=60, ledger=ledger)
@@ -373,17 +370,14 @@ async def lifespan(app: FastAPI):
     _task_scheduler_task.cancel()
     _archive_sync_task.cancel()
     _si_observe_task.cancel()
-    await qdrant.shutdown_promote()
-    # Sync conscious (NVMe) → subconscious (RAID archive) on shutdown.
-    # Persists any new session memories to durable long-term store.
-    try:
-        _pushed = await qdrant.sync_to_archive()
-        if _pushed:
-            logger.info("Qdrant archive sync: %d new points persisted NVMe → RAID", _pushed)
-        else:
-            logger.info("Qdrant archive sync: RAID archive already up to date")
-    except Exception as _e:
-        logger.warning("Qdrant archive sync (shutdown) failed — RAID archive may be stale: %s", _e)
+    # Promote eligible working_memory entries to RAID sovereign collections before shutdown.
+    # Entries not promoted here are lost on container exit (known acceptable risk —
+    # see docs/as-built.md; mitigated by 64GB RAM upgrade enabling periodic background flush).
+    promoted = await qdrant.shutdown_promote()
+    if promoted:
+        logger.info("Qdrant shutdown_promote: %d working_memory entries promoted to RAID", promoted)
+    else:
+        logger.info("Qdrant shutdown_promote: no new entries to promote")
 
 
 app = FastAPI(lifespan=lifespan)

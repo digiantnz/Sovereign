@@ -49,18 +49,20 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - `validate()` pass_num check uses `pass_num > 0` guard (avoids false failures on PASS 1 construction)
 - `set_security_clearance()` only accepts: `"cleared"` | `"conditional"` | `"blocked"`
 
-### Two-tier Qdrant memory architecture
-- `self.client` → NVMe Qdrant (`http://qdrant:6333`) — conscious/hot layer; all 7 sovereign collection writes go here
-- `self.archive_client` → RAID Qdrant (`http://qdrant-archive:6333`, `/home/sovereign/vector`) — subconscious/durable store; additive-only sync
-- `self.wm_client` → `AsyncQdrantClient(location=":memory:")` — truly ephemeral; `working_memory` only; zero disk IO; never touches either Qdrant server
-- `_client_for(collection)` helper — routes `WORKING` → `wm_client`, everything else → `self.client`
-- `setup()` deletes stale `working_memory` from both NVMe and RAID Qdrant servers on startup (do not store session data on RAID)
-- `sync_from_archive()` — startup: RAID → NVMe delta sync by UUID; skips `working_memory`
-- `sync_to_archive()` — shutdown + hourly: NVMe → RAID delta sync by UUID; skips `working_memory`
-- Lifecycle: `sync_from_archive` → `startup_load` (NVMe→wm_client, top-2/collection) → session → `shutdown_promote` (wm_client→NVMe) → `sync_to_archive`
-- Hourly sync wired in `monitoring/scheduler.py` via `start_archive_sync(qdrant, ledger)`; audited at LOW tier
+### Qdrant memory architecture (RAID-only sovereign collections)
+- `self.client` → qdrant container (`http://qdrant:6333`, tmpfs-backed `sovereign_runtime` volume) — working_memory ONLY; on_disk=False vectors; ephemeral by design
+- `self.archive_client` → qdrant-archive container (`http://qdrant-archive:6333`, `/home/sovereign/vector` RAID) — all 7 sovereign collections; durable; on_disk=True
+- `_client_for(collection)` helper — routes `WORKING` → `self.client`, everything else → `self.archive_client`
+- NO `wm_client` in-process Python client — working_memory lives in the qdrant container (tmpfs)
+- `setup()` always recreates working_memory fresh on startup; creates 7 RAID collections on archive_client if absent
+- `startup_load()` — pre-warms working_memory from RAID (top-50/collection, score≥0.3, hard stop at 2GB); tagged `startup_load=True` so shutdown_promote() skips them
+- `shutdown_promote()` — clean exit: promotes eligible working_memory entries → RAID collections; skips startup_load items, procedural, and items with no valid type
+- `sync_from_archive()` / `sync_to_archive()` — both are no-ops; retained for API compat; log a warning
+- Lifecycle: `setup()` → `startup_load()` (RAID→working_memory, 2GB limit) → session → `shutdown_promote()` (working_memory→RAID)
+- Crash without clean shutdown: un-promoted working_memory entries are LOST — known acceptable risk; mitigated by 64GB RAM upgrade (enables periodic background flush)
 - Graceful shutdown: `stop_grace_period: 30s` (compose.yml), uvicorn `--timeout-graceful-shutdown 25` (Dockerfile)
-- `on_disk=False` in Qdrant VectorParams does NOT mean truly in-memory — Qdrant still writes WAL/segments to disk; use `location=":memory:"` for true ephemeral
+- Embeddings: `_embed()` uses `self._embed_url` (default `http://ollama-embed:11434`) — CPU-only service; never blocks GPU
+- Key generation: `_generate_key_and_title()` uses `self._ollama_url` (`http://ollama:11434`) — GPU llama3.1:8b; separate from embedding
 
 ### Memory Index Protocol (MIP)
 - `execution/adapters/qdrant.py` implements ContextKeep v1.2 two-step retrieve pattern
@@ -236,10 +238,14 @@ sovereign:
 
 - Data-driven — no task-specific code
 - Task types: PROSPECTIVE (when/status/next_due), PROCEDURAL (steps, `human_confirmed=True`), EPISODIC (run history) — all share `task_id`
-- Scheduler loop: every 60s; uses `qdrant.client.set_payload()` to update next_due/status without re-embedding
+- Scheduler loop: every 60s; uses `qdrant.archive_client.set_payload()` to update next_due/status without re-embedding
 - `compute_next_due()` handles cron/interval/one_time
 - Scheduler keywords in `_quick_classify`: must be checked BEFORE conversational guard and BEFORE email keywords to avoid misrouting
 - `confirmed=True` must be passed via `payload={"confirmed": confirmed}` in short-circuit `_dispatch` call so PROCEDURAL writes get `human_confirmed=True`
+- `_get_procedure()` + `_find_point_id()`: use **filtered** Qdrant scroll (`FieldCondition` on `task_id` + `type`), NOT unfiltered `limit=200`. PROCEDURAL can grow past 200 entries (skill harness procedural memory bloat). Full-table scan causes `no procedure found` once collection > limit.
+- `seed_nightly_dev_task()` idempotency: checks PROCEDURAL for `type=task_procedure` + step `intent=dev_analyse + trigger=nightly`, then verifies PROSPECTIVE `status=active`. Title-based check unreliable — `qdrant.store()` overwrites `metadata["title"]` with LLM-generated `_key_fields["title"]` (last in payload merge order).
+- `qdrant.store()` title overwrite invariant: if you need a stable title in a stored entry, pass `_key` in `metadata` so LLM generation is skipped and only `last_updated` is added to `_key_fields`.
+- SI harness `_write_proposal()` + `propose()`: dedup gate via `_existing_pending_proposal()` — checks PROSPECTIVE for existing `pending_approval` proposal with same `trigger` + dedup field (`task_id`/`intent`/`event_type`/`metric`). Dedup fields stored in proposal payload so filter works on next cycle.
 
 ---
 

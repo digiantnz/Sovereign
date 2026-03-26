@@ -1,16 +1,26 @@
 """QdrantAdapter — 7 typed sovereign collections + ephemeral working_memory.
 
-Collections:
-  working_memory  — ephemeral RAM, session cache (NVMe, on_disk=False)
-  semantic        — durable facts/knowledge (RAID, on_disk=True)
-  procedural      — repeatable workflows (RAID, on_disk=True, human_confirmed required)
-  episodic        — timestamped experiences with outcomes (RAID, on_disk=True)
-  prospective     — scheduled/conditional tasks (RAID, on_disk=True)
-  associative     — links between memory items (RAID, on_disk=True)
-  relational      — concept comparisons/contrasts (RAID, on_disk=True)
-  meta            — domain knowledge maps with gap tracking (RAID, on_disk=True)
+Architecture (post Qdrant-2tier-v2):
+  working_memory  — qdrant container (tmpfs-backed, on_disk=False vectors); ephemeral by design.
+                    Lost on crash — known acceptable risk; 64GB RAM upgrade enables periodic flush.
+  semantic        — qdrant-archive (RAID, on_disk=True); durable facts/knowledge
+  procedural      — qdrant-archive (RAID, on_disk=True); repeatable workflows (human_confirmed required)
+  episodic        — qdrant-archive (RAID, on_disk=True); timestamped experiences with outcomes
+  prospective     — qdrant-archive (RAID, on_disk=True); scheduled/conditional tasks
+  associative     — qdrant-archive (RAID, on_disk=True); links between memory items
+  relational      — qdrant-archive (RAID, on_disk=True); concept comparisons/contrasts
+  meta            — qdrant-archive (RAID, on_disk=True); domain knowledge maps with gap tracking
 
-Embeddings via Ollama nomic-embed-text (768-dim).
+Memory promotion service:
+  Entries written to working_memory are promoted to the appropriate on-disk RAID collection when:
+    1. Rex issues an explicit promote instruction
+    2. sovereign-core's PASS 4 memory decision resolves to a durable collection
+    3. Clean container shutdown (shutdown_promote())
+  On startup, working_memory is pre-warmed from RAID (up to 2GB; top-N per collection).
+  Crash without clean shutdown = working_memory entries not yet promoted are LOST.
+
+Embeddings: nomic-embed-text (768-dim) via CPU-only ollama-embed service (http://ollama-embed:11434).
+Inference (key generation): llama3.1:8b via GPU ollama service (http://ollama:11434).
 Write permissions enforced per collection. All sovereign writes audited to JSONL.
 """
 import asyncio
@@ -44,6 +54,13 @@ VECTOR_DIM          = 768
 EMBED_MODEL         = "nomic-embed-text"
 AUDIT_PATH          = "/home/sovereign/audit/memory-promotions.jsonl"
 CONFIDENCE_THRESHOLD = 0.75
+
+# Preload budget: 2GB RAM ÷ ~3.5KB per point ≈ 590K points theoretical max.
+# In practice the collections hold a few thousand entries; this is a safety valve.
+_PRELOAD_BYTES_LIMIT = 2 * 1024 * 1024 * 1024   # 2 GB
+_BYTES_PER_POINT     = VECTOR_DIM * 4 + 512       # ~3.5 KB (vector heap + payload overhead)
+_PRELOAD_MAX_POINTS  = _PRELOAD_BYTES_LIMIT // _BYTES_PER_POINT   # ~590K
+_PRELOAD_PER_COLLECTION = 50   # top-N per collection per preload query
 
 # ── Query type classification ─────────────────────────────────────────────
 _ACTION_KW = frozenset([
@@ -98,19 +115,27 @@ WRITE_PERMISSIONS = {
 class QdrantAdapter:
     def __init__(self, qdrant_url="http://qdrant:6333",
                  qdrant_archive_url="http://qdrant-archive:6333",
-                 ollama_url="http://ollama:11434"):
-        self.client = AsyncQdrantClient(url=qdrant_url)                       # NVMe — conscious hot layer
-        self.archive_client = AsyncQdrantClient(url=qdrant_archive_url)       # RAID — subconscious durable store
-        self.wm_client = AsyncQdrantClient(location=":memory:")               # RAM — truly ephemeral, never touches disk
-        self._ollama_url = ollama_url
+                 ollama_url="http://ollama:11434",
+                 ollama_embed_url=None):
+        # working_memory lives in the qdrant container (tmpfs-backed, on_disk=False)
+        self.client = AsyncQdrantClient(url=qdrant_url)
+        # All 7 sovereign collections live in qdrant-archive (RAID, durable)
+        self.archive_client = AsyncQdrantClient(url=qdrant_archive_url)
+        self._ollama_url = ollama_url   # GPU — llama3.1:8b for inference/key generation
+        # CPU-only embed service — falls back to GPU ollama if not configured
+        self._embed_url = (
+            ollama_embed_url
+            or os.environ.get("OLLAMA_EMBED_URL", "http://ollama-embed:11434")
+        )
 
     def _client_for(self, collection: str) -> "AsyncQdrantClient":
-        """Route working_memory to the in-process RAM client; everything else to NVMe Qdrant."""
-        return self.wm_client if collection == WORKING else self.client
+        """Route working_memory to qdrant (tmpfs RAM); everything else to qdrant-archive (RAID)."""
+        return self.client if collection == WORKING else self.archive_client
 
     async def _embed(self, text: str) -> list[float]:
+        """Embed text via CPU-only nomic-embed-text on ollama-embed service."""
         async with httpx.AsyncClient(timeout=30.0) as http:
-            r = await http.post(f"{self._ollama_url}/api/embeddings",
+            r = await http.post(f"{self._embed_url}/api/embeddings",
                                 json={"model": EMBED_MODEL, "prompt": text})
             r.raise_for_status()
             return r.json()["embedding"]
@@ -120,6 +145,7 @@ class QdrantAdapter:
     ) -> tuple[str | None, str | None]:
         """Generate a deterministic _key and title for a memory entry via a single Ollama call.
 
+        Uses GPU ollama (llama3.1:8b) for inference — separate from the CPU embed service.
         Key format: {type}:{domain}:{slug} — the type and domain prefix is assembled here from
         known fields so Ollama cannot deviate from it. Only the slug is LLM-generated.
         Returns (key, title) on success, (None, None) on any failure or timeout.
@@ -140,6 +166,9 @@ class QdrantAdapter:
         )
         try:
             async with httpx.AsyncClient(timeout=10.0) as http:
+                # MIP key generation — direct Ollama call, documented B1 exclusion.
+                # Rationale: qdrant adapter is the LLM interface layer, not a caller of it.
+                # If this pattern spreads to other files, add a B5 rule for raw /api/generate URLs.
                 r = await http.post(
                     f"{self._ollama_url}/api/generate",
                     json={
@@ -185,68 +214,72 @@ class QdrantAdapter:
             return None, None
 
     async def setup(self):
-        """Called at startup. Recreates working_memory (ephemeral RAM).
-        Creates each sovereign collection only if absent (preserves RAID data).
-        Does NOT touch old sovereign_memory collection.
+        """Called at startup. Recreates working_memory (ephemeral tmpfs, on_disk=False).
+        Creates each sovereign collection on qdrant-archive only if absent (preserves RAID data).
         """
-        # working_memory: in-process RAM only — create on wm_client, never on the server
-        await self.wm_client.create_collection(
+        # working_memory: in qdrant container (tmpfs-backed, on_disk=False vectors + HNSW)
+        # Always recreate on startup — working_memory is intentionally ephemeral.
+        existing = {c.name for c in (await self.client.get_collections()).collections}
+        if WORKING in existing:
+            await self.client.delete_collection(WORKING)
+        await self.client.create_collection(
             collection_name=WORKING,
             vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE, on_disk=False),
             hnsw_config=HnswConfigDiff(on_disk=False),
         )
 
-        # Remove any stale working_memory from the NVMe Qdrant server (now lives in wm_client only)
-        existing = {c.name for c in (await self.client.get_collections()).collections}
-        if WORKING in existing:
-            await self.client.delete_collection(WORKING)
-
-        # Remove stale working_memory from RAID archive — it should never persist there
-        try:
-            archive_existing = {c.name for c in (await self.archive_client.get_collections()).collections}
-            if WORKING in archive_existing:
-                await self.archive_client.delete_collection(WORKING)
-                _log.info("setup: removed stale working_memory from RAID archive")
-        except Exception as _e:
-            _log.warning("setup: could not clean working_memory from archive: %s", _e)
-
-        # 7 sovereign collections: create if absent (NVMe hot layer; RAID archive in sync_from/to_archive)
+        # 7 sovereign collections: create on RAID archive if absent (preserves existing data)
+        archive_existing = {c.name for c in (await self.archive_client.get_collections()).collections}
         for coll in SOVEREIGN_COLLECTIONS:
-            if coll not in existing:
-                await self.client.create_collection(
+            if coll not in archive_existing:
+                await self.archive_client.create_collection(
                     collection_name=coll,
                     vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE, on_disk=True),
                     hnsw_config=HnswConfigDiff(on_disk=True),
                 )
 
     async def startup_load(self):
-        """Warm working_memory from all 7 sovereign collections.
-        Embeds a sentinel query once, then parallel-queries all collections.
-        Copies vectors directly (no re-embed). Items tagged startup_load=True.
+        """Pre-warm working_memory from RAID sovereign collections.
+
+        Loads recent + high-confidence entries (top-50 per collection, score ≥ 0.3).
+        Hard stop at 2GB estimated RAM to respect the 32GB system budget.
+        Items tagged startup_load=True so shutdown_promote() skips them (already on RAID).
+
+        On crash without clean shutdown: pre-warmed entries survive (already on RAID).
+        Session-new entries written after startup_load are the only at-risk data.
         """
         try:
             vector = await self._embed("current system state knowledge overview")
-        except Exception:
+        except Exception as exc:
+            _log.warning("startup_load: embed failed — skipping preload: %s", exc)
             return
 
+        total_loaded = 0
+
         async def _load_one(coll: str):
+            nonlocal total_loaded
+            if total_loaded >= _PRELOAD_MAX_POINTS:
+                return
             try:
-                response = await self.client.query_points(
+                limit = min(_PRELOAD_PER_COLLECTION, _PRELOAD_MAX_POINTS - total_loaded)
+                response = await self.archive_client.query_points(
                     collection_name=coll,
                     query=vector,
-                    limit=2,
+                    limit=limit,
                     score_threshold=0.3,
                     with_payload=True,
                     with_vectors=True,
                 )
                 for r in response.points:
+                    if total_loaded >= _PRELOAD_MAX_POINTS:
+                        break
                     raw_vec = r.vector if isinstance(r.vector, list) else None
                     if raw_vec is None:
                         continue
                     payload = dict(r.payload or {})
                     payload["startup_load"] = True
                     payload["source_collection"] = coll
-                    await self.wm_client.upsert(                # RAM only — subconscious → conscious seed
+                    await self.client.upsert(
                         collection_name=WORKING,
                         points=[PointStruct(
                             id=str(uuid.uuid4()),
@@ -254,10 +287,16 @@ class QdrantAdapter:
                             payload=payload,
                         )],
                     )
-            except Exception:
-                pass  # swallow per-collection errors
+                    total_loaded += 1
+            except Exception as exc:
+                _log.warning("startup_load: collection %s failed: %s", coll, exc)
 
         await asyncio.gather(*[_load_one(c) for c in SOVEREIGN_COLLECTIONS])
+        est_mb = total_loaded * _BYTES_PER_POINT / 1024 / 1024
+        _log.info(
+            "startup_load: preloaded %d entries into working_memory (~%.1f MB estimated RAM)",
+            total_loaded, est_mb,
+        )
 
     async def seed_skill_install_procedure(self) -> bool:
         """Seed the PROCEDURAL collection with the skill installation sequence.
@@ -292,10 +331,10 @@ class QdrantAdapter:
         )
 
         try:
-            # Check if already seeded
+            # Check if already seeded (search on RAID archive)
             try:
                 vec = await self._embed("install skill sequence search review load")
-                existing = await self.client.query_points(
+                existing = await self.archive_client.query_points(
                     collection_name=PROCEDURAL,
                     query=vec,
                     limit=5,
@@ -333,6 +372,8 @@ class QdrantAdapter:
                     human_confirmed: bool = False) -> str:
         """Embed and store. Returns point ID.
 
+        working_memory → qdrant container (tmpfs, ephemeral).
+        sovereign collections → qdrant-archive (RAID, durable).
         Raises PermissionError if writer lacks access or procedural written without human_confirmed.
         """
         if not self._can_write(writer, collection):
@@ -400,14 +441,14 @@ class QdrantAdapter:
     async def search_all_sovereign(self, query: str,
                                    top_k: int = 3,
                                    score_threshold: float = 0.35) -> list[dict]:
-        """Embed once, parallel-search all 7 sovereign collections.
+        """Embed once, parallel-search all 7 sovereign RAID collections.
         Returns merged results sorted descending by score, each tagged _collection.
         """
         vector = await self._embed(query)
 
         async def _search_one(coll: str):
             try:
-                resp = await self.client.query_points(
+                resp = await self.archive_client.query_points(
                     collection_name=coll,
                     query=vector,
                     limit=top_k,
@@ -450,11 +491,13 @@ class QdrantAdapter:
                       target_collection: str = None,
                       writer: str = "sovereign-core",
                       human_confirmed: bool = False) -> bool:
-        """Move a point from working_memory to a sovereign collection.
+        """Promote a point from working_memory to a sovereign RAID collection.
 
+        Reads from qdrant (working_memory, tmpfs) and writes to qdrant-archive (RAID).
         target_collection inferred from payload.type if not provided; defaults to episodic.
+        Deletes the source entry from working_memory after successful promotion.
         """
-        points = await self.wm_client.retrieve(
+        points = await self.client.retrieve(
             collection_name=WORKING,
             ids=[point_id],
             with_payload=True,
@@ -498,20 +541,26 @@ class QdrantAdapter:
             payload["_no_key"] = True
             payload["last_updated"] = _now
 
-        await self.client.upsert(                   # sovereign collection → NVMe hot layer
+        await self.archive_client.upsert(   # promote to RAID durable store
             collection_name=target_collection,
             points=[PointStruct(id=new_id, vector=vec, payload=payload)],
         )
-        await self.wm_client.delete(collection_name=WORKING, points_selector=[point_id])
+        await self.client.delete(collection_name=WORKING, points_selector=[point_id])
         self._log_audit("promote", target_collection, new_id, writer,
                         payload.get("content", "")[:120])
         return True
 
     async def shutdown_promote(self) -> int:
-        """On shutdown: promote eligible working_memory items to sovereign collections.
+        """On clean shutdown: promote eligible working_memory items to sovereign RAID collections.
 
-        Skips: items with startup_load=True, type not in SOVEREIGN_COLLECTIONS, procedural.
+        Reads from qdrant (working_memory, tmpfs) → writes to qdrant-archive (RAID).
+        Skips: items with startup_load=True (already on RAID), type not in SOVEREIGN_COLLECTIONS,
+               procedural entries (requires human confirmation — never auto-promote).
         Returns count of promoted items.
+
+        NOTE: If the container crashes without a clean shutdown, working_memory entries not yet
+        promoted here are LOST. This is known acceptable risk. The 64GB RAM upgrade would allow
+        a periodic background flush to mitigate it.
         """
         items = await self._get_all_working_memory()
         promoted = 0
@@ -519,7 +568,7 @@ class QdrantAdapter:
             payload = item.get("payload", {})
             mem_type = payload.get("type", "")
 
-            # Skip startup-loaded items (already came from sovereign)
+            # Skip startup-loaded items (already came from RAID sovereign collections)
             if payload.get("startup_load"):
                 continue
             # Skip items with no valid sovereign type
@@ -548,7 +597,7 @@ class QdrantAdapter:
                 payload["_no_key"] = True
                 payload["last_updated"] = _now
             try:
-                await self.client.upsert(
+                await self.archive_client.upsert(   # RAID durable store
                     collection_name=mem_type,
                     points=[PointStruct(id=new_id, vector=vec, payload=payload)],
                 )
@@ -563,133 +612,32 @@ class QdrantAdapter:
         return promoted
 
     async def sync_from_archive(self) -> int:
-        """Startup: pull any sovereign collection points from RAID Qdrant that are absent on NVMe.
+        """No-op — replaced by startup_load() pre-warm from RAID.
 
-        Scrolls each of the 7 sovereign collections on both instances; upserts RAID points
-        whose UUID is not already present on NVMe. working_memory is always ephemeral — skipped.
-        Returns total count of points copied RAID → NVMe.
+        The previous two-tier NVMe↔RAID sync is no longer needed. All 7 sovereign
+        collections now live exclusively on RAID (qdrant-archive). working_memory is
+        pre-warmed at startup via startup_load() and promoted on shutdown via shutdown_promote().
+        Retained for API compatibility with main.py lifespan.
         """
-        copied = 0
-        for coll in SOVEREIGN_COLLECTIONS:
-            try:
-                # Ensure collection exists on NVMe (setup() should have created it, but be safe)
-                existing_colls = {c.name for c in (await self.client.get_collections()).collections}
-                if coll not in existing_colls:
-                    await self.client.create_collection(
-                        collection_name=coll,
-                        vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE, on_disk=True),
-                        hnsw_config=HnswConfigDiff(on_disk=True),
-                    )
-
-                # Collect all existing NVMe point IDs for this collection
-                nvme_ids: set = set()
-                offset = None
-                while True:
-                    result, next_offset = await self.client.scroll(
-                        collection_name=coll, limit=200, offset=offset,
-                        with_payload=False, with_vectors=False,
-                    )
-                    for r in result:
-                        nvme_ids.add(str(r.id))
-                    if next_offset is None:
-                        break
-                    offset = next_offset
-
-                # Scroll RAID archive and upsert missing points to NVMe
-                offset = None
-                while True:
-                    try:
-                        result, next_offset = await self.archive_client.scroll(
-                            collection_name=coll, limit=100, offset=offset,
-                            with_payload=True, with_vectors=True,
-                        )
-                    except Exception:
-                        break  # collection may not exist on archive yet
-                    for r in result:
-                        if str(r.id) not in nvme_ids:
-                            vec = r.vector if isinstance(r.vector, list) else None
-                            if vec is None:
-                                continue
-                            await self.client.upsert(
-                                collection_name=coll,
-                                points=[PointStruct(id=r.id, vector=vec, payload=dict(r.payload or {}))],
-                            )
-                            copied += 1
-                    if next_offset is None:
-                        break
-                    offset = next_offset
-            except Exception as exc:
-                _log.warning("sync_from_archive: error on collection %s: %s", coll, exc)
-        return copied
+        _log.info("sync_from_archive: no-op — sovereign collections are RAID-only; "
+                  "working_memory pre-warmed via startup_load()")
+        return 0
 
     async def sync_to_archive(self) -> int:
-        """Shutdown: push any sovereign collection points from NVMe Qdrant absent on RAID archive.
+        """No-op — replaced by shutdown_promote() and explicit memory promotion.
 
-        Ensures RAID is always a superset of NVMe — the durable long-term store.
-        Returns total count of points copied NVMe → RAID.
+        Retained for API compatibility with monitoring/scheduler.py archive_sync_loop.
+        Returns 0 — no NVMe→RAID delta sync needed in RAID-only architecture.
         """
-        pushed = 0
-        for coll in SOVEREIGN_COLLECTIONS:
-            try:
-                # Ensure collection exists on archive
-                try:
-                    archive_colls = {c.name for c in (await self.archive_client.get_collections()).collections}
-                except Exception:
-                    archive_colls = set()
-                if coll not in archive_colls:
-                    await self.archive_client.create_collection(
-                        collection_name=coll,
-                        vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE, on_disk=True),
-                        hnsw_config=HnswConfigDiff(on_disk=True),
-                    )
-
-                # Collect all existing RAID point IDs for this collection
-                raid_ids: set = set()
-                offset = None
-                while True:
-                    try:
-                        result, next_offset = await self.archive_client.scroll(
-                            collection_name=coll, limit=200, offset=offset,
-                            with_payload=False, with_vectors=False,
-                        )
-                        for r in result:
-                            raid_ids.add(str(r.id))
-                        if next_offset is None:
-                            break
-                        offset = next_offset
-                    except Exception:
-                        break
-
-                # Scroll NVMe and upsert missing points to RAID
-                offset = None
-                while True:
-                    result, next_offset = await self.client.scroll(
-                        collection_name=coll, limit=100, offset=offset,
-                        with_payload=True, with_vectors=True,
-                    )
-                    for r in result:
-                        if str(r.id) not in raid_ids:
-                            vec = r.vector if isinstance(r.vector, list) else None
-                            if vec is None:
-                                continue
-                            await self.archive_client.upsert(
-                                collection_name=coll,
-                                points=[PointStruct(id=r.id, vector=vec, payload=dict(r.payload or {}))],
-                            )
-                            pushed += 1
-                    if next_offset is None:
-                        break
-                    offset = next_offset
-            except Exception as exc:
-                _log.warning("sync_to_archive: error on collection %s: %s", coll, exc)
-        return pushed
+        _log.debug("sync_to_archive: no-op — use shutdown_promote() for durable promotion")
+        return 0
 
     async def _get_all_working_memory(self) -> list[dict]:
-        """Scroll all working_memory items (with vectors). Uses in-memory wm_client."""
+        """Scroll all working_memory items (with vectors). Uses qdrant container (tmpfs)."""
         items = []
         offset = None
         while True:
-            result, next_offset = await self.wm_client.scroll(
+            result, next_offset = await self.client.scroll(
                 collection_name=WORKING,
                 limit=100,
                 offset=offset,
@@ -710,7 +658,7 @@ class QdrantAdapter:
     async def search_all_weighted(self, query: str, query_type: str = "knowledge",
                                    top_k: int = 3,
                                    score_threshold: float = 0.35) -> list[dict]:
-        """Embed once, parallel-search all 7 sovereign collections with context-aware
+        """Embed once, parallel-search all 7 sovereign RAID collections with context-aware
         score weighting. Episodic/procedural boosted for action queries; semantic/meta
         boosted for knowledge queries; prospective boosted on session start.
         """
@@ -719,7 +667,7 @@ class QdrantAdapter:
 
         async def _search_one(coll: str):
             try:
-                resp = await self.client.query_points(
+                resp = await self.archive_client.query_points(
                     collection_name=coll,
                     query=vector,
                     limit=top_k,
@@ -752,7 +700,7 @@ class QdrantAdapter:
         """
         today = datetime.now(timezone.utc).date().isoformat()
         try:
-            scroll_result = await self.client.scroll(
+            scroll_result = await self.archive_client.scroll(
                 collection_name=PROSPECTIVE,
                 limit=100,
                 with_payload=True,
@@ -806,7 +754,7 @@ class QdrantAdapter:
     async def startup_migration(self) -> int:
         """One-time migration: stamp _no_key=True on any sovereign entry missing a _key field.
 
-        Scrolls all 7 sovereign collections, patches payload only — no re-embedding.
+        Scrolls all 7 sovereign RAID collections, patches payload only — no re-embedding.
         Idempotent: entries already carrying _key or _no_key are skipped.
         Returns count of entries patched.
         """
@@ -815,7 +763,7 @@ class QdrantAdapter:
             try:
                 offset = None
                 while True:
-                    result, next_offset = await self.client.scroll(
+                    result, next_offset = await self.archive_client.scroll(
                         collection_name=coll,
                         limit=100,
                         offset=offset,
@@ -825,7 +773,7 @@ class QdrantAdapter:
                     for r in result:
                         payload = dict(r.payload or {})
                         if "_key" not in payload and not payload.get("_no_key"):
-                            await self.client.set_payload(
+                            await self.archive_client.set_payload(
                                 collection_name=coll,
                                 payload={"_no_key": True},
                                 points=[r.id],
@@ -841,7 +789,7 @@ class QdrantAdapter:
     async def list_all_keys(self) -> list[dict]:
         """Return a structured directory of all sovereign memory entries.
 
-        Scrolls all 7 collections. Returns index fields only — no full content.
+        Scrolls all 7 RAID collections. Returns index fields only — no full content.
         Use retrieve_by_key() for the complete payload.
         """
         directory: list[dict] = []
@@ -849,7 +797,7 @@ class QdrantAdapter:
             try:
                 offset = None
                 while True:
-                    result, next_offset = await self.client.scroll(
+                    result, next_offset = await self.archive_client.scroll(
                         collection_name=coll,
                         limit=100,
                         offset=offset,
@@ -881,14 +829,14 @@ class QdrantAdapter:
         return directory
 
     async def retrieve_by_key(self, key: str) -> dict | None:
-        """Exact-key lookup across all 7 sovereign collections.
+        """Exact-key lookup across all 7 sovereign RAID collections.
 
         Never uses vector search — pure Qdrant payload filter on _key == key.
         Returns full payload + collection and point_id, or None if not found.
         """
         for coll in SOVEREIGN_COLLECTIONS:
             try:
-                result, _ = await self.client.scroll(
+                result, _ = await self.archive_client.scroll(
                     collection_name=coll,
                     scroll_filter=Filter(
                         must=[FieldCondition(key="_key", match=MatchValue(value=key))]
@@ -923,7 +871,7 @@ class QdrantAdapter:
             if not content or not seed_id:
                 continue
             try:
-                existing, _ = await self.client.scroll(
+                existing, _ = await self.archive_client.scroll(
                     collection_name=SEMANTIC,
                     scroll_filter=Filter(
                         must=[FieldCondition(
@@ -940,7 +888,7 @@ class QdrantAdapter:
                     if stored_key == canonical_key:
                         continue  # Already seeded with correct canonical key — skip
                     # Wrong key (old generator or prefix change) — delete and re-seed
-                    await self.client.delete(
+                    await self.archive_client.delete(
                         collection_name=SEMANTIC,
                         points_selector=[existing[0].id],
                     )
@@ -982,7 +930,7 @@ class QdrantAdapter:
         offset = None
         while True:
             try:
-                pts, nxt = await self.client.scroll(
+                pts, nxt = await self.archive_client.scroll(
                     collection_name=SEMANTIC,
                     limit=100,
                     offset=offset,
@@ -1000,7 +948,7 @@ class QdrantAdapter:
                 for pattern in patterns:
                     if pattern["match"] in content:
                         try:
-                            await self.client.set_payload(
+                            await self.archive_client.set_payload(
                                 collection_name=SEMANTIC,
                                 payload={
                                     "_key": pattern["key"],

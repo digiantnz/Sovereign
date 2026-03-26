@@ -105,7 +105,7 @@ async def _load_si_session(qdrant) -> dict:
         from execution.adapters.qdrant import WORKING
         offset = None
         while True:
-            result, next_offset = await qdrant.wm_client.scroll(
+            result, next_offset = await qdrant.client.scroll(
                 collection_name=WORKING,
                 limit=100,
                 offset=offset,
@@ -141,7 +141,7 @@ async def _save_si_session(qdrant, session: dict) -> None:
         offset = None
         to_delete = []
         while True:
-            result, next_offset = await qdrant.wm_client.scroll(
+            result, next_offset = await qdrant.client.scroll(
                 collection_name=WORKING,
                 limit=100,
                 offset=offset,
@@ -155,7 +155,7 @@ async def _save_si_session(qdrant, session: dict) -> None:
                 break
             offset = next_offset
         if to_delete:
-            await qdrant.wm_client.delete(
+            await qdrant.client.delete(
                 collection_name=WORKING,
                 points_selector=to_delete,
             )
@@ -177,7 +177,7 @@ async def _load_baseline_entries(qdrant, metric_name: str) -> list[dict]:
     """
     from execution.adapters.qdrant import SEMANTIC
     try:
-        result, _ = await qdrant.client.scroll(
+        result, _ = await qdrant.archive_client.scroll(
             collection_name=SEMANTIC,
             scroll_filter=Filter(must=[
                 FieldCondition(key="_baseline_metric", match=MatchValue(value=True)),
@@ -267,7 +267,7 @@ async def _save_baseline(qdrant, metric_name: str, stats: dict) -> None:
                 pid = entry.get("point_id")
                 if pid:
                     try:
-                        await qdrant.client.delete(
+                        await qdrant.archive_client.delete(
                             collection_name=SEMANTIC,
                             points_selector=[pid],
                         )
@@ -291,7 +291,7 @@ async def _collect_skill_stats(qdrant) -> dict:
     try:
         offset = None
         while True:
-            result, next_offset = await qdrant.client.scroll(
+            result, next_offset = await qdrant.archive_client.scroll(
                 collection_name=EPISODIC,
                 scroll_filter=Filter(must=[
                     FieldCondition(key="_exec_log", match=MatchValue(value=True)),
@@ -346,7 +346,7 @@ async def _collect_prospective_stats(qdrant) -> dict:
     from execution.adapters.qdrant import PROSPECTIVE, EPISODIC
     try:
         # Scroll all active prospective tasks
-        p_result, _ = await qdrant.client.scroll(
+        p_result, _ = await qdrant.archive_client.scroll(
             collection_name=PROSPECTIVE,
             scroll_filter=Filter(must=[
                 FieldCondition(key="status", match=MatchValue(value="active")),
@@ -361,7 +361,7 @@ async def _collect_prospective_stats(qdrant) -> dict:
             return {"never_executed": [], "execution_rate": 1.0, "active_count": 0}
 
         # Scroll episodic for task execution history
-        e_result, _ = await qdrant.client.scroll(
+        e_result, _ = await qdrant.archive_client.scroll(
             collection_name=EPISODIC,
             scroll_filter=Filter(must=[
                 FieldCondition(key="event_type", match=MatchValue(value="task_run")),
@@ -483,8 +483,11 @@ async def _write_proposal(
     qdrant, trigger: str, observation_summary: str,
     root_cause_hypothesis: str, proposed_action: str,
     required_tier: str, expected_outcome: str,
+    dedup_fields: dict | None = None,
 ) -> str:
     """Store a structured improvement proposal in prospective memory.
+    dedup_fields: dict of extra payload fields used by _existing_pending_proposal
+                  (e.g. {"task_id": ..., "intent": ..., "event_type": ..., "metric": ...})
     Returns the proposal_id (UUID).
     """
     from execution.adapters.qdrant import PROSPECTIVE
@@ -494,23 +497,26 @@ async def _write_proposal(
         f"Self-improvement proposal [{trigger}]: {observation_summary[:200]}. "
         f"Proposed action: {proposed_action[:200]}."
     )
+    metadata = {
+        "type": "improvement_proposal",
+        "trigger": trigger,
+        "observation_summary": observation_summary,
+        "root_cause_hypothesis": root_cause_hypothesis,
+        "proposed_corrective_action": proposed_action,
+        "required_tier": required_tier,
+        "expected_outcome": expected_outcome,
+        "proposal_status": "pending_approval",
+        "proposal_id": proposal_id,
+        "created_ts": ts,
+        "_key": f"prospective:self_improvement:proposal:{proposal_id}",
+        "status": "pending_approval",
+    }
+    if dedup_fields:
+        metadata.update(dedup_fields)
     try:
         await qdrant.store(
             content=content,
-            metadata={
-                "type": "improvement_proposal",
-                "trigger": trigger,
-                "observation_summary": observation_summary,
-                "root_cause_hypothesis": root_cause_hypothesis,
-                "proposed_corrective_action": proposed_action,
-                "required_tier": required_tier,
-                "expected_outcome": expected_outcome,
-                "proposal_status": "pending_approval",
-                "proposal_id": proposal_id,
-                "created_ts": ts,
-                "_key": f"prospective:self_improvement:proposal:{proposal_id}",
-                "status": "pending_approval",
-            },
+            metadata=metadata,
             collection=PROSPECTIVE,
             writer="sovereign-core",
         )
@@ -566,7 +572,7 @@ async def _check_recovery(qdrant, cog, session: dict, metrics_snapshot: dict, ba
             proposal_id = anomaly_info.get("proposal_id")
             if proposal_id:
                 try:
-                    p_result, _ = await qdrant.client.scroll(
+                    p_result, _ = await qdrant.archive_client.scroll(
                         collection_name=PROSPECTIVE,
                         scroll_filter=Filter(must=[
                             FieldCondition(key="proposal_id", match=MatchValue(value=proposal_id)),
@@ -578,7 +584,7 @@ async def _check_recovery(qdrant, cog, session: dict, metrics_snapshot: dict, ba
                     for r in p_result:
                         payload = dict(r.payload or {})
                         if payload.get("proposal_status") == "pending_approval":
-                            await qdrant.client.set_payload(
+                            await qdrant.archive_client.set_payload(
                                 collection_name=PROSPECTIVE,
                                 payload={"proposal_status": "auto_closed_recovery", "closed_ts": ts},
                                 points=[r.id],
@@ -857,9 +863,46 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
 
 # ── Propose function ──────────────────────────────────────────────────────────
 
+async def _existing_pending_proposal(qdrant, trigger_type: str, dedup_key: str | None) -> bool:
+    """Return True if a pending_approval proposal with the same trigger + dedup_key exists.
+
+    dedup_key: task_id for prospective_never_executed, intent for skill_failure_pattern,
+               event_type for hard_failure, metric for soft_anomaly.
+    Prevents the observe loop from generating duplicate proposals each daily cycle.
+    """
+    from execution.adapters.qdrant import PROSPECTIVE
+    try:
+        must = [
+            FieldCondition(key="trigger",         match=MatchValue(value=trigger_type)),
+            FieldCondition(key="proposal_status", match=MatchValue(value="pending_approval")),
+        ]
+        if dedup_key:
+            # Map trigger type to the payload field that holds the dedup value
+            _key_field = {
+                "prospective_never_executed": "task_id",
+                "skill_failure_pattern":      "intent",
+                "hard_failure":               "event_type",
+                "soft_anomaly":               "metric",
+            }.get(trigger_type)
+            if _key_field:
+                must.append(FieldCondition(key=_key_field, match=MatchValue(value=dedup_key)))
+        items, _ = await qdrant.archive_client.scroll(
+            collection_name=PROSPECTIVE,
+            scroll_filter=Filter(must=must),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        return len(items) > 0
+    except Exception as e:
+        logger.warning("SIHarness: dedup check failed: %s", e)
+        return False  # fail-open: write proposal if check errors
+
+
 async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
     """Generate structured improvement proposals for the given triggers.
     Stores each in prospective memory and notifies Director.
+    Skips triggers that already have a pending_approval proposal (dedup).
     Returns list of generated proposal_ids.
     """
     if not triggers:
@@ -924,6 +967,17 @@ async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
         else:
             continue
 
+        # Dedup: skip if a pending_approval proposal already exists for this trigger
+        _dedup_key = {
+            "prospective_never_executed": trigger.get("task_id"),
+            "skill_failure_pattern":      trigger.get("intent"),
+            "hard_failure":               trigger.get("event_type"),
+            "soft_anomaly":               trigger.get("metric"),
+        }.get(ttype)
+        if await _existing_pending_proposal(qdrant, ttype, _dedup_key):
+            logger.info("SIHarness: skipping duplicate proposal for %s / %s", ttype, _dedup_key)
+            continue
+
         # Write proposal to prospective memory
         pid = await _write_proposal(
             qdrant, trigger=ttype,
@@ -932,6 +986,12 @@ async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
             proposed_action=action,
             required_tier=tier,
             expected_outcome=outcome,
+            dedup_fields={_key_field: _dedup_key} if (_key_field := {
+                "prospective_never_executed": "task_id",
+                "skill_failure_pattern":      "intent",
+                "hard_failure":               "event_type",
+                "soft_anomaly":               "metric",
+            }.get(ttype)) and _dedup_key else None,
         )
         proposal_ids.append(pid)
 
@@ -991,7 +1051,7 @@ async def list_pending_proposals(qdrant) -> dict:
     """Return all pending improvement proposals (status=pending_approval)."""
     from execution.adapters.qdrant import PROSPECTIVE
     try:
-        result, _ = await qdrant.client.scroll(
+        result, _ = await qdrant.archive_client.scroll(
             collection_name=PROSPECTIVE,
             scroll_filter=Filter(must=[
                 FieldCondition(key="type",            match=MatchValue(value="improvement_proposal")),

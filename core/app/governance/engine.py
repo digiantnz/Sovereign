@@ -142,5 +142,15 @@ class GovernanceEngine:
                 return rules
             elif operation == 'delete' and rules.get('notes_delete', False):
                 return rules
+        elif domain == 'dev_harness':
+            # Dev-Harness operations — internal analysis only, no external system access
+            if operation in ('analyse', 'status', 'reject', 'verify', 'clear') and rules.get('skill_read', False):
+                return rules
+            elif operation == 'approve' and (rules.get('skill_read', False) or rules.get('skill_load', False)):
+                return rules
+        elif domain == 'monitoring':
+            # SI-Harness operations — observe/baseline/proposals are read-only, write to memory
+            if operation in ('observe', 'proposals', 'baseline') and rules.get('memory_write', False):
+                return rules
 
         raise ValueError(f"Action {action} not allowed under tier {tier}")
