@@ -108,6 +108,41 @@ def _github_url_to_raw(url: str) -> Optional[str]:
     return f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}"
 
 
+def _extract_clawhub_scan(html: str) -> Optional[dict]:
+    """Extract llmAnalysis and vtAnalysis from clawhub.ai SSR-embedded page data.
+
+    clawhub.ai uses TanStack Router SSR serialisation ($R array). Fields are
+    embedded as JS object literals with double-quoted strings. The llmAnalysis
+    object contains nested $R references (dimensions array) so [^}] patterns
+    fail — instead we search a fixed window after the field marker.
+
+    Returns {"llm": {...}, "vt": {...}} or None if no scan data found.
+    """
+    import re as _re_scan
+
+    def _after(marker: str, pattern: str, window: int = 3000) -> Optional[str]:
+        idx = html.find(marker)
+        if idx < 0:
+            return None
+        m = _re_scan.search(pattern, html[idx:idx + window])
+        return m.group(1) if m else None
+
+    llm_verdict = _after("llmAnalysis", r'verdict:"([^"]+)"')
+    llm_status  = _after("llmAnalysis", r'status:"([^"]+)"')
+    llm_summary = _after("llmAnalysis", r'summary:"((?:[^"\\]|\\.){0,400})"', window=4000)
+
+    vt_verdict  = _after("vtAnalysis",  r'verdict:"([^"]+)"', window=2000)
+    vt_status   = _after("vtAnalysis",  r'status:"([^"]+)"',  window=2000)
+
+    if not llm_verdict and not vt_verdict:
+        return None
+
+    return {
+        "llm": {"status": llm_status, "verdict": llm_verdict, "summary": llm_summary},
+        "vt":  {"status": vt_status,  "verdict": vt_verdict},
+    }
+
+
 def _candidate_meta(fm: dict, content: str) -> dict:
     """Extract display metadata from parsed SKILL.md frontmatter.
 
@@ -295,15 +330,39 @@ class SkillLifecycleManager:
                         if not has_name and not has_sovereign and not has_openclaw:
                             continue
                         slug = fm.get("name") or _html_url.rstrip("/").split("/")[-2] or "unknown"
+                        # openclaw/skills is the official registry — treat as certified
+                        _is_certified = "github.com/openclaw/skills" in _html_url
+                        # Fetch clawhub.ai scan data (llmAnalysis + vtAnalysis) if available.
+                        # URL pattern: github.com/openclaw/skills/blob/<ref>/skills/<owner>/<skill>/SKILL.md
+                        # → clawhub.ai/<owner>/<skill>
+                        _clawhub_scan = None
+                        if _is_certified:
+                            try:
+                                _oc_m = __import__("re").search(
+                                    r"openclaw/skills/(?:blob|tree)/[^/]+/skills/([^/]+)/([^/]+)",
+                                    _html_url,
+                                )
+                                if _oc_m:
+                                    _oc_url = f"https://clawhub.ai/{_oc_m.group(1)}/{_oc_m.group(2)}"
+                                    _oc_resp = await self._fetch_raw_url(_oc_url)
+                                    if _oc_resp:
+                                        _clawhub_scan = _extract_clawhub_scan(_oc_resp)
+                            except Exception as _se:
+                                logger.debug("clawhub scan fetch failed: %s", _se)
                         candidates.append({
                             "slug": slug,
                             "summary": fm.get("description", ""),
                             "github_url": _html_url,
                             "raw_url": raw_url,
-                            "certified": None,
+                            "certified": _is_certified,
+                            "clawhub_scan": _clawhub_scan,
                             "skill_md": content,
                             "meta": _candidate_meta(fm, content),
-                            "WARNING": "Source: GitHub API — review required before loading",
+                            "WARNING": (
+                                "Source: OpenClaw registry (certified)"
+                                if _is_certified
+                                else "Source: GitHub — unverified, review required"
+                            ),
                         })
                         if len(candidates) >= limit:
                             break
@@ -336,15 +395,20 @@ class SkillLifecycleManager:
                     if not has_name and not has_sovereign and not has_openclaw:
                         continue
                     slug = fm.get("name") or url.rstrip("/").split("/")[-2] or "unknown"
+                    _is_certified_sx = "github.com/openclaw/skills" in url
                     candidate: dict = {
                         "slug": slug,
                         "summary": fm.get("description", item.get("content", "")[:200]),
                         "github_url": url,
                         "raw_url": raw_url,
-                        "certified": None,
+                        "certified": _is_certified_sx,
                         "skill_md": content,
                         "meta": _candidate_meta(fm, content),
-                        "WARNING": "Source: GitHub — review required before loading",
+                        "WARNING": (
+                            "Source: OpenClaw registry (certified)"
+                            if _is_certified_sx
+                            else "Source: GitHub — unverified, review required"
+                        ),
                     }
                     candidates.append(candidate)
                     if len(candidates) >= limit:

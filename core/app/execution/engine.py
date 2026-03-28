@@ -31,6 +31,8 @@ _DOMAIN_SOURCE = {
     "nanobot":    "nanobot_live",
     "monitoring":  "monitoring_live",
     "notes":       "nanobot_live",
+    "ncfs":     "nanobot_live",
+    "ncingest": "nanobot_live",
     "dev_harness": "dev_harness_live",
 }
 
@@ -55,6 +57,22 @@ INTENT_ACTION_MAP = {
     "create_note": {"domain": "notes", "operation": "write",  "name": "notes_create"},
     "update_note": {"domain": "notes", "operation": "write",  "name": "notes_update"},
     "delete_note": {"domain": "notes", "operation": "delete", "name": "notes_delete"},
+    # sovereign-nextcloud-fs — full filesystem navigation + OCS tagging
+    # name matches governance allowed_actions; _dispatch_inner remaps to nanobot op names
+    "ncfs_list":           {"domain": "ncfs", "operation": "read",   "name": "ncfs_list"},
+    "ncfs_list_recursive": {"domain": "ncfs", "operation": "read",   "name": "ncfs_list_recursive"},
+    "ncfs_read":           {"domain": "ncfs", "operation": "read",   "name": "ncfs_read"},
+    "ncfs_move":           {"domain": "ncfs", "operation": "move",   "name": "ncfs_move"},
+    "ncfs_copy":           {"domain": "ncfs", "operation": "copy",   "name": "ncfs_copy"},
+    "ncfs_mkdir":          {"domain": "ncfs", "operation": "mkdir",  "name": "ncfs_mkdir"},
+    "ncfs_delete":         {"domain": "ncfs", "operation": "delete", "name": "ncfs_delete"},
+    "ncfs_tag":            {"domain": "ncfs", "operation": "tag",    "name": "ncfs_tag"},
+    "ncfs_untag":          {"domain": "ncfs", "operation": "untag",  "name": "ncfs_untag"},
+    "ncfs_search":         {"domain": "ncfs", "operation": "search", "name": "ncfs_search"},
+    # sovereign-nextcloud-ingest — knowledge ingestion pipeline
+    "ingest_file":    {"domain": "ncingest", "operation": "ingest",  "name": "ingest_file"},
+    "ingest_folder":  {"domain": "ncingest", "operation": "ingest",  "name": "ingest_folder"},
+    "ingest_status":  {"domain": "ncingest", "operation": "status",  "name": "ingest_status"},
     "fetch_email":        {"domain": "mail",   "operation": "read",    "name": "nc_list_unread"},
     "search_email":       {"domain": "mail",   "operation": "search",  "name": "nc_search"},
     "move_email":         {"domain": "mail",   "operation": "move",    "name": "nc_move"},
@@ -135,12 +153,18 @@ INTENT_ACTION_MAP = {
     # Browser auth configuration — devops_agent scope (MID tier)
     "configure_browser_auth": {"domain": "browser_config", "operation": "configure_auth"},
     # Wallet intents — devops_agent scope (LOW/MID/HIGH tier)
-    "wallet_read_config":     {"domain": "wallet", "operation": "read",    "name": "wallet_read_config"},
-    "wallet_get_address":     {"domain": "wallet", "operation": "read",    "name": "wallet_get_address"},
-    "wallet_sign_message":    {"domain": "wallet", "operation": "sign",    "name": "wallet_sign_message"},
-    "wallet_propose_safe_tx": {"domain": "wallet", "operation": "propose", "name": "wallet_propose_safe_tx"},
-    "wallet_get_proposals":   {"domain": "wallet", "operation": "read",    "name": "wallet_get_proposals"},
-    "wallet_get_btc_xpub":    {"domain": "wallet", "operation": "read",    "name": "wallet_get_btc_xpub"},
+    "wallet_read_config":     {"domain": "wallet",           "operation": "read",    "name": "wallet_read_config"},
+    "wallet_get_address":     {"domain": "wallet",           "operation": "read",    "name": "wallet_get_address"},
+    "wallet_sign_message":    {"domain": "wallet",           "operation": "sign",    "name": "wallet_sign_message"},
+    "wallet_propose_safe_tx": {"domain": "wallet",           "operation": "propose", "name": "wallet_propose_safe_tx"},
+    "wallet_get_proposals":   {"domain": "wallet",           "operation": "read",    "name": "wallet_get_proposals"},
+    "wallet_get_btc_xpub":    {"domain": "wallet",           "operation": "read",    "name": "wallet_get_btc_xpub"},
+    # Wallet watchlist intents — watch address management via Qdrant MIP
+    "wallet_list_addresses":  {"domain": "wallet_watchlist", "operation": "list",    "name": "wallet_list_addresses"},
+    "wallet_add_address":     {"domain": "wallet_watchlist", "operation": "add",     "name": "wallet_add_address"},
+    "wallet_remove_address":  {"domain": "wallet_watchlist", "operation": "remove",  "name": "wallet_remove_address"},
+    "wallet_check_address":   {"domain": "wallet_watchlist", "operation": "check",   "name": "wallet_check_address"},
+    "wallet_portfolio":       {"domain": "wallet_watchlist", "operation": "check",   "name": "wallet_portfolio"},
     # Dev-Harness intents — devops_agent scope
     # Phase 1 (Analyse) and Phase 2→3 auto-chain are triggered by dev_analyse.
     # Phase 4 (Execute) is triggered by dev_approve after Director reviews Phase 3 plan.
@@ -162,6 +186,14 @@ INTENT_TIER_MAP = {
     "list_files_recursive": "LOW", "read_files_recursive": "LOW",
     "list_notes": "LOW", "read_note": "LOW",
     "create_note": "MID", "update_note": "MID", "delete_note": "HIGH",
+    # sovereign-nextcloud-fs tiers
+    # All ncfs ops are LOW — Nextcloud is Director-trusted; no confirmation required for FS ops.
+    # New files arriving in /downloads/ are still scanned before ingest (inline_scan gate).
+    "ncfs_list": "LOW", "ncfs_list_recursive": "LOW", "ncfs_read": "LOW", "ncfs_search": "LOW",
+    "ncfs_move": "LOW", "ncfs_copy": "LOW", "ncfs_mkdir": "LOW", "ncfs_delete": "LOW",
+    "ncfs_tag": "LOW", "ncfs_untag": "LOW",
+    # sovereign-nextcloud-ingest tiers — MID because memory write follows confirmation
+    "ingest_file": "MID", "ingest_folder": "MID", "ingest_status": "LOW",
     "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
     "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
     "read_feed": "LOW",
@@ -189,6 +221,12 @@ INTENT_TIER_MAP = {
     "wallet_propose_safe_tx": "HIGH",
     "wallet_get_proposals":   "MID",
     "wallet_get_btc_xpub":    "LOW",
+    # Wallet watchlist tiers
+    "wallet_list_addresses":  "LOW",
+    "wallet_check_address":   "LOW",
+    "wallet_portfolio":       "LOW",
+    "wallet_add_address":     "MID",
+    "wallet_remove_address":  "MID",
     # Scheduler tiers — all LOW: Rex managing prospective memory is internal,
     # equivalent to writing in a notebook. No Director confirmation required.
     "schedule_task":        "LOW",
@@ -589,6 +627,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "what do you remember", "what's in memory", "what is in memory",
         "eth address", "wallet address", "safe address", "tailscale",
         "recall", "look up in memory", "retrieve from memory",
+        # Wallet watchlist
+        "watchlist", "watch list", "watched addresses", "watching addresses",
+        "watch this address", "add to watchlist", "stop watching", "unwatch",
+        "portfolio", "portfolio value", "portfolio worth", "wallet balance",
+        "check address", "check wallet", "monitor this address",
         # Dev-Harness
         "dev analyse", "dev analysis", "dev harness", "dev status",
         "approve dev", "reject dev", "verify dev", "dev clear",
@@ -858,10 +901,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "show me the document", "get the document",
     )
     _list_kw = (
-        "list files", "list the files", "list my files", "list nextcloud", "show files",
-        "what files", "show me my files",
-        "show me the files", "what's on nextcloud", "whats on nextcloud",
-        "list my nextcloud files", "show my nextcloud files", "my nextcloud files",
+        "list files", "list the files", "list my files", "show files",
+        "what files", "show me my files", "show me the files",
         # "what's in" and "whats in" removed — too broad (matches "what's in my fridge" etc.)
         "how many files", "how many templates", "how many documents", "how many items",
         "count files", "count templates", "count the files", "count the templates",
@@ -903,48 +944,25 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "target": None, "tier": "LOW",
             "reasoning_summary": "Skill audit — deterministic pre-classifier",
         }
-    # Composite skill_install: "install a skill for X", "get me a skill that does X"
-    # Must be checked BEFORE skill_search so "install" takes the right path.
+    # NL skill install fallback — for plain-text "install a skill for X" requests.
+    # Primary path is /install command (see gateway.py CommandHandler + _run_install_harness).
+    # This fallback routes to the legacy composite flow for users who don't use the command.
+    import re as _re_sk_pre
     _skill_install_kw = (
         "install a skill", "install skill", "install the skill",
         "get me a skill", "get a skill", "load a skill", "load skill",
         "add a skill", "add skill", "set up a skill",
     )
-    import re as _re_sk_pre
     _skill_install_match = (
         any(w in u for w in _skill_install_kw)
         or bool(_re_sk_pre.search(r"\b(install|load|add)\b.{0,40}\bskill\b", u))
-        # After a skill search, "install <name>" / "load <name>" routes to skill_install
-        # even without the word "skill" — the prior_domain context makes the intent clear.
         or (prior_domain == "skills" and bool(_re_sk_pre.search(r"\b(install|load|add)\b\s+\S", u)))
     )
     if _skill_install_match:
-        import re as _re_sk_i
-        # Try "install [the|a] <skill-name> skill" pattern first — extracts the skill name
-        _name_match = _re_sk_i.search(
-            r"\b(?:install|load|add|get me|get|set up)\b\s+(?:the\s+|a\s+)?(.+?)\s+skill\b",
-            u, _re_sk_i.IGNORECASE
-        )
-        if _name_match:
-            _q_i = _name_match.group(1).strip().strip(".,!?")
-        else:
-            _q_i = _re_sk_i.sub(
-                r"(install|load|add|get me|get|set up)\s+(a\s+|the\s+)?skill(\s+for|\s+that|\s+to|\s+which)?",
-                "", u, flags=_re_sk_i.IGNORECASE
-            ).strip(" :,")
         return {
             "delegate_to": "devops_agent", "intent": "skill_install",
-            "target": _q_i or user_input, "tier": "MID",
-            "reasoning_summary": "Skill install (search→review→load sequence) — deterministic pre-classifier",
-        }
-
-    # "try again" / "try that again" — retry the previous skill search if context shows one
-    _retry_kw = ("try again", "try that again", "search again", "look again", "retry")
-    if any(w in u for w in _retry_kw) and prior_domain == "skills":
-        return {
-            "delegate_to": "devops_agent", "intent": "skill_search",
-            "target": user_input, "tier": "LOW",
-            "reasoning_summary": "Retry skill search — deterministic pre-classifier",
+            "target": user_input, "tier": "MID",
+            "reasoning_summary": "Skill install NL fallback — use /install for best experience",
         }
 
     _skill_search_kw = (
@@ -952,21 +970,9 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "find skills", "look for skills", "browse skills",
     )
     if any(w in u for w in _skill_search_kw):
-        # Extract the search query: everything after the trigger keyword
-        import re as _re_sk
-        _q = _re_sk.sub(
-            r"(clawhub|skill registry|search for skills?|find a? ?skills?|look for skills?|browse skills?)",
-            "", u, flags=_re_sk.IGNORECASE
-        ).strip(" :,")
-        # Strip action verb phrases left after removing trigger keywords
-        _q = _re_sk.sub(r"^\s*(search\s+for|look\s+for|find|browse|get|show\s+me)\s+", "", _q, flags=_re_sk.IGNORECASE).strip()
-        # Strip trailing source refs: "on clawhub", "from clawhub", "on the registry"
-        _q = _re_sk.sub(r"\s+(on|from|at|in)\s+(clawhub|the\s+registry|github).*$", "", _q, flags=_re_sk.IGNORECASE).strip()
-        # Strip leading/trailing filler words
-        _q = _re_sk.sub(r"^\s*(on|for|about|a|an|the|me|some)\s+", "", _q).strip()
         return {
             "delegate_to": "devops_agent", "intent": "skill_search",
-            "target": _q or user_input, "tier": "LOW",
+            "target": user_input, "tier": "LOW",
             "reasoning_summary": "Skill registry search — deterministic pre-classifier",
         }
 
@@ -1073,11 +1079,78 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Memory key retrieval — MIP deterministic pre-classifier",
         }
 
+    # ── Wallet watchlist intents ──────────────────────────────────────────────
+    _wallet_list_kw = (
+        "what addresses are being watched", "watched addresses", "watch list", "watchlist",
+        "which addresses", "show watchlist", "list watched", "what wallets are watched",
+        "watching addresses", "show watched addresses", "wallet watchlist",
+    )
+    if any(w in u for w in _wallet_list_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_list_addresses",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Wallet watchlist query",
+        }
+
+    _wallet_portfolio_kw = (
+        "portfolio", "portfolio value", "how much", "total value", "current value",
+        "wallet balance", "total balance", "how much is my", "what's my portfolio",
+        "whats my portfolio", "portfolio worth",
+    )
+    if any(w in u for w in _wallet_portfolio_kw) and any(c in u for c in ("eth", "btc", "crypto", "wallet", "portfolio", "nzd", "usd")):
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_portfolio",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Wallet portfolio value query",
+        }
+
+    _wallet_remove_kw = (
+        "stop watching", "remove from watchlist", "unwatch", "stop monitoring address",
+        "remove watch address", "remove address from", "delete from watchlist",
+    )
+    if any(w in u for w in _wallet_remove_kw):
+        import re as _re_waddr
+        _waddr_m = _re_waddr.search(r'\b(0x[0-9a-fA-F]{40}|bc1[a-z0-9]{25,90}|[13][a-zA-Z0-9]{25,34})\b', u)
+        _waddr = _waddr_m.group(1) if _waddr_m else u
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_remove_address",
+            "target": _waddr, "tier": "MID",
+            "reasoning_summary": "Remove address from watchlist (MID — requires confirmation)",
+        }
+
+    _wallet_add_kw = (
+        "watch this address", "watch address", "add to watchlist", "add this wallet",
+        "monitor this address", "add this address", "start watching",
+    )
+    if any(w in u for w in _wallet_add_kw):
+        import re as _re_waddr2
+        _waddr2_m = _re_waddr2.search(r'\b(0x[0-9a-fA-F]{40}|bc1[a-z0-9]{25,90}|[13][a-zA-Z0-9]{25,34})\b', u)
+        _waddr2 = _waddr2_m.group(1) if _waddr2_m else ""
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_add_address",
+            "target": _waddr2, "tier": "MID",
+            "reasoning_summary": "Add address to watchlist (MID — requires confirmation)",
+        }
+
+    _wallet_check_kw = (
+        "check address", "check wallet", "has .+ paid", "check balance of",
+        "check this address",
+    )
+    if any(w in u for w in _wallet_check_kw):
+        import re as _re_waddr3
+        _waddr3_m = _re_waddr3.search(r'\b(0x[0-9a-fA-F]{40}|bc1[a-z0-9]{25,90}|[13][a-zA-Z0-9]{25,34})\b', u)
+        _waddr3 = _waddr3_m.group(1) if _waddr3_m else u
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_check_address",
+            "target": _waddr3, "tier": "LOW",
+            "reasoning_summary": "On-demand wallet address check",
+        }
+
     _mkdir_kw = (
         "create a folder", "create folder", "make a folder", "make folder",
         "new folder", "mkdir", "create a directory", "make a directory",
     )
-    if any(w in u for w in _mkdir_kw):
+    if any(w in u for w in _mkdir_kw) and "nextcloud" not in u and "downloads" not in u:
         return {
             "delegate_to": "business_agent", "intent": "create_folder",
             "target": None, "tier": "MID",
@@ -1090,7 +1163,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "target": None, "tier": "MID",
             "reasoning_summary": "File write — deterministic pre-classifier",
         }
-    if any(w in u for w in _read_kw):
+    if any(w in u for w in _read_kw) and "nextcloud" not in u and "downloads" not in u:
         return {
             "delegate_to": "business_agent", "intent": "read_file",
             "target": None, "tier": "LOW",
@@ -1210,6 +1283,164 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "target": _extracted_title, "tier": "LOW",
                 "reasoning_summary": "Notes read by title — deterministic suffix classifier",
             }
+
+    # ── sovereign-nextcloud-fs ──────────────────────────────────────────
+    _ncfs_list_kw   = (
+        "list nextcloud", "show nextcloud", "what's on nextcloud", "whats on nextcloud",
+        "list the downloads", "show the downloads", "what's in downloads", "whats in downloads",
+        "what is in downloads", "what's in the downloads", "whats in the downloads",
+        "in the downloads folder", "in downloads folder", "downloads folder",
+        "list my nextcloud", "show me nextcloud", "browse nextcloud",
+        "what files are on nextcloud", "what's in my nextcloud",
+    )
+    _ncfs_list_recursive_kw = (
+        "full tree", "entire nextcloud", "all files on nextcloud",
+        "everything on nextcloud", "recursive nextcloud", "nextcloud tree",
+    )
+    _ncfs_read_kw   = (
+        "read from nextcloud", "read the file from nextcloud", "show me the file on nextcloud",
+        "get the file from nextcloud", "open the file on nextcloud", "fetch from nextcloud",
+        "read nextcloud file", "read the nextcloud file",
+        "from downloads", "from the downloads",
+    )
+    _ncfs_mkdir_kw  = (
+        "create folder on nextcloud", "create a folder on nextcloud",
+        "make a folder on nextcloud", "make folder on nextcloud",
+        "new folder on nextcloud", "mkdir on nextcloud",
+    )
+    _ncfs_delete_kw = (
+        "delete from nextcloud", "delete the file on nextcloud", "delete the nextcloud file",
+        "remove from nextcloud", "remove the file on nextcloud",
+        "delete /", "remove /",  # path-style: "delete /path"
+    )
+    _ncfs_move_kw   = ("move the file", "move file", "rename file", "rename the file",
+                        "move it to", "move this to", "move to")
+    _ncfs_copy_kw   = ("copy the file", "copy file", "copy it to", "copy this to", "duplicate file",
+                        "copy /", "copy the /")  # path-style: "copy /src to /dest"
+    _ncfs_tag_kw    = ("tag the file", "tag this file", "tag it", "add tag", "label the file",
+                        "tag /", "untag /")  # path-style: "tag /path with label"
+    _ncfs_search_kw = ("search nextcloud for", "search files for", "find files named",
+                        "find file named", "search for files")
+
+    if any(w in u for w in _ncfs_list_recursive_kw):
+        return {
+            "delegate_to": "research_agent", "intent": "ncfs_list_recursive",
+            "target": "/",
+            "reasoning_summary": "Full Nextcloud tree — ncfs_list_recursive",
+        }
+
+    if any(w in u for w in _ncfs_list_kw):
+        # Extract path hint — "downloads" folder or explicit /path
+        _ncfs_path = "/downloads" if "download" in u else "/"
+        import re as _re_ncfs
+        _slash_m = _re_ncfs.search(r'(/[\w/_\-\.]+)', u)
+        if _slash_m:
+            _ncfs_path = _slash_m.group(1)
+        return {
+            "delegate_to": "research_agent", "intent": "ncfs_list",
+            "target": _ncfs_path,
+            "reasoning_summary": "Nextcloud directory listing — ncfs_list",
+        }
+
+    if any(w in u for w in _ncfs_read_kw):
+        # Try to extract a path from the input
+        import re as _re_ncfs_rd
+        _rd_slash = _re_ncfs_rd.search(r'(/[\w/_\-\.]+)', u)
+        _rd_fname = _re_ncfs_rd.search(r'(?:file\s+|read\s+)([\w\-\.]+\.\w+)', u, _re_ncfs_rd.IGNORECASE)
+        if _rd_slash:
+            _ncfs_rd_path = _rd_slash.group(1)
+        elif _rd_fname and "download" in u:
+            _ncfs_rd_path = "/downloads/" + _rd_fname.group(1)
+        else:
+            _ncfs_rd_path = u  # let specialist resolve
+        return {
+            "delegate_to": "research_agent", "intent": "ncfs_read",
+            "target": _ncfs_rd_path,
+            "reasoning_summary": "Read file from Nextcloud — ncfs_read",
+        }
+
+    if any(w in u for w in _ncfs_mkdir_kw):
+        import re as _re_ncfs_mk
+        _mk_slash = _re_ncfs_mk.search(r'(/[\w/_\-\.]+)', u)
+        _mk_name  = _re_ncfs_mk.search(r'(?:called?|named?)\s+["\']?(\S+)["\']?', u, _re_ncfs_mk.IGNORECASE)
+        _mk_path  = (_mk_slash.group(1) if _mk_slash else
+                     ("/" + _mk_name.group(1).strip('/') if _mk_name else u))
+        return {
+            "delegate_to": "business_agent", "intent": "ncfs_mkdir",
+            "target": _mk_path,
+            "reasoning_summary": "Create Nextcloud folder — ncfs_mkdir",
+        }
+
+    if any(w in u for w in _ncfs_delete_kw):
+        import re as _re_del_nc
+        _del_slash = _re_del_nc.search(r'(/[\w/_\-\.]+)', u)
+        _del_nc_path = _del_slash.group(1) if _del_slash else u
+        return {
+            "delegate_to": "business_agent", "intent": "ncfs_delete",
+            "target": _del_nc_path,
+            "reasoning_summary": "Delete from Nextcloud — ncfs_delete",
+        }
+
+    if any(w in u for w in _ncfs_move_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "ncfs_move",
+            "target": u,
+            "reasoning_summary": "File move/rename — ncfs_move",
+        }
+
+    if any(w in u for w in _ncfs_copy_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "ncfs_copy",
+            "target": u,
+            "reasoning_summary": "File copy — ncfs_copy",
+        }
+
+    if any(w in u for w in _ncfs_tag_kw):
+        # Detect untag: "untag /" or "remove tag" patterns
+        _is_untag = "untag /" in u or "remove tag" in u or "untag" in u.split()
+        import re as _re_tag
+        _tag_slash = _re_tag.search(r'(/[\w/_\-\.]+)', u)
+        _tag_name_m = _re_tag.search(r'(?:with|label)\s+["\']?(\S+)["\']?', u, _re_tag.IGNORECASE)
+        _tag_path = _tag_slash.group(1) if _tag_slash else u
+        _tag_name = _tag_name_m.group(1) if _tag_name_m else ""
+        return {
+            "delegate_to": "business_agent",
+            "intent": "ncfs_untag" if _is_untag else "ncfs_tag",
+            "target": _tag_path,
+            "tag": _tag_name,
+            "reasoning_summary": "File untag — ncfs_untag" if _is_untag else "File tag — ncfs_tag",
+        }
+
+    if any(w in u for w in _ncfs_search_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "ncfs_search",
+            "target": u,
+            "reasoning_summary": "File search — ncfs_search",
+        }
+
+    # ── sovereign-nextcloud-ingest ──────────────────────────────────────
+    _ingest_kw = (
+        "ingest", "review and remember", "add to memory", "remember the contents",
+        "remember everything in", "ingest and remember", "read and remember",
+        "review the file and remember", "review the folder and remember",
+    )
+    if any(w in u for w in _ingest_kw):
+        _ingest_is_folder = any(w in u for w in ("folder", "directory", "everything in", "all files"))
+        return {
+            "delegate_to": "memory_agent",
+            "intent": "ingest_folder" if _ingest_is_folder else "ingest_file",
+            "target": u,
+            "reasoning_summary": "Nextcloud ingest — ncingest pipeline",
+        }
+
+    _ingest_status_kw = ("ingest status", "has this been reviewed", "check if reviewed",
+                          "sovereign-reviewed", "check tags")
+    if any(w in u for w in _ingest_status_kw):
+        return {
+            "delegate_to": "memory_agent", "intent": "ingest_status",
+            "target": u,
+            "reasoning_summary": "Ingest status check — OCS tags",
+        }
 
     _file_delete_kw = (
         "delete file", "delete the file", "delete a file",
@@ -1570,12 +1801,71 @@ class ExecutionEngine:
             return "Done."
         return "I wasn't able to complete that. Please try again."
 
+    # ── Telegram attachment upload (/attachment endpoint) ─────────────────
+    async def handle_attachment(self, filename: str, content_b64: str,
+                                mime_type: str, size: int, source: str) -> dict:
+        """Download a Telegram attachment and upload to Nextcloud via nanobot-01.
+
+        LOW tier — no confirmation required. Audit-logged.
+        Destination: /downloads/{filename} (fixed folder, not user-configurable).
+        Binary data is forwarded as multipart to nanobot's /upload endpoint to
+        avoid Linux ARG_MAX limits in _dispatch_python3_exec CLI args.
+        """
+        import re as _re
+        import base64
+
+        _MAX_SIZE = 25 * 1024 * 1024  # 25 MB
+
+        safe_name = _re.sub(r'[/\\<>:"|?*\x00-\x1f]', "_", filename)[:255] or "unknown"
+
+        if size > _MAX_SIZE:
+            return {"error": f"File too large: {size} bytes (max {_MAX_SIZE})", "status": "error"}
+
+        try:
+            content_bytes = base64.b64decode(content_b64)
+        except Exception as e:
+            return {"error": f"base64 decode failed: {e}", "status": "error"}
+
+        self._ledger.append({
+            "action":    "telegram_upload",
+            "filename":  safe_name,
+            "size":      size,
+            "mime_type": mime_type,
+            "source":    source,
+        })
+
+        result = await self.nanobot.run_upload(safe_name, content_bytes, mime_type, size)
+
+        if result.get("status") != "ok" or result.get("error"):
+            err = result.get("error") or f"upload failed"
+            return {"error": err, "status": "error"}
+
+        path = result.get("path", f"/downloads/{safe_name}")
+        size_kb = round(size / 1024, 1)
+        director_message = f"Uploaded {safe_name} → {path} ({size_kb} KB)"
+        return {
+            "status":           "ok",
+            "path":             path,
+            "filename":         safe_name,
+            "size":             size,
+            "director_message": director_message,
+        }
+
     # ── Natural language chat (/chat endpoint) ───────────────────────────
     async def handle_chat(self, user_input: str, pending_delegation: dict = None,
                           confirmed: bool = False,
                           confidence_acknowledged: bool = False,
                           security_confirmed: bool = False,
-                          context_window=None) -> dict:
+                          context_window=None,
+                          harness_cmd: str = None) -> dict:
+        # Gateway context FIFO — log inbound message before cognitive loop
+        # Skip on confirmed continuations (user_input is the original request, already logged)
+        if self.qdrant and not confirmed and not security_confirmed and not confidence_acknowledged:
+            try:
+                await self.qdrant.write_gateway_context(user_input, source="telegram")
+            except Exception:
+                pass
+
         # PROSPECTIVE + HEALTH SESSION-START CHECK — fires on first message of a new session
         # (no prior context, no pending delegation = fresh session)
         # NOTE: Do NOT pass due_items through ceo_translate — the LLM fabricates briefing
@@ -1681,6 +1971,28 @@ class ExecutionEngine:
         _u_lower = user_input.lower()
         if any(w in _u_lower for w in ("skill", "clawhub", "openclaw")):
             _TOTAL_TIMEOUT = max(_TOTAL_TIMEOUT, 240.0)
+
+        # ── Harness command fast-path (/install, /skills, /selfimprove, etc.) ───
+        # Explicit /commands bypass all NL routing — deterministic entry point.
+        # On confirmed continuation, recover _harness_cmd from pending_delegation.
+        _harness_cmd = harness_cmd or (pending_delegation or {}).get("_harness_cmd")
+        if _harness_cmd == "install":
+            return await self._run_install_harness(
+                goal=user_input,
+                confirmed=confirmed,
+                delegation=pending_delegation or {},
+                context_window=context_window,
+            )
+        if _harness_cmd == "skills":
+            return await self._run_skills_browse(goal=user_input)
+        if _harness_cmd == "selfimprove":
+            return await self._run_selfimprove_harness()
+        if _harness_cmd == "devcheck":
+            return await self._run_devcheck_harness()
+        if _harness_cmd == "portfolio":
+            return await self._run_portfolio_harness()
+        if _harness_cmd == "pm":
+            return {"director_message": "PM harness not yet built. Pending Director approval of the PM-Harness proposal."}
 
         # Track whether the pre-LLM scanner already evaluated security
         _scanner_evaluated = False
@@ -1868,7 +2180,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index"):
+        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist"):
             if action.get("domain") == "ollama":
                 conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
                 conv_text = conv_result.get("response", "")
@@ -2231,6 +2543,9 @@ class ExecutionEngine:
             "memory_list_keys", "memory_retrieve_key",  # MIP — pass structured index directly
             # Dev-Harness — all phases return structured dicts; bypass LLM summarisation
             "dev_analyse", "dev_status", "dev_approve", "dev_reject", "dev_verify", "dev_clear",
+            # Wallet watchlist — structured results, pass directly to translator
+            "wallet_list_addresses", "wallet_portfolio", "wallet_check_address",
+            "wallet_add_address", "wallet_remove_address",
         })
         # skill_search with no candidates — deterministic result, bypass translator invention
         if intent == "skill_search" and execution_result is not None:
@@ -2588,6 +2903,346 @@ class ExecutionEngine:
             )
         except Exception as _e:
             logger.warning("_skill_harness_save_checkpoint failed: %s", _e)
+
+    # ── /install harness — autonomous skill acquisition ──────────────────────
+
+    async def _install_select_best(self, goal: str, candidates: list) -> dict:
+        """Select the best skill candidate for the stated goal.
+
+        Deterministic first:
+          - If exactly one certified candidate exists → return it directly (no LLM).
+          - If all are certified or all uncertified → use LLM to pick best fit.
+          - Fallback on LLM failure: first certified, else first.
+        """
+        import json as _json
+        certified = [c for c in candidates if c.get("certified")]
+        # Single certified match — deterministic, no LLM needed
+        if len(certified) == 1:
+            return certified[0]
+        # Multiple candidates — use LLM to rank by goal fit; certified preferred
+        pool = certified if certified else candidates
+        slim = [
+            {
+                "index": i,
+                "slug": c.get("slug", ""),
+                "description": c.get("description") or c.get("summary", ""),
+                "certified": c.get("certified", False),
+            }
+            for i, c in enumerate(pool)
+        ]
+        prompt = (
+            f'The Director wants to: "{goal}"\n\n'
+            f"Available skill candidates:\n{_json.dumps(slim, indent=2)}\n\n"
+            "Select the BEST candidate that fulfils the goal. "
+            'Return JSON only: {"selected_index": 0, "reasoning": "one sentence"}'
+        )
+        try:
+            result = await self.cog.call_llm_json(prompt)
+            idx = int(result.get("selected_index", 0))
+            if 0 <= idx < len(pool):
+                return pool[idx]
+        except Exception as _e:
+            logger.warning("_install_select_best LLM failed: %s — using fallback", _e)
+        # Deterministic fallback: first certified, else first candidate
+        return next((c for c in candidates if c.get("certified")), candidates[0])
+
+    async def _skill_harness_clear_all(self) -> None:
+        """Delete all harness checkpoint entries from working memory."""
+        try:
+            _offset, _to_del = None, []
+            while True:
+                _res, _nxt = await self.qdrant.client.scroll(
+                    collection_name=WORKING, limit=100, offset=_offset,
+                    with_payload=True, with_vectors=False,
+                )
+                for _r in _res:
+                    if (_r.payload or {}).get("_harness_checkpoint"):
+                        _to_del.append(_r.id)
+                if _nxt is None:
+                    break
+                _offset = _nxt
+            if _to_del:
+                await self.qdrant.client.delete(
+                    collection_name=WORKING, points_selector=_to_del)
+        except Exception as _e:
+            logger.warning("_skill_harness_clear_all failed: %s", _e)
+
+    async def _run_install_harness(
+        self, goal: str, confirmed: bool, delegation: dict, context_window=None
+    ) -> dict:
+        """Autonomous /install harness.
+
+        Phase A (fresh):  search → LLM selects best → checkpoint → confirm gate
+        Phase B (confirmed): scanner → LLM review → install → clear
+        """
+        import uuid as _uuid, datetime as _dt, json as _json
+
+        lifecycle = self._get_lifecycle()
+
+        if not confirmed:
+            # ── Phase A: search + select ────────────────────────────────────
+            search_result = await lifecycle.search(
+                query=goal, certified_only=False, limit=10
+            )
+            candidates = [c for c in search_result.get("candidates", []) if c.get("skill_md")]
+
+            if not candidates:
+                dm = await self.cog.translator_pass({
+                    "success": False,
+                    "outcome": (
+                        f"No skills found for '{goal}'. "
+                        "Try a more specific description or check GitHub directly."
+                    ),
+                    "detail": {}, "error": "no_candidates", "next_action": None,
+                })
+                return {"director_message": dm}
+
+            # LLM selects best candidate for the stated goal
+            selected = await self._install_select_best(goal, candidates)
+
+            # Save checkpoint so Phase B can recover the candidate
+            _ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            await self._skill_harness_save_checkpoint({
+                "skill_name": "install-harness",
+                "session_id": str(_uuid.uuid4()),
+                "current_step": "awaiting_confirm",
+                "step_results": {
+                    "search": {
+                        "query": goal,
+                        "total_found": len(candidates),
+                        "selected_slug": selected.get("slug"),
+                        "ts": _ts,
+                    }
+                },
+                "_selected_candidate": selected,
+                "last_checkpoint_ts": _ts,
+            })
+
+            slug = selected.get("slug", "unknown")
+            desc = selected.get("description") or selected.get("summary") or ""
+            _certified = selected.get("certified")
+            certified_label = (
+                "OpenClaw registry (certified)" if _certified
+                else "⚠ unverified GitHub source (not in OpenClaw registry)"
+            )
+            url = selected.get("github_url", "")
+
+            # Include clawhub scan results if available
+            _ch_scan = selected.get("clawhub_scan")
+            _scan_lines = ""
+            if _ch_scan:
+                _llm = _ch_scan.get("llm") or {}
+                _vt  = _ch_scan.get("vt") or {}
+                if _llm.get("verdict"):
+                    _scan_lines += f"\nOpenClaw scan: {_llm['verdict'].upper()}"
+                    if _llm.get("summary"):
+                        _scan_lines += f" — {_llm['summary'][:120]}"
+                if _vt.get("verdict"):
+                    _scan_lines += f"\nVirusTotal: {_vt['verdict'].upper()}"
+            else:
+                _scan_lines = "\nClawhub scan: not yet available"
+
+            summary = (
+                f"**{slug}**"
+                + (f" — {desc}" if desc else "")
+                + f"\nSource: {certified_label}"
+                + (f"\n{url}" if url else "")
+                + _scan_lines
+                + f"\n\nInstall?"
+            )
+
+            return {
+                "requires_confirmation": True,
+                "summary": summary,
+                "pending_delegation": {
+                    "delegate_to": "devops_agent",
+                    "intent": "skill_install",
+                    "_harness_cmd": "install",
+                    "_pending_install": selected,
+                },
+            }
+
+        # ── Phase B: confirmed — scan → review → install ────────────────────
+        selected = delegation.get("_pending_install")
+        if not selected:
+            cp = await self._skill_harness_load_checkpoint()
+            selected = (cp or {}).get("_selected_candidate")
+
+        if not selected or not selected.get("skill_md"):
+            dm = await self.cog.translator_pass({
+                "success": False,
+                "outcome": "Install session expired — run /install again.",
+                "detail": {}, "error": "no_session", "next_action": None,
+            })
+            return {"director_message": dm}
+
+        slug = selected.get("slug", "unknown")
+        skill_md = selected["skill_md"]
+
+        # Clawhub external scan gate: block if VirusTotal or OpenClaw LLM flagged malicious.
+        _ch = selected.get("clawhub_scan") or {}
+        _ch_llm = _ch.get("llm") or {}
+        _ch_vt  = _ch.get("vt") or {}
+        _MALICIOUS = frozenset({"malicious", "suspicious", "dangerous"})
+        _ch_block = []
+        if _ch_llm.get("verdict", "").lower() in _MALICIOUS:
+            _ch_block.append(f"OpenClaw: {_ch_llm['verdict']}")
+        if _ch_vt.get("verdict", "").lower() in _MALICIOUS:
+            _ch_block.append(f"VirusTotal: {_ch_vt['verdict']}")
+        if _ch_block:
+            await self._skill_harness_clear_all()
+            dm = await self.cog.translator_pass({
+                "success": False,
+                "outcome": (
+                    f"Clawhub scan blocked {slug}: {', '.join(_ch_block)}. "
+                    "Installation cancelled."
+                ),
+                "detail": {"clawhub_scan": _ch},
+                "error": "clawhub_scan_block", "next_action": None,
+            })
+            return {"director_message": dm}
+
+        # Deterministic pre-scan: only unambiguous literal injection phrases hard-block.
+        # The Director's "yes" at the confirm gate IS the security review for /install.
+        # Regex patterns and sensitive-data keywords are too noisy on legitimate SDK docs
+        # (e.g. a wallet dev kit that documents "ignore previous instructions" as an example
+        # of what NOT to trust in user input would be blocked by any LLM reviewer given only
+        # a 500-char content preview — it cannot distinguish documentation from attack).
+        _INJECT_BLOCK = frozenset({
+            "governance_bypass", "secret_exfiltration", "tool_escalation",
+        })
+        pre_scan = self.scanner.scan(skill_md)
+        _hard_cats = [c for c in pre_scan.categories if c in _INJECT_BLOCK]
+        if _hard_cats:
+            await self._skill_harness_clear_all()
+            dm = await self.cog.translator_pass({
+                "success": False,
+                "outcome": (
+                    f"Scan blocked {slug}: {', '.join(_hard_cats)}. "
+                    "Installation cancelled."
+                ),
+                "detail": {"categories": _hard_cats},
+                "error": "scanner_block", "next_action": None,
+            })
+            return {"director_message": dm}
+
+        # Director already confirmed — that is the security gate.
+        # Pass an approved stub so lifecycle.load() records the decision correctly.
+        _director_review = {
+            "decision": "approve",
+            "risk_level": "low",
+            "escalate_to_director": False,
+            "escalation_reasons": [],
+            "scanner_categories": pre_scan.categories,
+        }
+        install_result = await lifecycle.load(
+            name=slug,
+            skill_md_content=skill_md,
+            review_result=_director_review,
+            confirmed=True,
+            clawhub_slug=selected.get("slug"),
+            clawhub_certified=bool(selected.get("certified", False)),
+            proposed_by="devops_agent",
+            reason=f"Director confirmed /install — goal: {goal}",
+        )
+
+        await self._skill_harness_clear_all()
+
+        if install_result.get("status") == "installed":
+            dm = await self.cog.translator_pass({
+                "success": True,
+                "outcome": f"Installed {slug}. Skill is ready to use.",
+                "detail": install_result, "error": None, "next_action": None,
+            })
+        else:
+            dm = await self.cog.translator_pass({
+                "success": False,
+                "outcome": (
+                    f"Install failed for {slug}: "
+                    f"{install_result.get('message', 'unknown error')}"
+                ),
+                "detail": install_result, "error": "install_failed", "next_action": None,
+            })
+
+        return {"director_message": dm}
+
+    async def _run_skills_browse(self, goal: str) -> dict:
+        """/skills <query> — search and list skills, no install."""
+        lifecycle = self._get_lifecycle()
+        search_result = await lifecycle.search(query=goal, certified_only=False, limit=10)
+        candidates = search_result.get("candidates", [])
+        if not candidates:
+            dm = await self.cog.translator_pass({
+                "success": False,
+                "outcome": f"No skills found for '{goal}'.",
+                "detail": {}, "error": "no_candidates", "next_action": None,
+            })
+            return {"director_message": dm}
+        slim = [
+            {k: v for k, v in c.items() if k not in ("skill_md", "raw_url")}
+            for c in candidates
+        ]
+        dm = await self.cog.translator_pass({
+            "success": True,
+            "outcome": f"Found {len(slim)} skill(s) matching '{goal}'.",
+            "detail": {"candidates": slim},
+            "error": None, "next_action": "Use /install <goal> to install one.",
+        })
+        return {"director_message": dm}
+
+    async def _run_selfimprove_harness(self) -> dict:
+        """/selfimprove — run SI observe cycle then surface pending proposals."""
+        from monitoring.self_improvement import run_manual_observe, list_pending_proposals
+        _app_state = getattr(self, "app_state", None)
+        # Observe: collect metrics, detect anomalies, generate proposals if needed
+        observe_result = await run_manual_observe(self.qdrant, self.cog, self.ledger, _app_state)
+        # Surface any pending proposals regardless of whether new ones were just created
+        proposals_result = await list_pending_proposals(self.qdrant)
+        proposals = proposals_result.get("proposals", [])
+        _rft = {
+            "success": True,
+            "outcome": observe_result.get("summary", "Observe cycle complete."),
+            "detail": {
+                "observe": observe_result,
+                "pending_proposals": proposals,
+                "proposal_count": len(proposals),
+            },
+            "error": None,
+            "next_action": (
+                f"{len(proposals)} proposal(s) pending Director approval."
+                if proposals else "No proposals pending."
+            ),
+        }
+        dm = await self.cog.translator_pass(_rft)
+        return {"director_message": dm}
+
+    async def _run_devcheck_harness(self) -> dict:
+        """/devcheck — run full dev harness analysis cycle."""
+        dh = self._get_dev_harness()
+        result = await dh.run_phase1(trigger="explicit")
+        _rft = {
+            "success": result.get("status") not in ("error",),
+            "outcome": result.get("summary") or result.get("message") or "Dev analysis complete.",
+            "detail": result,
+            "error": result.get("error"),
+            "next_action": result.get("next_action") or result.get("next_step"),
+        }
+        dm = await self.cog.translator_pass(_rft)
+        return {"director_message": dm}
+
+    async def _run_portfolio_harness(self) -> dict:
+        """/portfolio — trigger snapshot and return current balances + value."""
+        action = {"domain": "wallet_watchlist", "operation": "check", "name": "wallet_portfolio"}
+        result = await self._dispatch_inner(action, delegation={}, payload={})
+        _rft = {
+            "success": result.get("status") not in ("error",),
+            "outcome": "Portfolio snapshot complete.",
+            "detail": result,
+            "error": result.get("error"),
+            "next_action": None,
+        }
+        dm = await self.cog.translator_pass(_rft)
+        return {"director_message": dm}
 
     # ── Cognitive loop helpers ───────────────────────────────────────────────
 
@@ -3151,6 +3806,204 @@ class ExecutionEngine:
 
             return {"status": "error", "error": f"Unhandled notes operation: name={name!r}"}
 
+        if domain == "ncfs":
+            _skill_ncfs = "sovereign-nextcloud-fs"
+            op = action.get("operation", "")
+            sp  = specialist or {}
+            _del_target = (delegation.get("target") if delegation else "") or ""
+            # Only use delegation target as path if it looks like a filesystem path
+            _del_path = _del_target if _del_target.startswith("/") else ""
+            path = sp.get("path") or sp.get("target") or _del_path
+            _target_txt = _del_target
+            src  = sp.get("src")  or sp.get("source") or sp.get("from") or ""
+            dest = sp.get("dest") or sp.get("destination") or sp.get("to") or ""
+            # Fallback: extract src/dest from user input (e.g. "copy /a to /b")
+            if not src or not dest:
+                import re as _re_cp
+                _cp_m = _re_cp.search(r'(/[\w/_\-\.]+)\s+to\s+(/[\w/_\-\.]+)', _target_txt)
+                if _cp_m:
+                    if not src:  src  = _cp_m.group(1)
+                    if not dest: dest = _cp_m.group(2)
+            tag  = (sp.get("tag") or sp.get("tag_name")
+                    or (delegation.get("tag") if delegation else "")
+                    or "sovereign-reviewed")
+            query = (sp.get("query") or sp.get("search_query")
+                     or sp.get("search_term") or sp.get("keyword") or "")
+            # Fallback: extract query keyword from delegation target
+            # e.g. "search nextcloud for pipeline" → "pipeline"
+            if not query and _target_txt:
+                import re as _re_q
+                _qm = _re_q.search(r'\b(?:for|named?|called?)\s+(\S+)', _target_txt, _re_q.IGNORECASE)
+                query = _qm.group(1).strip() if _qm else _target_txt
+
+            # Map intent name → nanobot operation name
+            _ncfs_op = {
+                "ncfs_list": "fs_list", "ncfs_list_recursive": "fs_list_recursive",
+                "ncfs_read": "fs_read", "ncfs_move": "fs_move", "ncfs_copy": "fs_copy",
+                "ncfs_mkdir": "fs_mkdir", "ncfs_delete": "fs_delete",
+                "ncfs_tag": "fs_tag", "ncfs_untag": "fs_untag", "ncfs_search": "fs_search",
+            }.get(name)
+
+            if name in ("ncfs_list", "ncfs_list_recursive"):
+                return await self.nanobot.run(_skill_ncfs, _ncfs_op, {"path": path or "/"})
+            if name == "ncfs_read":
+                if not path:
+                    return {"error": "ncfs_read requires a path"}
+                return await self.nanobot.run(_skill_ncfs, _ncfs_op, {"path": path})
+            if name in ("ncfs_move", "ncfs_copy"):
+                if not src or not dest:
+                    return {"error": f"{name} requires src and dest"}
+                return await self.nanobot.run(_skill_ncfs, _ncfs_op, {"src": src, "dest": dest})
+            if name in ("ncfs_mkdir", "ncfs_delete"):
+                if not path:
+                    return {"error": f"{name} requires a path"}
+                return await self.nanobot.run(_skill_ncfs, _ncfs_op, {"path": path})
+            if name in ("ncfs_tag", "ncfs_untag"):
+                if not path:
+                    return {"error": f"{name} requires a path"}
+                return await self.nanobot.run(_skill_ncfs, _ncfs_op, {"path": path, "tag": tag})
+            if name == "ncfs_search":
+                if not query:
+                    return {"error": "ncfs_search requires a query"}
+                return await self.nanobot.run(_skill_ncfs, _ncfs_op,
+                                              {"query": query, "path": path or "/"})
+
+        if domain == "ncingest":
+            _skill_ingest = "sovereign-nextcloud-ingest"
+            sp   = specialist or {}
+            path = sp.get("path") or sp.get("target") or (delegation.get("target") if delegation else None)
+            memory_type = sp.get("memory_type") or "semantic"
+            is_private = "private" in (path or "").lower()
+            _force_local = is_private  # Private paths stay on local Ollama
+
+            if name == "ingest_status":
+                if not path:
+                    return {"error": "ingest_status requires a path"}
+                return await self.nanobot.run(_skill_ingest, "ingest_status", {"path": path})
+
+            if name in ("ingest_file", "ingest_folder"):
+                if not path:
+                    return {"error": f"{name} requires a path"}
+
+                op_name = "fetch_classify" if name == "ingest_file" else "fetch_classify_folder"
+                nb = await self.nanobot.run(_skill_ingest, op_name, {"path": path})
+
+                if not nb.get("status") == "ok":
+                    return nb
+
+                # Enforce Private flag: never route to external LLMs
+                nb_private = nb.get("_private", False) or is_private
+                if nb_private:
+                    logger.info("ncingest: Private path %s — all LLM calls force_local", path)
+
+                # Security scan gate — check inline_scan risk level
+                if name == "ingest_file":
+                    scan = nb.get("inline_scan", {})
+                    if scan.get("risk_level") == "high":
+                        self._ledger.append({
+                            "action": "ingest_blocked",
+                            "path": path,
+                            "reason": "inline_scan high risk",
+                            "patterns": scan.get("patterns_found", []),
+                        })
+                        return {
+                            "error": f"Ingest blocked: high-risk scan result — patterns: {scan.get('patterns_found')}",
+                            "status": "error",
+                            "path": path,
+                        }
+
+                    content = nb.get("content")
+                    if not content or nb.get("binary"):
+                        return {
+                            "status": "ok",
+                            "path": path,
+                            "message": f"Binary file — metadata recorded, no text embedded",
+                            "content_type": nb.get("content_type", ""),
+                            "size": nb.get("size", 0),
+                            "_private": nb_private,
+                        }
+
+                    resolved_type = sp.get("memory_type") or nb.get("suggested_memory_type", "semantic")
+                    # ingest_file is MID tier — Director confirmed before we arrive here.
+                    # human_confirmed=True is required for procedural writes.
+                    await self.qdrant.store(
+                        content,
+                        metadata={
+                            "type":          resolved_type,
+                            "source":        "nextcloud",
+                            "source_path":   path,
+                            "content_type":  nb.get("content_type", "text/plain"),
+                            "size":          nb.get("size", 0),
+                            "_trusted_by":   "sovereign-core",
+                            "_private":      nb_private,
+                        },
+                        collection=resolved_type,
+                        human_confirmed=True,
+                    )
+
+                    # Tag file in Nextcloud as sovereign-reviewed
+                    asyncio.create_task(
+                        self.nanobot.run("sovereign-nextcloud-fs", "fs_tag",
+                                         {"path": path, "tag": "sovereign-reviewed"})
+                    )
+
+                    return {
+                        "status":       "ok",
+                        "path":         path,
+                        "collection":   resolved_type,
+                        "size":         nb.get("size", 0),
+                        "content_type": nb.get("content_type", ""),
+                        "_private":     nb_private,
+                    }
+
+                # ingest_folder
+                files = nb.get("files", [])
+                ingested = 0
+                blocked  = 0
+                errors   = 0
+                for f in files:
+                    if f.get("status") != "ok":
+                        errors += 1
+                        continue
+                    scan = f.get("inline_scan", {})
+                    if scan.get("risk_level") == "high":
+                        blocked += 1
+                        continue
+                    content = f.get("content")
+                    if not content or f.get("binary"):
+                        continue
+                    fpath = f.get("path", path)
+                    resolved_type = f.get("suggested_memory_type", "semantic")
+                    f_private = f.get("_private", False) or is_private
+                    await self.qdrant.store(
+                        content,
+                        metadata={
+                            "type":         resolved_type,
+                            "source":       "nextcloud",
+                            "source_path":  fpath,
+                            "content_type": f.get("content_type", "text/plain"),
+                            "_trusted_by":  "sovereign-core",
+                            "_private":     f_private,
+                        },
+                        collection=resolved_type,
+                        human_confirmed=True,
+                    )
+                    asyncio.create_task(
+                        self.nanobot.run("sovereign-nextcloud-fs", "fs_tag",
+                                         {"path": fpath, "tag": "sovereign-reviewed"})
+                    )
+                    ingested += 1
+
+                return {
+                    "status":   "ok",
+                    "path":     path,
+                    "ingested": ingested,
+                    "blocked":  blocked,
+                    "errors":   errors,
+                    "skipped":  nb.get("skipped", 0),
+                    "_private": is_private,
+                }
+
         if domain == "mail":
             # All mail ops route through nc-mail community skill (Nextcloud Mail REST API).
             # Uses stable databaseId integers — no fragile IMAP UIDs, no account suffix hacks.
@@ -3500,6 +4353,10 @@ class ExecutionEngine:
                     })
                     _search_result["harness_checkpoint_written"] = True
                     _search_result["numbered_candidates"] = _numbered
+                    # Replace candidates with checkpoint-aligned numbered list so
+                    # display IDs match checkpoint IDs exactly. Non-fetchable candidates
+                    # (no skill_md) are excluded — they can't be reviewed anyway.
+                    _search_result["candidates"] = _numbered
                 return _search_result
 
             if op == "review":
@@ -3611,17 +4468,28 @@ class ExecutionEngine:
                         "status": "error",
                         "message": f"Candidate {_cid} has no SKILL.md content to review.",
                     }
-                # Gate 1: pre-scan (injection_patterns.yaml — fast deterministic rejection)
+                # Gate 1: pre-scan — only unambiguous injection categories hard-block.
+                # Sensitive data keywords (password, API_KEY, TOKEN=), destructive_commands,
+                # exfiltration regex, and prompt_injection_regex (which fires on 'developer mode'
+                # in legitimate blockchain/SDK docs) are advisory only — passed to LLM reviewer.
+                # Matt directive 2026-03-28: contents of variables are secret, not the headings.
+                _INJECT_HARD_BLOCK = frozenset({
+                    # identity_override excluded — "ignore previous instructions" etc. appear
+                    # legitimately in security documentation as examples of what to detect.
+                    # prompt_injection_regex excluded — 'developer mode' fires on SDK docs.
+                    "governance_bypass", "secret_exfiltration", "tool_escalation",
+                })
                 _pre_scan = self.scanner.scan(_skill_md)
                 _ts_rv = _dt_rv.datetime.now(_dt_rv.timezone.utc).isoformat()
-                if _pre_scan.flagged:
+                _hard_cats_rv = [c for c in _pre_scan.categories if c in _INJECT_HARD_BLOCK]
+                if _hard_cats_rv:
                     _updated = dict(_cp)
                     _sr = dict(_cp.get("step_results", {}))
                     _sr["review"] = {
                         "candidate_id": _cid, "slug": _slug,
                         "verdict": "block", "risk_level": "critical",
                         "pre_scan_blocked": True,
-                        "pre_scan_categories": _pre_scan.categories,
+                        "pre_scan_categories": _hard_cats_rv,
                         "ts": _ts_rv,
                     }
                     _updated["step_results"] = _sr
@@ -3636,7 +4504,7 @@ class ExecutionEngine:
                             f"Pre-scan blocked candidate {_cid} ({_slug}): "
                             "injection patterns detected."
                         ),
-                        "categories": _pre_scan.categories,
+                        "categories": _hard_cats_rv,
                     }
                 # Gate 2: full LLM security review
                 _certified = bool(_candidate.get("certified", False))
@@ -3871,6 +4739,30 @@ class ExecutionEngine:
                     )
                 search_result = await lifecycle.search(query=query, certified_only=True, limit=5)
 
+                # Update harness checkpoint with fresh search results so that any
+                # subsequent "install candidate N" uses the correct candidates from
+                # THIS search, not a stale checkpoint from a prior session.
+                _leg_all = search_result.get("candidates", [])
+                _leg_valid = [c for c in _leg_all if c.get("skill_md")]
+                if _leg_valid:
+                    import uuid as _leg_uuid, datetime as _leg_dt
+                    _leg_numbered = [{"id": i + 1, **c} for i, c in enumerate(_leg_valid)]
+                    _leg_ts = _leg_dt.datetime.now(_leg_dt.timezone.utc).isoformat()
+                    await self._skill_harness_save_checkpoint({
+                        "skill_name": "skill-harness",
+                        "session_id": str(_leg_uuid.uuid4()),
+                        "current_step": "search",
+                        "step_results": {
+                            "search": {
+                                "query": query,
+                                "candidates": _leg_numbered,
+                                "ts": _leg_ts,
+                            },
+                        },
+                        "last_checkpoint_ts": _leg_ts,
+                    })
+                    search_result["candidates"] = _leg_numbered
+
                 # Step 2: review the top candidate that has skill_md content
                 top = next(
                     (c for c in search_result.get("candidates", []) if c.get("skill_md")),
@@ -4099,6 +4991,78 @@ class ExecutionEngine:
             if name == "wallet_get_btc_xpub":
                 return await self.wallet_control.get_btc_xpub()
             return {"error": f"Unknown wallet action: {name}"}
+
+        if domain == "wallet_watchlist":
+            _sov_wallet = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
+            _wt_token   = os.environ.get("WALLET_INTERNAL_TOKEN", "")
+            _wt_headers = {"Content-Type": "application/json", "X-Wallet-Token": _wt_token}
+
+            if name == "wallet_list_addresses":
+                async with __import__("httpx").AsyncClient(timeout=10.0) as _wc:
+                    _wr = await _wc.get(f"{_sov_wallet}/watchlist")
+                if _wr.status_code != 200:
+                    return {"status": "error", "error": f"sov-wallet HTTP {_wr.status_code}"}
+                _data = _wr.json()
+                addrs = _data.get("addresses", [])
+                return {
+                    "status": "ok",
+                    "count": len(addrs),
+                    "addresses": [
+                        {"label": a.get("label", "?"), "value": a.get("value", "?"),
+                         "chain": a.get("metadata", {}).get("chain", "?"),
+                         "harness": a.get("metadata", {}).get("harness", [])}
+                        for a in addrs
+                    ],
+                }
+
+            if name == "wallet_portfolio":
+                async with __import__("httpx").AsyncClient(timeout=15.0) as _wc:
+                    _wr = await _wc.get(f"{_sov_wallet}/portfolio")
+                if _wr.status_code == 503:
+                    return {"status": "pending", "message": "Portfolio snapshot not yet available — try again in a moment"}
+                if _wr.status_code != 200:
+                    return {"status": "error", "error": f"sov-wallet HTTP {_wr.status_code}"}
+                snap = _wr.json().get("snapshot", {})
+                return {
+                    "status":    "ok",
+                    "totals":    snap.get("totals", {}),
+                    "timestamp": snap.get("timestamp", ""),
+                    "prices":    snap.get("prices", {}),
+                }
+
+            if name == "wallet_check_address":
+                _addr = (delegation or {}).get("target") or (specialist or {}).get("address") or ""
+                if not _addr:
+                    return {"status": "error", "error": "address required"}
+                async with __import__("httpx").AsyncClient(timeout=15.0) as _wc:
+                    _wr = await _wc.post(f"{_sov_wallet}/check",
+                                         json={"address": _addr}, headers=_wt_headers)
+                return _wr.json() if _wr.status_code == 200 else {"status": "error", "error": f"HTTP {_wr.status_code}"}
+
+            if name == "wallet_add_address":
+                _sp = specialist or {}
+                _addr = (delegation or {}).get("target") or _sp.get("address") or _sp.get("value") or ""
+                _label = _sp.get("label", "")
+                _chain = _sp.get("chain", "eth")
+                _harness = _sp.get("harness", ["portfolio", "a2a"])
+                if not _addr:
+                    return {"status": "error", "error": "address required"}
+                async with __import__("httpx").AsyncClient(timeout=10.0) as _wc:
+                    _wr = await _wc.post(f"{_sov_wallet}/watchlist",
+                                         json={"value": _addr, "label": _label, "chain": _chain,
+                                               "harness": _harness},
+                                         headers=_wt_headers)
+                return _wr.json() if _wr.status_code == 200 else {"status": "error", "error": f"HTTP {_wr.status_code}"}
+
+            if name == "wallet_remove_address":
+                _addr = (delegation or {}).get("target") or (specialist or {}).get("address") or ""
+                if not _addr:
+                    return {"status": "error", "error": "address required"}
+                async with __import__("httpx").AsyncClient(timeout=10.0) as _wc:
+                    _wr = await _wc.delete(f"{_sov_wallet}/watchlist/{_addr}", headers=_wt_headers)
+                return _wr.json() if _wr.status_code == 200 else {"status": "error", "error": f"HTTP {_wr.status_code}"}
+
+            return {"error": f"Unknown wallet_watchlist action: {name}"}
 
         if domain == "scheduler":
             if not self.task_scheduler:

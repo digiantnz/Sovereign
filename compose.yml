@@ -329,6 +329,8 @@ services:
         limits:
           memory: 256m
     cpuset: "8-11,20-23"
+    volumes:
+      - /home/sovereign/governance/wallet-config.json:/home/sovereign/governance/wallet-config.json:ro
 
   gateway:
     build:

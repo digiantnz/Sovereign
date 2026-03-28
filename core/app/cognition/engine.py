@@ -346,11 +346,18 @@ class CognitionEngine:
         )
         if gaps:
             context = context + f"\n\nKnown knowledge gaps: {', '.join(gaps)}"
+        gateway_ctx: list[dict] = []
+        if self.qdrant:
+            try:
+                gateway_ctx = await self.qdrant.get_gateway_context()
+            except Exception:
+                pass
         prompt = prompts.classify(
             ceo_persona=self.load_orchestrator(),
             user_input=user_input,
             memory_context=context,
             context_window=context_window,
+            gateway_context=gateway_ctx,
         )
         result = await self.call_llm_json(prompt)
         result["_memory_confidence"] = confidence
@@ -732,11 +739,25 @@ class CognitionEngine:
         """Evaluate a flagged scan result with the Security Agent persona.
         Returns {"block": bool, "risk_level": str, "risk_categories": [...],
                  "reasoning_summary": str, "required_mitigation": str}"""
+        # Build context snippets: for each matched phrase, extract the surrounding line(s)
+        # so the LLM can judge whether it's a malicious instruction or legitimate documentation
+        # (e.g. "ignore previous instructions" appearing in a security warning section).
+        phrase_contexts = []
+        content_lower = content.lower()
+        for phrase in scan_result.matched_phrases[:5]:
+            idx = content_lower.find(phrase.lower())
+            if idx >= 0:
+                # Grab ~120 chars of context centred on the phrase
+                start = max(0, idx - 60)
+                end = min(len(content), idx + len(phrase) + 60)
+                snippet = content[start:end].replace("\n", " ").strip()
+                phrase_contexts.append({"phrase": phrase, "context": snippet})
         prompt = prompts.security_eval(
             security_persona=self._security_persona,
             scan_categories=scan_result.categories,
             matched_phrases=scan_result.matched_phrases,
             content_preview=content[:500],
+            phrase_contexts=phrase_contexts,
         )
         result = await self.call_llm_json(prompt)
         return result

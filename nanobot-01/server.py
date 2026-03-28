@@ -27,7 +27,7 @@ from typing import Any
 
 import httpx
 import yaml
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sovereign_a2a import A2AMessage, A2AErrorCodes, A2AResponse
@@ -1221,6 +1221,71 @@ async def translate_skill(req: TranslateRequest, _: None = Depends(security.veri
         "sovereign": sovereign_block,
         "advisory": advisory,
     })
+
+
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    filename: str = Form(...),
+    mime_type: str = Form("application/octet-stream"),
+    size: str = Form("0"),
+    _: None = Depends(security.verify_secret),
+):
+    """Binary file upload endpoint for Telegram attachments.
+
+    Accepts multipart/form-data. Saves to workspace/tmp/, calls
+    sovereign-nextcloud-fs telegram_upload operation, then cleans up.
+    This endpoint exists because binary content cannot safely transit
+    _dispatch_python3_exec CLI args (Linux ARG_MAX ~2MB).
+    """
+    import tempfile
+    import re as _re
+
+    # Sanitise filename
+    safe_name = _re.sub(r'[/\\<>:"|?*\x00-\x1f]', "_", filename)[:255] or "unknown"
+    run_id = str(uuid.uuid4())[:8]
+
+    # Save to workspace/tmp/
+    tmp_dir = os.path.join(WORKSPACE, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = os.path.join(tmp_dir, f"upload_{run_id}.bin")
+
+    try:
+        content = await file.read()
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        logger.error("[%s] upload: write to tmp failed: %s", run_id, e)
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
+
+    # Load op_spec from sovereign-nextcloud-fs SKILL.md
+    ops = _load_operations("sovereign-nextcloud-fs")
+    op_spec = (ops or {}).get("telegram_upload")
+    if not op_spec:
+        os.unlink(tmp_path)
+        return JSONResponse(status_code=500, content={
+            "status": "error",
+            "error": "sovereign-nextcloud-fs/telegram_upload not found — skill installed?",
+        })
+
+    params = {
+        "filename":  safe_name,
+        "tmp_path":  tmp_path,
+        "size":      size,
+        "mime_type": mime_type,
+    }
+
+    logger.info("[%s] upload: dispatching telegram_upload filename=%s size=%s", run_id, safe_name, size)
+    result = _dispatch_python3_exec("sovereign-nextcloud-fs", op_spec, params, run_id)
+
+    # Clean up temp file regardless of outcome
+    try:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    except Exception:
+        pass
+
+    return JSONResponse(content=result)
 
 
 @app.get("/health")

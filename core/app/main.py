@@ -1,7 +1,8 @@
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from governance.engine import GovernanceEngine
 from execution.engine import ExecutionEngine
 from cognition.engine import CognitionEngine
@@ -206,6 +207,104 @@ async def lifespan(app: FastAPI):
             ),
             "domain": "governance",
         })
+    # Network endpoints — RPC nodes and infrastructure (MIP-as-config pattern)
+    # Non-secret infrastructure endpoints live here, not in .env files.
+    # sov-wallet watcher reads these at startup to avoid hardcoded IPs.
+    _net_endpoints = [
+        {
+            "seed_id": "backfill_v1_net_eth_primary",
+            "key": "semantic:network:endpoints:eth-node-primary",
+            "title": "ETH node RPC primary endpoint",
+            "content": (
+                "Ethereum RPC primary endpoint: 172.16.201.15:8545. "
+                "Local Ethereum execution node on the Sovereign VLAN. "
+                "Protocol: HTTP JSON-RPC 2.0. Chain: ETH mainnet (chain ID 1). "
+                "Also hosts the Beacon API on port 5052. Status: active."
+            ),
+            "domain": "network.endpoints",
+            "label": "eth-node-primary",
+            "value": "172.16.201.15:8545",
+            "metadata": {"protocol": "http", "chain": "eth", "status": "active", "beacon_port": 5052},
+        },
+        {
+            "seed_id": "backfill_v1_net_eth_secondary",
+            "key": "semantic:network:endpoints:eth-node-secondary",
+            "title": "ETH node RPC secondary endpoint",
+            "content": (
+                "Ethereum RPC secondary endpoint: 172.16.201.2:8545. "
+                "Fallback Ethereum execution node on the Sovereign VLAN. "
+                "Protocol: HTTP JSON-RPC 2.0. Chain: ETH mainnet. Status: active."
+            ),
+            "domain": "network.endpoints",
+            "label": "eth-node-secondary",
+            "value": "172.16.201.2:8545",
+            "metadata": {"protocol": "http", "chain": "eth", "status": "active"},
+        },
+        {
+            "seed_id": "backfill_v1_net_btc_rpc",
+            "key": "semantic:network:endpoints:btc-node-rpc",
+            "title": "Bitcoin node RPC endpoint (Start9)",
+            "content": (
+                "Bitcoin RPC endpoint: 172.16.201.5:8332. "
+                "Start9 self-hosted Bitcoin full node on the Sovereign VLAN. "
+                "Also hosts Specter Desktop on port 25441 for multisig coordination. "
+                "Protocol: HTTP JSON-RPC 1.0 with basic auth (credentials in secrets/wallet.env). "
+                "Chain: BTC mainnet. Status: active."
+            ),
+            "domain": "network.endpoints",
+            "label": "btc-node-rpc",
+            "value": "172.16.201.5:8332",
+            "metadata": {"protocol": "http", "chain": "btc", "status": "active", "host": "start9"},
+        },
+        {
+            "seed_id": "backfill_v1_net_specter",
+            "key": "semantic:network:endpoints:specter",
+            "title": "Specter Desktop endpoint (Start9)",
+            "content": (
+                "Specter Desktop endpoint: 172.16.201.5:25441. "
+                "Multisig wallet coordination UI on the Start9 node. "
+                "Used for BTC multisig signing and PSBT coordination. "
+                "Status: active. Wallet: 'Sovereign MultiSig' (2-of-3 P2WSH)."
+            ),
+            "domain": "network.endpoints",
+            "label": "specter",
+            "value": "172.16.201.5:25441",
+            "metadata": {"protocol": "http", "chain": "btc", "status": "active", "host": "start9"},
+        },
+        {
+            "seed_id": "backfill_v1_net_btcpay",
+            "key": "semantic:network:endpoints:btcpay",
+            "title": "BTCPay Server endpoint (Start9 — pending configuration)",
+            "content": (
+                "BTCPay Server endpoint: 172.16.201.5 (port TBD). "
+                "Lightning Network payment processor on the Start9 node. "
+                "Currently being configured — port and credentials not yet assigned. "
+                "Will be used for Lightning/BTCPay wallet.lightning module. Status: pending."
+            ),
+            "domain": "network.endpoints",
+            "label": "btcpay",
+            "value": "172.16.201.5",
+            "metadata": {"protocol": "http", "chain": "btc", "status": "pending", "host": "start9", "port": None},
+        },
+        {
+            "seed_id": "backfill_v1_net_a2a_browser",
+            "key": "semantic:network:endpoints:a2a-browser",
+            "title": "a2a-browser service endpoint (node04)",
+            "content": (
+                "a2a-browser endpoint on node04: 172.16.201.4:8001. "
+                "Provides browser fetch, SearXNG web search, and A2A payment rail receiver. "
+                "Protocol: A2A JSON-RPC 3.0 via POST /run, POST /search, POST /fetch. "
+                "Auth: X-API-Key shared secret (A2A_SHARED_SECRET env var). "
+                "Network: ai_net (sovereign-core → node04 VLAN). Status: active."
+            ),
+            "domain": "network.endpoints",
+            "label": "a2a-browser",
+            "value": "172.16.201.4:8001",
+            "metadata": {"protocol": "http", "status": "active", "host": "node04"},
+        },
+    ]
+    _static_facts.extend(_net_endpoints)
+
     # Wallet — BTC xpub placeholder (wallet pending first-boot key derivation)
     _static_facts.append({
         "seed_id": "backfill_v1_btc_xpub",
@@ -218,6 +317,23 @@ async def lifespan(app: FastAPI):
             "The xpub will be available via `get_btc_xpub` intent after initialisation."
         ),
         "domain": "wallet",
+    })
+    # Wallet price feed — CoinGecko for USD normalisation of payment events
+    _static_facts.append({
+        "seed_id": "backfill_v1_wallet_pricefeed_coingecko",
+        "key": "semantic:wallet:pricefeed:coingecko",
+        "title": "CoinGecko price feed endpoint for USD normalisation",
+        "content": (
+            "CoinGecko price feed endpoint: https://api.coingecko.com/api/v3/simple/price. "
+            "Used for USD normalisation of wallet payment events before a2a-browser credit dispatch. "
+            "Query: ids=ethereum|bitcoin, vs_currencies=usd. "
+            "Free public API, no key required. Failure blocks credit dispatch — never estimate. "
+            "Status: active."
+        ),
+        "domain": "wallet.pricefeed",
+        "label": "coingecko",
+        "value": "https://api.coingecko.com/api/v3/simple/price",
+        "metadata": {"provider": "coingecko", "status": "active", "auth": "none"},
     })
     _backfilled = await qdrant.seed_static_facts(_static_facts)
     if _backfilled:
@@ -412,6 +528,354 @@ async def wallet_verify(prefix: str):
     return wallet.verify_sig(prefix)
 
 
+@app.post("/wallet_event")
+async def wallet_event(request: Request):
+    """Receive structured payment events from sov-wallet (A2A JSON-RPC 3.0).
+
+    Called by wallet-harness-a2a.js on confirmed inbound transaction.
+    Signs the event with Rex's Ed25519 key, stores in episodic memory,
+    formats a plain English Telegram alert via Ollama, sends notification.
+
+    Auth: X-Wallet-Token header matching WALLET_INTERNAL_TOKEN env var.
+    Only reachable from ai_net (sov-wallet) — not exposed externally.
+    """
+    import datetime as _dt
+    from execution.adapters.signing import SigningAdapter as _SA
+
+    _wallet_token = os.environ.get("WALLET_INTERNAL_TOKEN", "")
+    if not _wallet_token:
+        return {"status": "error", "error": "WALLET_INTERNAL_TOKEN not configured"}
+    if request.headers.get("X-Wallet-Token", "") != _wallet_token:
+        return {"status": "error", "error": "Unauthorized"}, 401
+
+    try:
+        body = await request.json()
+    except Exception:
+        return {"status": "error", "error": "invalid JSON"}
+
+    # Support both raw event dict and A2A JSON-RPC 3.0 wrapper
+    if body.get("jsonrpc") == "3.0":
+        event = body.get("params", {}).get("payload", {})
+        request_id = body.get("id", "")
+    else:
+        event = body
+        request_id = body.get("tx_hash", "")
+
+    required = ("chain", "tx_hash", "amount", "currency", "confirmations", "timestamp")
+    missing = [f for f in required if not event.get(f) and event.get(f) != 0]
+    if missing:
+        return {"status": "error", "error": f"missing fields: {missing}"}
+
+    # Sign the event with Rex's Ed25519 key
+    sig = sig_prefix = ""
+    try:
+        _signer = _SA()
+        _canon  = {k: event[k] for k in sorted(event)}
+        sig        = _signer.sign_dict(_canon)
+        sig_prefix = sig[:8]
+    except Exception as e:
+        logger.warning("wallet_event: signing failed: %s", e)
+
+    # Write to audit ledger
+    ledger = getattr(app.state, "ledger", None)
+    if ledger:
+        try:
+            ledger.append("wallet_payment_event", "wallet_watcher", {
+                **event,
+                "sig":        sig,
+                "sig_prefix": sig_prefix,
+                "request_id": request_id,
+            })
+        except Exception as e:
+            logger.warning("wallet_event: ledger write failed: %s", e)
+
+    # Store in episodic memory (Qdrant)
+    qdrant = getattr(app.state, "qdrant", None)
+    if qdrant:
+        try:
+            await qdrant.store(
+                collection="episodic",
+                content=(
+                    f"Wallet payment event: {event.get('amount')} {event.get('currency')} "
+                    f"on {event.get('chain', '').upper()} — {event.get('label', event.get('to_address', '')[:12])}. "
+                    f"Tx: {event.get('tx_hash', '')[:16]}. Confirmations: {event.get('confirmations')}."
+                ),
+                metadata={
+                    "domain":      "wallet.events",
+                    "chain":       event.get("chain"),
+                    "tx_hash":     event.get("tx_hash"),
+                    "amount":      event.get("amount"),
+                    "currency":    event.get("currency"),
+                    "label":       event.get("label", ""),
+                    "sig_prefix":  sig_prefix,
+                    "event_ts":    event.get("timestamp"),
+                },
+                mem_type="episodic",
+            )
+        except Exception as e:
+            logger.warning("wallet_event: qdrant store failed: %s", e)
+
+    # Format and send Telegram notification via Ollama
+    cog = getattr(app.state, "cog", None)
+    if cog:
+        try:
+            label = event.get("label") or (event.get("to_address") or "")[:12] + "…"
+            result_for_translator = {
+                "domain":     "wallet_payment",
+                "event_type": "payment_confirmed",
+                "chain":      event.get("chain", "").upper(),
+                "amount":     event.get("amount"),
+                "currency":   event.get("currency"),
+                "label":      label,
+                "from":       event.get("from_address", "")[:12] + "…",
+                "confirmations": event.get("confirmations"),
+                "tx_short":   event.get("tx_hash", "")[:16] + "…",
+                "verify_cmd": f"/verify {sig_prefix}" if sig_prefix else "",
+                "summary":    (
+                    f"Received {event.get('amount')} {event.get('currency')} "
+                    f"on {event.get('chain', '').upper()} ({label})"
+                ),
+            }
+            alert_text = await cog.translator_pass(result_for_translator, user_input="wallet payment alert")
+            # Send Telegram notification
+            _token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            _chat_id = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
+            if _token and _chat_id:
+                import httpx as _hx
+                async with _hx.AsyncClient(timeout=10.0) as _cl:
+                    await _cl.post(
+                        f"https://api.telegram.org/bot{_token}/sendMessage",
+                        json={"chat_id": _chat_id, "text": alert_text},
+                    )
+        except Exception as e:
+            logger.warning("wallet_event: Telegram notification failed: %s", e)
+
+    # ── A2A Credit Dispatch ───────────────────────────────────────────────────
+    # Push wallet/credit notification to a2a-browser on confirmed payment.
+    # Sequence: dedup → mark seen (IMMEDIATE) → CoinGecko USD → sign → POST → retry
+    _a2a_url  = os.environ.get("A2A_BROWSER_URL", "http://172.16.201.4:8001")
+    _a2a_key  = os.environ.get("A2A_SHARED_SECRET", "")
+    _cr_chain = event.get("chain", "").lower()
+    _cr_tx    = event.get("tx_hash", "")
+
+    if qdrant and _a2a_url and _a2a_key and _cr_tx:
+        try:
+            import uuid as _uuid_mod
+            import httpx as _hx_cr
+            from qdrant_client.models import (
+                PointStruct as _PS, Filter as _FQ, FieldCondition as _FC, MatchValue as _MV,
+            )
+
+            # 1. Dedup check — idempotency gate for credit dispatch
+            _credit_pid = str(_uuid_mod.uuid5(
+                _uuid_mod.NAMESPACE_URL,
+                f"wallet.a2a_credit:{_cr_chain}:{_cr_tx}",
+            ))
+            _seen_pts, _ = await qdrant.archive_client.scroll(
+                collection_name="episodic",
+                scroll_filter=_FQ(must=[
+                    _FC(key="domain", match=_MV(value="wallet.a2a_credit")),
+                    _FC(key="tx_hash", match=_MV(value=_cr_tx)),
+                ]),
+                limit=1, with_payload=False, with_vectors=False,
+            )
+            if _seen_pts:
+                logger.info("wallet_event: a2a_credit already dispatched for tx %s — skip", _cr_tx[:16])
+            else:
+                # 2. Mark seen IMMEDIATELY — before normalisation, prevents double-credit on crash
+                _cr_ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                await qdrant.archive_client.upsert(
+                    collection_name="episodic",
+                    points=[_PS(
+                        id=_credit_pid,
+                        vector=[0.0] * 768,
+                        payload={
+                            "type":     "episodic",
+                            "domain":   "wallet.a2a_credit",
+                            "chain":    _cr_chain,
+                            "tx_hash":  _cr_tx,
+                            "seen_at":  _cr_ts,
+                            "status":   "pending",
+                        },
+                    )],
+                )
+
+                # 3. USD normalisation via CoinGecko — failure BLOCKS dispatch, never estimate
+                _cg_coin_ids = {"eth": "ethereum", "arb": "ethereum", "op": "ethereum", "btc": "bitcoin"}
+                _cg_id = _cg_coin_ids.get(_cr_chain)
+                _amount_usd: str | None = None
+                if _cg_id:
+                    try:
+                        async with _hx_cr.AsyncClient(timeout=10.0) as _cg:
+                            _cg_r = await _cg.get(
+                                "https://api.coingecko.com/api/v3/simple/price",
+                                params={"ids": _cg_id, "vs_currencies": "usd"},
+                            )
+                            if _cg_r.status_code == 200:
+                                _price = _cg_r.json().get(_cg_id, {}).get("usd")
+                                if _price:
+                                    _amount_usd = f"{float(event.get('amount', '0')) * float(_price):.2f}"
+                    except Exception as _cge:
+                        logger.warning("wallet_event: CoinGecko failed: %s", _cge)
+
+                _tg_tok  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                _tg_chat = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
+
+                if _amount_usd is None:
+                    # Price feed failure — block and alert Director
+                    logger.error(
+                        "wallet_event: price feed failure for tx %s — a2a credit BLOCKED",
+                        _cr_tx[:16],
+                    )
+                    await qdrant.archive_client.set_payload(
+                        collection_name="episodic",
+                        payload={"status": "price_feed_failed"},
+                        points=[_credit_pid],
+                    )
+                    if _tg_tok and _tg_chat:
+                        async with _hx_cr.AsyncClient(timeout=10.0) as _cl:
+                            await _cl.post(
+                                f"https://api.telegram.org/bot{_tg_tok}/sendMessage",
+                                json={"chat_id": _tg_chat, "text": (
+                                    f"WALLET ALERT: Price feed failure — a2a credit blocked.\n"
+                                    f"Tx: {_cr_tx[:16]}…\n"
+                                    f"Amount: {event.get('amount')} {event.get('currency')} ({_cr_chain.upper()})\n"
+                                    f"Manual credit required."
+                                )},
+                            )
+                else:
+                    # 4. Build A2A 3.0 wallet/credit payload (signed above — sig/sig_prefix reused)
+                    _credit_request_id = str(_uuid_mod.uuid4())
+                    _a2a_body = {
+                        "jsonrpc": "3.0",
+                        "id":      _credit_request_id,
+                        "method":  "wallet/credit",
+                        "params":  {
+                            "skill":     "wallet",
+                            "operation": "credit",
+                            "payload": {
+                                "tx_hash":       _cr_tx,
+                                "chain":         _cr_chain,
+                                "amount_native": event.get("amount"),
+                                "currency":      event.get("currency"),
+                                "amount_usd":    _amount_usd,
+                                "label":         event.get("label", ""),
+                                "from_address":  event.get("from_address", ""),
+                                "to_address":    event.get("to_address", ""),
+                                "confirmations": event.get("confirmations"),
+                                "timestamp":     event.get("timestamp"),
+                                "sig_prefix":    sig_prefix,
+                                "rex_sig":       sig,
+                            },
+                        },
+                    }
+                    _a2a_hdrs = {"X-API-Key": _a2a_key, "Content-Type": "application/json"}
+
+                    # 5. First POST attempt
+                    _credit_ok  = False
+                    _credit_err = ""
+                    try:
+                        async with _hx_cr.AsyncClient(timeout=30.0) as _ac:
+                            _ar = await _ac.post(f"{_a2a_url}/run", json=_a2a_body, headers=_a2a_hdrs)
+                        if _ar.status_code == 200:
+                            if _ar.json().get("duplicate"):
+                                logger.info("wallet_event: a2a-browser duplicate tx %s — ok", _cr_tx[:16])
+                            _credit_ok = True
+                        else:
+                            _credit_err = f"HTTP {_ar.status_code}: {_ar.text[:100]}"
+                    except Exception as _ace:
+                        _credit_err = str(_ace)[:150]
+
+                    if _credit_ok:
+                        await qdrant.archive_client.set_payload(
+                            collection_name="episodic",
+                            payload={"status": "sent", "amount_usd": _amount_usd,
+                                     "credit_id": _credit_request_id},
+                            points=[_credit_pid],
+                        )
+                    else:
+                        # First attempt failed — background retry after 30 s
+                        logger.warning(
+                            "wallet_event: a2a credit first attempt failed (%s) — scheduling retry",
+                            _credit_err,
+                        )
+
+                        async def _retry_credit(
+                            _body=_a2a_body, _hdrs=_a2a_hdrs, _pid=_credit_pid,
+                            _tx=_cr_tx, _usd=_amount_usd, _rid=_credit_request_id,
+                            _url=_a2a_url,
+                        ):
+                            await asyncio.sleep(30)
+                            _r_ok = False
+                            _r_err = ""
+                            try:
+                                import httpx as _hxr
+                                async with _hxr.AsyncClient(timeout=30.0) as _rc:
+                                    _rr = await _rc.post(f"{_url}/run", json=_body, headers=_hdrs)
+                                if _rr.status_code == 200:
+                                    if _rr.json().get("duplicate"):
+                                        logger.info(
+                                            "wallet_event retry: duplicate tx %s — ok", _tx[:16],
+                                        )
+                                    _r_ok = True
+                                else:
+                                    _r_err = f"HTTP {_rr.status_code}: {_rr.text[:100]}"
+                            except Exception as _re:
+                                _r_err = str(_re)[:150]
+
+                            _pl = {"status": "sent" if _r_ok else "failed",
+                                   "credit_id": _rid}
+                            if _r_ok:
+                                _pl["amount_usd"] = _usd
+                            else:
+                                _pl["error"] = _r_err
+                            try:
+                                await qdrant.archive_client.set_payload(
+                                    collection_name="episodic",
+                                    payload=_pl,
+                                    points=[_pid],
+                                )
+                            except Exception as _qe:
+                                logger.warning("wallet_event retry: qdrant update failed: %s", _qe)
+
+                            if not _r_ok:
+                                logger.error(
+                                    "wallet_event: a2a credit FAILED after retry tx %s: %s",
+                                    _tx[:16], _r_err,
+                                )
+                                _t2 = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+                                _c2 = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
+                                if _t2 and _c2:
+                                    try:
+                                        import httpx as _hxal
+                                        async with _hxal.AsyncClient(timeout=10.0) as _al:
+                                            await _al.post(
+                                                f"https://api.telegram.org/bot{_t2}/sendMessage",
+                                                json={"chat_id": _c2, "text": (
+                                                    f"WALLET ALERT: a2a credit failed — manual review required.\n"
+                                                    f"Tx: {_tx[:16]}…\n"
+                                                    f"Amount: {_usd} USD\n"
+                                                    f"Error: {_r_err}\n"
+                                                    f"POST {_url}/run wallet/credit manually."
+                                                )},
+                                            )
+                                    except Exception:
+                                        pass
+
+                        asyncio.create_task(_retry_credit())
+
+        except Exception as _a2ae:
+            logger.error("wallet_event: a2a credit dispatch error: %s", _a2ae)
+
+    return {
+        "status":     "ok",
+        "chain":      event.get("chain"),
+        "tx_hash":    event.get("tx_hash"),
+        "sig_prefix": sig_prefix,
+        "verify_cmd": f"/verify {sig_prefix}" if sig_prefix else "",
+    }
+
+
 @app.post("/credential_proxy")
 async def credential_proxy(payload: dict):
     """Single-use credential token redemption for nanobot-01.
@@ -433,6 +897,23 @@ async def credential_proxy(payload: dict):
     return {"status": "ok", "credentials": credentials}
 
 
+@app.post("/attachment")
+async def attachment(payload: dict):
+    """Telegram attachment upload — gateway POSTs file bytes here.
+
+    Payload: {filename, content_b64, mime_type, size, source}
+    Decodes base64 content and writes to Nextcloud via WebDAV.
+    LOW tier — no confirmation required. Audit-logged.
+    """
+    return await app.state.exec.handle_attachment(
+        filename=payload.get("filename", "unknown"),
+        content_b64=payload.get("content_b64", ""),
+        mime_type=payload.get("mime_type", "application/octet-stream"),
+        size=int(payload.get("size", 0)),
+        source=payload.get("source", "unknown"),
+    )
+
+
 @app.post("/chat")
 async def chat(payload: dict):
     user_input        = payload.get("input", "")
@@ -442,6 +923,8 @@ async def chat(payload: dict):
     security_conf     = payload.get("security_confirmed", False)
     # context_window: list of {user,assistant} dicts (gateway sends list) or single dict (legacy)
     context_window    = payload.get("context_window")
+    # _harness_cmd: set by gateway for /slash commands — bypasses NL routing entirely
+    harness_cmd       = payload.get("_harness_cmd")
     return await app.state.exec.handle_chat(
         user_input,
         pending_delegation=pending,
@@ -449,4 +932,5 @@ async def chat(payload: dict):
         confidence_acknowledged=conf_ack,
         security_confirmed=security_conf,
         context_window=context_window,
+        harness_cmd=harness_cmd,
     )

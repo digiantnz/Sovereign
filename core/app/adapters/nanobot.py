@@ -413,6 +413,51 @@ class NanobotAdapter:
         # ── LLM fallback — no DSL match ─────────────────────────────────────
         return await self._forward(skill, action, params, context, node, t0, path="llm")
 
+    async def run_upload(self, filename: str, content_bytes: bytes,
+                         mime_type: str, size: int,
+                         node: str = "nanobot-01") -> dict:
+        """Upload a binary file to nanobot-01 via multipart POST /upload.
+
+        Used for Telegram attachment uploads where binary content is too large
+        for _dispatch_python3_exec CLI args (Linux ARG_MAX ~2MB).
+        nanobot saves to workspace/tmp/, calls nc_fs.py telegram_upload, cleans up.
+        """
+        import time as _time
+        t0 = _time.monotonic()
+        try:
+            base_url = self._base_url(node)
+        except ValueError as e:
+            return {"status": "error", "error": str(e)}
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                r = await client.post(
+                    f"{base_url}/upload",
+                    headers=_auth_headers(),
+                    files={
+                        "file": (filename, content_bytes, mime_type),
+                    },
+                    data={
+                        "filename":  filename,
+                        "mime_type": mime_type,
+                        "size":      str(size),
+                    },
+                )
+            elapsed = _time.monotonic() - t0
+            if r.status_code != 200:
+                return {"status": "error",
+                        "error": f"nanobot /upload returned HTTP {r.status_code}",
+                        "http_status": r.status_code}
+            body = r.json()
+            self._log("nanobot_upload", {
+                "node": node, "filename": filename, "size": size,
+                "ok": body.get("status") == "ok", "elapsed_s": round(elapsed, 2),
+            })
+            return body
+        except Exception as e:
+            logger.error("NanobotAdapter.run_upload: %s", e)
+            return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
     async def fetch_capabilities(self, node: str = "nanobot-01") -> dict | None:
         """Fetch and cache agent_card from nanobot /capabilities endpoint.
 

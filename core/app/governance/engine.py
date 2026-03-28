@@ -142,6 +142,20 @@ class GovernanceEngine:
                 return rules
             elif operation == 'delete' and rules.get('notes_delete', False):
                 return rules
+        elif domain == 'ncfs':
+            # sovereign-nextcloud-fs — all operations whitelisted in allowed_actions above;
+            # webdav_read covers reads, webdav_write covers writes. Director trusts Nextcloud.
+            if operation in ('read', 'search') and rules.get('webdav_read', False):
+                return rules
+            elif operation in ('move', 'copy', 'mkdir', 'delete', 'tag', 'untag') and (
+                    rules.get('webdav_write', False) or rules.get('webdav_read', False)):
+                return rules
+        elif domain == 'ncingest':
+            # sovereign-nextcloud-ingest — fetch/classify at LOW (webdav_read); ingest at MID
+            if operation in ('status',) and rules.get('webdav_read', False):
+                return rules
+            elif operation == 'ingest' and rules.get('memory_write', False):
+                return rules
         elif domain == 'dev_harness':
             # Dev-Harness operations — internal analysis only, no external system access
             if operation in ('analyse', 'status', 'reject', 'verify', 'clear') and rules.get('skill_read', False):
@@ -151,6 +165,14 @@ class GovernanceEngine:
         elif domain == 'monitoring':
             # SI-Harness operations — observe/baseline/proposals are read-only, write to memory
             if operation in ('observe', 'proposals', 'baseline') and rules.get('memory_write', False):
+                return rules
+        elif domain == 'wallet_watchlist':
+            # Wallet watchlist management — add/list/remove/check watched addresses
+            if operation in ('list', 'check') and rules.get('webdav_read', False):
+                return rules
+            elif operation == 'add' and rules.get('memory_write', False):
+                return rules
+            elif operation == 'remove' and rules.get('file_write', False):
                 return rules
 
         raise ValueError(f"Action {action} not allowed under tier {tier}")

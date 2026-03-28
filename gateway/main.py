@@ -1,8 +1,10 @@
 import asyncio
+import base64
 import os
 import json
 import logging
 import httpx
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -393,6 +395,100 @@ async def handle_verify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"✗ Verification failed: {err}")
 
 
+async def handle_install(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /install <goal> — autonomous skill acquisition harness.
+
+    Bypasses all NL routing. Rex searches, ranks, and selects the best skill
+    for the stated goal, then surfaces a single confirm gate before scanning
+    and installing. No step-by-step micromanagement required.
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    goal = " ".join(context.args).strip() if context.args else ""
+    if not goal:
+        await update.message.reply_text(
+            "Usage: /install <goal or skill name>\n"
+            "Example: /install crypto portfolio tracker\n"
+            "Example: /install tether wallet development kit"
+        )
+        return
+    session = store.get_or_create(chat_id)
+    payload = {
+        "input": goal,
+        "_harness_cmd": "install",
+        "context_window": session.history,
+    }
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, goal, chat_id, context.bot, session)
+
+
+async def handle_skills(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /skills <query> — browse skills without installing."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /skills <search query>\nExample: /skills wallet tracker")
+        return
+    session = store.get_or_create(chat_id)
+    payload = {"input": query, "_harness_cmd": "skills", "context_window": session.history}
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, query, chat_id, context.bot, session)
+
+
+async def handle_selfimprove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /selfimprove — run SI observe cycle and surface pending proposals."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    session = store.get_or_create(chat_id)
+    payload = {"input": "selfimprove", "_harness_cmd": "selfimprove", "context_window": session.history}
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, "/selfimprove", chat_id, context.bot, session)
+
+
+async def handle_devcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /devcheck — run full dev harness analysis cycle."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    session = store.get_or_create(chat_id)
+    payload = {"input": "devcheck", "_harness_cmd": "devcheck", "context_window": session.history}
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, "/devcheck", chat_id, context.bot, session)
+
+
+async def handle_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /portfolio — trigger portfolio snapshot and return balances + value."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    session = store.get_or_create(chat_id)
+    payload = {"input": "portfolio", "_harness_cmd": "portfolio", "context_window": session.history}
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, "/portfolio", chat_id, context.bot, session)
+
+
+async def handle_pm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /pm — PM harness (stub, pending build)."""
+    user = update.effective_user
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    await update.message.reply_text("PM harness not yet built — pending Director approval of the proposal.")
+
+
 async def handle_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /remember and /memorise slash commands."""
     user = update.effective_user
@@ -407,6 +503,92 @@ async def handle_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await handle_message(update, context)
 
 
+async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle file/photo/voice/document messages — upload to Nextcloud via sovereign-core."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    msg = update.message
+
+    if user.id != AUTHORIZED_USER_ID:
+        logger.warning("Rejected attachment from user_id=%s", user.id)
+        return
+
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y%m%d_%H%M%S")
+
+    # Resolve file_id, filename, mime_type from message type
+    file_id = None
+    filename = None
+    mime_type = "application/octet-stream"
+
+    if msg.document:
+        file_id = msg.document.file_id
+        filename = msg.document.file_name or f"doc_{ts}"
+        mime_type = msg.document.mime_type or "application/octet-stream"
+    elif msg.photo:
+        # Highest-resolution PhotoSize
+        photo = sorted(msg.photo, key=lambda p: p.width * p.height)[-1]
+        file_id = photo.file_id
+        filename = f"photo_{ts}.jpg"
+        mime_type = "image/jpeg"
+    elif msg.voice:
+        file_id = msg.voice.file_id
+        filename = f"voice_{ts}.ogg"
+        mime_type = msg.voice.mime_type or "audio/ogg"
+    elif msg.video_note:
+        file_id = msg.video_note.file_id
+        filename = f"videonote_{ts}.mp4"
+        mime_type = "video/mp4"
+    elif msg.video:
+        file_id = msg.video.file_id
+        filename = getattr(msg.video, "file_name", None) or f"video_{ts}.mp4"
+        mime_type = msg.video.mime_type or "video/mp4"
+
+    if not file_id:
+        await msg.reply_text("Unsupported attachment type.")
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        data = await tg_file.download_as_bytearray()
+    except Exception as e:
+        await msg.reply_text(f"Download from Telegram failed: {e}")
+        return
+
+    content_b64 = base64.b64encode(bytes(data)).decode()
+    size = len(data)
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(
+                f"{SOVEREIGN_URL}/attachment",
+                json={
+                    "filename":    filename,
+                    "content_b64": content_b64,
+                    "mime_type":   mime_type,
+                    "size":        size,
+                    "source":      "telegram",
+                },
+            )
+            r.raise_for_status()
+            data_resp = r.json()
+    except httpx.TimeoutException:
+        await msg.reply_text("Upload timed out.")
+        return
+    except Exception as e:
+        await msg.reply_text(f"Upload error: {e}")
+        return
+
+    if data_resp.get("director_message"):
+        await msg.reply_text(data_resp["director_message"])
+    elif data_resp.get("error"):
+        await msg.reply_text(f"Upload failed: {data_resp['error']}")
+    else:
+        await msg.reply_text(f"Uploaded {filename} ({round(size/1024, 1)} KB)")
+
+
 def main():
     logger.info("Sovereign gateway starting (authorized user: %s)", AUTHORIZED_USER_ID)
     logger.info("Sovereign core URL: %s", SOVEREIGN_URL)
@@ -416,8 +598,18 @@ def main():
         .token(TOKEN)
         .build()
     )
+    app.add_handler(CommandHandler("install", handle_install))
+    app.add_handler(CommandHandler("skills", handle_skills))
+    app.add_handler(CommandHandler("selfimprove", handle_selfimprove))
+    app.add_handler(CommandHandler("devcheck", handle_devcheck))
+    app.add_handler(CommandHandler("portfolio", handle_portfolio))
+    app.add_handler(CommandHandler("pm", handle_pm))
     app.add_handler(CommandHandler(["remember", "memorise", "memorize"], handle_remember))
     app.add_handler(CommandHandler("verify", handle_verify))
+    app.add_handler(MessageHandler(
+        filters.Document.ALL | filters.PHOTO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE,
+        handle_attachment,
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling(drop_pending_updates=True)
 

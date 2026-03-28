@@ -287,6 +287,9 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | Dev-Harness | **COMPLETE** | 4-phase code quality harness (Analyse→Classify→Plan→Execute). pylint+semgrep+boundary_scanner+GitHub Actions. LLM advisory (Ollama+Claude escalation via DCL). CC runsheet HITL handoff. Memory integration: episodic/meta/semantic/prospective. Nightly cron 14:00 UTC. Self-scan: 0 findings. 2026-03-25. |
 | Scheduler+SI-Fixes | **COMPLETE** | `_get_procedure`/`_find_point_id` limit=200 ceiling replaced with filtered Qdrant queries. `seed_nightly_dev_task` idempotency via PROCEDURAL step check (title-based unreliable — `qdrant.store()` overwrites title). SI proposal dedup gate (`_existing_pending_proposal`). Task data cleanup (5 cancelled). 2026-03-26. |
 | Translator-Bleed-Fix | **COMPLETE** | Deterministic `_translator_sanitise()` strips meta-commentary sentences/bullets before Telegram delivery. Retry-once on >30% strip with EPISODIC violation log. Health brief re-routed through `translator_pass()`. B5 boundary rule detects leak phrases baked into string literals in cognition/gateway path. Validator Queue monitor updated: Entry+Exit extraction, 7-day alert threshold. 2026-03-26. |
+| Skill-Install-Hardening | **COMPLETE** | Scanner false-positive fixes: `identity_override` + `prompt_injection_regex` removed from `_INJECT_HARD_BLOCK` (legitimately appear in security docs). LLM review removed from Phase B — Director confirmation is the security gate. OpenClaw certification: `certified=True` for `github.com/openclaw/skills`. `_install_select_best` deterministic for single certified candidate. Confirm gate shows clawhub.ai scan (llmAnalysis + vtAnalysis from SSR HTML). Hard-block on malicious/suspicious clawhub verdict. NL routing simplified. 2026-03-28. |
+| WDK-Skill | **COMPLETE** | Tether Wallet Development Kit skill installed from OpenClaw registry (certified). Active for: research_agent. 2026-03-28. |
+| Wallet-A2A-Rail | **COMPLETE** | `wallet/credit` push notification in `/wallet_event` endpoint (`main.py`). Full sequence: dedup (Qdrant `domain: wallet.a2a_credit`, UUID5 point ID) → mark seen IMMEDIATELY before normalisation → CoinGecko USD price (failure blocks, never estimate) → A2A 3.0 `wallet/credit` payload with Ed25519 sig → POST `{A2A_BROWSER_URL}/run` with `X-API-Key` → retry once (background asyncio.create_task, 30s delay) → alert Director on permanent failure. `duplicate: true` from a2a-browser is not an error. MIP seeds added: `semantic:network:endpoints:a2a-browser` + `semantic:wallet:pricefeed:coingecko`. 2026-03-28. |
 | PM-Harness | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Full SDLC project management harness against sovereign semantic memory. Proposal in prospective memory. Requires Dev-Harness first. |
 | Retry-Logic | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Exponential backoff (max 3) for all harnesses, surface failure to Director. Proposal in prospective memory. |
 
@@ -414,8 +417,40 @@ All harness intents are added to the translator bypass list so structured output
 
 | Harness | Session key flag | Steps | Notes |
 |---------|-----------------|-------|-------|
-| Skill-Harness | `_harness_checkpoint` | search → list → review → install → clear | HIGH confirm on install |
+| Skill-Harness (`/install`) | `_harness_checkpoint` | search → LLM select → confirm → scan → install | Single Director gate: confirm before scan+install |
 | SI-Harness | `_si_session` | observe (daily auto) → propose (auto-triggered) | Director approves proposals; never self-modifies |
+| Dev-Harness | `_dev_harness` | analyse → status → approve/reject → verify → clear | Nightly cron; Director approves findings |
+
+### /command harness architecture
+
+**Design principle**: What is deterministic should be deterministic; what needs reasoning is the LLM.
+- Harness step sequencing → deterministic (checkpoint state drives next action)
+- Candidate/option selection → LLM
+- Security pattern scanning → deterministic (scanner.scan)
+- Security verdict → LLM (interprets scanner + SKILL.md intent)
+- Install/write/delete → deterministic (adapter call after confirmed)
+
+**Implemented /commands** (registered in gateway.py + BotFather):
+
+| Command | Harness | Behaviour |
+|---------|---------|-----------|
+| `/install <goal>` | Skill-Harness | Autonomous: search → LLM picks best → confirm gate → scan → install |
+
+**Pending /commands** — build when harnesses are ready:
+
+| Command | Harness | Notes |
+|---------|---------|-------|
+| `/selfimprove` | SI-Harness | Run observe+propose cycle; surface pending proposals to Director |
+| `/devcheck` | Dev-Harness | Run full analysis cycle; surface findings requiring approval |
+| `/portfolio` | Portfolio-Harness | Trigger snapshot; return current balances + NZD/USD value |
+| `/pm <action>` | PM-Harness | Project management harness (PROPOSAL — pending Director approval) |
+
+All /commands:
+- Bypass NL routing entirely (no `_quick_classify`)
+- Are detected in `gateway.py` as `CommandHandler` entries
+- Pass `_harness_cmd` field to `/chat` endpoint
+- Are recovered from `pending_delegation._harness_cmd` on confirmed continuation
+- Have a single Director confirmation gate at the action point, not at every step
 
 ---
 

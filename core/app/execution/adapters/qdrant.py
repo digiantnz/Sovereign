@@ -632,6 +632,56 @@ class QdrantAdapter:
         _log.debug("sync_to_archive: no-op — use shutdown_promote() for durable promotion")
         return 0
 
+    async def write_gateway_context(self, content: str, source: str = "telegram") -> None:
+        """FIFO slot — last 5 inbound Director messages in working_memory (ephemeral).
+
+        Capped at 5: oldest entry is deleted on each write once the cap is reached.
+        Lost on restart by design — ephemeral scratchpad only. Rex may explicitly
+        promote any entry to a sovereign collection before it is evicted.
+        """
+        points, _ = await self.client.scroll(
+            collection_name=WORKING,
+            scroll_filter=Filter(
+                must=[FieldCondition(key="_gateway_context", match=MatchValue(value=True))]
+            ),
+            limit=10,
+            with_payload=True,
+            with_vectors=False,
+        )
+        entries = sorted(points, key=lambda p: p.payload.get("sequence", 0))
+        if len(entries) >= 5:
+            await self.client.delete(
+                collection_name=WORKING,
+                points_selector=[entries[0].id],
+            )
+            entries = entries[1:]
+        next_seq = (entries[-1].payload.get("sequence", 0) + 1) if entries else 1
+        await self.store(
+            content=content,
+            metadata={
+                "type": "episodic",
+                "domain": "gateway",
+                "source": source,
+                "sequence": next_seq,
+                "_gateway_context": True,
+            },
+            collection=WORKING,
+        )
+
+    async def get_gateway_context(self) -> list[dict]:
+        """Return last 5 gateway_context entries from working_memory, oldest first."""
+        points, _ = await self.client.scroll(
+            collection_name=WORKING,
+            scroll_filter=Filter(
+                must=[FieldCondition(key="_gateway_context", match=MatchValue(value=True))]
+            ),
+            limit=10,
+            with_payload=True,
+            with_vectors=False,
+        )
+        entries = sorted(points, key=lambda p: p.payload.get("sequence", 0))
+        return [p.payload for p in entries[-5:]]
+
     async def _get_all_working_memory(self) -> list[dict]:
         """Scroll all working_memory items (with vectors). Uses qdrant container (tmpfs)."""
         items = []
