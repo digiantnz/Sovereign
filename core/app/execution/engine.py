@@ -768,14 +768,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         if any(w in u for w in _send_kw):
             import re as _re_send
             _to_m = _re_send.search(r'\bto\s+([\w.+-]+@[\w.-]+\.[a-z]{2,})', user_input, _re_send.IGNORECASE)
-            _sub_m = _re_send.search(r'subject[:\s]+(.+?)(?:\s+(?:body|and|with|saying|that|$))', user_input, _re_send.IGNORECASE)
-            _body_m = _re_send.search(r'body[:\s]+(.+?)$', user_input, _re_send.IGNORECASE)
             return {
                 "delegate_to": "business_agent", "intent": "send_email",
                 "target": account, "tier": "MID",
                 "to": _to_m.group(1) if _to_m else "",
-                "subject": _sub_m.group(1).strip() if _sub_m else "",
-                "body": _body_m.group(1).strip() if _body_m else "",
+                # subject/body extracted by PASS 3 specialist from full user_input
                 "reasoning_summary": "Email send — deterministic pre-classifier",
             }
         if any(w in u for w in _delete_kw):
@@ -813,20 +810,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "reasoning_summary": "Email fetch by ID — deterministic pre-classifier",
             }
         if any(w in u for w in _search_kw):
-            # Extract search terms from common patterns: "from X", "about X", "containing X"
-            import re as _re_sq
-            _sq = ""
-            _sq_m = _re_sq.search(r'\bfrom\s+([A-Za-z][A-Za-z\s.@\'-]+?)(?:\s*$|\s+(?:in\s+my|about|and\s))', u)
-            if _sq_m:
-                _sq = _sq_m.group(1).strip()
-            else:
-                _sq_m2 = _re_sq.search(r'(?:about|containing|subject[:\s]+)\s*(.+?)(?:\s*$)', u)
-                if _sq_m2:
-                    _sq = _sq_m2.group(1).strip()
             return {
                 "delegate_to": "business_agent", "intent": "search_email",
                 "target": account, "tier": "LOW",
-                "query": _sq,
+                # query extracted by PASS 3 specialist from full user_input
                 "reasoning_summary": "Email search — deterministic pre-classifier",
             }
         return {
@@ -1499,25 +1486,12 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Task pause — deterministic pre-classifier",
         }
 
-    # ── Self-improvement harness — observe / proposals / baseline ─────────
-    _si_observe_kw = (
-        "run observe", "observe cycle", "self improve", "self-improve",
-        "run self-check improvement", "si observe", "improvement harness observe",
-        "check for improvements", "run improvement check",
-        "run si harness", "run the si harness", "si harness", "start si harness",
-        "run self improvement harness", "self improvement harness",
-    )
-    if any(w in u for w in _si_observe_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "self_improve_observe",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Self-improvement observe cycle — deterministic pre-classifier",
-        }
-
+    # ── Self-improvement harness — proposals / baseline views ─────────────
+    # Entry point is /selfimprove (Telegram command) — no NL entry keywords.
+    # Mid-session views are retained so Director can query status after /selfimprove runs.
     _si_proposals_kw = (
         "improvement proposals", "pending proposals", "list proposals",
-        "show proposals", "what proposals", "improvement suggestions",
-        "si proposals",
+        "show proposals", "what proposals", "si proposals",
     )
     if any(w in u for w in _si_proposals_kw):
         return {
@@ -1527,8 +1501,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         }
 
     _si_baseline_kw = (
-        "show baseline", "baseline report", "current baseline",
-        "improvement baseline", "si baseline",
+        "show baseline", "baseline report", "si baseline",
     )
     if any(w in u for w in _si_baseline_kw):
         return {
@@ -1545,12 +1518,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _dev_id_m = _re_dh.search(r'\b([0-9a-f]{8})\b', u)
     _dev_id   = _dev_id_m.group(1) if _dev_id_m else None
 
+    # Entry point is /devcheck (Telegram command) — NL kept only for unambiguous dev-prefixed phrases.
     _dev_analyse_kw = (
         "dev analyse", "dev analyze", "dev analysis", "run dev analysis",
         "dev harness analyse", "dev harness analyze", "dev harness run",
         "run dev harness", "run the dev harness", "start dev harness",
-        "run harness", "analyse codebase", "analyze codebase",
-        "run code analysis", "code quality check", "harness analyse",
     )
     if any(w in u for w in _dev_analyse_kw):
         return {
