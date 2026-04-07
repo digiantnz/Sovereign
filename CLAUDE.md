@@ -157,7 +157,7 @@ cognition/prompts.py
 cognition/message.py          ← InternalMessage universal envelope
 scheduling/task_scheduler.py  ← NL intent parser, Qdrant-backed store, 60s executor
 execution/engine.py           ← routes to adapters after governance check
-execution/adapters/           ← ollama, whisper, broker, webdav, caldav, imap, smtp, grok, nanobot
+execution/adapters/           ← ollama, whisper, broker, imap, smtp, grok, nanobot
 memory/session.py
 ```
 
@@ -190,9 +190,12 @@ PASS 5  Translator              → plain English director_message (always local
 | Skill | Executor | Specialists | Operations |
 |-------|----------|-------------|------------|
 | `imap-smtp-email` | python3_exec → nanobot-01 | business_agent | |
-| `openclaw-nextcloud` | python3_exec → nanobot-01 | business_agent | calendar_list/create/delete/update, tasks_list/create/complete/delete, files_list/search/read/write/delete/mkdir (14 ops) |
+| `openclaw-nextcloud` | python3_exec → nanobot-01 | business_agent | calendar_list/list_events/create/delete/update, tasks_list/create/complete/delete, files_list/search/read/write/delete/mkdir, notes_list/read/create/update/delete (22 ops) |
+| `sovereign-browser` | python3_exec → nanobot-01 | research_agent | search, fetch (2 ops) |
+| `sovereign-nextcloud-fs` | python3_exec → nanobot-01 | business_agent | telegram_upload, fs_list/list_recursive/read/move/copy/mkdir/delete/tag/untag/search (11 ops) |
+| `sovereign-nextcloud-ingest` | python3_exec → nanobot-01 | memory_agent | fetch_classify, fetch_classify_folder, ingest_status (3 ops) |
 | `rss-digest` | python3_exec → nanobot-01 | research_agent, business_agent | |
-| `deep-research` | browser+ollama | research_agent | |
+| `deep-research` | nanobot+ollama | research_agent | |
 | `security-audit` | ollama | security_agent | |
 | `session-wrap-up` | ollama | all 5 specialists | |
 | `memory-curate` | ollama+qdrant | memory_agent | |

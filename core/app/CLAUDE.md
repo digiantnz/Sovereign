@@ -118,24 +118,17 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 
 ---
 
-## CalDAV Adapter (`adapters/caldav.py`)
+## CalDAV routing (via openclaw-nextcloud skill)
 
-- `_discover_calendar()` always returns a dict `{url, propfind_http_status, propfind_response_body, calendars_found}` — never `None`
-- `create_event` / `delete_event` / `create_task` / `delete_task` always include `http_calls_made`, `http_status`, `response_body`, `propfind_http_status`; if call not made → says so explicitly ("PUT not attempted")
-- No synthesised error strings — only raw status codes and bodies
-- All write ops PROPFIND to `/remote.php/dav/calendars/digiant/` (Depth:1) first, then PUT/DELETE to `{discovered_url}/{uid}.ics`. Never assume LLM label is valid Nextcloud slug
-- All methods check `r.status_code` directly — no `raise_for_status()`. Return `{"status": "error", "error": ..., "http_status": ...}` for non-2xx
-- `_safe_translate` never passes error results to translator; error path is deterministic
-- `create_task(calendar, uid, summary, due, start, description, status)` generates valid VTODO ICS; `delete_task` delegates to `delete_event`
-- Tasks calendar slug discovery: same `_discover_calendar` partial-match logic with `"tasks"` as default name
+> `adapters/caldav.py` removed (2026-04-03). All calendar/task ops now dispatch through
+> `openclaw-nextcloud` python3_exec skill on nanobot-01.
 
-### CalDAV in execution/engine.py
 - Calendar fast-path in `_quick_classify`: `create_event`, `delete_event`, `update_event` always route to `business_agent` — never through CEO LLM
 - `delete_event` and `update_event` in `INTENT_ACTION_MAP` (domain=caldav) and `INTENT_TIER_MAP` (MID)
-- `_dispatch_inner` has `calendar_update` handler routing to `caldav.update_event()`
 - `_normalise_dt(value)`: strips NZDT/NZST/NZT/UTC/GMT suffixes, ordinal suffixes (st/nd/rd/th), "at" separators; tries `fromisoformat` → multiple `strptime` formats; default year 2026 if absent
 - `calendar_create` in `_dispatch_inner` tries 12+ field names for start/end (start, start_time, datetime, when, date_time, event_start, scheduled_at, begin + date+date_part+time combinations; scans content/draft_content/target as last resort)
 - `prompts.specialist()` injects intent-specific required-field reminders for create/delete/update_event, create_task — includes today's date for relative date resolution
+- `calendar_list_events` op added to `openclaw-nextcloud` SKILL.md + nextcloud.py (2026-04-03)
 
 ---
 
@@ -153,7 +146,7 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - Mail domain calls `self.nanobot.run("imap-smtp-email", action, params)` — NOT IMAPAdapter/SMTPAdapter
 - Account suffix: `_suf = "" if account == "business" else "_personal"` selects personal vs business command
 - Account resolution order: `sp.get("account")` → `delegation.get("target")` → `action.get("account")` → `"personal"` (never default to business)
-- CalDAV/WebDAV still use Python adapters
+- CalDAV/WebDAV now route through nanobot-01 skills (openclaw-nextcloud / sovereign-nextcloud-fs) — Python adapters removed 2026-04-03
 - Email list pre-formatter in `execution/engine.py`: runs after EXEC on `fetch_email/search_email/list_inbox` intents; produces numbered `sender — subject (date)` lines; builds `uid_index` dict for subsequent delete/move
 - Loop variable MUST be `_em` (not `_msg`) — `_msg` is the InternalMessage envelope; shadowing it causes a 500 on the next pass
 - `delete_message` / `move_message` operations: defined in SKILL.md frontmatter (not server.py `_translate_imap_smtp`); `imap_check.py` `cmd_delete` + `cmd_move` use `_resolve_uid()` helper
@@ -163,11 +156,13 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 
 ---
 
-## WebDAV Adapter (`adapters/webdav.py`)
+## WebDAV / filesystem routing (via sovereign-nextcloud-fs + openclaw-nextcloud)
 
-- `path = action.get("path", "/")` always returns `"/"` (static `INTENT_ACTION_MAP` entries carry no runtime path)
-- Runtime file path always comes from specialist output: check `specialist.get("path")` first, then `specialist.get("target")`
-- `target` field is for container names; is last resort for webdav paths
+> `adapters/webdav.py` removed (2026-04-03). File ops now dispatch through nanobot-01 skills.
+
+- `domain=="webdav"` → `sovereign-nextcloud-fs` (list/read/mkdir/delete/search) or `openclaw-nextcloud` (files_write)
+- `_nb_unwrap()` pattern preserves flat dict shape for post-dispatch code
+- Runtime file path always comes from specialist output: `specialist.get("path")` first, then `specialist.get("target")`
 
 ---
 
