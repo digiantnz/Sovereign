@@ -75,10 +75,6 @@ async def lifespan(app: FastAPI):
     # ── Step 2: Core services
     qdrant = QdrantAdapter()
     await qdrant.setup()
-    # Pre-warm working_memory from RAID sovereign collections (up to 2GB).
-    # Sovereign collections are RAID-only (qdrant-archive); startup_load() seeds
-    # working_memory (qdrant, tmpfs) with recent/high-confidence entries.
-    await qdrant.startup_load()
 
     # ── Step 2-zero: Sovereign root — cognitive anchor (FIRST semantic write)
     # Writes semantic:entity:sovereign with sov_id=00000000-0000-0000-0000-000000000001.
@@ -464,10 +460,16 @@ async def lifespan(app: FastAPI):
     except Exception as _sys_err:
         logger.warning("System record seed failed (non-fatal): %s", _sys_err)
 
-    # ── Step 2g: Bootstrap working_memory from sovereign root seed keys
+    # ── Step 2g: Pre-warm working_memory from RAID sovereign collections.
+    # Runs AFTER all seeds so startup_load() reads the corrected RAID state —
+    # any stale entries deleted/reseeded by steps 2b–2f are not loaded.
+    # Seeds write to RAID (archive_client) only; no working_memory dependency.
+    await qdrant.startup_load()
+
+    # ── Step 2h: Bootstrap working_memory from sovereign root seed keys
     # Reads working_memory_seed_keys from semantic:entity:sovereign entry and
     # pre-loads each key into working_memory with stored vectors from RAID.
-    # Runs AFTER all seeds so all entries are guaranteed present in RAID.
+    # Runs AFTER startup_load() so targeted keys overlay the broad preload.
     try:
         _boot_count = await qdrant.bootstrap_working_memory()
         logger.info("Bootstrap working_memory: %d seed keys loaded", _boot_count)
