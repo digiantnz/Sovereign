@@ -329,6 +329,7 @@ class TaskScheduler:
                 metadata={
                     "type": "scheduled_task",
                     "task_id": task_id,
+                    "sov_id": task_id,   # canonical UID: point_id == task_id for direct joins
                     "title": title,
                     "schedule": schedule,
                     "next_due": next_due,
@@ -357,6 +358,7 @@ class TaskScheduler:
                 metadata={
                     "type": "task_procedure",
                     "task_id": task_id,
+                    "sov_id": task_id,   # canonical UID: point_id == task_id for direct joins
                     "title": title,
                     "steps": steps,
                     "created_at": now_iso,

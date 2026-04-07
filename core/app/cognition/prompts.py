@@ -48,24 +48,13 @@ def _get_skill_summary() -> str:
 
 
 def classify(ceo_persona: str, user_input: str, memory_context: str,
-             context_window=None, gateway_context=None) -> str:
-    gateway_section = ""
-    if gateway_context:
-        lines = ["---", "Recent Director context (last 5 messages):"]
-        for entry in gateway_context:
-            ts = entry.get("timestamp", "")[:19].replace("T", " ")
-            src = entry.get("source", "telegram")
-            seq = entry.get("sequence", "")
-            content = entry.get("content", "")
-            lines.append(f"[{seq}] {ts} {src}: {content}")
-        lines.append("---")
-        gateway_section = "\n".join(lines) + "\n"
+             context_window=None) -> str:
     context_section = ""
     if context_window:
         # Normalise: list of {user,assistant} dicts or legacy single dict
         turns = context_window if isinstance(context_window, list) else [context_window]
         lines = ["---", "CONVERSATION HISTORY (most recent last — use to resolve pronouns and follow-ups):"]
-        for t in turns[-3:]:
+        for t in turns:
             lines.append(f"Director: {t.get('user', '')}")
             lines.append(f"Sovereign: {t.get('assistant', '')}")
         lines += [
@@ -89,7 +78,7 @@ Current time: {_ts}
 Installed skills (name: what it does):
 {_skill_dir}
 ---
-{gateway_section}RECENT MEMORY CONTEXT:
+RECENT MEMORY CONTEXT:
 {memory_context}
 {context_section}
 ---

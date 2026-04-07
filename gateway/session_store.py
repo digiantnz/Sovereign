@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Optional, Any
 
-HISTORY_MAX = 6  # turns kept in session for context window
+HISTORY_MAX = 10  # turns kept in session for context window
 
 
 @dataclass

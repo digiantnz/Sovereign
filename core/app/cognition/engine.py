@@ -354,18 +354,11 @@ class CognitionEngine:
         )
         if gaps:
             context = context + f"\n\nKnown knowledge gaps: {', '.join(gaps)}"
-        gateway_ctx: list[dict] = []
-        if self.qdrant:
-            try:
-                gateway_ctx = await self.qdrant.get_gateway_context()
-            except Exception:
-                pass
         prompt = prompts.classify(
             ceo_persona=self.load_orchestrator(),
             user_input=user_input,
             memory_context=context,
             context_window=context_window,
-            gateway_context=gateway_ctx,
         )
         result = await self.call_llm_json(prompt)
         result["_memory_confidence"] = confidence

@@ -467,13 +467,19 @@ All harness intents are added to the translator bypass list so structured output
 |---------|---------|-----------|
 | `/install <goal>` | Skill-Harness | Autonomous: search → LLM picks best → confirm gate → scan → install |
 
+**Implemented /commands:**
+
+| Command | Harness | Notes |
+|---------|---------|-------|
+| `/install <goal>` | Skill-Harness | Autonomous: search → LLM picks best → confirm gate → scan → install |
+| `/selfimprove` | SI-Harness | Run observe+propose cycle; surface pending proposals to Director |
+| `/devcheck` | Dev-Harness | Run full analysis cycle; surface findings requiring approval |
+| `/portfolio` | Portfolio-Harness | Trigger snapshot; return current balances + NZD/USD value |
+
 **Pending /commands** — build when harnesses are ready:
 
 | Command | Harness | Notes |
 |---------|---------|-------|
-| `/selfimprove` | SI-Harness | Run observe+propose cycle; surface pending proposals to Director |
-| `/devcheck` | Dev-Harness | Run full analysis cycle; surface findings requiring approval |
-| `/portfolio` | Portfolio-Harness | Trigger snapshot; return current balances + NZD/USD value |
 | `/pm <action>` | PM-Harness | Project management harness (PROPOSAL — pending Director approval) |
 
 All /commands:
