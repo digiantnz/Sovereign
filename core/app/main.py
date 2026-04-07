@@ -163,12 +163,16 @@ async def lifespan(app: FastAPI):
         },
         {
             "seed_id": "backfill_v1_node04_ip",
-            "key": "semantic:networking:node04_ip",
+            # Key changed :networking: → :network:host: to force reseed with corrected content
+            # (old entry didn't clarify that Rex accesses via nanobot-01 skills, not directly).
+            "key": "semantic:network:host:node04",
             "title": "node04 external services host IP and ports",
             "content": (
                 "node04 IP: 172.16.201.4 (VLAN 172.16.201.0/24). "
-                "Hosts a2a-browser (port 8001) and a2a-whisper (port 8003). "
-                "All external web egress from sovereign-core routes through node04."
+                "Hosts a2a-browser (web search + URL fetch proxy, port 8001) and "
+                "a2a-whisper (speech transcription, port 8003). "
+                "Rex uses these services through nanobot-01 skills (sovereign-browser, whisper) "
+                "— not by calling node04 directly."
             ),
             "domain": "networking",
         },
@@ -317,16 +321,20 @@ async def lifespan(app: FastAPI):
         },
         {
             "seed_id": "backfill_v1_net_a2a_browser",
-            "key": "semantic:network:endpoints:a2a-browser",
-            "title": "a2a-browser service endpoint (node04)",
+            # Key changed from :endpoints: → :service: to force delete-and-reseed of the
+            # stale v1 entry that contained "POST /run" — Ollama was regurgitating that
+            # endpoint as a URL to the Director.
+            "key": "semantic:network:service:a2a-browser",
+            "title": "a2a-browser web proxy service (node04)",
             "content": (
-                "a2a-browser endpoint on node04: 172.16.201.4:8001. "
-                "Provides browser fetch, SearXNG web search, and A2A payment rail receiver. "
-                "Protocol: A2A JSON-RPC 3.0 via POST /run, POST /search, POST /fetch. "
-                "Auth: X-API-Key shared secret (A2A_SHARED_SECRET env var). "
-                "Network: ai_net (sovereign-core → node04 VLAN). Status: active."
+                "a2a-browser is the external web proxy service running on node04 (172.16.201.4:8001). "
+                "It provides SearXNG web search and URL fetch with per-host credential profiles, "
+                "and receives A2A payment rail notifications (wallet/credit). "
+                "Rex accesses this service exclusively through the sovereign-browser skill on "
+                "nanobot-01 — sovereign-core never calls a2a-browser directly. "
+                "Auth: X-API-Key shared secret. Status: active."
             ),
-            "domain": "network.endpoints",
+            "domain": "network.service",
             "label": "a2a-browser",
             "value": "172.16.201.4:8001",
             "metadata": {"protocol": "http", "status": "active", "host": "node04"},
