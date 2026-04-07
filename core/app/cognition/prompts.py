@@ -6,6 +6,45 @@ The expected JSON schemas match the persona output contracts exactly.
 
 import json
 import os
+import re as _re
+
+_SKILLS_DIR = "/home/sovereign/skills"
+_skill_summary_cache: str = ""
+
+def _build_skill_summary() -> str:
+    """Load all installed skill names + descriptions from SKILL.md files.
+
+    Returns a compact multi-line string for injection into the PASS 1 prompt.
+    Cached at module level — reloaded on each sovereign-core startup.
+    """
+    lines = []
+    try:
+        for skill in sorted(os.listdir(_SKILLS_DIR)):
+            path = os.path.join(_SKILLS_DIR, skill, "SKILL.md")
+            if not os.path.isfile(path):
+                continue
+            try:
+                content = open(path).read()
+                m = _re.match(r'^---\n(.*?)\n---', content, _re.DOTALL)
+                if not m:
+                    continue
+                fm = m.group(1)
+                desc_m = _re.search(r'^description:\s*(.+?)(?=\n\w|\Z)', fm, _re.DOTALL | _re.MULTILINE)
+                if not desc_m:
+                    continue
+                desc = _re.sub(r'\n\s+', ' ', desc_m.group(1).strip()).strip('"').strip()
+                lines.append(f"  {skill}: {desc}")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+def _get_skill_summary() -> str:
+    global _skill_summary_cache
+    if not _skill_summary_cache:
+        _skill_summary_cache = _build_skill_summary()
+    return _skill_summary_cache
 
 
 def classify(ceo_persona: str, user_input: str, memory_context: str,
@@ -41,11 +80,14 @@ def classify(ceo_persona: str, user_input: str, memory_context: str,
     _now = _dt.now(_tz.utc)
     _ts = _now.strftime("%Y-%m-%d %H:%M UTC (%A)")  # e.g. "2026-03-23 09:15 UTC (Monday)"
 
+    _skill_dir = _get_skill_summary()
     return f"""{ceo_persona}
 
 ---
 SYSTEM CONTEXT:
 Current time: {_ts}
+Installed skills (name: what it does):
+{_skill_dir}
 ---
 {gateway_section}RECENT MEMORY CONTEXT:
 {memory_context}
@@ -659,11 +701,18 @@ REQUIRED FIELDS for create_event (today is {_date.today().isoformat()}):
   "operation": "caldav_create_event"
   "calendar": "personal"
   "summary": "<exact event title>"
-  "start": "<ISO 8601 YYYY-MM-DDTHH:MM:SS>"
-  "end": "<ISO 8601 — default start + 1 hour if not specified>"
-  "description": ""
+  "start": "<ISO 8601 YYYY-MM-DDTHH:MM:SS — REQUIRED, never blank>"
+  "end": "<ISO 8601 YYYY-MM-DDTHH:MM:SS>"
+  "description": "<location or details if provided>"
   "uid": ""
-Convert all natural-language dates to ISO 8601. Never leave start/end blank."""
+
+DATE RULES — read carefully:
+- All-day event (no time given): use T00:00:00 e.g. "2026-06-06T00:00:00"
+- Multi-day range "6–7 June 2026": start = "2026-06-06T00:00:00", end = "2026-06-07T00:00:00"
+- Single date, no time: start = date T00:00:00, end = same day T23:59:59
+- Single date with time: end = start + 1 hour
+- NEVER output a range in a single field (e.g. "6-7 June") — split into start and end.
+- Convert all natural-language dates to ISO 8601. Never leave start blank."""
     elif intent == "create_task":
         _schema_hint = f"""
 REQUIRED FIELDS for create_task (today is {_date.today().isoformat()}):
@@ -1037,7 +1086,8 @@ def task_intent_parser(user_input: str) -> str:
     available_intents = [
         "fetch_email", "search_email", "send_email", "move_email",
         "list_files", "read_file", "write_file",
-        "list_calendars", "create_event", "create_task",
+        "list_events", "list_calendars", "create_event", "create_task",
+        "read_feed",
         "web_search", "fetch_url",
         "query", "research",
         "list_containers", "get_stats",
@@ -1049,8 +1099,19 @@ def task_intent_parser(user_input: str) -> str:
 Current time: {_now_ts}
 User request: {json.dumps(user_input)}
 
+CRITICAL — TIMEZONE RULE:
+All cron schedules run in UTC. The Director is in New Zealand.
+  NZ Standard Time (NZST, winter Apr-Sep) = UTC+12  →  subtract 12h from NZ time to get UTC
+  NZ Daylight Time (NZDT, summer Oct-Mar) = UTC+13  →  subtract 13h from NZ time to get UTC
+Examples:
+  "8:30 AM NZ (NZST)"  →  cron "30 20 * * 0-4"  (8:30 PM UTC Sunday-Thursday = 8:30 AM NZST Monday-Friday)
+  "8:30 AM NZ (NZDT)"  →  cron "30 19 * * 0-4"  (7:30 PM UTC Sunday-Thursday = 8:30 AM NZDT Monday-Friday)
+  "9:00 AM daily NZ"   →  cron "0 21 * * *"      (NZST) or "0 20 * * *" (NZDT)
+When in doubt, use NZST offsets — they are correct for ~6 months of the year.
+NEVER write cron times as if they were NZ local times. "8:30 AM" NZ ≠ "30 8 * * *".
+
 Your job:
-1. Determine the schedule (cron, interval, or one_time).
+1. Determine the schedule (cron, interval, or one_time) — apply NZ→UTC conversion.
 2. Identify the sequence of steps (intents) needed to fulfil the task.
 3. Decide when to notify the Director (always / on_findings / never).
 4. Identify any stop condition.
@@ -1061,6 +1122,8 @@ Available step intents: {json.dumps(available_intents)}
 Step params depend on intent:
 - fetch_email:    {{"account": "personal|business"}}
 - search_email:   {{"account": "personal|business", "subject": "...", "from_addr": "...", "since": "YYYY-MM-DD", "body": "..."}}
+- read_feed:      {{}}   (fetches configured RSS/news feeds)
+- list_events:    {{"calendar": "personal|tasks", "from_date": "today", "to_date": "today"}}  (use "today" for dynamic date)
 - web_search:     {{"query": "<search query>"}}
 - list_files:     {{"path": "/folder/"}}
 - read_file:      {{"path": "/path/to/file"}}
@@ -1069,16 +1132,16 @@ Step params depend on intent:
 - fetch_url:      {{"url": "https://..."}}
 
 Schedule types:
-- cron:      {{"type":"cron",     "cron":"M H D Mon Wday", "description":"..."}}   # standard 5-field, 0=Sun
+- cron:      {{"type":"cron",     "cron":"M H D Mon Wday", "description":"..."}}   # standard 5-field, 0=Sun, TIMES ARE UTC
 - interval:  {{"type":"interval", "value":30, "unit":"minutes|hours|days|weeks"}}
 - one_time:  {{"type":"one_time", "at":"YYYY-MM-DDTHH:MM:SSZ"}}
 
-Common cron patterns:
-  "30 7 * * 1-5"  — 7:30 AM Monday-Friday
-  "0 8 * * *"     — 8:00 AM daily
-  "0 9 * * 1"     — 9:00 AM every Monday
-  "*/30 * * * *"  — every 30 minutes
-  "0 0 * * 0"     — midnight every Sunday
+NZ-adjusted cron patterns (NZST = UTC+12):
+  Mon-Fri 8:30 AM NZST  →  "30 20 * * 0-4"   (cron day 0=Sun at 20:30 UTC = Mon 8:30 AM NZST)
+  Mon-Fri 9:00 AM NZST  →  "0 21 * * 0-4"
+  Daily 2:00 AM NZST    →  "0 14 * * *"
+  Every Monday 9 AM NZST→  "0 21 * * 0"       (cron day 0=Sun at 21:00 UTC = Mon 9:00 AM NZST)
+  Every 30 minutes      →  "*/30 * * * *"      (interval preferred for this)
 
 notify_when:
   "always"       — always send Telegram notification after task runs
@@ -1092,16 +1155,17 @@ stop_condition:
 
 EXAMPLES:
 
-Request: "Give me a briefing every weekday morning at 7:30 with emails and calendar"
+Request: "Give me a weekday morning briefing at 8:30 AM with emails, news and calendar"
 Output:
 {{
   "needs_clarification": false,
   "title": "Weekday Morning Briefing",
-  "schedule": {{"type": "cron", "cron": "30 7 * * 1-5", "description": "Weekdays at 7:30 AM"}},
+  "schedule": {{"type": "cron", "cron": "30 20 * * 0-4", "description": "Mon-Fri 8:30 AM NZST"}},
   "steps": [
-    {{"intent": "fetch_email", "params": {{"account": "personal"}}, "description": "Check unread personal emails"}},
-    {{"intent": "fetch_email", "params": {{"account": "business"}}, "description": "Check unread business emails"}},
-    {{"intent": "list_calendars", "params": {{}}, "description": "Check today's calendar"}}
+    {{"intent": "fetch_email",  "params": {{"account": "personal"}}, "description": "Check personal email"}},
+    {{"intent": "fetch_email",  "params": {{"account": "business"}}, "description": "Check business email"}},
+    {{"intent": "read_feed",    "params": {{}}, "description": "Read news headlines"}},
+    {{"intent": "list_events",  "params": {{"calendar": "personal", "from_date": "today", "to_date": "today"}}, "description": "List today's calendar events"}}
   ],
   "notify_when": "always",
   "stop_condition": null
@@ -1112,7 +1176,7 @@ Output:
 {{
   "needs_clarification": false,
   "title": "Daily Domain Name Monitor",
-  "schedule": {{"type": "cron", "cron": "0 9 * * *", "description": "Daily at 9:00 AM"}},
+  "schedule": {{"type": "cron", "cron": "0 21 * * *", "description": "Daily at 9:00 AM NZST"}},
   "steps": [
     {{"intent": "web_search", "params": {{"query": "newly registered domain names containing matt OR a2a site:whois.domaintools.com OR site:instantdomainsearch.com"}}, "description": "Search for newly registered domains containing matt or a2a"}}
   ],

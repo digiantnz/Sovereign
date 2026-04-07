@@ -12,6 +12,14 @@ MODEL = "llama3.1:8b-instruct-q4_K_M"
 PERSONAS_DIR = "/home/sovereign/personas"
 SECURITY_AGENT_PATH = os.path.join(PERSONAS_DIR, "SECURITY_AGENT.md")
 
+# ── Memory-first routing (shadow mode) ───────────────────────────────────────
+# When True: run semantic intent search in parallel with LLM PASS 1 and log
+# agreement/disagreement to episodic memory.  Routing itself is unchanged —
+# the LLM result is always used until Reasoning Sunday validates thresholds.
+# Flip to False to disable shadow entirely without touching routing logic.
+MEMORY_ROUTING_SHADOW_MODE = True
+MEMORY_ROUTING_THRESHOLD   = 0.85   # score at which shadow would have overridden LLM
+
 TRANSLATOR_PATH = os.path.join(PERSONAS_DIR, "translator.md")
 
 # ---------------------------------------------------------------------------
@@ -364,16 +372,154 @@ class CognitionEngine:
         result["_memory_gaps"] = gaps
         return result
 
+    async def _memory_route_shadow(self, user_input: str) -> dict:
+        """Shadow semantic search for PASS 1 routing validation.
+
+        Embeds user_input and queries the SEMANTIC collection restricted to
+        intent_seed entries (source="intent_seed") while excluding historical
+        entries (status="historical").  Returns the top candidate and its score.
+
+        Never raises — all errors return a safe default so shadow failures never
+        affect actual routing.
+
+        Returns:
+            matched:          bool — True if any candidate was found
+            key:              str  — semantic:intent:{slug} of top candidate
+            score:            float
+            action:           str  — "{domain}:{operation}:{name}" from payload
+            shadow_intent:    str  — intent slug extracted from key
+            above_threshold:  bool — score >= MEMORY_ROUTING_THRESHOLD
+        """
+        _empty: dict = {
+            "matched": False, "key": "", "score": 0.0,
+            "action": "", "shadow_intent": "", "above_threshold": False,
+        }
+        if not self.qdrant:
+            return _empty
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            from execution.adapters.qdrant import SEMANTIC
+            vector = await self.qdrant._embed(user_input)
+            resp = await self.qdrant.archive_client.query_points(
+                collection_name=SEMANTIC,
+                query=vector,
+                query_filter=Filter(
+                    must=[FieldCondition(key="source", match=MatchValue(value="intent_seed"))],
+                    must_not=[FieldCondition(key="status", match=MatchValue(value="historical"))],
+                ),
+                limit=1,
+                score_threshold=0.0,   # capture top hit regardless of score
+                with_payload=True,
+            )
+            if not resp.points:
+                return _empty
+            hit = resp.points[0]
+            score = hit.score
+            payload = hit.payload or {}
+            key = payload.get("_key", "")
+            action = payload.get("action", "")
+            shadow_intent = key[len("semantic:intent:"):] if key.startswith("semantic:intent:") else ""
+            return {
+                "matched":          True,
+                "key":              key,
+                "score":            round(score, 4),
+                "action":           action,
+                "shadow_intent":    shadow_intent,
+                "above_threshold":  score >= MEMORY_ROUTING_THRESHOLD,
+            }
+        except Exception as exc:
+            logger.debug("_memory_route_shadow: failed (non-fatal): %s", exc)
+            return _empty
+
+    async def _write_shadow_routing_episodic(
+        self,
+        user_input: str,
+        llm_intent: str,
+        shadow: dict,
+        agreement: bool | None,
+    ) -> None:
+        """Write one shadow routing observation to episodic memory.
+
+        Fires via asyncio.create_task() — non-blocking, never raises.
+        These entries are the dataset for Reasoning Sunday threshold calibration.
+        Keyed episodic:shadow_routing:{date}:{llm_intent} — not unique per call
+        (LLM-derived title will differ), but the content carries all fields needed.
+        """
+        if not self.qdrant:
+            return
+        try:
+            from datetime import datetime, timezone
+            ts  = datetime.now(timezone.utc).isoformat()
+            day = ts[:10]
+            content = (
+                f"SHADOW_ROUTING [{day}]: "
+                f"llm={llm_intent!r} shadow={shadow['shadow_intent']!r} "
+                f"score={shadow['score']:.4f} threshold={MEMORY_ROUTING_THRESHOLD} "
+                f"above_threshold={shadow['above_threshold']} agreement={agreement}"
+            )
+            await self.qdrant.store(
+                content=content,
+                metadata={
+                    "type":              "episodic",
+                    "domain":            "shadow_routing",
+                    "_key":              f"episodic:shadow_routing:{day}:{llm_intent}",
+                    "llm_intent":        llm_intent,
+                    "shadow_intent":     shadow["shadow_intent"],
+                    "shadow_score":      shadow["score"],
+                    "shadow_key":        shadow["key"],
+                    "above_threshold":   shadow["above_threshold"],
+                    "agreement":         agreement,
+                    "timestamp":         ts,
+                    "outcome":           "shadow_observation",
+                },
+                collection="episodic",
+                writer="sovereign-core",
+            )
+        except Exception as exc:
+            logger.debug("_write_shadow_routing_episodic: failed (non-fatal): %s", exc)
+
     async def orchestrator_classify(self, user_input: str, context_window=None) -> dict:
         """PASS 1: Orchestrator classification with routing memory lookup.
         New contract: adds specialist + routing_rationale fields.
         Backward compat: also sets delegate_to = specialist.
+
+        Stamps _routing_source: "llm_pass1" on all results.
+        When MEMORY_ROUTING_SHADOW_MODE is True, also runs _memory_route_shadow()
+        and stamps shadow fields for Reasoning Sunday calibration. Actual routing
+        is unchanged — LLM result is always used until thresholds are validated.
         """
         result = await self.ceo_classify(user_input, context_window=context_window)
         # Normalise: ensure both specialist and delegate_to are present
         agent = result.get("specialist") or result.get("delegate_to", "")
-        result["specialist"] = agent
-        result["delegate_to"] = agent
+        result["specialist"]    = agent
+        result["delegate_to"]   = agent
+        result["_routing_source"] = "llm_pass1"
+
+        if MEMORY_ROUTING_SHADOW_MODE and self.qdrant:
+            shadow    = await self._memory_route_shadow(user_input)
+            llm_intent = result.get("intent", "")
+            agreement  = (shadow["shadow_intent"] == llm_intent) if shadow["matched"] else None
+
+            result["_memory_routing_confidence"]    = shadow["score"]
+            result["_memory_routing_key"]           = shadow["key"]
+            result["_memory_routing_shadow_intent"] = shadow["shadow_intent"]
+            result["_memory_routing_above_threshold"] = shadow["above_threshold"]
+
+            logger.info(
+                "SHADOW ROUTING: llm=%r shadow=%r score=%.4f above_threshold=%s agreement=%s",
+                llm_intent, shadow["shadow_intent"], shadow["score"],
+                shadow["above_threshold"], agreement,
+            )
+
+            if shadow["matched"]:
+                import asyncio as _asyncio
+                _asyncio.create_task(self._write_shadow_routing_episodic(
+                    user_input=user_input,
+                    llm_intent=llm_intent,
+                    shadow=shadow,
+                    agreement=agreement,
+                ))
+
         return result
 
     # ── Pass 2: Specialist Reasoning ──────────────────────────────────────

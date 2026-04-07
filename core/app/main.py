@@ -17,6 +17,7 @@ from monitoring.scheduler import start_scheduler, start_archive_sync, start_obse
 from monitoring.eth_watcher import start_eth_watcher
 from skills.loader import scan_all_skills
 from skills.lifecycle import load_skill_watchlist
+from api.portal import router as portal_router
 from execution.adapters.wallet import WalletAdapter
 from scheduling.task_scheduler import TaskScheduler
 from execution.credential_proxy import CredentialProxy
@@ -78,6 +79,34 @@ async def lifespan(app: FastAPI):
     # Sovereign collections are RAID-only (qdrant-archive); startup_load() seeds
     # working_memory (qdrant, tmpfs) with recent/high-confidence entries.
     await qdrant.startup_load()
+
+    # ── Step 2-zero: Sovereign root — cognitive anchor (FIRST semantic write)
+    # Writes semantic:entity:sovereign with sov_id=00000000-0000-0000-0000-000000000001.
+    # This is the ONLY entry where parent_sov_id=None. Idempotent.
+    try:
+        await qdrant.seed_sovereign_root()
+        logger.info("Sovereign root entry seeded (cognitive anchor)")
+    except Exception as _root_err:
+        logger.warning("Sovereign root seed failed (non-fatal): %s", _root_err)
+
+    # ── Step 2-one: Entity registry seed
+    # Writes semantic:entity:{slug} entries for all 12 foundational entities (002–013).
+    # entity_type used (not component_type). Hardware entities (003–006) parent to
+    # sovereign root. External entities (persons, orgs, networks, blockchains) have
+    # parent_sov_id=None. Also writes semantic:governance:entity-registry index.
+    # Must run before component seeds (components reference hardware entity sov_ids).
+    try:
+        from memory.entity_registry import build_entity_seeds, build_entity_index
+        _entity_seeds = build_entity_seeds()
+        _entity_index = build_entity_index()
+        _entity_audit = await qdrant.seed_entity_entries(_entity_seeds, _entity_index)
+        logger.info(
+            "Entity registry seed: total=%d created=%d existed=%d errors=%d",
+            _entity_audit["total"], _entity_audit["created"],
+            _entity_audit["already_existed"], _entity_audit["errors"],
+        )
+    except Exception as _ent_err:
+        logger.warning("Entity registry seed failed (non-fatal): %s", _ent_err)
 
     # ── Step 2a: Memory Index Protocol — startup migration
     # Stamps _no_key=True on any pre-MIP sovereign entry lacking a _key field.
@@ -367,8 +396,83 @@ async def lifespan(app: FastAPI):
     if _skill_seeded:
         logger.info("Qdrant: skill install sequence procedural entry seeded")
 
+    # ── Step 2d: Intent / skill / harness semantic entry seed (Beta-1)
+    # Writes a semantic:intent:{slug} entry for every INTENT_ACTION_MAP entry,
+    # every installed RAID skill, and the 3 harnesses. Idempotent via _backfill_seed_id.
+    try:
+        from memory.semantic_seeds import build_intent_seeds, build_skill_seeds, build_harness_seeds
+        from execution.engine import INTENT_ACTION_MAP as _IAM
+        _sem_seeds = build_intent_seeds(_IAM) + build_skill_seeds() + build_harness_seeds()
+        _sem_audit = await qdrant.seed_intent_semantic_entries(_sem_seeds)
+        logger.info(
+            "Intent semantic seed: total=%d created=%d existed=%d errors=%d",
+            _sem_audit["total"], _sem_audit["created"],
+            _sem_audit["already_existed"], _sem_audit["errors"],
+        )
+    except Exception as _sem_err:
+        logger.warning("Intent semantic seed failed (non-fatal): %s", _sem_err)
+
+    # ── Step 2e: Component registry seed (Beta-2)
+    # Writes semantic:component:{name} entries for all ~69 system components +
+    # meta:system:component-registry aggregate index. Idempotent via _backfill_seed_id.
+    try:
+        from memory.component_registry import build_component_seeds, build_component_index
+        _comp_seeds = build_component_seeds()
+        _comp_index = build_component_index(_comp_seeds)
+        _comp_audit = await qdrant.seed_component_entries(_comp_seeds, _comp_index)
+        logger.info(
+            "Component registry seed: total=%d created=%d existed=%d errors=%d",
+            _comp_audit["total"], _comp_audit["created"],
+            _comp_audit["already_existed"], _comp_audit["errors"],
+        )
+    except Exception as _comp_err:
+        logger.warning("Component registry seed failed (non-fatal): %s", _comp_err)
+
+    # ── Step 2f: System record seeds (Beta-2)
+    # Writes governance invariants, adapter rules, nanobot invariants, domain rules,
+    # and as-built architecture decisions to SEMANTIC collection. Historical entries
+    # carry status="historical" and are excluded from routing searches automatically.
+    try:
+        from memory.system_record_seeds import (
+            build_governance_seeds,
+            build_adapter_invariant_seeds,
+            build_nanobot_invariant_seeds,
+            build_governance_domain_rule_seeds,
+            build_as_built_seeds,
+        )
+        _sys_seeds = (
+            build_governance_seeds()
+            + build_adapter_invariant_seeds()
+            + build_nanobot_invariant_seeds()
+            + build_governance_domain_rule_seeds("/app/governance/governance.json")
+            + build_as_built_seeds()
+        )
+        _sys_audit = await qdrant.seed_intent_semantic_entries(_sys_seeds)
+        logger.info(
+            "System record seed: total=%d created=%d existed=%d errors=%d",
+            _sys_audit["total"], _sys_audit["created"],
+            _sys_audit["already_existed"], _sys_audit["errors"],
+        )
+    except Exception as _sys_err:
+        logger.warning("System record seed failed (non-fatal): %s", _sys_err)
+
+    # ── Step 2g: Bootstrap working_memory from sovereign root seed keys
+    # Reads working_memory_seed_keys from semantic:entity:sovereign entry and
+    # pre-loads each key into working_memory with stored vectors from RAID.
+    # Runs AFTER all seeds so all entries are guaranteed present in RAID.
+    try:
+        _boot_count = await qdrant.bootstrap_working_memory()
+        logger.info("Bootstrap working_memory: %d seed keys loaded", _boot_count)
+    except Exception as _boot_err:
+        logger.warning("Bootstrap working_memory failed (non-fatal): %s", _boot_err)
+
     app.state.gov      = GovernanceEngine("/app/governance/governance.json")
     app.state.cog      = CognitionEngine(qdrant, ledger=ledger)
+    # Inject cog into qdrant AFTER all startup seeds complete — ensures boot-time
+    # semantic writes (static facts, intent seeds, component registry) do not each
+    # trigger a structural synthesis task. From this point on, every semantic write
+    # fires synthesise_structural(key=<new_key>) as a background asyncio task.
+    qdrant.set_cog(app.state.cog)
     app.state.exec     = ExecutionEngine(
         app.state.gov, app.state.cog, qdrant,
         scanner=scanner, guardrail=guardrail, ledger=ledger,
@@ -454,6 +558,7 @@ async def lifespan(app: FastAPI):
     # Seed nightly dev-harness task (idempotent — no-op if already registered).
     # Runs at 14:00 UTC (02:00 NZST) with trigger="nightly" explicit in step params.
     await task_scheduler.seed_nightly_dev_task()
+    await task_scheduler.seed_nightly_synthesis_task()
 
     # ── Step 3c: Credential proxy — session-scoped token delegation for nanobot-01
     credential_proxy = CredentialProxy(default_ttl=60, ledger=ledger)
@@ -497,6 +602,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(portal_router)
 
 
 @app.get("/health")

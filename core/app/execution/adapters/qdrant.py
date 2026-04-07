@@ -55,6 +55,12 @@ EMBED_MODEL         = "nomic-embed-text"
 AUDIT_PATH          = "/home/sovereign/audit/memory-promotions.jsonl"
 CONFIDENCE_THRESHOLD = 0.75
 
+# Sovereign ID namespace — single UUID5 authority for all stores.
+# Any item with a stable native_id gets a deterministic sovereign point ID
+# via uuid5(_SOV_NS, "{item_type}:{native_id}"). This ID travels with the
+# item from working_memory → RAID → backups, never reassigned.
+_SOV_NS = uuid.UUID("7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d")
+
 # Preload budget: 2GB RAM ÷ ~3.5KB per point ≈ 590K points theoretical max.
 # In practice the collections hold a few thousand entries; this is a safety valve.
 _PRELOAD_BYTES_LIMIT = 2 * 1024 * 1024 * 1024   # 2 GB
@@ -127,10 +133,41 @@ class QdrantAdapter:
             ollama_embed_url
             or os.environ.get("OLLAMA_EMBED_URL", "http://ollama-embed:11434")
         )
+        # CognitionEngine — injected after startup via set_cog().
+        # None during boot (startup seeds must not trigger structural synthesis).
+        # Set to CognitionEngine instance in main.py lifespan after both are initialised.
+        self._cog = None
+
+    def set_cog(self, cog) -> None:
+        """Inject CognitionEngine after startup. Called once in main.py lifespan.
+
+        Enables structural synthesis trigger on semantic writes. Must be called after
+        all startup seeds complete so boot-time semantic writes do not trigger synthesis.
+        """
+        self._cog = cog
 
     def _client_for(self, collection: str) -> "AsyncQdrantClient":
         """Route working_memory to qdrant (tmpfs RAM); everything else to qdrant-archive (RAID)."""
         return self.client if collection == WORKING else self.archive_client
+
+    @staticmethod
+    def sovereign_id(item_type: str, native_id: str) -> str:
+        """Generate a deterministic sovereign point ID for any item.
+
+        This is the single ID authority for Sovereign. Call it as soon as an item
+        needs an ID — before it is written anywhere. The returned UUID5 is used as
+        the Qdrant point ID in working_memory, RAID, and all backups, so the item
+        carries one stable identity across every store in the system.
+
+        Args:
+            item_type: logical type of the item ("email", "note", "event", "file", etc.)
+            native_id: the item's stable native identifier from its source system
+                       (IMAP uid, Nextcloud note id, CalDAV uid, file path, …)
+
+        For items with no stable native_id, generate uuid4() once, store it as
+        sov_id in the payload, and pass that on subsequent calls.
+        """
+        return str(uuid.uuid5(_SOV_NS, f"{item_type}:{native_id}"))
 
     async def _embed(self, text: str) -> list[float]:
         """Embed text via CPU-only nomic-embed-text on ollama-embed service."""
@@ -279,10 +316,14 @@ class QdrantAdapter:
                     payload = dict(r.payload or {})
                     payload["startup_load"] = True
                     payload["source_collection"] = coll
+                    # Preserve sovereign ID — use existing sov_id if present, else the RAID point ID
+                    _wm_id = payload.get("sov_id") or str(r.id)
+                    if "sov_id" not in payload:
+                        payload["sov_id"] = _wm_id
                     await self.client.upsert(
                         collection_name=WORKING,
                         points=[PointStruct(
-                            id=str(uuid.uuid4()),
+                            id=_wm_id,
                             vector=raw_vec,
                             payload=payload,
                         )],
@@ -294,7 +335,8 @@ class QdrantAdapter:
         await asyncio.gather(*[_load_one(c) for c in SOVEREIGN_COLLECTIONS])
         est_mb = total_loaded * _BYTES_PER_POINT / 1024 / 1024
         _log.info(
-            "startup_load: preloaded %d entries into working_memory (~%.1f MB estimated RAM)",
+            "startup_load: preloaded %d entries into working_memory (~%.1f MB estimated RAM)"
+            " — sov_id preserved as working_memory point ID",
             total_loaded, est_mb,
         )
 
@@ -386,7 +428,10 @@ class QdrantAdapter:
             )
 
         vector = await self._embed(content)
-        point_id = str(uuid.uuid4())
+        # Sovereign ID: respect existing sov_id in metadata, otherwise generate uuid4.
+        # Callers that have a stable native_id should pre-compute via sovereign_id() and
+        # pass it in metadata["sov_id"] so the deterministic UUID5 is used as the point ID.
+        point_id = metadata.get("sov_id") or str(uuid.uuid4())
         _now = datetime.now(timezone.utc).isoformat()
 
         # Key + title generation — sovereign collections only (working_memory is ephemeral)
@@ -414,6 +459,7 @@ class QdrantAdapter:
                 payload={
                     "content": content,
                     "timestamp": _now,
+                    "sov_id": point_id,   # sovereign ID travels with the record in all stores
                     **metadata,
                     **_key_fields,
                 },
@@ -421,7 +467,26 @@ class QdrantAdapter:
         )
 
         if collection in SOVEREIGN_COLLECTIONS:
-            self._log_audit("store", collection, point_id, writer, content[:120])
+            self._log_audit("store", collection, point_id, writer, content[:120], sov_id=point_id)
+
+        # ── Structural synthesis trigger — semantic writes only ───────────────
+        # Non-blocking: asyncio.create_task() fires after the write has committed.
+        # If the key generation failed (_no_key), there is no scoped key to pass —
+        # the nightly full scan will process the entry once it gets a key.
+        # Lazy import avoids circular dependency: synthesis.py imports from qdrant.py.
+        if collection == SEMANTIC and self._cog is not None:
+            _trigger_key = _key_fields.get("_key")
+            if _trigger_key:
+                try:
+                    from memory.synthesis import synthesise_structural as _synth
+                    asyncio.create_task(
+                        _synth(key=_trigger_key, qdrant=self, cog=self._cog)
+                    )
+                except Exception as _synth_err:
+                    _log.warning(
+                        "store: structural synthesis trigger failed for %r: %s",
+                        _trigger_key, _synth_err,
+                    )
 
         return point_id
 
@@ -443,14 +508,19 @@ class QdrantAdapter:
                                    score_threshold: float = 0.35) -> list[dict]:
         """Embed once, parallel-search all 7 sovereign RAID collections.
         Returns merged results sorted descending by score, each tagged _collection.
+        Excludes entries with status="historical" (Task 7 — semantic:system:history:*).
         """
         vector = await self._embed(query)
+        _excl_historical = Filter(
+            must_not=[FieldCondition(key="status", match=MatchValue(value="historical"))]
+        )
 
         async def _search_one(coll: str):
             try:
                 resp = await self.archive_client.query_points(
                     collection_name=coll,
                     query=vector,
+                    query_filter=_excl_historical,
                     limit=top_k,
                     score_threshold=score_threshold,
                     with_payload=True,
@@ -526,7 +596,10 @@ class QdrantAdapter:
         if vec is None:
             return False
 
-        new_id = str(uuid.uuid4())
+        # Preserve sovereign ID — same point ID in RAID as in working_memory
+        new_id = payload.get("sov_id") or str(p.id)
+        if "sov_id" not in payload:
+            payload["sov_id"] = new_id
         _now = datetime.now(timezone.utc).isoformat()
         _key, _title = await self._generate_key_and_title(
             payload.get("content", ""),
@@ -547,7 +620,7 @@ class QdrantAdapter:
         )
         await self.client.delete(collection_name=WORKING, points_selector=[point_id])
         self._log_audit("promote", target_collection, new_id, writer,
-                        payload.get("content", "")[:120])
+                        payload.get("content", "")[:120], sov_id=new_id)
         return True
 
     async def shutdown_promote(self) -> int:
@@ -582,7 +655,10 @@ class QdrantAdapter:
             if not vec:
                 continue
 
-            new_id = str(uuid.uuid4())
+            # Preserve sovereign ID — item carries the same point ID into RAID
+            new_id = payload.get("sov_id") or str(item.get("id", uuid.uuid4()))
+            if "sov_id" not in payload:
+                payload["sov_id"] = new_id
             _now = datetime.now(timezone.utc).isoformat()
             _key, _title = await self._generate_key_and_title(
                 payload.get("content", ""),
@@ -604,6 +680,7 @@ class QdrantAdapter:
                 self._log_audit(
                     "shutdown_promote", mem_type, new_id,
                     "sovereign-core", payload.get("content", "")[:120],
+                    sov_id=new_id,
                 )
                 promoted += 1
             except Exception:
@@ -632,55 +709,6 @@ class QdrantAdapter:
         _log.debug("sync_to_archive: no-op — use shutdown_promote() for durable promotion")
         return 0
 
-    async def write_gateway_context(self, content: str, source: str = "telegram") -> None:
-        """FIFO slot — last 5 inbound Director messages in working_memory (ephemeral).
-
-        Capped at 5: oldest entry is deleted on each write once the cap is reached.
-        Lost on restart by design — ephemeral scratchpad only. Rex may explicitly
-        promote any entry to a sovereign collection before it is evicted.
-        """
-        points, _ = await self.client.scroll(
-            collection_name=WORKING,
-            scroll_filter=Filter(
-                must=[FieldCondition(key="_gateway_context", match=MatchValue(value=True))]
-            ),
-            limit=10,
-            with_payload=True,
-            with_vectors=False,
-        )
-        entries = sorted(points, key=lambda p: p.payload.get("sequence", 0))
-        if len(entries) >= 5:
-            await self.client.delete(
-                collection_name=WORKING,
-                points_selector=[entries[0].id],
-            )
-            entries = entries[1:]
-        next_seq = (entries[-1].payload.get("sequence", 0) + 1) if entries else 1
-        await self.store(
-            content=content,
-            metadata={
-                "type": "episodic",
-                "domain": "gateway",
-                "source": source,
-                "sequence": next_seq,
-                "_gateway_context": True,
-            },
-            collection=WORKING,
-        )
-
-    async def get_gateway_context(self) -> list[dict]:
-        """Return last 5 gateway_context entries from working_memory, oldest first."""
-        points, _ = await self.client.scroll(
-            collection_name=WORKING,
-            scroll_filter=Filter(
-                must=[FieldCondition(key="_gateway_context", match=MatchValue(value=True))]
-            ),
-            limit=10,
-            with_payload=True,
-            with_vectors=False,
-        )
-        entries = sorted(points, key=lambda p: p.payload.get("sequence", 0))
-        return [p.payload for p in entries[-5:]]
 
     async def _get_all_working_memory(self) -> list[dict]:
         """Scroll all working_memory items (with vectors). Uses qdrant container (tmpfs)."""
@@ -711,15 +739,20 @@ class QdrantAdapter:
         """Embed once, parallel-search all 7 sovereign RAID collections with context-aware
         score weighting. Episodic/procedural boosted for action queries; semantic/meta
         boosted for knowledge queries; prospective boosted on session start.
+        Excludes entries with status="historical" (Task 7 — semantic:system:history:*).
         """
         weights = COLLECTION_WEIGHTS.get(query_type, COLLECTION_WEIGHTS["knowledge"])
         vector = await self._embed(query)
+        _excl_historical = Filter(
+            must_not=[FieldCondition(key="status", match=MatchValue(value="historical"))]
+        )
 
         async def _search_one(coll: str):
             try:
                 resp = await self.archive_client.query_points(
                     collection_name=coll,
                     query=vector,
+                    query_filter=_excl_historical,
                     limit=top_k,
                     score_threshold=score_threshold,
                     with_payload=True,
@@ -802,11 +835,16 @@ class QdrantAdapter:
     # ── Memory Index Protocol (MIP) ───────────────────────────────────────
 
     async def startup_migration(self) -> int:
-        """One-time migration: stamp _no_key=True on any sovereign entry missing a _key field.
+        """Startup migration: stamp _no_key and sov_id on any sovereign entry missing them.
 
         Scrolls all 7 sovereign RAID collections, patches payload only — no re-embedding.
-        Idempotent: entries already carrying _key or _no_key are skipped.
-        Returns count of entries patched.
+        Idempotent: entries already carrying the field are skipped.
+
+        _no_key: marks pre-MIP entries that have no _key field.
+        sov_id: for pre-sov_id entries, the existing Qdrant point UUID becomes the
+                permanent sovereign ID (we cannot reconstruct the UUID5 without the
+                original item_type + native_id, so we adopt the current point ID).
+        Returns count of patch operations applied.
         """
         patched = 0
         for coll in SOVEREIGN_COLLECTIONS:
@@ -822,10 +860,16 @@ class QdrantAdapter:
                     )
                     for r in result:
                         payload = dict(r.payload or {})
+                        patch: dict = {}
                         if "_key" not in payload and not payload.get("_no_key"):
+                            patch["_no_key"] = True
+                        if "sov_id" not in payload:
+                            # Adopt existing Qdrant point ID as permanent sovereign ID
+                            patch["sov_id"] = str(r.id)
+                        if patch:
                             await self.archive_client.set_payload(
                                 collection_name=coll,
-                                payload={"_no_key": True},
+                                payload=patch,
                                 points=[r.id],
                             )
                             patched += 1
@@ -834,6 +878,8 @@ class QdrantAdapter:
                     offset = next_offset
             except Exception:
                 pass  # swallow per-collection errors; never crash startup
+        if patched:
+            _log.info("startup_migration: stamped sov_id + _no_key on %d legacy RAID entries", patched)
         return patched
 
     async def list_all_keys(self) -> list[dict]:
@@ -1021,17 +1067,457 @@ class QdrantAdapter:
                 break
         return tagged
 
+    async def seed_intent_semantic_entries(self, seeds: list[dict]) -> dict:
+        """Idempotent seed for intent/skill/harness semantic entries.
+
+        Each seed dict: {seed_id, key, title, content, domain, extra_meta}.
+        - key: canonical _key (e.g. "semantic:intent:list-files")
+        - seed_id: stable dedup identifier (checked via _backfill_seed_id scroll)
+        - extra_meta: merged into stored payload (intent_signals, owner, trigger_point, etc.)
+
+        Returns audit report: {"total": N, "created": N, "already_existed": N, "errors": N}
+        """
+        total   = len(seeds)
+        created = 0
+        existed = 0
+        errors  = 0
+
+        for seed in seeds:
+            seed_id      = seed.get("seed_id", "")
+            canonical_key = seed.get("key", "")
+            content      = seed.get("content", "")
+            title        = seed.get("title", content[:80])
+            domain       = seed.get("domain", "general")
+            extra_meta   = seed.get("extra_meta") or {}
+
+            if not content or not seed_id or not canonical_key:
+                errors += 1
+                continue
+
+            try:
+                # Check by _backfill_seed_id — same idempotency gate as seed_static_facts()
+                existing, _ = await self.archive_client.scroll(
+                    collection_name=SEMANTIC,
+                    scroll_filter=Filter(
+                        must=[FieldCondition(
+                            key="_backfill_seed_id", match=MatchValue(value=seed_id)
+                        )]
+                    ),
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if existing:
+                    existed += 1
+                    continue
+
+                metadata = {
+                    "type":              "semantic",
+                    "domain":            domain,
+                    "source":            "intent_seed",
+                    "_backfill_seed_id": seed_id,
+                    "_key":              canonical_key,
+                    "title":             title,
+                    **extra_meta,
+                }
+                await self.store(
+                    content=content,
+                    metadata=metadata,
+                    collection=SEMANTIC,
+                    writer="sovereign-core",
+                )
+                created += 1
+            except Exception as exc:
+                _log.warning("seed_intent_semantic_entries: failed for %s: %s", seed_id, exc)
+                errors += 1
+
+        _log.info(
+            "seed_intent_semantic_entries: total=%d created=%d existed=%d errors=%d",
+            total, created, existed, errors,
+        )
+        return {"total": total, "created": created, "already_existed": existed, "errors": errors}
+
+    async def seed_sovereign_root(self) -> bool:
+        """Seed the Sovereign system root entry — the cognitive anchor and top of the hierarchy.
+
+        This is the ONLY entry in the system where parent_sov_id is None.
+        sov_id is hardcoded: 00000000-0000-0000-0000-000000000001 (never UUID5-derived).
+        The entry is written first at startup, before all other seeds.
+
+        Idempotent:
+          - If _key already exists → update non-content fields via set_payload() and return False.
+          - If missing → write via store() with hardcoded sov_id and return True.
+        """
+        _KEY    = "semantic:entity:sovereign"
+        _SOV_ID = "00000000-0000-0000-0000-000000000001"
+
+        _BOOTSTRAP_SEQ = [
+            "semantic:entity:sovereign",
+            "semantic:governance:entity-registry",
+            "meta:system:component-registry",
+            "semantic:governance:soul_document",
+            "semantic:governance:soul_checksum",
+            "semantic:governance:confirmation_tiers",
+            "semantic:governance:standing-design-orders",
+        ]
+        _WM_SEED_KEYS = [
+            "semantic:entity:sovereign",
+            "semantic:governance:entity-registry",
+            "semantic:governance:soul_checksum",
+            "meta:system:component-registry",
+        ]
+        _DESCRIPTION = (
+            "Root of the Sovereign system. All entities, components, skills, harnesses, "
+            "cognitive passes, and memory entries are descendants of this entry. "
+            "This is the cognitive anchor — the first entry loaded at session start and "
+            "the default starting point for all self-interrogation, memory traversal, "
+            "and task anchoring."
+        )
+        _CONTENT = (
+            f"Sovereign system root. {_DESCRIPTION} "
+            "Director: Matt. Location: New Zealand. Birthday: 2026-03-03. "
+            "Hardware: semantic:entity:sovereign-server "
+            "(AMD Ryzen 9 9900X, 32GB RAM, RTX 3060 Ti, RAID5). "
+            "Memory: 7 Qdrant RAID collections + working_memory (tmpfs). "
+            "Bootstrap sequence loads critical semantic keys into working_memory at startup."
+        )
+
+        existing = await self.retrieve_by_key(_KEY)
+        if existing:
+            # Already written — refresh mutable fields only
+            try:
+                await self.archive_client.set_payload(
+                    collection_name=SEMANTIC,
+                    payload={
+                        "bootstrap_sequence":    _BOOTSTRAP_SEQ,
+                        "working_memory_seed_keys": _WM_SEED_KEYS,
+                        "last_updated":          datetime.now(timezone.utc).isoformat(),
+                        "status":                "active",
+                    },
+                    points=[existing["point_id"]],
+                )
+                _log.info("seed_sovereign_root: refreshed existing entry (sov_id=%s)", _SOV_ID)
+            except Exception as exc:
+                _log.warning("seed_sovereign_root: refresh set_payload failed: %s", exc)
+            return False
+
+        metadata = {
+            "type":                    "semantic",
+            "domain":                  "system.entity",
+            "_key":                    _KEY,
+            "sov_id":                  _SOV_ID,
+            "entity_type":             "system",
+            "name":                    "Sovereign",
+            "description":             _DESCRIPTION,
+            "parent_sov_id":           None,
+            "birthday":                "2026-03-03",
+            "director":                "Matt",
+            "location":                "New Zealand",
+            "hardware":                "semantic:entity:sovereign-server",
+            "soul":                    "semantic:governance:soul_document",
+            "bootstrap_sequence":      _BOOTSTRAP_SEQ,
+            "working_memory_seed_keys": _WM_SEED_KEYS,
+            "self_interrogation_start": "list_all_keys",
+            "memory_index_entry":       _KEY,
+            "status":                  "active",
+            "source":                  "entity_registry",
+            "_backfill_seed_id":        "system_root_v1_sovereign",
+            "title":                   "Sovereign — system root and cognitive anchor",
+        }
+        await self.store(
+            content=_CONTENT,
+            metadata=metadata,
+            collection=SEMANTIC,
+            writer="sovereign-core",
+        )
+        _log.info("seed_sovereign_root: written (sov_id=%s key=%s)", _SOV_ID, _KEY)
+        return True
+
+    async def seed_entity_entries(self, seeds: list[dict], entity_index: dict) -> dict:
+        """Idempotent seed for foundational entity registry.
+
+        Entities use entity_type (not component_type) — never both on the same entry.
+        Foundational entities are sovereign_entity class: exist independently of Sovereign,
+        are bootstrap critical, and are Director-approved.
+
+        Steps:
+          1. Write individual entity entries to SEMANTIC via seed_intent_semantic_entries()
+          2. Write/update semantic:governance:entity-registry to SEMANTIC (real embedding)
+
+        Returns audit report from seed_intent_semantic_entries().
+        """
+        # 1. Write individual entity entries
+        result = await self.seed_intent_semantic_entries(seeds)
+
+        # 2. Write entity registry governance entry to SEMANTIC (with real embedding)
+        _reg_seed_id = "entity_registry_v1_meta"
+        _reg_content = (
+            "Sovereign entity registry — Director-curated foundational entities with "
+            "sequential sov_ids. These entities exist independently of Sovereign, are "
+            "bootstrap critical, and have Director-approved durable relationships to the "
+            "sovereign root. Distinct from the component registry (system components use "
+            "UUID5 sov_ids and component_type). Entities use entity_type — never "
+            "component_type."
+        )
+        try:
+            existing, _ = await self.archive_client.scroll(
+                collection_name=SEMANTIC,
+                scroll_filter=Filter(
+                    must=[FieldCondition(
+                        key="_backfill_seed_id", match=MatchValue(value=_reg_seed_id)
+                    )]
+                ),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if existing:
+                await self.archive_client.set_payload(
+                    collection_name=SEMANTIC,
+                    payload={
+                        "total":        entity_index["total"],
+                        "entities":     entity_index["entities"],
+                        "last_updated": datetime.now(timezone.utc).isoformat(),
+                    },
+                    points=[existing[0].id],
+                )
+                _log.info("seed_entity_entries: entity registry updated")
+            else:
+                await self.store(
+                    content=_reg_content,
+                    metadata=entity_index,
+                    collection=SEMANTIC,
+                    writer="sovereign-core",
+                )
+                _log.info("seed_entity_entries: entity registry written")
+        except Exception as exc:
+            _log.warning("seed_entity_entries: registry write failed (non-fatal): %s", exc)
+
+        _log.info(
+            "seed_entity_entries: total=%d created=%d existed=%d errors=%d",
+            result["total"], result["created"], result["already_existed"], result["errors"],
+        )
+        return result
+
+    async def seed_component_entries(self, seeds: list[dict], meta_index: dict) -> dict:
+        """Idempotent seed for system component registry.
+
+        Writes a semantic:component:{name} entry for each component to SEMANTIC
+        collection (via seed_intent_semantic_entries — same dedup gate).
+
+        Then patches parent_sov_id onto any existing entries that were seeded before
+        the parent hierarchy was introduced — idempotent (skips entries already patched).
+
+        Then writes/updates the aggregate meta:system:component-registry entry to
+        META collection as a zero-vector payload-only record.
+
+        Returns audit report: {"total": N, "created": N, "already_existed": N, "errors": N}
+        """
+        # 1. Write individual component entries to SEMANTIC
+        result = await self.seed_intent_semantic_entries(seeds)
+
+        # 2. Patch parent_sov_id onto existing entries — also re-parents entries that
+        #    carried the old sovereign root parent before hardware entities were introduced.
+        #    Compares current value: skips only if already equal to the target.
+        _now = datetime.now(timezone.utc).isoformat()
+        _patched = 0
+        for seed in seeds:
+            comp_key      = seed.get("key", "")
+            parent_sov_id = (seed.get("extra_meta") or {}).get("parent_sov_id")
+            if not comp_key or not parent_sov_id:
+                continue
+            try:
+                pts, _ = await self.archive_client.scroll(
+                    collection_name=SEMANTIC,
+                    scroll_filter=Filter(
+                        must=[FieldCondition(key="_key", match=MatchValue(value=comp_key))]
+                    ),
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if pts:
+                    pay = dict(pts[0].payload or {})
+                    if pay.get("parent_sov_id") != parent_sov_id:
+                        await self.archive_client.set_payload(
+                            collection_name=SEMANTIC,
+                            payload={
+                                "parent_sov_id": parent_sov_id,
+                                "last_updated":  _now,
+                            },
+                            points=[pts[0].id],
+                        )
+                        _patched += 1
+            except Exception as exc:
+                _log.warning(
+                    "seed_component_entries: parent patch failed for %s: %s", comp_key, exc
+                )
+        if _patched:
+            _log.info("seed_component_entries: patched parent_sov_id on %d existing entries", _patched)
+
+        # 3. Write meta index to META collection (zero-vector, filter-only lookup)
+        meta_seed_id = meta_index.get("_backfill_seed_id", "component_registry_v1_meta_index")
+        try:
+            existing, _ = await self.archive_client.scroll(
+                collection_name=META,
+                scroll_filter=Filter(
+                    must=[FieldCondition(
+                        key="_backfill_seed_id", match=MatchValue(value=meta_seed_id)
+                    )]
+                ),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if existing:
+                # Update existing meta index in-place (total/components/created_at change)
+                await self.archive_client.set_payload(
+                    collection_name=META,
+                    payload={
+                        "total":              meta_index["total"],
+                        "sovereign_root_id":  meta_index.get("sovereign_root_id"),
+                        "components":         meta_index["components"],
+                        "created_at":         meta_index["created_at"],
+                    },
+                    points=[existing[0].id],
+                )
+                _log.info("seed_component_entries: meta index updated (point_id=%s)", existing[0].id)
+            else:
+                # First write — zero-vector entry in META
+                import uuid as _uuid
+                point_id = str(_uuid.uuid5(
+                    _uuid.UUID("7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d"),
+                    "component:meta:system:component-registry",
+                ))
+                from qdrant_client.models import PointStruct as _PS
+                await self.archive_client.upsert(
+                    collection_name=META,
+                    points=[_PS(
+                        id=point_id,
+                        vector=[0.0] * VECTOR_DIM,
+                        payload=meta_index,
+                    )],
+                )
+                _log.info("seed_component_entries: meta index written (point_id=%s)", point_id)
+        except Exception as exc:
+            _log.warning("seed_component_entries: meta index write failed (non-fatal): %s", exc)
+
+        _log.info(
+            "seed_component_entries: total=%d created=%d existed=%d errors=%d patched_parents=%d",
+            result["total"], result["created"], result["already_existed"], result["errors"],
+            _patched,
+        )
+        return result
+
+    async def bootstrap_working_memory(self) -> int:
+        """Load working_memory_seed_keys from the sovereign root into working_memory.
+
+        Called after all startup seeds complete. Gives Rex immediate context at
+        session start without waiting for a Director message to trigger retrieval.
+
+        Steps:
+          1. Retrieve semantic:entity:sovereign from RAID
+          2. Read working_memory_seed_keys array
+          3. For each key: fetch full entry (with vector) from RAID → write to working_memory
+             with _bootstrap=True flag
+          4. Log bootstrap completion to episodic
+
+        Returns count of keys successfully loaded.
+        """
+        root = await self.retrieve_by_key("semantic:entity:sovereign")
+        if root is None:
+            _log.warning("bootstrap_working_memory: sovereign root not found — skipping")
+            return 0
+
+        seed_keys: list[str] = root.get("working_memory_seed_keys") or []
+        if not seed_keys:
+            _log.info("bootstrap_working_memory: no working_memory_seed_keys defined")
+            return 0
+
+        loaded = 0
+        _now = datetime.now(timezone.utc).isoformat()
+        for seed_key in seed_keys:
+            try:
+                # Fetch with vector from the appropriate RAID collection
+                for coll in SOVEREIGN_COLLECTIONS:
+                    pts, _ = await self.archive_client.scroll(
+                        collection_name=coll,
+                        scroll_filter=Filter(
+                            must=[FieldCondition(key="_key", match=MatchValue(value=seed_key))]
+                        ),
+                        limit=1,
+                        with_payload=True,
+                        with_vectors=True,
+                    )
+                    if pts:
+                        p = pts[0]
+                        raw_vec = p.vector if isinstance(p.vector, list) else None
+                        if raw_vec is None:
+                            break
+                        payload = dict(p.payload or {})
+                        payload["_bootstrap"] = True
+                        payload["startup_load"] = True   # skip re-promotion on shutdown
+                        payload["source_collection"] = coll
+                        _wm_id = payload.get("sov_id") or str(p.id)
+                        if "sov_id" not in payload:
+                            payload["sov_id"] = _wm_id
+                        await self.client.upsert(
+                            collection_name=WORKING,
+                            points=[PointStruct(
+                                id=_wm_id,
+                                vector=raw_vec,
+                                payload=payload,
+                            )],
+                        )
+                        loaded += 1
+                        _log.debug("bootstrap_working_memory: loaded %s from %s", seed_key, coll)
+                        break
+            except Exception as exc:
+                _log.warning("bootstrap_working_memory: failed to load %r: %s", seed_key, exc)
+
+        # Log bootstrap completion to episodic
+        try:
+            import uuid as _uuid_b
+            from qdrant_client.models import PointStruct as _PS_b
+            await self.archive_client.upsert(
+                collection_name=EPISODIC,
+                points=[_PS_b(
+                    id=str(_uuid_b.uuid4()),
+                    vector=[0.0] * VECTOR_DIM,
+                    payload={
+                        "type":        "episodic",
+                        "domain":      "system.bootstrap",
+                        "event":       "system_bootstrap",
+                        "keys_loaded": loaded,
+                        "seed_keys":   seed_keys,
+                        "timestamp":   _now,
+                        "_no_key":     True,
+                        "last_updated": _now,
+                    },
+                )],
+            )
+        except Exception:
+            pass  # episodic log failure is not surfaced
+
+        _log.info("bootstrap_working_memory: loaded %d/%d seed keys", loaded, len(seed_keys))
+        return loaded
+
     def _can_write(self, writer: str, collection: str) -> bool:
         return writer in WRITE_PERMISSIONS.get(collection, {"sovereign-core"})
 
     def _log_audit(self, event_type: str, collection: str,
-                   point_id: str, writer: str, content_preview: str):
+                   point_id: str, writer: str, content_preview: str,
+                   sov_id: str = None):
+        # For records written after the sov_id change, point_id == sov_id.
+        # For legacy promoted entries, sov_id may differ — log both.
+        _sov = sov_id or point_id
         try:
             os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
             entry = json.dumps({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "event_type": event_type,
                 "collection": collection,
+                "sov_id": _sov,
                 "point_id": point_id,
                 "writer": writer,
                 "content_preview": content_preview,
@@ -1040,3 +1526,5 @@ class QdrantAdapter:
                 f.write(entry + "\n")
         except Exception:
             pass  # audit failure must never crash the adapter
+        _log.debug("qdrant.%s sov_id=%s collection=%s writer=%s",
+                   event_type, _sov, collection, writer)
