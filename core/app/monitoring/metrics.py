@@ -169,10 +169,7 @@ def collect_audit_count(audit_path: str = AUDIT_PATH) -> dict:
         return {"error": str(e)}
 
 
-async def collect_external_reachability() -> dict:
-    """Probe external services that sovereign-core depends on."""
-    checks = {}
-
+async def _probe_grok() -> tuple[str, dict]:
     grok_key = os.environ.get("GROK_API_KEY", "")
     try:
         t0 = time.monotonic()
@@ -182,11 +179,13 @@ async def collect_external_reachability() -> dict:
                 headers={"Authorization": f"Bearer {grok_key}"} if grok_key else {},
             )
         grok_ok = gr.status_code < 500
-        checks["grok_api"] = {"reachable": grok_ok, "status_code": gr.status_code,
-                               "latency_ms": round((time.monotonic() - t0) * 1000, 1)}
+        return "grok_api", {"reachable": grok_ok, "status_code": gr.status_code,
+                             "latency_ms": round((time.monotonic() - t0) * 1000, 1)}
     except Exception as e:
-        checks["grok_api"] = {"reachable": False, "error": str(e)}
+        return "grok_api", {"reachable": False, "error": str(e)}
 
+
+async def _probe_webdav() -> tuple[str, dict]:
     webdav_user = os.environ.get("WEBDAV_USER", "")
     webdav_pass = os.environ.get("WEBDAV_PASS", "")
     try:
@@ -194,18 +193,43 @@ async def collect_external_reachability() -> dict:
             r = await client.request("PROPFIND", WEBDAV_URL,
                                      auth=(webdav_user, webdav_pass) if webdav_user else None,
                                      headers={"Depth": "0"})
-            ok = r.status_code in (207, 200, 401)  # 401 = reachable, just unauthed
-            checks["nextcloud_webdav"] = {"reachable": ok, "status_code": r.status_code}
+            ok = r.status_code in (207, 200, 401)
+            return "nextcloud_webdav", {"reachable": ok, "status_code": r.status_code}
     except Exception as e:
-        checks["nextcloud_webdav"] = {"reachable": False, "error": str(e)}
+        return "nextcloud_webdav", {"reachable": False, "error": str(e)}
 
+
+async def _probe_telegram() -> tuple[str, dict]:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     if token:
         ok, lat = await _reachable(f"https://api.telegram.org/bot{token}/getMe", timeout=6.0)
     else:
         ok, lat = False, -1.0
-    checks["telegram"] = {"reachable": ok, "latency_ms": lat}
+    return "telegram", {"reachable": ok, "latency_ms": lat}
 
+
+async def collect_external_reachability() -> dict:
+    """Probe external services concurrently. Total time = slowest single probe."""
+    results = await asyncio.gather(
+        _probe_grok(),
+        _probe_webdav(),
+        _probe_telegram(),
+        _reachable("https://api.anthropic.com", timeout=6.0),
+        _reachable("http://172.16.201.4:8001/health", timeout=5.0),
+        _reachable("http://172.16.201.4:8003/health", timeout=5.0),
+        return_exceptions=True,
+    )
+    grok, webdav, telegram, claude_res, browser_res, whisper_res = results
+    checks = {}
+    for r in (grok, webdav, telegram):
+        if isinstance(r, tuple):
+            checks[r[0]] = r[1]
+    def _ok_lat(r, key):
+        if isinstance(r, tuple): checks[key] = {"reachable": r[0], "latency_ms": r[1]}
+        else: checks[key] = {"reachable": False, "error": str(r)}
+    _ok_lat(claude_res,  "claude_api")
+    _ok_lat(browser_res, "a2a_browser")
+    _ok_lat(whisper_res, "a2a_whisper")
     return checks
 
 

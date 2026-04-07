@@ -5,7 +5,7 @@ Four operations over the full skill lifecycle:
   SEARCH — Query the ClawhHub community registry for skill candidates. Returns slug,
             summary, downloads, stars, certification status, and clawhub_url.
             Fetches raw SKILL.md content for top candidates via httpx (REST API primary;
-            A2ABrowserAdapter SearXNG fallback if API is unreachable).
+            nanobot sovereign-browser SearXNG fallback if API is unreachable).
 
   REVIEW — Pass candidate SKILL.md content through the full inbound security pipeline:
             deterministic pattern scan across all YAML rule files, then LLM security agent
@@ -217,7 +217,7 @@ class SkillLifecycleManager:
     Constructor args (all optional — degrade gracefully if absent):
       scanner   — SecurityScanner instance (deterministic pattern matching)
       cog       — CognitionEngine instance (LLM security evaluation via security_evaluate())
-      browser   — BrowserAdapter instance (fallback search if ClawhHub API unreachable)
+      nanobot   — NanobotAdapter instance (browser search/fetch via sovereign-browser skill)
       ledger    — AuditLedger instance (all lifecycle events logged)
       guardian  — SoulGuardian instance (runtime file watchlist registration on LOAD)
     """
@@ -226,15 +226,17 @@ class SkillLifecycleManager:
         self,
         scanner=None,
         cog=None,
-        browser=None,
+        nanobot=None,
         ledger=None,
         guardian=None,
+        qdrant=None,
     ):
         self.scanner = scanner
         self.cog = cog
-        self.browser = browser
+        self.nanobot = nanobot
         self.ledger = ledger
         self.guardian = guardian
+        self.qdrant = qdrant
 
     # ── SEARCH ────────────────────────────────────────────────────────────────
 
@@ -256,11 +258,11 @@ class SkillLifecycleManager:
         Non-certified candidates are always flagged; certified_only=True (default)
         adds an explicit WARNING marker to discourage loading unreviewed skills.
         """
-        if not self.browser:
+        if not self.nanobot:
             return {
                 "query": query,
                 "candidates": [],
-                "error": "No browser adapter available — cannot search for skills",
+                "error": "No nanobot adapter available — cannot search for skills",
                 "_source": "none",
             }
 
@@ -377,8 +379,10 @@ class SkillLifecycleManager:
         if not candidates:
             try:
                 search_q = f'sovereign skill {query} "SKILL.md" site:github.com'
-                result = await self.browser.search(search_q)
-                raw_items = ((result.get("data") or {}).get("data") or {}).get("results", []) or []
+                _nb = await self.nanobot.run("sovereign-browser", "search", {"query": search_q, "timeout": 60})
+                # nb["result"] is the flat a2a-browser SearchResponse fields
+                _nb_result = _nb.get("result") if _nb.get("result") is not None else {}
+                raw_items = _nb_result.get("results", []) or []
 
                 for item in raw_items[:limit * 3]:  # overscan to account for non-SKILL.md hits
                     url = item.get("url", "")
@@ -422,8 +426,9 @@ class SkillLifecycleManager:
         if not candidates:
             try:
                 fallback_q = f"sovereign AI skill {query} SKILL.md github"
-                result = await self.browser.search(fallback_q)
-                raw_items = ((result.get("data") or {}).get("data") or {}).get("results", []) or []
+                _nb_fb = await self.nanobot.run("sovereign-browser", "search", {"query": fallback_q, "timeout": 60})
+                _nb_fb_result = _nb_fb.get("result") if _nb_fb.get("result") is not None else {}
+                raw_items = _nb_fb_result.get("results", []) or []
                 for item in raw_items[:limit]:
                     url = item.get("url", "")
                     raw_url = _github_url_to_raw(url)
@@ -478,7 +483,7 @@ class SkillLifecycleManager:
         """Fetch raw content from a URL (expected: raw.githubusercontent.com).
 
         Tries direct httpx first (works if sovereign-core has internet egress).
-        Falls back to browser.fetch() via a2a-browser on browser_net (internet egress).
+        Falls back to nanobot sovereign-browser fetch via a2a-browser (browser_net egress).
         """
         # Try direct httpx (fast path — works if internet egress is available)
         try:
@@ -490,18 +495,20 @@ class SkillLifecycleManager:
         except Exception as e:
             logger.warning("SkillLifecycle._fetch_raw_url direct: %s — %s", url, e)
 
-        # Fall back to a2a-browser /fetch (browser_net has internet egress)
-        if self.browser:
+        # Fall back to a2a-browser /fetch via nanobot sovereign-browser skill
+        if self.nanobot:
             try:
-                result = await self.browser.fetch(url, extract="text")
-                if result.get("status") == "ok":
-                    content = ((result.get("data") or {}).get("data") or {}).get("content", "")
+                _nb_fetch = await self.nanobot.run("sovereign-browser", "fetch", {"url": url, "extract": "text", "timeout": 60})
+                # nb["result"] is the flat a2a-browser FetchResponse fields
+                _nb_fetch_result = _nb_fetch.get("result") if _nb_fetch.get("result") is not None else {}
+                if _nb_fetch.get("status") == "ok":
+                    content = _nb_fetch_result.get("content", "")
                     if content:
-                        logger.info("SkillLifecycle._fetch_raw_url: browser fallback succeeded for %s", url)
+                        logger.info("SkillLifecycle._fetch_raw_url: nanobot fallback succeeded for %s", url)
                         return content
-                logger.warning("SkillLifecycle._fetch_raw_url browser fallback: %s", result.get("message", "no content"))
+                logger.warning("SkillLifecycle._fetch_raw_url nanobot fallback: %s", _nb_fetch.get("error", "no content"))
             except Exception as e:
-                logger.warning("SkillLifecycle._fetch_raw_url browser fallback: %s — %s", url, e)
+                logger.warning("SkillLifecycle._fetch_raw_url nanobot fallback: %s — %s", url, e)
 
         return None
 
@@ -852,6 +859,20 @@ class SkillLifecycleManager:
                     f"Reason: {nanobot_advisory.get('reason', '')} "
                     f"Steps: {'; '.join(nanobot_advisory.get('steps', []))}"
                 )
+
+        # ── Standing Design Order: write semantic memory entry on install ────────
+        # Every new skill install must have exactly one semantic:intent:{slug} entry.
+        # Written here (post-install) so the entry always reflects the installed state.
+        if self.qdrant is not None:
+            try:
+                from memory.semantic_seeds import make_skill_semantic_seed
+                _sem_seed = make_skill_semantic_seed(safe_name, specialists, tier)
+                import asyncio as _asyncio
+                _asyncio.create_task(
+                    self.qdrant.seed_intent_semantic_entries([_sem_seed])
+                )
+            except Exception as _sem_err:
+                logger.warning("lifecycle.load: semantic entry write failed: %s", _sem_err)
 
         return result
 

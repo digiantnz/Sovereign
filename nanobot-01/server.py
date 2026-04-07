@@ -892,7 +892,7 @@ def _dispatch_python3_exec(skill: str, op_spec: dict, params: dict, run_id: str,
     if extra_env:
         env.update(extra_env)
 
-    logger.info("[%s] python3_exec: %s %s", run_id, script_path, fixed_args)
+    logger.info("[%s] python3_exec: %s %s", run_id, script_path, fixed_args + dynamic_args)
     try:
         proc = subprocess.run(
             cmd_list,

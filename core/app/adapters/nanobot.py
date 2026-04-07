@@ -10,11 +10,10 @@ All results are structured dicts — never raises to callers.
 All calls are logged to the audit ledger.
 
 Stage 3 DSL dispatch:
-  For tool: browser — BrowserAdapter called directly in sovereign-core (a2a-browser proxy).
   For tool: broker_exec — BrokerAdapter called directly (SYSTEM_COMMANDS only).
   For tool: python3_exec | filesystem | exec — forwarded to nanobot-01 with credential token.
   For unknown/no DSL ops — forwarded to nanobot-01 for LLM fallback.
-  imap/webdav/caldav are now python3_exec scripts in nanobot-01 workspace (OC-S6).
+  browser/imap/webdav/caldav are python3_exec scripts in nanobot-01 workspace.
 
 REST API: POST http://nanobot-01:8080/run
   Request:  {skill, action, params, context}  (legacy)
@@ -60,14 +59,14 @@ _SKILLS_DIR = os.environ.get("SKILLS_DIR", "/home/sovereign/skills")
 # mtime-invalidated DSL cache: skill_name -> (mtime_float, operations_dict | None)
 _dsl_cache: dict[str, tuple[float, dict | None]] = {}
 
-# Tools handled natively by this adapter (sovereign-core proxy — minimal set)
-_NATIVE_TOOLS = {"browser"}
+# Tools handled natively by this adapter (sovereign-core proxy — broker_exec only)
+_NATIVE_TOOLS: frozenset = frozenset()
 
 # Tools forwarded to nanobot-01 (nanobot-01 is the primary skill execution environment)
-# imap/smtp/webdav/caldav: nanobot-01 has credential env vars (Phase 1) — handles directly
+# browser/imap/smtp/webdav/caldav: python3_exec scripts in nanobot-01 workspace
 # python3_exec: Bash(python3:*) OpenClaw format — nanobot-01 python3 runtime
 _REMOTE_TOOLS = {"filesystem", "exec", "python3_exec",
-                 "imap", "smtp", "webdav", "caldav"}
+                 "browser", "imap", "smtp", "webdav", "caldav"}
 
 # broker_exec commands that are legitimate system/OS calls — route to broker
 # Everything else labelled broker_exec routes to nanobot-01 instead
@@ -192,8 +191,8 @@ def _validate_dsl_params(op_spec: dict, params: dict) -> tuple[dict, list[str]]:
 async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: dict | None = None) -> dict:
     """Dispatch a DSL operation that must run natively in sovereign-core.
 
-    Called only when tool in _NATIVE_TOOLS (currently: browser) or tool == broker_exec.
-    imap/webdav/caldav are no longer native — they are forwarded to nanobot-01 via python3_exec.
+    Called only when tool in _NATIVE_TOOLS (broker_exec only — _NATIVE_TOOLS is now empty).
+    All application skills (browser/imap/smtp/webdav/caldav) are python3_exec in nanobot-01.
     Returns structured result dict. Never raises.
     """
     try:
@@ -215,34 +214,12 @@ async def _dispatch_dsl_native(tool: str, action: str, params: dict, op_spec: di
                 )
             return await broker.exec_command(command_name, params)
 
-        elif tool == "browser":
-            from execution.adapters.browser import BrowserAdapter
-            browser = BrowserAdapter()
-            return await _call_browser(browser, action, params)
-
         else:
             return {"status": "error", "error": f"_dispatch_dsl_native: unsupported tool {tool!r}"}
 
     except Exception as e:
         logger.exception(f"_dispatch_dsl_native: {tool}.{action} raised {type(e).__name__}")
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
-
-
-async def _call_browser(adapter, action: str, params: dict) -> dict:
-    """Route a browser DSL action to the BrowserAdapter."""
-    if action == "search":
-        return await adapter.search(
-            query=params["query"],
-            locale=params.get("locale", "en-NZ"),
-            return_format=params.get("return_format", "standard"),
-        )
-    elif action == "fetch":
-        return await adapter.fetch(
-            url=params["url"],
-            extract=params.get("extract", "text"),
-        )
-    else:
-        return {"status": "error", "error": f"browser: unknown action {action!r}"}
 
 
 class NanobotAdapter:

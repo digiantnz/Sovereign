@@ -97,6 +97,21 @@ _REPORT_EVENTS = """<?xml version="1.0" encoding="utf-8"?>
 _REPORT_VTODO = _REPORT_EVENTS.replace("{component}", "VTODO")
 _REPORT_VEVENT = _REPORT_EVENTS.replace("{component}", "VEVENT")
 
+_REPORT_VEVENT_RANGE = """<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:getetag/>
+    <c:calendar-data/>
+  </d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT">
+        <c:time-range start="{start}" end="{end}"/>
+      </c:comp-filter>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>"""
+
 
 def _caldav_discover_calendar(calendar_hint):
     """PROPFIND to discover calendar URL by partial name match."""
@@ -898,6 +913,59 @@ def cmd_notes_delete(note_id):
     return {"status": "ok", "id": note_id, "http_status": r.status_code}
 
 
+def cmd_calendar_list_events(calendar="personal", from_date=None, to_date=None):
+    """REPORT calendar-query to list VEVENT items, optionally filtered by date range.
+
+    from_date / to_date: ISO 8601 date strings (e.g. '2026-03-01').
+    If omitted, lists all events in the calendar without time-range filter.
+    Returns events with fields: uid, summary, dtstart, dtend, description.
+    """
+    from datetime import datetime as _dt
+
+    cal_url, err = _caldav_discover_calendar(calendar)
+    if err:
+        return {"status": "error", **err}
+
+    if from_date and to_date:
+        try:
+            start_str = _dt.fromisoformat(from_date).strftime("%Y%m%dT000000")
+            end_str   = _dt.fromisoformat(to_date).strftime("%Y%m%dT235959")
+            report_xml = _REPORT_VEVENT_RANGE.format(start=start_str, end=end_str)
+        except ValueError:
+            report_xml = _REPORT_VEVENT
+    else:
+        report_xml = _REPORT_VEVENT
+
+    r = requests.request(
+        "REPORT", cal_url,
+        headers={**_headers(), "Depth": "1"},
+        data=report_xml.encode("utf-8"),
+        auth=_auth(), timeout=30
+    )
+    if r.status_code not in (207, 200):
+        return {"status": "error", "error": f"REPORT failed: HTTP {r.status_code}",
+                "body": r.text[:300]}
+
+    events = []
+    for block in re.findall(
+        r"<[^:>]+:calendar-data[^>]*>(.*?)</[^:>]+:calendar-data>", r.text, re.DOTALL
+    ):
+        uid_m     = re.search(r"^UID:(.+)$", block, re.MULTILINE)
+        summary_m = re.search(r"^SUMMARY:(.+)$", block, re.MULTILINE)
+        start_m   = re.search(r"^DTSTART[^:]*:(.+)$", block, re.MULTILINE)
+        end_m     = re.search(r"^DTEND[^:]*:(.+)$", block, re.MULTILINE)
+        desc_m    = re.search(r"^DESCRIPTION:(.+)$", block, re.MULTILINE)
+        events.append({
+            "uid":         uid_m.group(1).strip() if uid_m else "",
+            "summary":     summary_m.group(1).strip() if summary_m else "",
+            "dtstart":     start_m.group(1).strip() if start_m else "",
+            "dtend":       end_m.group(1).strip() if end_m else "",
+            "description": desc_m.group(1).strip() if desc_m else "",
+        })
+
+    return {"status": "ok", "calendar": calendar, "events": events, "count": len(events)}
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -905,7 +973,8 @@ def cmd_notes_delete(note_id):
 def main():
     parser = argparse.ArgumentParser(description="Nextcloud CalDAV + WebDAV operations")
     parser.add_argument("--command", required=True,
-                        choices=["calendar_list", "calendar_create", "calendar_delete",
+                        choices=["calendar_list", "calendar_list_events",
+                                 "calendar_create", "calendar_delete",
                                  "calendar_update",
                                  "tasks_list", "tasks_create", "tasks_complete", "tasks_delete",
                                  "files_list", "files_search", "files_read", "files_write",
@@ -920,6 +989,8 @@ def main():
     parser.add_argument("--description", default="")
     parser.add_argument("--calendar", default="personal")
     parser.add_argument("--uid", default="")
+    parser.add_argument("--from_date", default="")
+    parser.add_argument("--to_date", default="")
     # Task params
     parser.add_argument("--summary", default="")
     parser.add_argument("--due", default="")
@@ -941,6 +1012,12 @@ def main():
     try:
         if args.command == "calendar_list":
             result = cmd_calendar_list()
+        elif args.command == "calendar_list_events":
+            result = cmd_calendar_list_events(
+                args.calendar or "personal",
+                from_date=args.from_date or None,
+                to_date=args.to_date or None,
+            )  # args.from_date / args.to_date set by --from_date / --to_date (underscores match SKILL.md param keys)
         elif args.command == "calendar_create":
             result = cmd_calendar_create(args.title, args.start, args.end or None,
                                          args.description or None, args.calendar)

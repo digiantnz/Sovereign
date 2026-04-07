@@ -3,12 +3,12 @@ import os
 from datetime import datetime, timezone
 
 from adapters.broker import BrokerAdapter
-from adapters.webdav import WebDAVAdapter
-from adapters.caldav import CalDAVAdapter
+
+
 from adapters.nanobot import NanobotAdapter
 from execution.adapters.github import GitHubAdapter
-from execution.adapters.browser import BrowserAdapter
 from execution.adapters.qdrant import (
+    QdrantAdapter,
     WORKING, SOVEREIGN_COLLECTIONS, CONFIDENCE_THRESHOLD,
     SEMANTIC, PROCEDURAL, EPISODIC, PROSPECTIVE, ASSOCIATIVE, RELATIONAL, META,
 )
@@ -73,6 +73,9 @@ INTENT_ACTION_MAP = {
     "ingest_file":    {"domain": "ncingest", "operation": "ingest",  "name": "ingest_file"},
     "ingest_folder":  {"domain": "ncingest", "operation": "ingest",  "name": "ingest_folder"},
     "ingest_status":  {"domain": "ncingest", "operation": "status",  "name": "ingest_status"},
+    # cognitive skills — specialist synthesis, no external dispatch
+    "session_wrap_up": {"domain": "session",       "operation": "wrap_up", "name": "session_wrap_up"},
+    "memory_curate":   {"domain": "memory_curate", "operation": "curate",  "name": "memory_curate"},
     "fetch_email":        {"domain": "mail",   "operation": "read",    "name": "nc_list_unread"},
     "search_email":       {"domain": "mail",   "operation": "search",  "name": "nc_search"},
     "move_email":         {"domain": "mail",   "operation": "move",    "name": "nc_move"},
@@ -90,6 +93,7 @@ INTENT_ACTION_MAP = {
     "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
     # Memory intents
     "remember_fact":      {"domain": "memory",  "operation": "write"},
+    "memory_synthesise":  {"domain": "memory_synthesise", "operation": "synthesise"},
     # Memory Index Protocol — deterministic directory + exact-key retrieval (MIP v1.2)
     "memory_list_keys":    {"domain": "memory_index", "operation": "list_keys"},
     "memory_retrieve_key": {"domain": "memory_index", "operation": "retrieve_key"},
@@ -163,6 +167,7 @@ INTENT_ACTION_MAP = {
     "wallet_list_addresses":  {"domain": "wallet_watchlist", "operation": "list",    "name": "wallet_list_addresses"},
     "wallet_add_address":     {"domain": "wallet_watchlist", "operation": "add",     "name": "wallet_add_address"},
     "wallet_remove_address":  {"domain": "wallet_watchlist", "operation": "remove",  "name": "wallet_remove_address"},
+    "wallet_update_address":  {"domain": "wallet_watchlist", "operation": "update",  "name": "wallet_update_address"},
     "wallet_check_address":   {"domain": "wallet_watchlist", "operation": "check",   "name": "wallet_check_address"},
     "wallet_portfolio":       {"domain": "wallet_watchlist", "operation": "check",   "name": "wallet_portfolio"},
     # Dev-Harness intents — devops_agent scope
@@ -174,6 +179,9 @@ INTENT_ACTION_MAP = {
     "dev_reject":  {"domain": "dev_harness", "operation": "reject"},
     "dev_verify":  {"domain": "dev_harness", "operation": "verify"},
     "dev_clear":   {"domain": "dev_harness", "operation": "clear"},
+    # Portal introspection
+    "skill_status":   {"domain": "portal", "operation": "read", "name": "skill_status"},
+    "harness_status": {"domain": "portal", "operation": "read", "name": "harness_status"},
 }
 
 # Tier required for each operation — deterministic, never from LLM
@@ -185,7 +193,7 @@ INTENT_TIER_MAP = {
     "list_files": "LOW", "navigate": "LOW", "read_file": "LOW", "search_files": "LOW",
     "list_files_recursive": "LOW", "read_files_recursive": "LOW",
     "list_notes": "LOW", "read_note": "LOW",
-    "create_note": "MID", "update_note": "MID", "delete_note": "HIGH",
+    "create_note": "MID", "update_note": "MID", "delete_note": "MID",
     # sovereign-nextcloud-fs tiers
     # All ncfs ops are LOW — Nextcloud is Director-trusted; no confirmation required for FS ops.
     # New files arriving in /downloads/ are still scanned before ingest (inline_scan gate).
@@ -194,6 +202,7 @@ INTENT_TIER_MAP = {
     "ncfs_tag": "LOW", "ncfs_untag": "LOW",
     # sovereign-nextcloud-ingest tiers — MID because memory write follows confirmation
     "ingest_file": "MID", "ingest_folder": "MID", "ingest_status": "LOW",
+    "session_wrap_up": "LOW", "memory_curate": "LOW",
     "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
     "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
     "read_feed": "LOW",
@@ -207,6 +216,7 @@ INTENT_TIER_MAP = {
     "remember_fact": "LOW",
     "memory_list_keys": "LOW",
     "memory_retrieve_key": "LOW",
+    "memory_synthesise": "LOW",
     # Skill harness tiers — explicit steps with validation gates + WM checkpoints
     "skill_search":           "LOW",   # search + write checkpoint
     "skill_list_candidates":  "LOW",   # read checkpoint
@@ -216,7 +226,7 @@ INTENT_TIER_MAP = {
     # NOTE: other skill_* tiers are governed by governance.json intent_tiers
     # Wallet tiers
     "wallet_read_config":     "LOW",
-    "wallet_get_address":     "MID",
+    "wallet_get_address":     "LOW",
     "wallet_sign_message":    "MID",
     "wallet_propose_safe_tx": "HIGH",
     "wallet_get_proposals":   "MID",
@@ -227,6 +237,7 @@ INTENT_TIER_MAP = {
     "wallet_portfolio":       "LOW",
     "wallet_add_address":     "MID",
     "wallet_remove_address":  "MID",
+    "wallet_update_address":  "MID",
     # Scheduler tiers — all LOW: Rex managing prospective memory is internal,
     # equivalent to writing in a notebook. No Director confirmation required.
     "schedule_task":        "LOW",
@@ -263,6 +274,8 @@ INTENT_TIER_MAP = {
     "dev_reject":  "LOW",
     "dev_verify":  "LOW",
     "dev_clear":   "LOW",
+    "skill_status":   "LOW",
+    "harness_status": "LOW",
 }
 
 def _normalise_dt(value: str, default_year: int = 2026) -> str:
@@ -364,6 +377,22 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     """
     u = user_input.lower()
     prior_domain = _infer_prior_domain(context_window)
+
+    # ── Session wrap-up — closure signals; checked FIRST, before all other guards ──
+    # These are unambiguous — must never fall through to LLM or time_signals web_search.
+    _closure_early_kw = (
+        "that's all", "thats all", "goodbye", "good bye", "wrap up", "wrap-up",
+        "signing off", "sign off", "end of session", "we're done", "done for today",
+        "thanks bye", "catch you later", "until tomorrow", "close session",
+        "session wrap", "closing out", "close out",
+    )
+    if any(w in u for w in _closure_early_kw):
+        return {
+            "delegate_to": "research_agent",
+            "intent": "session_wrap_up",
+            "target": user_input,
+            "reasoning_summary": "Session closure — wrap-up synthesis",
+        }
 
     # ── URL fetch — explicit https?:// present in input ────────────────────
     import re as _re
@@ -630,12 +659,30 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         # Wallet watchlist
         "watchlist", "watch list", "watched addresses", "watching addresses",
         "watch this address", "add to watchlist", "stop watching", "unwatch",
+        "update watchlist", "rename watchlist", "relabel watchlist",
+        "update the watchlist", "change the label",
         "portfolio", "portfolio value", "portfolio worth", "wallet balance",
         "check address", "check wallet", "monitor this address",
         # Dev-Harness
         "dev analyse", "dev analysis", "dev harness", "dev status",
         "approve dev", "reject dev", "verify dev", "dev clear",
         "code analysis", "code quality", "run analysis", "harness analyse",
+        # Session wrap-up closure signals
+        "that's all", "thats all", "goodbye", "good bye", "wrap up", "wrap-up",
+        "signing off", "sign off", "end of session", "we're done", "done for today",
+        "thanks bye", "catch you later", "until tomorrow", "close session",
+        "session wrap", "closing out", "close out",
+        # Memory curation
+        "curate memory", "curate working memory", "review working memory",
+        "memory curation", "promote memory", "memory review", "review memories",
+        "clean up memory", "cleanup memory",
+        # Memory synthesis
+        "synthesise memory", "synthesize memory", "memory synthesis",
+        "run synthesis", "memory synthesise", "memory synthesize",
+        # Portal introspection
+        "skill status", "harness status", "what skills", "what harnesses",
+        "list skills", "show skills", "installed skills", "loaded skills",
+        "harness state", "show harnesses",
     )
     prior_has_system = prior_domain is not None
 
@@ -698,7 +745,9 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     import re as _re_ns
     _note_suffix = bool(_re_ns.search(r'\bnote\b\s*$', u))
 
-    if not prior_has_system and not any(sig in u for sig in _system_signals) and not _note_suffix:
+    # "Please" prefix signals a direct command/request — always pass the guard.
+    _please_prefix = u.startswith("please ")
+    if not prior_has_system and not any(sig in u for sig in _system_signals) and not _note_suffix and not _please_prefix:
         return {
             "delegate_to": "research_agent", "intent": "query",
             "target": None, "tier": "LOW",
@@ -1037,12 +1086,26 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         }
 
     # Memory Index Protocol — list all keys (directory scan, no vector search)
+    # ── Rex's own ETH address — deterministic read, no memory lookup ────────
+    _rex_eth_kw = (
+        "your eth address", "your ethereum address", "rex eth address",
+        "rex's eth address", "rex's address", "your wallet address",
+        "what is your address", "what's your address", "your address",
+    )
+    if any(w in u for w in _rex_eth_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "wallet_get_address",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Rex ETH address read — deterministic",
+        }
+
     _mem_list_kw = (
         "list my memories", "list all memories", "show my memories",
         "show memory", "memory keys", "memory index", "memory directory",
         "what do you remember", "what's in memory", "what is in memory",
-        "eth address", "wallet address", "safe address",
         "look up in memory", "retrieve from memory",
+        # Specific endpoint lookups — route to MIP not web_search
+        "validator queue url", "validator queue link", "validatorqueue",
     )
     if any(w in u for w in _mem_list_kw):
         return {
@@ -1067,30 +1130,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         }
 
     # ── Wallet watchlist intents ──────────────────────────────────────────────
-    _wallet_list_kw = (
-        "what addresses are being watched", "watched addresses", "watch list", "watchlist",
-        "which addresses", "show watchlist", "list watched", "what wallets are watched",
-        "watching addresses", "show watched addresses", "wallet watchlist",
-    )
-    if any(w in u for w in _wallet_list_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "wallet_list_addresses",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Wallet watchlist query",
-        }
-
-    _wallet_portfolio_kw = (
-        "portfolio", "portfolio value", "how much", "total value", "current value",
-        "wallet balance", "total balance", "how much is my", "what's my portfolio",
-        "whats my portfolio", "portfolio worth",
-    )
-    if any(w in u for w in _wallet_portfolio_kw) and any(c in u for c in ("eth", "btc", "crypto", "wallet", "portfolio", "nzd", "usd")):
-        return {
-            "delegate_to": "business_agent", "intent": "wallet_portfolio",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Wallet portfolio value query",
-        }
-
+    # Mutating ops (add/remove) checked BEFORE list — "add to the watchlist" contains
+    # "watchlist" which would otherwise mis-route to wallet_list_addresses.
     _wallet_remove_kw = (
         "stop watching", "remove from watchlist", "unwatch", "stop monitoring address",
         "remove watch address", "remove address from", "delete from watchlist",
@@ -1113,10 +1154,61 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         import re as _re_waddr2
         _waddr2_m = _re_waddr2.search(r'\b(0x[0-9a-fA-F]{40}|bc1[a-z0-9]{25,90}|[13][a-zA-Z0-9]{25,34})\b', u)
         _waddr2 = _waddr2_m.group(1) if _waddr2_m else ""
+        # Extract label — patterns: "as [the] X", "called X", "named X", "label X"
+        _lbl_m = _re_waddr2.search(
+            r'(?:as\s+(?:the\s+)?|called\s+|named\s+|label(?:\s+it)?\s+)([A-Za-z0-9][A-Za-z0-9 \-_]+)',
+            u,
+        )
+        _waddr2_label = _lbl_m.group(1).strip() if _lbl_m else ""
         return {
             "delegate_to": "business_agent", "intent": "wallet_add_address",
-            "target": _waddr2, "tier": "MID",
+            "target": _waddr2, "label": _waddr2_label, "tier": "MID",
             "reasoning_summary": "Add address to watchlist (MID — requires confirmation)",
+        }
+
+    _wallet_update_kw = (
+        "update watchlist", "rename watchlist", "relabel watchlist",
+        "update the watchlist", "rename the watchlist", "relabel the watchlist",
+        "update watchlist address", "rename watchlist address", "relabel watchlist address",
+        "change the label", "change label", "update the label", "rename the address",
+    )
+    if any(w in u for w in _wallet_update_kw):
+        import re as _re_waddr_upd
+        _wupd_addr_m = _re_waddr_upd.search(
+            r'\b(0x[0-9a-fA-F]{40}|bc1[a-z0-9]{25,90}|[13][a-zA-Z0-9]{25,34})\b', u,
+        )
+        _wupd_addr = _wupd_addr_m.group(1) if _wupd_addr_m else ""
+        # Extract new label from "to '[label]'" or "to [label]"
+        _wupd_lbl_m = _re_waddr_upd.search(r"\bto\s+['\"]?([A-Za-z0-9][A-Za-z0-9 \-_/]+?)['\"]?\s*$", u)
+        _wupd_label = _wupd_lbl_m.group(1).strip() if _wupd_lbl_m else ""
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_update_address",
+            "target": _wupd_addr, "label": _wupd_label, "tier": "MID",
+            "reasoning_summary": "Update watchlist address label (MID — requires confirmation)",
+        }
+
+    _wallet_list_kw = (
+        "what addresses are being watched", "watched addresses", "watch list", "watchlist",
+        "which addresses", "show watchlist", "list watched", "what wallets are watched",
+        "watching addresses", "show watched addresses", "wallet watchlist",
+    )
+    if any(w in u for w in _wallet_list_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_list_addresses",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Wallet watchlist query",
+        }
+
+    _wallet_portfolio_kw = (
+        "portfolio", "portfolio value", "how much", "total value", "current value",
+        "wallet balance", "total balance", "how much is my", "what's my portfolio",
+        "whats my portfolio", "portfolio worth",
+    )
+    if any(w in u for w in _wallet_portfolio_kw) and any(c in u for c in ("eth", "btc", "crypto", "wallet", "portfolio", "nzd", "usd")):
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_portfolio",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Wallet portfolio value query",
         }
 
     _wallet_check_kw = (
@@ -1406,6 +1498,16 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         }
 
     # ── sovereign-nextcloud-ingest ──────────────────────────────────────
+    # ingest_status must be checked BEFORE ingest_kw — "ingest" substring fires on "ingest status"
+    _ingest_status_kw = ("ingest status", "has this been reviewed", "check if reviewed",
+                          "sovereign-reviewed", "check tags")
+    if any(w in u for w in _ingest_status_kw):
+        return {
+            "delegate_to": "memory_agent", "intent": "ingest_status",
+            "target": u,
+            "reasoning_summary": "Ingest status check — OCS tags",
+        }
+
     _ingest_kw = (
         "ingest", "review and remember", "add to memory", "remember the contents",
         "remember everything in", "ingest and remember", "read and remember",
@@ -1420,13 +1522,46 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Nextcloud ingest — ncingest pipeline",
         }
 
-    _ingest_status_kw = ("ingest status", "has this been reviewed", "check if reviewed",
-                          "sovereign-reviewed", "check tags")
-    if any(w in u for w in _ingest_status_kw):
+    # ── Session wrap-up ────────────────────────────────────────────────────
+    _closure_kw = (
+        "that's all", "thats all", "goodbye", "good bye", "wrap up", "wrap-up",
+        "signing off", "sign off", "end of session", "we're done", "done for today",
+        "thanks bye", "catch you later", "until tomorrow", "close session",
+        "session wrap", "closing out", "close out",
+    )
+    if any(w in u for w in _closure_kw):
         return {
-            "delegate_to": "memory_agent", "intent": "ingest_status",
+            "delegate_to": "research_agent",
+            "intent": "session_wrap_up",
             "target": u,
-            "reasoning_summary": "Ingest status check — OCS tags",
+            "reasoning_summary": "Session closure — wrap-up synthesis",
+        }
+
+    # ── Memory curation ────────────────────────────────────────────────────
+    _memory_curate_kw = (
+        "curate memory", "curate working memory", "review working memory",
+        "memory curation", "promote memory", "memory review", "review memories",
+        "clean up memory", "cleanup memory",
+    )
+    if any(w in u for w in _memory_curate_kw):
+        return {
+            "delegate_to": "memory_agent",
+            "intent": "memory_curate",
+            "target": u,
+            "reasoning_summary": "Memory curation — promotion evaluation",
+        }
+
+    # ── Memory synthesis ────────────────────────────────────────────────────
+    _memory_synth_kw = (
+        "synthesise memory", "synthesize memory", "memory synthesis",
+        "run synthesis", "memory synthesise", "memory synthesize",
+    )
+    if any(w in u for w in _memory_synth_kw):
+        return {
+            "delegate_to": "memory_agent",
+            "intent": "memory_synthesise",
+            "target": u,
+            "reasoning_summary": "Memory synthesis — associative/relational pattern discovery",
         }
 
     _file_delete_kw = (
@@ -1633,10 +1768,9 @@ class ExecutionEngine:
         self.guardrail = guardrail
         self.ledger = ledger
         self.broker = BrokerAdapter()
-        self.webdav = WebDAVAdapter()
-        self.caldav = CalDAVAdapter()
+
+
         self.github = GitHubAdapter()
-        self.browser = BrowserAdapter()
         self.nanobot = NanobotAdapter(ledger=ledger)
         from execution.adapters.wallet import WalletControlAdapter
         self.wallet_control = WalletControlAdapter(ledger=ledger)
@@ -1651,58 +1785,165 @@ class ExecutionEngine:
         # MIP session tracking — True once memory_list_keys has been dispatched this boot.
         # Used to flag retrieve_key calls that skipped the mandatory list-first step.
         self._mip_listed_this_session = False
-        # Notes title→id index cache (session-scoped, 5 min TTL)
-        self._notes_index_cache: dict = {}   # {title.lower(): {"id": int, "title": str}}
-        self._notes_index_ts: float = 0.0    # epoch seconds of last build
 
-    # ── Notes title→ID index helpers ─────────────────────────────────────
-    async def _notes_get_or_build_index(self, force: bool = False) -> dict:
-        """Return the session-scoped notes title→id index, rebuilding if stale or forced.
+    # ── Universal item index (working_memory, zero-vector, session-scoped) ────
+    #
+    # Any Nextcloud item Rex retrieves (note, event, task, file, email) is written
+    # here as a zero-vector point — no embed call, near-zero cost.  Lookups use
+    # payload filter scroll, not vector search.
+    #
+    # item_type values: "note" | "event" | "task" | "file" | "email"
 
-        TTL: 5 minutes. Force=True is used after list_notes to keep index fresh.
-        Fetches notes_list from nanobot; does NOT count as a user-facing operation.
+    _ITEM_INDEX_FLAG = "_item_index"
+    _ZERO_VECTOR = [0.0] * 768
+
+    async def _index_items(self, items: list, item_type: str) -> None:
+        """Write a batch of retrieved items into the working_memory item index.
+
+        Point IDs are QdrantAdapter.sovereign_id(item_type, item_id) — deterministic UUID5
+        so the same item always maps to the same Qdrant point across all stores.
+        The sov_id is also stored in the payload so it travels with the record.
         """
-        import time as _time
-        if not force and self._notes_index_cache and (_time.time() - self._notes_index_ts) < 300:
-            return self._notes_index_cache
+        if not items or not self.qdrant:
+            return
+        from qdrant_client.models import PointStruct as _PS
+        from datetime import datetime as _dt, timezone as _tz
+        _now = _dt.now(_tz.utc).isoformat()
+        points = []
+        for item in items:
+            title = (item.get("title") or item.get("subject") or item.get("name") or "").strip()
+            item_id = item.get("id") or item.get("uid") or item.get("item_id")
+            if not title or item_id is None:
+                continue
+            _point_id = QdrantAdapter.sovereign_id(item_type, str(item_id))
+            payload = {
+                self._ITEM_INDEX_FLAG: True,
+                "item_type": item_type,
+                "title":     title,
+                "title_lc":  title.lower(),
+                "item_id":   str(item_id),
+                "sov_id":    _point_id,
+                "timestamp": _now,
+            }
+            for f in ("date", "calendar", "account", "from_addr", "sender"):
+                if item.get(f):
+                    payload[f] = item[f]
+            points.append(_PS(id=_point_id, vector=self._ZERO_VECTOR, payload=payload))
+        if points:
+            try:
+                await self.qdrant.client.upsert(collection_name="working_memory", points=points)
+                logger.debug(
+                    "item_index: upserted %d %s entries — sov_ids: %s",
+                    len(points), item_type,
+                    ", ".join(p.id for p in points[:5]) + ("…" if len(points) > 5 else ""),
+                )
+            except Exception as e:
+                logger.warning("_index_items(%s): %s", item_type, e)
+
+    async def _lookup_item(self, title: str, item_type: str) -> list:
+        """Look up indexed items by title in working_memory.
+
+        Returns list of matching payload dicts.  Empty list = nothing indexed yet.
+        Match order: exact → title contains search → search contains title.
+        """
+        if not title or not self.qdrant:
+            return []
+        try:
+            from qdrant_client.models import Filter as _F, FieldCondition as _FC, MatchValue as _MV
+            points, _ = await self.qdrant.client.scroll(
+                collection_name="working_memory",
+                scroll_filter=_F(must=[
+                    _FC(key=self._ITEM_INDEX_FLAG, match=_MV(value=True)),
+                    _FC(key="item_type",           match=_MV(value=item_type)),
+                ]),
+                limit=500,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception:
+            return []
+        q = title.strip().lower()
+        exact    = [p.payload for p in points if p.payload.get("title_lc") == q]
+        if exact:
+            return exact
+        contains = [p.payload for p in points if q in (p.payload.get("title_lc") or "")]
+        if contains:
+            return contains
+        return   [p.payload for p in points if (p.payload.get("title_lc") or "") in q and p.payload.get("title_lc")]
+
+    async def _clear_item_index(self, item_type: str) -> None:
+        """Remove all working_memory item index entries of a given type (call after create/delete)."""
+        if not self.qdrant:
+            return
+        try:
+            from qdrant_client.models import (Filter as _F, FieldCondition as _FC,
+                                               MatchValue as _MV, FilterSelector as _FS)
+            await self.qdrant.client.delete(
+                collection_name="working_memory",
+                points_selector=_FS(filter=_F(must=[
+                    _FC(key=self._ITEM_INDEX_FLAG, match=_MV(value=True)),
+                    _FC(key="item_type",           match=_MV(value=item_type)),
+                ])),
+            )
+        except Exception as e:
+            logger.warning("_clear_item_index(%s): %s", item_type, e)
+
+    # ── Notes index helpers (built on universal item index) ───────────────
+
+    async def _notes_get_or_build_index(self, force: bool = False) -> None:
+        """Ensure the note index is populated in working_memory.
+
+        If working_memory already has note entries and force=False, no-op.
+        Otherwise fetches notes_list from nanobot and indexes them.
+        """
+        if not force:
+            # Quick presence check — if any note entry exists, index is warm
+            try:
+                from qdrant_client.models import Filter as _F, FieldCondition as _FC, MatchValue as _MV
+                pts, _ = await self.qdrant.client.scroll(
+                    collection_name="working_memory",
+                    scroll_filter=_F(must=[
+                        _FC(key=self._ITEM_INDEX_FLAG, match=_MV(value=True)),
+                        _FC(key="item_type",           match=_MV(value="note")),
+                    ]),
+                    limit=1, with_payload=False, with_vectors=False,
+                )
+                if pts:
+                    return
+            except Exception:
+                pass
         try:
             nb = await self.nanobot.run("openclaw-nextcloud", "notes_list", {})
             notes_raw = (nb.get("result") or {}).get("notes") or nb.get("notes") or []
-            idx: dict = {}
-            for _n in notes_raw:
-                _t = (_n.get("title") or "").strip()
-                _i = _n.get("id")
-                if _t and _i is not None:
-                    idx[_t.lower()] = {"id": _i, "title": _t}
-            self._notes_index_cache = idx
-            self._notes_index_ts = _time.time()
+            await self._index_items(notes_raw, "note")
         except Exception:
-            pass  # return whatever we have
-        return self._notes_index_cache
+            pass
 
-    def _notes_find_by_title(self, search_title: str, index: dict) -> tuple:
-        """Resolve a note title string to an integer ID using the cached index.
+    async def _notes_find_by_title(self, search_title: str) -> tuple:
+        """Resolve a note title to an integer ID via the working_memory item index.
 
         Returns (id, None) on success or (None, error_message) on failure.
-        Match order: exact (case-insensitive) → title contains search → search contains title.
         """
-        q = (search_title or "").strip().lower()
-        if not q:
-            return None, "No note title provided — please specify which note"
-        # Exact match
-        if q in index:
-            return index[q]["id"], None
-        # Note title contains the search phrase
-        matches = [(k, v) for k, v in index.items() if q in k]
-        if not matches:
-            # Search phrase contains a note title (user gave more words than the title)
-            matches = [(k, v) for k, v in index.items() if k in q]
+        matches = await self._lookup_item(search_title, "note")
         if len(matches) == 1:
-            return matches[0][1]["id"], None
+            return int(matches[0]["item_id"]), None
         if len(matches) > 1:
-            titles = ", ".join(f"'{v['title']}'" for _, v in matches[:5])
+            titles = ", ".join(f"'{m['title']}'" for m in matches[:5])
             return None, f"Multiple notes match '{search_title}': {titles} — please be more specific"
-        available = ", ".join(f"'{v['title']}'" for v in list(index.values())[:8])
+        # Nothing in index — surface available titles
+        try:
+            from qdrant_client.models import Filter as _F, FieldCondition as _FC, MatchValue as _MV
+            all_pts, _ = await self.qdrant.client.scroll(
+                collection_name="working_memory",
+                scroll_filter=_F(must=[
+                    _FC(key=self._ITEM_INDEX_FLAG, match=_MV(value=True)),
+                    _FC(key="item_type",           match=_MV(value="note")),
+                ]),
+                limit=8, with_payload=True, with_vectors=False,
+            )
+            available = ", ".join("'" + p.payload.get("title", "") + "'" for p in all_pts)
+        except Exception:
+            available = "unknown"
         return None, f"Note '{search_title}' not found. Available: {available}"
 
     # ── Direct structured query (/query endpoint) ────────────────────────
@@ -1798,13 +2039,13 @@ class ExecutionEngine:
         except Exception as e:
             return {"error": f"base64 decode failed: {e}", "status": "error"}
 
-        self._ledger.append({
-            "action":    "telegram_upload",
-            "filename":  safe_name,
-            "size":      size,
-            "mime_type": mime_type,
-            "source":    source,
-        })
+        if self.ledger:
+            self.ledger.append("telegram_upload", "inbound", {
+                "filename":  safe_name,
+                "size":      size,
+                "mime_type": mime_type,
+                "source":    source,
+            })
 
         result = await self.nanobot.run_upload(safe_name, content_bytes, mime_type, size)
 
@@ -1830,14 +2071,6 @@ class ExecutionEngine:
                           security_confirmed: bool = False,
                           context_window=None,
                           harness_cmd: str = None) -> dict:
-        # Gateway context FIFO — log inbound message before cognitive loop
-        # Skip on confirmed continuations (user_input is the original request, already logged)
-        if self.qdrant and not confirmed and not security_confirmed and not confidence_acknowledged:
-            try:
-                await self.qdrant.write_gateway_context(user_input, source="telegram")
-            except Exception:
-                pass
-
         # PROSPECTIVE + HEALTH SESSION-START CHECK — fires on first message of a new session
         # (no prior context, no pending delegation = fresh session)
         # NOTE: Do NOT pass due_items through ceo_translate — the LLM fabricates briefing
@@ -1990,6 +2223,7 @@ class ExecutionEngine:
             quick = _quick_classify(user_input, context_window=context_window)
             if quick:
                 delegation = quick
+                delegation["_routing_source"] = "quick_classify"
                 confidence, gaps = 1.0, []
             else:
                 _t_p1 = _time_mod.monotonic()
@@ -2019,6 +2253,7 @@ class ExecutionEngine:
         intent = delegation.get("intent", "")
         if intent not in INTENT_ACTION_MAP:
             intent = _AGENT_DEFAULT_INTENT.get(agent, "query")
+            delegation["_routing_source"] = "fallback_map"
 
         # Tier always derived deterministically — never trust the LLM
         tier = self.gov.get_intent_tier(intent) or INTENT_TIER_MAP.get(intent, "LOW")
@@ -2061,6 +2296,37 @@ class ExecutionEngine:
                 await self._log_ceo_confidence_override(user_input)
             except Exception:
                 pass
+
+        # Deterministic email ID + account extraction for delete/move.
+        # When no [id:XXXX] in user message, scan context_window for the matching email line.
+        # Also infer account (business/personal) from recent user turns in context_window.
+        # Runs before confirmation gate so values are baked into pending_delegation.
+        if intent in ("delete_email", "move_email"):
+            import re as _re_em
+            _cw_turns = context_window if isinstance(context_window, list) else ([context_window] if context_window else [])
+            _cw_text = "\n".join(t.get("assistant", "") + "\n" + t.get("user", "") for t in _cw_turns if isinstance(t, dict))
+
+            # Extract database_id from context_window if not already in delegation
+            if not delegation.get("database_id") and _cw_text and "[id:" in _cw_text:
+                _stopwords_em = {"delete", "please", "email", "the", "this", "that",
+                                 "move", "from", "to", "and", "for", "mail", "archive"}
+                _kw_em = [w.lower() for w in _re_em.findall(r'[A-Za-z]{4,}', user_input)
+                          if w.lower() not in _stopwords_em]
+                _uid_re_em = _re_em.compile(r'\[id:(\d+)\]')
+                for _cw_line in _cw_text.splitlines():
+                    _id_m = _uid_re_em.search(_cw_line)
+                    if _id_m and _kw_em and any(k in _cw_line.lower() for k in _kw_em):
+                        delegation = {**delegation, "database_id": _id_m.group(1)}
+                        break
+
+            # Infer account from recent context_window user turns if not explicit in current message
+            if not delegation.get("target") and _cw_turns:
+                _acct_text = " ".join(t.get("user", "") for t in _cw_turns[-4:] if isinstance(t, dict)).lower()
+                _acct_text += " " + user_input.lower()
+                if "business" in _acct_text:
+                    delegation = {**delegation, "target": "business"}
+                elif "personal" in _acct_text:
+                    delegation = {**delegation, "target": "personal"}
 
         action = self._delegation_to_action({**delegation, "intent": intent})
 
@@ -2152,7 +2418,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist"):
+        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise"):
             if action.get("domain") == "ollama":
                 conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
                 conv_text = conv_result.get("response", "")
@@ -2513,11 +2779,17 @@ class ExecutionEngine:
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "research",
             "memory_list_keys", "memory_retrieve_key",  # MIP — pass structured index directly
+            "remember_fact",   # confirmation with mip_key passes directly to translator
             # Dev-Harness — all phases return structured dicts; bypass LLM summarisation
             "dev_analyse", "dev_status", "dev_approve", "dev_reject", "dev_verify", "dev_clear",
-            # Wallet watchlist — structured results, pass directly to translator
+            # Wallet — structured results, pass directly to translator
+            "wallet_get_address", "wallet_read_config", "wallet_get_btc_xpub",
             "wallet_list_addresses", "wallet_portfolio", "wallet_check_address",
-            "wallet_add_address", "wallet_remove_address",
+            "wallet_add_address", "wallet_remove_address", "wallet_update_address",
+            # cognitive skills — specialist synthesis passes directly to translator
+            "session_wrap_up", "memory_curate",
+            # Memory synthesis — structured result passes directly to translator
+            "memory_synthesise",
         })
         # skill_search with no candidates — deterministic result, bypass translator invention
         if intent == "skill_search" and execution_result is not None:
@@ -2604,6 +2876,83 @@ class ExecutionEngine:
                     f"Reviewed candidate {_rv_cid} ({_rv_slug}): verdict {_rv_verdict.upper()}."
                 )
 
+        elif intent == "wallet_add_address" and execution_result is not None:
+            _wa_entry = execution_result.get("entry", {})
+            _wa_meta  = _wa_entry.get("metadata", {})
+            _wa_lbl   = _wa_entry.get("label", "")
+            _wa_val   = _wa_entry.get("value", "")
+            _wa_short = (_wa_val[:10] + "…") if len(_wa_val) > 10 else _wa_val
+            _wa_chain = _wa_meta.get("chain", "eth")
+            if execution_result.get("status") == "ok":
+                _rft = {
+                    "success": True,
+                    "outcome": f"Added '{_wa_lbl}' ({_wa_short}, {_wa_chain}) to the watchlist.",
+                    "detail": {"label": _wa_lbl, "address": _wa_val, "chain": _wa_chain},
+                    "error": None, "next_action": None,
+                }
+            else:
+                _rft = {
+                    "success": False,
+                    "outcome": "Failed to add address to watchlist.",
+                    "detail": {}, "error": execution_result.get("error"), "next_action": None,
+                }
+
+        elif intent == "wallet_update_address" and execution_result is not None:
+            _wu_entry = execution_result.get("entry", {})
+            _wu_addr  = execution_result.get("address", "")
+            _wu_lbl   = _wu_entry.get("label", "")
+            _wu_short = (_wu_addr[:10] + "…") if len(_wu_addr) > 10 else _wu_addr
+            if execution_result.get("status") == "ok":
+                _rft = {
+                    "success": True,
+                    "outcome": f"Renamed {_wu_short} to '{_wu_lbl}'.",
+                    "detail": {"address": _wu_addr, "label": _wu_lbl},
+                    "error": None, "next_action": None,
+                }
+            else:
+                _rft = {
+                    "success": False,
+                    "outcome": "Failed to update watchlist entry.",
+                    "detail": {}, "error": execution_result.get("error"), "next_action": None,
+                }
+
+        elif intent == "wallet_remove_address" and execution_result is not None:
+            _wr_addr   = (execution_result.get("target") or
+                          execution_result.get("address", ""))
+            _wr_removed = execution_result.get("removed", False)
+            if execution_result.get("status") == "ok":
+                _wr_short = (_wr_addr[:10] + "…") if len(_wr_addr) > 10 else _wr_addr
+                _rft = {
+                    "success": True,
+                    "outcome": (f"Removed {_wr_short} from the watchlist."
+                                if _wr_removed else "Address was not in the watchlist."),
+                    "detail": {"address": _wr_addr, "removed": _wr_removed},
+                    "error": None, "next_action": None,
+                }
+            else:
+                _rft = {
+                    "success": False,
+                    "outcome": "Failed to remove address from watchlist.",
+                    "detail": {}, "error": execution_result.get("error"), "next_action": None,
+                }
+
+        elif intent == "wallet_get_address" and execution_result is not None:
+            _wga_addr = execution_result.get("address", "")
+            if execution_result.get("status") == "ok" and _wga_addr:
+                _rft = {
+                    "success": True,
+                    "outcome": f"Rex ETH address: {_wga_addr}",
+                    "detail": {"address": _wga_addr,
+                               "derivation_path": execution_result.get("derivation_path", "")},
+                    "error": None, "next_action": None,
+                }
+            else:
+                _rft = {
+                    "success": False,
+                    "outcome": "Wallet address not available.",
+                    "detail": {}, "error": execution_result.get("error"), "next_action": None,
+                }
+
         elif intent in _DIAGNOSTIC_INTENTS and execution_result:
             _raw = {k: v for k, v in execution_result.items()
                     if not k.startswith("_")
@@ -2676,6 +3025,16 @@ class ExecutionEngine:
                 _rft["detail"]["count"] = len(_lines)
                 if _id_index:
                     _rft["detail"]["id_index"] = _id_index
+                # Index emails in working_memory for cross-turn lookup
+                _acct = action.get("account") or (delegation or {}).get("target") or "personal"
+                _asyncio.create_task(self._index_items([
+                    {"title": _em.get("subject", "(no subject)"),
+                     "id": str(_em.get("databaseId", _em.get("uid", ""))),
+                     "from_addr": _em.get("from", ""),
+                     "date": _em.get("date", ""),
+                     "account": _acct}
+                    for _em in _msgs[:10] if _em.get("databaseId") or _em.get("uid")
+                ], "email"))
 
         # Pre-format file listings deterministically so the translator cannot miscount.
         # Items is a list of dicts {name, type, size, last_modified} — convert to numbered string.
@@ -2695,6 +3054,14 @@ class ExecutionEngine:
                 _rft["detail"] = dict(_rft["detail"])
                 _rft["detail"]["items"] = "\n".join(_fl_lines) if _fl_lines else "(empty)"
                 _rft["detail"]["count"] = len(_fl_lines)
+                # Index files in working_memory
+                _fp = action.get("path") or (specialist or {}).get("path") or "/"
+                _asyncio.create_task(self._index_items([
+                    {"title": _it.get("name", _it) if isinstance(_it, dict) else str(_it),
+                     "id": _it.get("name", _it) if isinstance(_it, dict) else str(_it),
+                     "date": _it.get("last_modified", "") if isinstance(_it, dict) else ""}
+                    for _it in _items if _it
+                ], "file"))
 
         # Pre-format notes list so translator renders a clean numbered list without
         # Unix timestamps (which trigger the fabrication guard when the LLM invents years).
@@ -2718,6 +3085,45 @@ class ExecutionEngine:
                     "count": len(_note_lines),
                     "id_index": _note_id_index,
                 }
+
+        # ── Working-memory content_ref markers ───────────────────────────────
+        # Rule: if a result has a stable ID → already indexed above as a full item.
+        # If a result is a blob (no stable ID) → store a proper episodic entry so
+        # shutdown_promote() can carry it to RAID. Marker only — not the blob itself.
+        async def _store_content_ref(content: str, domain: str, extra: dict) -> None:
+            try:
+                await self.qdrant.store(
+                    content=content,
+                    metadata={"type": "episodic", "domain": domain,
+                              "source": "content_ref", **extra},
+                    collection="working_memory",
+                    writer="sovereign-core",
+                )
+            except Exception as _e:
+                logger.debug("content_ref store failed: %s", _e)
+
+        if intent == "web_search":
+            _ws_q     = (delegation or {}).get("target") or action.get("query", "web search")
+            _ws_count = len(execution_result.get("results", [])) if isinstance(execution_result, dict) else 0
+            asyncio.create_task(_store_content_ref(
+                f"Web search: {_ws_q} ({_ws_count} results)",
+                "research", {"query": _ws_q, "result_count": _ws_count}
+            ))
+
+        if intent in ("fetch_url", "browser_fetch"):
+            _bu_url   = action.get("url") or (delegation or {}).get("target", "")
+            _bu_title = (execution_result or {}).get("data", {}).get("title", "") if isinstance(execution_result, dict) else ""
+            asyncio.create_task(_store_content_ref(
+                f"Fetched URL: {_bu_title or _bu_url}",
+                "research", {"url": _bu_url, "page_title": _bu_title}
+            ))
+
+        if intent == "read_file":
+            _rf_path = action.get("path") or (specialist or {}).get("path") or (delegation or {}).get("target", "")
+            asyncio.create_task(_store_content_ref(
+                f"Read file: {_rf_path}",
+                "filesystem", {"path": _rf_path}
+            ))
 
         # Sanitise LLM-generated detail: strip internal keys before translator sees them
         _DETAIL_STRIP = frozenset({
@@ -2783,9 +3189,10 @@ class ExecutionEngine:
             self._skill_lifecycle = SkillLifecycleManager(
                 scanner=self.scanner,
                 cog=self.cog,
-                browser=self.browser,
+                nanobot=self.nanobot,
                 ledger=self.ledger,
                 guardian=guardian,  # injected via set_guardian() after lifespan init
+                qdrant=self.qdrant,
             )
         return self._skill_lifecycle
 
@@ -2833,7 +3240,7 @@ class ExecutionEngine:
                 )
                 for r in result:
                     p = dict(r.payload or {})
-                    if p.get("_harness_checkpoint"):
+                    if p.get("_skill_harness_checkpoint"):
                         return p
                 if next_offset is None:
                     return None
@@ -2857,7 +3264,7 @@ class ExecutionEngine:
                     with_vectors=False,
                 )
                 for r in result:
-                    if (r.payload or {}).get("_harness_checkpoint"):
+                    if (r.payload or {}).get("_skill_harness_checkpoint"):
                         to_delete.append(r.id)
                 if next_offset is None:
                     break
@@ -2870,7 +3277,7 @@ class ExecutionEngine:
             # Embed and write new checkpoint
             await self.qdrant.store(
                 content="skill_harness:checkpoint",
-                metadata={**checkpoint, "_harness_checkpoint": True, "type": "harness_checkpoint"},
+                metadata={**checkpoint, "_skill_harness_checkpoint": True, "type": "skill_harness_checkpoint"},
                 collection=WORKING,
             )
         except Exception as _e:
@@ -2928,7 +3335,7 @@ class ExecutionEngine:
                     with_payload=True, with_vectors=False,
                 )
                 for _r in _res:
-                    if (_r.payload or {}).get("_harness_checkpoint"):
+                    if (_r.payload or {}).get("_skill_harness_checkpoint"):
                         _to_del.append(_r.id)
                 if _nxt is None:
                     break
@@ -3395,6 +3802,31 @@ class ExecutionEngine:
             else:
                 source = _DOMAIN_SOURCE.get(domain, "unknown_adapter")
             result["_result_source"] = source
+
+        # ── Outcome write-back — fire and forget, never blocks return path
+        # Skip if result is a confirmation gate (no actual execution happened).
+        if (
+            isinstance(result, dict)
+            and delegation
+            and self.qdrant
+            and not result.get("requires_security_confirmation")
+            and not result.get("requires_confirmation")
+        ):
+            _intent = (
+                delegation.get("intent")
+                or (payload or {}).get("intent")
+                or action.get("name", action.get("domain", ""))
+            )
+            if _intent:
+                import asyncio as _asyncio_wb
+                _asyncio_wb.create_task(self._outcome_write_back(
+                    intent=_intent,
+                    action=action,
+                    result=result,
+                    routing_source=delegation.get("_routing_source", "unknown"),
+                    delegation=delegation,
+                ))
+
         return result
 
     async def _dispatch_inner(self, action: dict, prompt: str = None,
@@ -3491,27 +3923,47 @@ class ExecutionEngine:
             return {"error": f"Unknown docker action: {name}"}
 
         if domain == "webdav":
+            # WebDAV adapter removed (Phase 2 adapter removal) — all file ops now route through
+            # nanobot-01 (sovereign-nextcloud-fs / openclaw-nextcloud python3_exec scripts).
+            # Unwrap nanobot envelope so callers receive a flat dict matching the old adapter
+            # shape, preserving _trust for the security scanner.
+            def _nb_unwrap(nb):
+                if nb.get("status") == "ok":
+                    flat = nb.get("result") if nb.get("result") is not None else {}
+                    return {"status": "ok", "_trust": nb.get("_trust", "untrusted_external"), **flat}
+                return nb
+
             if name == "file_navigate":
-                return await self.webdav.navigate(path)
+                return _nb_unwrap(await self.nanobot.run(
+                    "sovereign-nextcloud-fs", "fs_list", {"path": path}
+                ))
             if name in ("file_list",):
                 # RAID paths are mounted directly in sovereign-core — read via broker, not Nextcloud
                 if path.startswith(("/home/sovereign/", "/docker/sovereign/")):
                     return await self.broker.read_host_file(path)
-                return await self.webdav.list(path)
+                return _nb_unwrap(await self.nanobot.run(
+                    "sovereign-nextcloud-fs", "fs_list", {"path": path}
+                ))
             if name == "file_read":
                 # RAID paths are mounted in sovereign-core — route to broker hostfs, not Nextcloud WebDAV
                 if path.startswith(("/home/sovereign/", "/docker/sovereign/")):
                     return await self.broker.read_host_file(path)
-                return await self.webdav.read(path)
+                return _nb_unwrap(await self.nanobot.run(
+                    "sovereign-nextcloud-fs", "fs_read", {"path": path}
+                ))
             if name == "folder_create":
-                return await self.webdav.mkdir(path)
+                return _nb_unwrap(await self.nanobot.run(
+                    "sovereign-nextcloud-fs", "fs_mkdir", {"path": path}
+                ))
             if name == "file_search":
                 sp = specialist or {}
                 query = sp.get("query") or action.get("query") or prompt or ""
                 search_path = sp.get("path") or action.get("path", "/")
                 if not query:
                     return {"error": "search_files requires a query term"}
-                return await self.webdav.search(query, search_path)
+                return _nb_unwrap(await self.nanobot.run(
+                    "sovereign-nextcloud-fs", "fs_search", {"query": query, "path": search_path}
+                ))
             if name == "file_write":
                 sp = specialist or {}
                 content = (
@@ -3526,21 +3978,34 @@ class ExecutionEngine:
                     m = _re.search(r"(?:content|text|body)\s*[:=]\s*['\"]?(.+)", prompt, _re.IGNORECASE)
                     if m:
                         content = m.group(1).strip().strip("'\"")
-                return await self.webdav.write(path, content)
+                return _nb_unwrap(await self.nanobot.run(
+                    "openclaw-nextcloud", "files_write", {"path": path, "content": content}
+                ))
             if name == "file_delete":
-                return await self.webdav.delete(path)
+                return _nb_unwrap(await self.nanobot.run(
+                    "sovereign-nextcloud-fs", "fs_delete", {"path": path}
+                ))
             if name == "file_list_recursive":
-                return await self.nanobot.run(
+                return _nb_unwrap(await self.nanobot.run(
                     "openclaw-nextcloud", "files_list_recursive", {"path": path}
-                )
+                ))
             if name == "file_read_recursive":
-                return await self.nanobot.run(
+                return _nb_unwrap(await self.nanobot.run(
                     "openclaw-nextcloud", "files_read_recursive", {"path": path}
-                )
+                ))
 
         if domain == "caldav":
+            # CalDAV adapter removed (Phase 3 adapter removal) — all calendar/task ops now route
+            # through nanobot-01 (openclaw-nextcloud python3_exec scripts).
+            # _nb_unwrap: identical helper to the webdav block — flatten nanobot envelope.
+            def _nb_unwrap(nb):
+                if nb.get("status") == "ok":
+                    flat = nb.get("result") if nb.get("result") is not None else {}
+                    return {"status": "ok", "_trust": nb.get("_trust", "untrusted_external"), **flat}
+                return nb
+
             if name == "calendar_read":
-                return await self.caldav.list_calendars()
+                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_list", {}))
             if name == "calendar_create":
                 d = delegation or {}
                 sp = specialist or {}
@@ -3556,8 +4021,6 @@ class ExecutionEngine:
                 cal_summary     = sp.get("summary")     or action.get("summary")     or d.get("intent", "")
                 cal_calendar    = sp.get("calendar")    or action.get("calendar", "personal")
                 cal_description = sp.get("description") or action.get("description", "")
-                import uuid as _uuid
-                cal_uid = sp.get("uid") or action.get("uid") or str(_uuid.uuid4())
 
                 # ── Datetime extraction — accept any reasonable field name ──
                 # Specialist may output: start, start_time, datetime, when, date_time,
@@ -3590,6 +4053,21 @@ class ExecutionEngine:
                     "until", "finish", "event_end",
                 )
 
+                # ── Date range preprocessing ───────────────────────────────────
+                # Handle "6–7 June 2026" / "6-7 June 2026" style ranges the
+                # specialist may output as a single start value.  Split into
+                # separate start/end strings before _normalise_dt is called.
+                import re as _re_rng
+                if _start_raw and not _end_raw:
+                    _rng_m = _re_rng.search(
+                        r'^(\d{1,2})\s*[–\-]\s*(\d{1,2})\s+([A-Za-z]+(?:\s+\d{4})?)',
+                        _start_raw.strip(),
+                    )
+                    if _rng_m:
+                        _d1, _d2, _rest = _rng_m.group(1), _rng_m.group(2), _rng_m.group(3)
+                        _start_raw = f"{_d1} {_rest}"
+                        _end_raw   = f"{_d2} {_rest}"
+
                 cal_start = _normalise_dt(_start_raw)
                 cal_end   = _normalise_dt(_end_raw) if _end_raw else ""
 
@@ -3602,50 +4080,58 @@ class ExecutionEngine:
                 if not cal_end:
                     cal_end = cal_start  # point event if end omitted
 
-                return await self.caldav.create_event(
-                    calendar=cal_calendar,
-                    uid=cal_uid,
-                    summary=cal_summary,
-                    start=cal_start,
-                    end=cal_end,
-                    description=cal_description,
-                )
+                # Note: uid is generated by openclaw-nextcloud internally (not passed)
+                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_create", {
+                    "title": cal_summary,
+                    "start": cal_start,
+                    "end": cal_end,
+                    "description": cal_description,
+                    "calendar": cal_calendar,
+                }))
             if name == "task_create":
                 d = delegation or {}
                 sp = specialist or {}
-                import uuid as _uuid
                 task_summary     = sp.get("summary")     or action.get("summary")     or d.get("intent", "")
                 task_due         = sp.get("due")         or action.get("due",         "")
-                task_start       = sp.get("start")       or action.get("start",       "")
                 task_calendar    = sp.get("calendar")    or action.get("calendar",    "tasks")
                 task_description = sp.get("description") or action.get("description", "")
-                task_status      = sp.get("status")      or action.get("status",      "NEEDS-ACTION")
-                task_uid         = sp.get("uid")         or action.get("uid")         or str(_uuid.uuid4())
-                return await self.caldav.create_task(
-                    calendar=task_calendar,
-                    uid=task_uid,
-                    summary=task_summary,
-                    due=task_due,
-                    start=task_start,
-                    description=task_description,
-                    status=task_status,
-                )
+                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_create", {
+                    "summary": task_summary,
+                    "due": task_due,
+                    "description": task_description,
+                    "calendar": task_calendar,
+                }))
             if name == "calendar_list_events":
                 sp = specialist or {}
                 evt_calendar  = sp.get("calendar") or action.get("calendar", "personal")
                 evt_from_date = sp.get("from_date") or action.get("from_date", "")
                 evt_to_date   = sp.get("to_date")   or action.get("to_date",   "")
-                return await self.caldav.list_events(evt_calendar, evt_from_date, evt_to_date)
+                _evts_nb = await self.nanobot.run("openclaw-nextcloud", "calendar_list_events", {
+                    "calendar": evt_calendar,
+                    "from_date": evt_from_date,
+                    "to_date": evt_to_date,
+                })
+                _evts_result = _nb_unwrap(_evts_nb)
+                _evts_raw = _evts_result.get("events") or []
+                if _evts_raw:
+                    _asyncio.create_task(self._index_items(
+                        [{"title": e.get("summary",""), "uid": e.get("uid",""), "date": e.get("dtstart",""), "calendar": evt_calendar}
+                         for e in _evts_raw if e.get("uid")],
+                        "event"
+                    ))
+                return _evts_result
             if name == "task_complete":
                 sp = specialist or {}
                 comp_calendar = sp.get("calendar") or action.get("calendar", "tasks")
                 comp_uid      = sp.get("uid")      or action.get("uid", "")
                 if not comp_uid:
                     return {"error": "complete_task requires a UID — please specify which task"}
-                return await self.caldav.complete_task(comp_calendar, comp_uid)
+                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_complete", {
+                    "uid": comp_uid,
+                    "calendar": comp_calendar,
+                }))
             if name == "calendar_update":
                 sp = specialist or {}
-                import uuid as _uuid
                 upd_calendar    = sp.get("calendar")    or action.get("calendar", "personal")
                 upd_uid         = sp.get("uid")         or action.get("uid", "")
                 upd_summary     = sp.get("summary")     or action.get("summary", "")
@@ -3657,11 +4143,14 @@ class ExecutionEngine:
                 upd_end   = _normalise_dt(_upd_end_raw)   if _upd_end_raw   else ""
                 if not upd_uid:
                     return {"error": "update_event requires a UID — list events first to obtain one"}
-                return await self.caldav.update_event(
-                    calendar=upd_calendar, uid=upd_uid,
-                    summary=upd_summary, start=upd_start, end=upd_end,
-                    description=upd_description,
-                )
+                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_update", {
+                    "uid": upd_uid,
+                    "calendar": upd_calendar,
+                    "title": upd_summary,
+                    "start": upd_start,
+                    "end": upd_end,
+                    "description": upd_description,
+                }))
             if name in ("task_delete", "calendar_delete"):
                 sp = specialist or {}
                 del_calendar = sp.get("calendar") or action.get("calendar", "personal")
@@ -3669,8 +4158,14 @@ class ExecutionEngine:
                 if not del_uid:
                     return {"error": f"{name} requires a UID — please specify which item to delete"}
                 if name == "task_delete":
-                    return await self.caldav.delete_task(del_calendar, del_uid)
-                return await self.caldav.delete_event(del_calendar, del_uid)
+                    return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_delete", {
+                        "uid": del_uid,
+                        "calendar": del_calendar,
+                    }))
+                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_delete", {
+                    "uid": del_uid,
+                    "calendar": del_calendar,
+                }))
 
         if domain == "notes":
             sp = specialist or {}
@@ -3679,41 +4174,26 @@ class ExecutionEngine:
             # ── notes_list — also refreshes the session index ──────────────
             if name == "notes_list":
                 nb = await self.nanobot.run(_skill_nc, "notes_list", {})
-                # Build title→id index from result so subsequent ops can resolve by title
                 _idx_raw = (nb.get("result") or {}).get("notes") or nb.get("notes") or []
                 if _idx_raw:
-                    import time as _ti
-                    _idx = {}
-                    for _n in _idx_raw:
-                        _t = (_n.get("title") or "").strip()
-                        _i = _n.get("id")
-                        if _t and _i is not None:
-                            _idx[_t.lower()] = {"id": _i, "title": _t}
-                    if _idx:
-                        self._notes_index_cache = _idx
-                        self._notes_index_ts = _ti.time()
+                    await self._clear_item_index("note")
+                    await self._index_items(_idx_raw, "note")
                 return nb
 
             # ── Shared ID resolution: numeric ID first, then title lookup ──
             async def _resolve_note_id(note_id_val, search_title_val):
-                """Return (id_str, None) or (None, error_message).
-
-                note_id_val: numeric string → used directly as ID.
-                note_id_val: non-numeric string (title from fast-path target) → treated as search_title.
-                search_title_val: explicit title from specialist output.
-                """
+                """Return (id_str, None) or (None, error_message)."""
                 if note_id_val:
                     if str(note_id_val).strip().lstrip('-').isdigit():
-                        return str(note_id_val), None   # numeric → use as ID directly
-                    # Non-numeric: fast-path extracted a title string — treat as search
+                        return str(note_id_val), None
                     search_title_val = search_title_val or str(note_id_val)
                 if search_title_val:
-                    _idx = await self._notes_get_or_build_index()
-                    _nid, _err = self._notes_find_by_title(search_title_val, _idx)
+                    await self._notes_get_or_build_index()
+                    _nid, _err = await self._notes_find_by_title(search_title_val)
                     if _nid is not None:
                         return str(_nid), None
                     return None, _err
-                return None, None  # caller will provide its own "missing ID" error
+                return None, None
 
             # ── notes_read ─────────────────────────────────────────────────
             if name == "notes_read":
@@ -3736,7 +4216,7 @@ class ExecutionEngine:
                     "content":  sp.get("content")  or action.get("content", ""),
                     "category": sp.get("category") or action.get("category", ""),
                 })
-                self._notes_index_cache = {}  # invalidate — new note added
+                asyncio.create_task(self._clear_item_index("note"))
                 return nb
 
             # ── notes_update ───────────────────────────────────────────────
@@ -3757,7 +4237,7 @@ class ExecutionEngine:
                     "content":  sp.get("content")  or action.get("content", ""),
                     "category": sp.get("category") or action.get("category", ""),
                 })
-                self._notes_index_cache = {}  # invalidate — title may have changed
+                asyncio.create_task(self._clear_item_index("note"))
                 return nb
 
             # ── notes_delete ───────────────────────────────────────────────
@@ -3773,7 +4253,7 @@ class ExecutionEngine:
                 if not note_id:
                     return {"error": err or "delete_note requires a note ID or title — please specify which note"}
                 nb = await self.nanobot.run(_skill_nc, "notes_delete", {"note-id": note_id})
-                self._notes_index_cache = {}  # invalidate — note removed
+                asyncio.create_task(self._clear_item_index("note"))
                 return nb
 
             return {"status": "error", "error": f"Unhandled notes operation: name={name!r}"}
@@ -3872,12 +4352,12 @@ class ExecutionEngine:
                 if name == "ingest_file":
                     scan = nb.get("inline_scan", {})
                     if scan.get("risk_level") == "high":
-                        self._ledger.append({
-                            "action": "ingest_blocked",
-                            "path": path,
-                            "reason": "inline_scan high risk",
-                            "patterns": scan.get("patterns_found", []),
-                        })
+                        if self.ledger:
+                            self.ledger.append("ingest_blocked", "inbound", {
+                                "path": path,
+                                "reason": "inline_scan high risk",
+                                "patterns": scan.get("patterns_found", []),
+                            })
                         return {
                             "error": f"Ingest blocked: high-risk scan result — patterns: {scan.get('patterns_found')}",
                             "status": "error",
@@ -3975,6 +4455,30 @@ class ExecutionEngine:
                     "skipped":  nb.get("skipped", 0),
                     "_private": is_private,
                 }
+
+        # ── Cognitive skills — specialist synthesis, no external dispatch ──────
+        if domain == "session":
+            sp = specialist or {}
+            return {
+                "status":               "ok",
+                "session_summary":      sp.get("session_summary", ""),
+                "sign_off_message":     sp.get("sign_off_message", ""),
+                "open_tasks":           sp.get("open_tasks", []),
+                "memory_recommendation": sp.get("memory_recommendation", {}),
+                "github_push_recommended": sp.get("github_push_recommended", False),
+            }
+
+        if domain == "memory_curate":
+            sp = specialist or {}
+            return {
+                "status":     "ok",
+                "promote":    sp.get("promote", False),
+                "collection": sp.get("collection", ""),
+                "content":    sp.get("content", ""),
+                "confidence": sp.get("confidence", ""),
+                "gap_actions": sp.get("gap_actions", []),
+                "reasoning":  sp.get("reasoning", ""),
+            }
 
         if domain == "mail":
             # All mail ops route through nc-mail community skill (Nextcloud Mail REST API).
@@ -4077,6 +4581,24 @@ class ExecutionEngine:
                                or (delegation or {}).get("database_id") or action.get("database_id", ""))
                 from_addr   = sp.get("from_addr") or action.get("from_addr", "")
                 subject     = sp.get("subject")   or action.get("subject", "")
+                # If no database_id yet, search by sender/subject to resolve it before deleting.
+                # This enables natural "delete the Real Vision email" without requiring the user
+                # to quote the ID. The search uses supplied text; delete uses the resolved ID.
+                if not database_id and (from_addr or subject):
+                    _search_hint = from_addr or subject
+                    _search_nb = await self.nanobot.run(
+                        _skill_nc_mail, "list_unread",
+                        {"account": account, "filter": _search_hint,
+                         "unread_only": "false", "limit": 5, "timeout": _NC_MAIL_TIMEOUT},
+                    )
+                    _search_msgs = (_search_nb.get("messages") or []) if isinstance(_search_nb, dict) else []
+                    for _smsg in _search_msgs:
+                        _sfrom = (_smsg.get("from") or "")
+                        _ssubj = (_smsg.get("subject") or "")
+                        if (from_addr and from_addr.lower() in _sfrom.lower()) or \
+                           (subject and subject.lower() in _ssubj.lower()):
+                            database_id = str(_smsg.get("databaseId", ""))
+                            break
                 nb = await self.nanobot.run(
                     _skill_nc_mail, "delete_message",
                     {"account": account, "database_id": database_id,
@@ -4121,37 +4643,43 @@ class ExecutionEngine:
                 url = action.get("url") or prompt or ""
                 if not url:
                     return {"error": "url required for browser fetch"}
-                result = await self.browser.fetch(
-                    url=url,
-                    extract=action.get("extract", "text"),
+                nb = await self.nanobot.run(
+                    "sovereign-browser", "fetch",
+                    {"url": url, "extract": action.get("extract", "text"), "timeout": 60},
                 )
-                if result.get("status") == "ok":
-                    data = result.get("data", {})
+                if nb.get("status") == "ok":
+                    # nb["result"] is the flat a2a-browser FetchResponse fields
+                    flat = nb.get("result") if nb.get("result") is not None else nb
                     return {
                         "status": "ok",
-                        "url": data.get("url", ""),
-                        "title": data.get("title", ""),
-                        "content": data.get("content", ""),
-                        "content_length": data.get("content_length", 0),
-                        "fetch_sha256": data.get("fetch_sha256", ""),
+                        "url": flat.get("url", ""),
+                        "title": flat.get("title", ""),
+                        "content": flat.get("content", ""),
+                        "content_length": flat.get("content_length", 0),
+                        "fetch_sha256": flat.get("fetch_sha256", ""),
                     }
-                return result
+                return nb
 
             # action["query"] set by _delegation_to_action when quick_classify extracts the query;
             # prefer it over the full prompt (which may include "search the web for..." prefix).
             query = action.get("query") or prompt or ""
             if not query:
                 return {"error": "query required for browser search"}
-            result = await self.browser.search(
-                query=query,
-                locale=action.get("locale", payload.get("locale", "en-US")),
-                return_format=action.get("return_format", "full"),
-                test_mode=payload.get("test_mode", False),
+            nb = await self.nanobot.run(
+                "sovereign-browser", "search",
+                {
+                    "query":         query,
+                    "locale":        action.get("locale", payload.get("locale", "en-US")),
+                    "return_format": action.get("return_format", "full"),
+                    "test_mode":     payload.get("test_mode", False),
+                    "timeout":       60,
+                },
             )
             # Synthesise a human-readable response so the gateway can render it
-            if result.get("status") == "ok":
+            if nb.get("status") == "ok":
                 import urllib.parse as _up
-                enriched = result.get("data", {})
+                # nb["result"] is the flat a2a-browser SearchResponse fields
+                enriched = nb.get("result") if nb.get("result") is not None else {}
                 # Log signed ACK — proves sovereign-core received and accepted this specific result
                 if self.ledger:
                     try:
@@ -4165,7 +4693,6 @@ class ExecutionEngine:
                         pass
                 synth = enriched.get("sovereign_synthesis", {})
                 top_results = enriched.get("results", [])
-                nav = enriched.get("ai_navigation", {})
                 parts = []
                 summary = synth.get("summary", "")
                 if summary:
@@ -4179,8 +4706,8 @@ class ExecutionEngine:
                             host = _up.urlparse(url).netloc
                             parts.append(f"• {title} — {host}")
                 # follow_up_queries are AI navigation metadata — not Director-facing content
-                result["response"] = "\n".join(parts)
-            return result
+                nb["response"] = "\n".join(parts)
+            return nb
 
         if domain == "security":
             op = action.get("operation")
@@ -4525,7 +5052,7 @@ class ExecutionEngine:
                             with_vectors=False,
                         )
                         for _r in _cl_res:
-                            if (_r.payload or {}).get("_harness_checkpoint"):
+                            if (_r.payload or {}).get("_skill_harness_checkpoint"):
                                 _to_del.append(_r.id)
                         if _cl_next is None:
                             break
@@ -4882,7 +5409,26 @@ class ExecutionEngine:
                     )
                 except PermissionError as e:
                     return {"status": "error", "message": str(e)}
-                return {"status": "ok", "message": f"Stored: {fact}", "point_id": point_id}
+                # Confirm the MIP key that was generated so the Director can verify retrieval
+                _mip_key = None
+                try:
+                    _pts = await self.qdrant.archive_client.retrieve(
+                        collection_name=coll,
+                        ids=[point_id],
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    if _pts:
+                        _mip_key = _pts[0].payload.get("_key") or "(key generation pending)"
+                except Exception:
+                    pass
+                return {
+                    "status": "ok",
+                    "message": f"Stored: {fact}",
+                    "point_id": point_id,
+                    "mip_key": _mip_key,
+                    "collection": coll,
+                }
 
             return {"error": f"Unknown memory operation: {op}"}
 
@@ -4934,6 +5480,10 @@ class ExecutionEngine:
                 return {"status": "ok", "entry": entry}
 
             return {"error": f"Unknown memory_index operation: {op}"}
+
+        if domain == "memory_synthesise":
+            from memory.synthesis import run_synthesis
+            return await run_synthesis(self.qdrant, cog=self.cog)
 
         if domain == "wallet":
             if name == "wallet_read_config":
@@ -5014,7 +5564,7 @@ class ExecutionEngine:
             if name == "wallet_add_address":
                 _sp = specialist or {}
                 _addr = (delegation or {}).get("target") or _sp.get("address") or _sp.get("value") or ""
-                _label = _sp.get("label", "")
+                _label = _sp.get("label") or (delegation or {}).get("label", "")
                 _chain = _sp.get("chain", "eth")
                 _harness = _sp.get("harness", ["portfolio", "a2a"])
                 if not _addr:
@@ -5033,6 +5583,23 @@ class ExecutionEngine:
                 async with __import__("httpx").AsyncClient(timeout=10.0) as _wc:
                     _wr = await _wc.delete(f"{_sov_wallet}/watchlist/{_addr}", headers=_wt_headers)
                 return _wr.json() if _wr.status_code == 200 else {"status": "error", "error": f"HTTP {_wr.status_code}"}
+
+            if name == "wallet_update_address":
+                _sp = specialist or {}
+                _addr = (delegation or {}).get("target") or _sp.get("address") or ""
+                _label = _sp.get("label") or (delegation or {}).get("label", "")
+                if not _addr:
+                    return {"status": "error", "error": "address required"}
+                if not _label:
+                    return {"status": "error", "error": "new label required"}
+                async with __import__("httpx").AsyncClient(timeout=10.0) as _wc:
+                    _wr = await _wc.patch(f"{_sov_wallet}/watchlist/{_addr}",
+                                          json={"label": _label}, headers=_wt_headers)
+                if _wr.status_code == 200:
+                    _res = _wr.json()
+                    _res["address"] = _addr
+                    return _res
+                return {"status": "error", "error": f"HTTP {_wr.status_code}"}
 
             return {"error": f"Unknown wallet_watchlist action: {name}"}
 
@@ -5224,12 +5791,8 @@ class ExecutionEngine:
                 return {"status": "error",
                         "error": f"Failed to write browser-auth-profiles.yaml: {_e}"}
 
-            # Hot-reload in-memory AUTH_PROFILES for env vars already present
-            try:
-                from execution.adapters import browser as _bm
-                _bm.AUTH_PROFILES.update(_bm._load_auth_profiles_yaml())
-            except Exception:
-                pass
+            # AUTH_PROFILES hot-reload removed — BrowserAdapter deleted (Phase 1 adapter removal).
+            # New profiles are applied on the next sovereign-core restart.
 
             result = {
                 "status": "ok",
@@ -5289,7 +5852,15 @@ class ExecutionEngine:
                 # params field ({"trigger": "nightly"}) or defaulted to "explicit"
                 # for Director-initiated runs. Never inferred from message content.
                 _trigger = action.get("trigger", "explicit")
-                return await dh.run_phase1(trigger=_trigger)
+                # Pre-flight self-awareness snapshots — LOW tier, introspective.
+                # Called via _dispatch_inner directly; never re-enters handle_chat.
+                _skill_snap   = await self._dispatch_inner({"domain": "portal", "name": "skill_status"}, payload={})
+                _harness_snap = await self._dispatch_inner({"domain": "portal", "name": "harness_status"}, payload={})
+                _ledger = getattr(self, "ledger", None)
+                if _ledger:
+                    _ledger.append("portal_read", "introspective", {"tier": "LOW", "intent": "skill_status",   "source": "dev_harness"})
+                    _ledger.append("portal_read", "introspective", {"tier": "LOW", "intent": "harness_status", "source": "dev_harness"})
+                return await dh.run_phase1(trigger=_trigger, skill_snapshot=_skill_snap, harness_snapshot=_harness_snap)
             if op == "status":
                 return await dh.run_status()
             if op == "approve":
@@ -5364,6 +5935,61 @@ class ExecutionEngine:
                 }
             return {"error": f"Unknown dev_harness operation: {op}"}
 
+        if domain == "portal":
+            op = action.get("name", action.get("operation", ""))
+            if op == "skill_status":
+                skill_summary = getattr(getattr(self, "app_state", None), "skill_summary", None) or {}
+                if not skill_summary:
+                    skill_summary = getattr(getattr(self, "_app_state", None), "skill_summary", None) or {}
+                total_ops = 0
+                result_skills = []
+                for specialist, names in skill_summary.items():
+                    for name in names:
+                        result_skills.append({"name": name, "specialist": specialist})
+                return {
+                    "status": "ok",
+                    "skill_count": sum(len(v) for v in skill_summary.values()),
+                    "skills": result_skills,
+                    "summary": skill_summary,
+                }
+            if op == "harness_status":
+                from execution.adapters.qdrant import WORKING
+                harness_flags = {
+                    "developer_harness": "_developer_harness_checkpoint",
+                    "self_improvement":  "_self_improvement_session",
+                    "skill_harness":     "_skill_harness_checkpoint",
+                }
+                harness_states = {}
+                try:
+                    offset = None
+                    while True:
+                        result_pts, next_offset = await self.qdrant.client.scroll(
+                            collection_name=WORKING, limit=100, offset=offset,
+                            with_payload=True, with_vectors=False,
+                        )
+                        for r in result_pts:
+                            p = r.payload or {}
+                            for hkey, flag in harness_flags.items():
+                                if p.get(flag) and hkey not in harness_states:
+                                    harness_states[hkey] = {
+                                        "active": True,
+                                        "current_step": p.get("current_step"),
+                                        "last_checkpoint_ts": p.get("last_checkpoint_ts"),
+                                    }
+                        if next_offset is None:
+                            break
+                        offset = next_offset
+                except Exception as e:
+                    logger.warning("portal harness_status scroll failed: %s", e)
+                statuses = []
+                for hkey, flag in harness_flags.items():
+                    if hkey in harness_states:
+                        statuses.append({"harness": hkey, **harness_states[hkey]})
+                    else:
+                        statuses.append({"harness": hkey, "active": False})
+                return {"status": "ok", "harnesses": statuses}
+            return {"error": f"Unknown portal operation: {op}"}
+
         return {"error": f"Unknown domain: {domain}"}
 
     # ── CEO confidence override logging ──────────────────────────────────
@@ -5385,3 +6011,175 @@ class ExecutionEngine:
             collection=WORKING,
             writer="sovereign-core",
         )
+
+    # ── Outcome write-back (Beta-2 Task 6) ───────────────────────────────────
+
+    async def _outcome_write_back(
+        self,
+        intent: str,
+        action: dict,
+        result: dict,
+        routing_source: str,
+        delegation: dict,
+    ) -> None:
+        """Write execution outcome to episodic memory and update semantic intent stats.
+
+        Fires via asyncio.create_task() from _dispatch() — non-blocking, never raises.
+
+        Always writes an episodic entry.
+        Updates semantic:intent:{slug} success_count / failure_count /
+        consecutive_failure_count via set_payload() — lightweight, no re-embedding.
+        Resets consecutive_failure_count to 0 on success.
+        Fires _write_failure_prospective() at exactly consecutive_failure_count == 3.
+        """
+        if not self.qdrant:
+            return
+        try:
+            import uuid as _uuid
+            ts = datetime.now(timezone.utc).isoformat()
+            domain = action.get("domain", "")
+
+            # Determine outcome from result
+            is_success = (
+                "error" not in result
+                and result.get("status") not in ("error", "failed", "blocked")
+                and result.get("success", True) is not False
+                and not result.get("requires_security_confirmation")
+                and not result.get("requires_confirmation")
+            )
+            outcome = "success" if is_success else "failure"
+
+            # 1. Episodic entry — always
+            await self.qdrant.store(
+                content=(
+                    f"OUTCOME [{ts[:10]}] intent={intent!r} domain={domain!r} "
+                    f"outcome={outcome!r} routing_source={routing_source!r}"
+                ),
+                metadata={
+                    "type":              "episodic",
+                    "domain":            domain,
+                    "_key":              f"episodic:outcome:{ts[:10]}:{intent}",
+                    "intent":            intent,
+                    "outcome":           outcome,
+                    "routing_source":    routing_source,
+                    "execution_confirmed": is_success,
+                    "timestamp":         ts,
+                },
+                collection=EPISODIC,
+                writer="sovereign-core",
+            )
+
+            # 2. Update semantic:intent:{slug} counters — no re-embedding
+            slug    = intent.replace("_", "-")
+            sem_key = f"semantic:intent:{slug}"
+            sem     = await self.qdrant.retrieve_by_key(sem_key)
+            if not sem:
+                return
+
+            point_id   = _uuid.UUID(sem["point_id"])
+            collection = sem.get("collection", SEMANTIC)
+            success_count = int(sem.get("success_count", 0))
+            failure_count = int(sem.get("failure_count", 0))
+            consec_fail   = int(sem.get("consecutive_failure_count", 0))
+
+            new_payload: dict = {"last_outcome": outcome, "last_outcome_ts": ts}
+            if is_success:
+                success_count += 1
+                consec_fail    = 0
+                new_payload["success_count"]            = success_count
+                new_payload["consecutive_failure_count"] = 0
+            else:
+                failure_count += 1
+                consec_fail   += 1
+                new_payload["failure_count"]            = failure_count
+                new_payload["consecutive_failure_count"] = consec_fail
+                new_payload["last_failure_ts"]          = ts
+
+            await self.qdrant.archive_client.set_payload(
+                collection_name=collection,
+                payload=new_payload,
+                points=[point_id],
+            )
+
+            # 3. Consecutive failure alert — fire prospective + Telegram at EXACTLY 3
+            if not is_success and consec_fail == 3:
+                import asyncio as _asyncio_ob
+                _asyncio_ob.create_task(self._write_failure_prospective(
+                    intent=intent,
+                    slug=slug,
+                    sem_key=sem_key,
+                    ts=ts,
+                    total_failures=failure_count,
+                ))
+
+        except Exception as exc:
+            import logging as _lg
+            _lg.getLogger(__name__).debug("_outcome_write_back: failed (non-fatal): %s", exc)
+
+    async def _write_failure_prospective(
+        self,
+        intent: str,
+        slug: str,
+        sem_key: str,
+        ts: str,
+        total_failures: int,
+    ) -> None:
+        """Write prospective failure alert and send Telegram at consecutive_failure_count == 3.
+
+        Dedup gate: checks for existing prospective:failure_alert:{slug} entry before writing.
+        Non-blocking, never raises.
+        """
+        if not self.qdrant:
+            return
+        try:
+            alert_key = f"prospective:failure_alert:{slug}"
+            existing  = await self.qdrant.retrieve_by_key(alert_key)
+            if existing:
+                return   # active alert already in place for this intent
+
+            content = (
+                f"FAILURE ALERT: intent {intent!r} has failed 3 consecutive times. "
+                f"Last failure: {ts[:10]}. Total failures recorded: {total_failures}. "
+                f"Semantic entry: {sem_key}. Review and resolve before the alert clears."
+            )
+            await self.qdrant.store(
+                content=content,
+                metadata={
+                    "type":                     "prospective",
+                    "domain":                   "failure_alert",
+                    "_key":                     alert_key,
+                    "intent":                   intent,
+                    "last_failure_ts":          ts,
+                    "total_failures":           total_failures,
+                    "consecutive_failure_count": 3,
+                    "status":                   "pending_review",
+                    "timestamp":                ts,
+                },
+                collection=PROSPECTIVE,
+                writer="sovereign-core",
+            )
+
+            # Telegram notification — same pattern as task_scheduler._notify_telegram
+            import httpx as _httpx
+            _token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            _chat_id = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
+            if _token and _chat_id:
+                msg = (
+                    f"⚠️ *Failure Alert*\n"
+                    f"Intent `{intent}` has failed *3 consecutive times*.\n"
+                    f"Last failure: {ts[:10]}\n"
+                    f"Total failures: {total_failures}\n"
+                    f"Prospective entry written at `{alert_key}`."
+                )
+                try:
+                    async with _httpx.AsyncClient(timeout=10.0) as _hx:
+                        await _hx.post(
+                            f"https://api.telegram.org/bot{_token}/sendMessage",
+                            json={"chat_id": _chat_id, "text": msg, "parse_mode": "Markdown"},
+                        )
+                except Exception:
+                    pass   # Telegram failure must never propagate
+
+        except Exception as exc:
+            import logging as _lg
+            _lg.getLogger(__name__).debug("_write_failure_prospective: failed (non-fatal): %s", exc)
