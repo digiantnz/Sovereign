@@ -114,7 +114,7 @@ async def _load_si_session(qdrant) -> dict:
             )
             for r in result:
                 p = dict(r.payload or {})
-                if p.get("_si_session"):
+                if p.get("_self_improvement_session"):
                     return p
             if next_offset is None:
                 break
@@ -123,7 +123,7 @@ async def _load_si_session(qdrant) -> dict:
         logger.warning("SIHarness: _load_si_session failed: %s", e)
     # Default fresh session
     return {
-        "_si_session": True,
+        "_self_improvement_session": True,
         "cycle_count": 0,
         "last_observe_ts": None,
         "last_baseline_update_ts": None,
@@ -149,7 +149,7 @@ async def _save_si_session(qdrant, session: dict) -> None:
                 with_vectors=False,
             )
             for r in result:
-                if (r.payload or {}).get("_si_session"):
+                if (r.payload or {}).get("_self_improvement_session"):
                     to_delete.append(r.id)
             if next_offset is None:
                 break
@@ -162,7 +162,7 @@ async def _save_si_session(qdrant, session: dict) -> None:
         # Write fresh session
         await qdrant.store(
             content="self_improvement:session",
-            metadata={**session, "_si_session": True, "type": "si_session"},
+            metadata={**session, "_self_improvement_session": True, "type": "self_improvement_session"},
             collection=WORKING,
         )
     except Exception as e:
@@ -343,7 +343,7 @@ async def _collect_prospective_stats(qdrant) -> dict:
     """Check prospective tasks: active tasks that have never executed.
     Returns {never_executed: [task_ids], execution_rate: float}.
     """
-    from execution.adapters.qdrant import PROSPECTIVE, EPISODIC
+    from execution.adapters.qdrant import PROSPECTIVE
     try:
         # Scroll all active prospective tasks
         p_result, _ = await qdrant.archive_client.scroll(
@@ -355,36 +355,29 @@ async def _collect_prospective_stats(qdrant) -> dict:
             with_payload=True,
             with_vectors=False,
         )
-        active_tasks = [(str(r.id), dict(r.payload or {})) for r in p_result]
 
-        if not active_tasks:
+        if not p_result:
             return {"never_executed": [], "execution_rate": 1.0, "active_count": 0}
 
-        # Scroll episodic for task execution history
-        e_result, _ = await qdrant.archive_client.scroll(
-            collection_name=EPISODIC,
-            scroll_filter=Filter(must=[
-                FieldCondition(key="event_type", match=MatchValue(value="task_run")),
-            ]),
-            limit=500,
-            with_payload=True,
-            with_vectors=False,
-        )
-        executed_task_ids = {
-            dict(r.payload or {}).get("task_id")
-            for r in e_result
-        }
+        # Use last_run from PROSPECTIVE payload — set by the scheduler after every execution.
+        # Prior approach cross-joined PROSPECTIVE point UUIDs against EPISODIC payload task_ids,
+        # which never matched (qdrant.store() generates its own point UUID independent of the
+        # task_id field), causing every active task to always appear as never-executed.
+        never_executed = []
+        for r in p_result:
+            payload = dict(r.payload or {})
+            if not payload.get("last_run"):
+                never_executed.append({
+                    "task_id": payload.get("task_id") or str(r.id),
+                    "title": payload.get("title", "unknown"),
+                })
 
-        never_executed = [
-            {"task_id": tid, "title": payload.get("title", "unknown")}
-            for tid, payload in active_tasks
-            if tid not in executed_task_ids
-        ]
-        exec_rate = 1.0 - (len(never_executed) / len(active_tasks)) if active_tasks else 1.0
+        active_count = len(p_result)
+        exec_rate = 1.0 - (len(never_executed) / active_count) if active_count else 1.0
         return {
             "never_executed": never_executed,
             "execution_rate": round(exec_rate, 3),
-            "active_count": len(active_tasks),
+            "active_count": active_count,
         }
     except Exception as e:
         logger.warning("SIHarness: _collect_prospective_stats failed: %s", e)

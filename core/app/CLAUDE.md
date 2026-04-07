@@ -234,6 +234,29 @@ sovereign:
 
 ---
 
+## Universal Item Index (`execution/engine.py`)
+
+Session-scoped index of all items Rex processes that have a stable native ID (notes, events, emails, files, tasks). Stored as zero-vector Qdrant entries in working_memory — filter-only lookup, no semantic search, zero context_window cost.
+
+### Key design decisions
+- **Point ID = UUID5** — `uuid5(NAMESPACE="7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d", "{item_type}:{item_id}")`. Deterministic: same item always maps to the same Qdrant point → upsert is idempotent, no duplicates on re-index.
+- **item_id is the native system ID** — email `uid`, note `id`, CalDAV `uid`, file path. Not a Sovereign-generated UUID. This is also the "system-wide ID" for cross-referencing items within a session.
+- **Zero vector** — `[0.0] * 768`. These entries are never retrieved by vector search; always by payload filter (`_item_index: True`, `item_type`).
+- **Blob results** (RSS entries, web search, file content) — stored as episodic entries with real embed vectors, not item index entries. Promotable to RAID via `shutdown_promote()`. Use `_store_content_ref()`.
+
+### Methods
+- `_index_items(items, item_type)` — batch upsert; builds UUID5 point IDs; auto-called after list operations
+- `_lookup_item(title, item_type)` — scroll filter; exact→substring→reverse-substring title match
+- `_clear_item_index(item_type)` — delete all index entries for a given type (call after delete ops to invalidate stale entries)
+
+### Auto-index triggers
+- `list_notes` → indexes all notes as `item_type="note"`
+- `fetch_email` / `list_inbox` → indexes messages as `item_type="email"`
+- `list_files` → indexes files as `item_type="file"`
+- `list_events` → indexes events as `item_type="event"`
+
+---
+
 ## Task Scheduler (`scheduling/task_scheduler.py`)
 
 - Data-driven — no task-specific code

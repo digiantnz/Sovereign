@@ -247,6 +247,25 @@ async function removeAddress(address) {
   return true;
 }
 
+async function updateAddress(address, updates) {
+  const addr  = address.toLowerCase();
+  const entry = _watchlist.get(addr);
+  if (!entry) return null;
+  const pointId = entry._point_id || _addrId(addr);
+  const patch   = {};
+  if (updates.label !== undefined) patch.label = updates.label;
+  const res = await fetch(`${QDRANT_URL}/collections/${COLLECTION}/points/payload?wait=true`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ payload: patch, points: [pointId] }),
+  });
+  if (!res.ok) throw new Error(`Qdrant set_payload HTTP ${res.status}`);
+  const updated = { ...entry, ...patch };
+  _watchlist.set(addr, updated);
+  log(`updated ${addr.slice(0, 10)}… label → ${patch.label || '(unchanged)'}`);
+  return updated;
+}
+
 // ── Accessors ─────────────────────────────────────────────────────────────────
 
 function getAll()              { return [..._watchlist.values()]; }
@@ -281,6 +300,7 @@ module.exports = {
   seedFromConfig,
   addAddress,
   removeAddress,
+  updateAddress,
   getAll,
   getConfig,
   getByAddress,

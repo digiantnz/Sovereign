@@ -115,6 +115,18 @@ app.delete('/watchlist/:address', _requireInternalToken, async (req, res) => {
   res.json({ status: 'ok', removed });
 });
 
+app.patch('/watchlist/:address', _requireInternalToken, async (req, res) => {
+  const { label } = req.body;
+  if (!label) return res.status(400).json({ error: 'label is required' });
+  try {
+    const updated = await watchlist.updateAddress(req.params.address, { label });
+    if (!updated) return res.status(404).json({ error: 'address not in watchlist' });
+    res.json({ status: 'ok', entry: updated });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/check', _requireInternalToken, async (req, res) => {
   const { address } = req.body;
   if (!address) return res.status(400).json({ error: 'address required' });

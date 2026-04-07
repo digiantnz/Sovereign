@@ -250,6 +250,32 @@ class TaskScheduler:
 
     # ── Task storage ──────────────────────────────────────────────────────
 
+    async def find_active_by_title(self, title: str) -> dict | None:
+        """Return the first active PROSPECTIVE entry whose title contains any word
+        from *title* (≥5 chars) — used to detect duplicate recurring tasks.
+        Returns the point payload or None.
+        """
+        try:
+            words = [w for w in title.lower().split() if len(w) >= 5]
+            if not words:
+                return None
+            results, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="status", match=MatchValue(value="active")),
+                ]),
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in results:
+                pt_title = (pt.payload.get("title") or "").lower()
+                if any(w in pt_title for w in words):
+                    return {"point_id": str(pt.id), **pt.payload}
+        except Exception as e:
+            logger.warning("TaskScheduler: find_active_by_title failed: %s", e)
+        return None
+
     async def store_task(self, task_def: dict, human_confirmed: bool = False) -> dict:
         """Write a validated task to Qdrant.
 
@@ -261,6 +287,20 @@ class TaskScheduler:
         """
         task_id    = str(uuid.uuid4())
         title      = task_def.get("title", "Unnamed task")
+
+        # ── Duplicate guard: refuse if an active task with overlapping title exists ──
+        existing = await self.find_active_by_title(title)
+        if existing:
+            return {
+                "status": "duplicate",
+                "message": (
+                    f"An active task already exists with a similar title: "
+                    f"'{existing.get('title')}' (task_id={existing.get('task_id')}). "
+                    f"Cancel it first, or ask to update it."
+                ),
+                "existing_task_id": existing.get("task_id"),
+                "existing_title":   existing.get("title"),
+            }
         schedule   = task_def.get("schedule", {})
         steps      = task_def.get("steps", [])
         notify_when = task_def.get("notify_when", "always")
@@ -452,6 +492,91 @@ class TaskScheduler:
             )
             return False
 
+    async def seed_nightly_synthesis_task(self) -> bool:
+        """Seed the nightly memory synthesis task at startup. Idempotent.
+
+        Registers a cron task (0 15 * * * — 15:00 UTC = 03:00 NZST) that runs
+        memory_synthesise with no additional params.
+
+        Idempotency: checks PROCEDURAL for an existing entry with
+        intent=memory_synthesise step, then verifies its PROSPECTIVE status is active.
+
+        notify_when="always": synthesis results (entry counts) are meaningful to Director.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Nightly Memory Synthesis"
+
+        try:
+            proc_items, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROCEDURAL,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="type", match=MatchValue(value="task_procedure")),
+                ]),
+                limit=50,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for _pi in proc_items:
+                _pp = dict(_pi.payload or {})
+                _existing_tid = _pp.get("task_id")
+                if not _existing_tid:
+                    continue
+                for _step in _pp.get("steps", []):
+                    if _step.get("intent") == "memory_synthesise":
+                        prosp_items, _ = await self.qdrant.archive_client.scroll(
+                            collection_name=PROSPECTIVE,
+                            scroll_filter=Filter(must=[
+                                FieldCondition(key="task_id", match=MatchValue(value=_existing_tid)),
+                                FieldCondition(key="status",  match=MatchValue(value="active")),
+                            ]),
+                            limit=2,
+                            with_payload=False,
+                            with_vectors=False,
+                        )
+                        if prosp_items:
+                            logger.info(
+                                "TaskScheduler: nightly synthesis task already active (task_id=%s) — skipping seed",
+                                _existing_tid[:8],
+                            )
+                            return False
+        except Exception as _e:
+            logger.debug("seed_nightly_synthesis_task: idempotency check failed: %s", _e)
+
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                "cron": "0 15 * * *",  # 15:00 UTC = 03:00 NZST (fixed offset, no tz lib)
+            },
+            "steps": [
+                {
+                    "intent": "memory_synthesise",
+                    "params": {},
+                    "description": (
+                        "Scan episodic archive to discover associative (same_intent_variant, "
+                        "co_occurs_with) and relational (mixed-outcome) patterns. "
+                        "Writes new entries; skips duplicates. LOW tier — no Director confirmation."
+                    ),
+                }
+            ],
+            "notify_when": "always",
+            "stop_condition": None,
+        }
+
+        result = await self.store_task(task_def, human_confirmed=True)
+        if result.get("status") in ("ok", "partial"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s next_due=%s",
+                _TASK_TITLE, result.get("task_id"), result.get("next_due"),
+            )
+            return True
+        else:
+            logger.warning(
+                "TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result
+            )
+            return False
+
     # ── Task listing ──────────────────────────────────────────────────────
 
     async def list_tasks(self, status_filter: str = "active") -> dict:
@@ -617,6 +742,10 @@ class TaskScheduler:
             params = step.get("params", {})
             description = step.get("description", intent)
 
+            # Dynamic date substitution: "today" → current UTC date ISO string
+            _today_str = datetime.now(timezone.utc).date().isoformat()
+            params = {k: (_today_str if v == "today" else v) for k, v in params.items()}
+
             # Build action dict from INTENT_ACTION_MAP (imported locally to avoid circular)
             from execution.engine import INTENT_ACTION_MAP
             base_action = INTENT_ACTION_MAP.get(intent, {"domain": "ollama", "operation": "query"})
@@ -661,12 +790,21 @@ class TaskScheduler:
                 break
 
         # Determine outcome and whether to notify
+        def _result_has_content(res: dict) -> bool:
+            if not isinstance(res, dict):
+                return False
+            return bool(
+                res.get("count", 0) > 0
+                or res.get("messages")
+                or res.get("response")
+                or res.get("results")
+                or res.get("data")        # browser fetch: {"status":"ok","data":{"content":...}}
+                or res.get("notes")       # nextcloud notes list
+                or res.get("events")      # caldav events
+                or res.get("files")       # file listings
+            )
         has_content = any(
-            r.get("status") == "ok"
-            and (r.get("result", {}).get("count", 0) > 0
-                 or r.get("result", {}).get("messages")
-                 or r.get("result", {}).get("response")
-                 or r.get("result", {}).get("results"))
+            r.get("status") == "ok" and _result_has_content(r.get("result", {}))
             for r in step_results
         )
         errors = [r for r in step_results if r.get("status") == "error"]
@@ -678,18 +816,83 @@ class TaskScheduler:
             or (notify_when == "on_error" and errors)
         )
 
+        def _format_step_content(r: dict) -> str:
+            """Expand step result into readable content lines for briefing output."""
+            if r.get("status") != "ok":
+                return r.get("error", "no detail")
+            res = r.get("result", {})
+            if not isinstance(res, dict):
+                return "no detail"
+
+            # Email messages — show sender, subject, uid
+            messages = res.get("messages", [])
+            if messages:
+                lines = [f"{len(messages)} messages"]
+                for i, m in enumerate(messages[:25], 1):
+                    uid = m.get("uid") or m.get("message_id") or m.get("id", "?")
+                    sender = (m.get("from") or m.get("sender") or "?")[:60]
+                    subject = m.get("subject", "(no subject)")[:80]
+                    lines.append(f"  {i}. {sender} — {subject} [uid:{uid}]")
+                return "\n".join(lines)
+
+            # RSS entries — show title + URL
+            entries = res.get("entries", [])
+            if entries:
+                lines = [f"{len(entries)} headlines"]
+                for i, e in enumerate(entries[:20], 1):
+                    etitle = e.get("title", "(no title)")[:100]
+                    eurl = e.get("url") or e.get("link", "")
+                    lines.append(f"  {i}. {etitle}")
+                    if eurl:
+                        lines.append(f"     {eurl}")
+                return "\n".join(lines)
+
+            # CalDAV events — show summary + start time
+            events = res.get("events", [])
+            if isinstance(events, list):
+                if not events:
+                    return "no events"
+                lines = [f"{len(events)} events"]
+                for e in events[:15]:
+                    esummary = e.get("summary") or e.get("title", "(no title)")
+                    estart = e.get("dtstart") or e.get("start", "")
+                    lines.append(f"  • {esummary}" + (f" — {estart}" if estart else ""))
+                return "\n".join(lines)
+
+            # CalDAV tasks — show summary + due
+            tasks = res.get("tasks", [])
+            if tasks:
+                lines = [f"{len(tasks)} tasks"]
+                for t in tasks[:15]:
+                    tsummary = t.get("summary", "(no summary)")
+                    tdue = t.get("due", "")
+                    lines.append(f"  • {tsummary}" + (f" (due {tdue})" if tdue else ""))
+                return "\n".join(lines)
+
+            # Browser fetch content
+            data_content = (res.get("data") or {}).get("content", "")
+            if data_content:
+                return data_content[:600]
+
+            # Plain response text
+            response = res.get("response", "")
+            if response:
+                return response[:600]
+
+            # Count fallback
+            if "count" in res:
+                return f"{res['count']} results (no detail available)"
+
+            return "no detail"
+
         # Build summary for notification + episodic
         summary_parts = [f"*Scheduled task: {title}*", ""]
         for r in step_results:
             status_icon = "✅" if r.get("status") == "ok" else "❌"
-            res = r.get("result", {})
-            detail = (
-                res.get("response", "")[:300]
-                or (f"{res.get('count', 0)} results" if "count" in res else "")
-                or (f"{len(res.get('messages', []))} messages" if "messages" in res else "")
-                or r.get("error", "no detail")
-            )
-            summary_parts.append(f"{status_icon} {r['description']}: {detail}")
+            content = _format_step_content(r)
+            summary_parts.append(f"{status_icon} *{r['description']}*")
+            summary_parts.append(content)
+            summary_parts.append("")
 
         if stop_triggered:
             summary_parts.append("\n_Stop condition met — task halted early._")

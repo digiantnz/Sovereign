@@ -8,6 +8,34 @@
 
 ---
 
+## Standing Design Orders
+
+These rules apply in every session. They are not negotiable and cannot be overridden by inline task instructions.
+
+1. **OpenClaw skill exists → Skill Harness install.** If an OpenClaw equivalent skill exists for a capability, install it via the Skill Harness and execute via nanobot-01. Never build bespoke when a certified community skill covers the need.
+
+2. **No OpenClaw skill → bespoke, single canonical location.** If no OpenClaw equivalent exists, implement as a bespoke module at one location appropriate to its architecture. Do not install partial duplicates.
+
+3. **One implementation, one invocation point — no duplicates regardless of location.** The same capability must never exist in two places (e.g. inline in engine.py AND in a nanobot skill). If it exists in two places it is a bug to be fixed, not a pattern to follow.
+
+4. **Updates go to the canonical location only.** No shadow copies, no inline patches. Find the canonical file and edit it. Never update a copy.
+
+5. **Engine.py is orchestration only.** Capability logic belongs in skill modules or dedicated harness modules. Engine.py may extract parameters, route, and normalise responses — it must not implement capability logic inline.
+
+6. **Every skill (nanobot or bespoke) has exactly one semantic memory entry pointing to its canonical trigger.** Key format: `semantic:intent:{slug}`.
+
+7. **New skill created or installed → semantic memory entry written at that time.** The Skill Harness install step writes the entry automatically. Bespoke modules must write their entry in their own creation task.
+
+8. **New component created → sov_id assigned + semantic memory entry written at that time.** No component is fully created until its semantic entry exists.
+
+9. **Deprecation → episodic entry written, semantic entry marked inactive, no deletion.** Inactive entries remain for historical integrity. Never delete semantic or episodic entries.
+
+10. **Updates to existing skills → modify in place at canonical location only.** No new file, no versioned copy, no shadow. The canonical file is the source of truth.
+
+11. **Foundational entities use `entity_type`; system components use `component_type`. Never both on the same entry.** A foundational entity (`sovereign_entity` class) qualifies for a sequential sov_id only if it: (1) exists independently of Sovereign, (2) is bootstrap critical, (3) has a durable named relationship to the sovereign root, and (4) has been explicitly approved by the Director. Sequential sov_ids are assigned in `entity_registry.py` (append-only, never re-assigned). All other entities receive UUID5 sov_ids. The sovereign root entry is `semantic:entity:sovereign` (not `semantic:component:sovereign`).
+
+---
+
 ## Core Philosophy
 - **tmpfs (`sovereign_runtime` Docker volume, 4GB)** — ephemeral RAM scratch; qdrant working_memory storage + sovereign-core session data; lost on restart by design
 - **RAID5 (`/home/sovereign`)** — subconscious/durable truth; governance, memory, audit, backups; all 7 sovereign Qdrant collections
@@ -262,7 +290,7 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | 6.5 | **COMPLETE** | Skill Lifecycle Manager: SEARCH/REVIEW/LOAD/AUDIT, security review pipeline, config change notification |
 | 6.6 | **COMPLETE** | Skills domain in governance.json, GovernanceEngine.get_intent_tier(), skill_install composite, procedural memory seed |
 | 7 | **COMPLETE** | Generalised task scheduler: NL→TaskDefinition, Qdrant PROSPECTIVE+PROCEDURAL+EPISODIC, 60s executor |
-| W1+W2 | **BUILT — pending first boot** | sov-wallet, BIP-39 keygen, HKDF+AES-256-GCM, EIP-712 SafeTx, get_btc_xpub |
+| W1+W2 | **COMPLETE** | sov-wallet, BIP-39 keygen, HKDF+AES-256-GCM, EIP-712 SafeTx, get_btc_xpub. First boot confirmed 2026-03-31. |
 | OC-S1–S3.1 | **COMPLETE** | Python adapters, nanobot-01 sidecar, Model B DSL, broker CLI exec |
 | OC-S4 | **COMPLETE** | Community skills (imap-smtp-email, openclaw-nextcloud), skill_install flow, confirmed-continuation bypass |
 | OC-S5 | **COMPLETE** | nanobot-01 as primary executor, CredentialProxy single-use token delegation |
@@ -280,8 +308,8 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | Email-Fix | **COMPLETE** | Delete + move ops; numbered email list pre-formatter (`N. Sender — Subject (Date) [uid:XXXX]`); `_original_request` preservation for confirmed-continuation; account carry-forward from context_window; `fetch_message` fast-path; file listing post-formatter |
 | NC-Mail | **COMPLETE** | `nc-mail` python3_exec skill (9 ops). Stable `databaseId` integers. Personal inbox graceful timeout (57s cap, `status:"ok"` with note). Client-side filter for search. Deterministic ID extraction in `_quick_classify`. `_DIAGNOSTIC_INTENTS` for delete/move/send with outcome stamps. `_unwrap_nb` preserves status/success for `execution_confirmed`. T-M1–T-M7 all passing 2026-03-25. |
 | NC-Notes | **COMPLETE** | 5 ops (notes_list/read/create/update/delete) added to nextcloud.py + SKILL.md + governance.json (v1.16) + engine.py. All 6 tests T1–T6 passing 2026-03-24. |
-| Notes-Index | **BUILT — PENDING UAT** | Session-scoped title→ID index on ExecutionEngine (5 min TTL). `_notes_get_or_build_index()` + `_notes_find_by_title()` (exact→substring→reverse-substring match). Index built on `list_notes`; auto-fetched cold on read/update/delete by title. Note-suffix classifier: "read/delete/update the [title] note" → deterministic regex extracts title → stored in `delegation["target"]`. `_resolve_note_id()` handles numeric vs title strings. Routing fixes: "list all the notes", "list the notes from nextcloud" → list_notes. `create/update/delete_note` added to `_DIAGNOSTIC_INTENTS` — IDs now shown in response. Delete fast-path now extracts numeric ID; `_original_request` regex fallback in delete dispatch. Matt live-tested 2026-03-24: list ✓ create ✓ update-by-ID ✓ delete-by-ID needs UAT. |
-| NC-Index-Universal | **PROPOSAL** | Extend the title→ID index pattern to all Nextcloud item types (calendar events, tasks, mail). Each item type has its own scoped index (notes_index, calendar_index, mail_index) built on list operations. Disambiguation is NOT a problem — intent routing already separates "read the dentist note" (read_note) from "cancel the dentist appointment" (delete_event). Item type is determined by the verb+noun pattern before the title lookup. Calendar index is harder: events can have duplicate titles (multiple "dentist" entries on different dates) — index entry would need to include date + title. Mail already has sender/subject/date as natural keys; a title index is less useful. Priority: Notes-Index UAT first, then assess. |
+| Notes-Index | **COMPLETE** | Session-scoped title→ID index on ExecutionEngine (5 min TTL). `_notes_get_or_build_index()` + `_notes_find_by_title()` (exact→substring→reverse-substring match). Index built on `list_notes`; auto-fetched cold on read/update/delete by title. Note-suffix classifier: "read/delete/update the [title] note" → deterministic regex extracts title → stored in `delegation["target"]`. `_resolve_note_id()` handles numeric vs title strings. UAT complete 2026-03-31: list ✓ create ✓ update-by-ID ✓ delete-by-title ✓. |
+| NC-Index-Universal | **COMPLETE** | Universal Item Index in working_memory. All items Rex processes with a stable ID (notes, events, emails, files) are indexed as zero-vector Qdrant entries (`_item_index: True`). Point IDs are deterministic UUID5(`namespace`, `"{item_type}:{item_id}"`) — idempotent re-indexing. `_index_items()`, `_lookup_item()`, `_clear_item_index()` on ExecutionEngine. Content blobs (web search, RSS, file reads) stored as episodic entries with real embed vectors (promotable to RAID). 2026-03-31. |
 | Skill-Harness | **COMPLETE** | Stateful multi-step skill lifecycle harness in engine.py + working_memory. search→list→review→install→clear. Pre-scan gate, WM checkpoint, HIGH-tier confirm gate. E2E tested 2026-03-23. |
 | SI-Harness | **COMPLETE** | Self-improvement harness (monitoring/self_improvement.py). Daily observe loop, baseline+anomaly detection, proposal generation with Director approval gate. Primary autonomy boundary. 2026-03-23. |
 | Dev-Harness | **COMPLETE** | 4-phase code quality harness (Analyse→Classify→Plan→Execute). pylint+semgrep+boundary_scanner+GitHub Actions. LLM advisory (Ollama+Claude escalation via DCL). CC runsheet HITL handoff. Memory integration: episodic/meta/semantic/prospective. Nightly cron 14:00 UTC. Self-scan: 0 findings. 2026-03-25. |
@@ -290,8 +318,11 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | Skill-Install-Hardening | **COMPLETE** | Scanner false-positive fixes: `identity_override` + `prompt_injection_regex` removed from `_INJECT_HARD_BLOCK` (legitimately appear in security docs). LLM review removed from Phase B — Director confirmation is the security gate. OpenClaw certification: `certified=True` for `github.com/openclaw/skills`. `_install_select_best` deterministic for single certified candidate. Confirm gate shows clawhub.ai scan (llmAnalysis + vtAnalysis from SSR HTML). Hard-block on malicious/suspicious clawhub verdict. NL routing simplified. 2026-03-28. |
 | WDK-Skill | **COMPLETE** | Tether Wallet Development Kit skill installed from OpenClaw registry (certified). Active for: research_agent. 2026-03-28. |
 | Wallet-A2A-Rail | **COMPLETE** | `wallet/credit` push notification in `/wallet_event` endpoint (`main.py`). Full sequence: dedup (Qdrant `domain: wallet.a2a_credit`, UUID5 point ID) → mark seen IMMEDIATELY before normalisation → CoinGecko USD price (failure blocks, never estimate) → A2A 3.0 `wallet/credit` payload with Ed25519 sig → POST `{A2A_BROWSER_URL}/run` with `X-API-Key` → retry once (background asyncio.create_task, 30s delay) → alert Director on permanent failure. `duplicate: true` from a2a-browser is not an error. MIP seeds added: `semantic:network:endpoints:a2a-browser` + `semantic:wallet:pricefeed:coingecko`. 2026-03-28. |
+| UAT-S1 | **COMPLETE** | Full UAT session 2026-03-31: weather ✓, browser ✓, nextcloud-ingest ✓, notes-index-delete ✓, security-audit ✓, memory-curate ✓, session-wrap-up (routing fixed). Attachment upload chain fixed (3 bugs: `_ledger` attr, argparse hyphens→underscores, WebDAV URL encoding for spaces). `delete_note` tier HIGH→MID. `ingest_status` routing moved before `ingest` keyword block. |
+| Scheduler-TZ-Fix | **COMPLETE** | Task scheduler NZ timezone fix. `task_intent_parser` prompt: mandatory UTC conversion rules (NZST=UTC+12, NZDT=UTC+13), corrected cron examples, `read_feed`+`list_events` added to available intents. `_execute_task`: dynamic `"today"` substitution in step params. `store_task`: dedup guard via `find_active_by_title()` — refuses duplicate active tasks. Gateway context FIFO (`write_gateway_context`/`get_gateway_context`) removed from qdrant.py + engine.py (redundant with context_window). Weekday Morning Briefing task created: cron `30 20 * * 0-4` UTC = Mon-Fri 8:30 AM NZST; steps: personal email → business email → news → today's calendar events. 7 stale briefing tasks cancelled. 2026-03-31. |
 | PM-Harness | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Full SDLC project management harness against sovereign semantic memory. Proposal in prospective memory. Requires Dev-Harness first. |
 | Retry-Logic | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Exponential backoff (max 3) for all harnesses, surface failure to Director. Proposal in prospective memory. |
+| Adapter-Removal | **COMPLETE** | Removed BrowserAdapter, WebDAVAdapter, CalDAVAdapter from sovereign-core. All application I/O through nanobot-01 only. Phase 1 Browser 2026-04-03, Phase 2 WebDAV 2026-04-03, Phase 3 CalDAV 2026-04-03. |
 
 Full phase history: `docs/CLAUDE-archive.md`
 
@@ -333,7 +364,7 @@ Multi-step skills MUST write a checkpoint to `working_memory` at each validation
     "review": {"verdict": "approve", "risk_level": "low", "ts": "..."}
   },
   "last_checkpoint_ts": "...",
-  "_harness_checkpoint": true
+  "_skill_harness_checkpoint": true
 }
 ```
 
@@ -369,7 +400,7 @@ All future multi-step capabilities in sovereign-core follow this pattern. A harn
 {capability}:session      # e.g. skill_harness:session, self_improvement:session
 ```
 
-The session payload flag (`_harness_checkpoint`, `_si_session`, etc.) distinguishes the record type in working_memory scrolls. All session keys are ephemeral — they live in working_memory (NVMe in-process RAM) and are re-established on demand.
+The session payload flag (`_skill_harness_checkpoint`, `_self_improvement_session`, etc.) distinguishes the record type in working_memory scrolls. All session keys are ephemeral — they live in working_memory (NVMe in-process RAM) and are re-established on demand.
 
 ### Standard checkpoint format
 
@@ -386,7 +417,7 @@ The session payload flag (`_harness_checkpoint`, `_si_session`, etc.) distinguis
 }
 ```
 
-`{flag_key}` is the unique bool field used to identify this checkpoint type when scrolling working_memory (e.g. `_harness_checkpoint`, `_si_session`).
+`{flag_key}` is the unique bool field used to identify this checkpoint type when scrolling working_memory (e.g. `_skill_harness_checkpoint`, `_self_improvement_session`).
 
 ### Step sequence rules
 
@@ -417,9 +448,9 @@ All harness intents are added to the translator bypass list so structured output
 
 | Harness | Session key flag | Steps | Notes |
 |---------|-----------------|-------|-------|
-| Skill-Harness (`/install`) | `_harness_checkpoint` | search → LLM select → confirm → scan → install | Single Director gate: confirm before scan+install |
-| SI-Harness | `_si_session` | observe (daily auto) → propose (auto-triggered) | Director approves proposals; never self-modifies |
-| Dev-Harness | `_dev_harness` | analyse → status → approve/reject → verify → clear | Nightly cron; Director approves findings |
+| Skill-Harness (`/install`) | `_skill_harness_checkpoint` | search → LLM select → confirm → scan → install | Single Director gate: confirm before scan+install |
+| SI-Harness | `_self_improvement_session` | observe (daily auto) → propose (auto-triggered) | Director approves proposals; never self-modifies |
+| Dev-Harness | `_developer_harness_checkpoint` | analyse → status → approve/reject → verify → clear | Nightly cron; Director approves findings |
 
 ### /command harness architecture
 
@@ -482,3 +513,78 @@ curl -s -X POST http://localhost:8000/query \
   -H "Content-Type: application/json" \
   -d '{"action":{"domain":"docker","operation":"workflow","name":"restart"},"tier":"MID"}'
 ```
+
+---
+
+## Plan: Adapter Removal — Browser → WebDAV → CalDAV
+
+**Principle**: No duplicate of what nanobot does. All application I/O (browser, Nextcloud files, calendar/tasks) routes through nanobot-01. Direct adapters in sovereign-core are legacy and must be removed.
+
+**Context**: BrowserAdapter was calling `POST /run` (non-existent on a2a-browser) — fixed to use `POST /search` / `POST /fetch` in session 2026-04-01. Adapters exist at `core/app/execution/adapters/browser.py`, `core/app/adapters/webdav.py`, `core/app/adapters/caldav.py`.
+
+---
+
+### Phase 1: Browser (do first)
+
+**What needs adding to nanobot** — `sovereign-browser` SKILL.md exists but has no python3_exec script; currently routes through BrowserAdapter.
+
+1. Add `secrets/browser.env` to nanobot-01 `env_file` in `compose.yml` — injects `A2A_BROWSER_URL` + `A2A_SHARED_SECRET`
+2. Create `nanobot-01/workspace/skills/sovereign-browser/scripts/browser.py` — stdlib+requests, commands: `search` (POST `/search`) and `fetch` (POST `/fetch`) against a2a-browser; read `A2A_BROWSER_URL` + `A2A_SHARED_SECRET` from env; output flat JSON matching a2a-browser response schema
+3. Update `/home/sovereign/skills/sovereign-browser/SKILL.md` — change `tool: browser` → `tool: python3_exec`, add `script: scripts/browser.py`, update args for search/fetch commands
+4. Update `engine.py` `domain == "browser"` dispatch — replace `self.browser.search()`/`self.browser.fetch()` with `self.nanobot.run("sovereign-browser", "search"|"fetch", params)`; result data is in `nb["result"]` not `nb["data"]`; keep existing ledger logging and response formatting
+5. Remove `from execution.adapters.browser import BrowserAdapter` and `self.browser = BrowserAdapter()` from engine.py
+6. Delete `core/app/execution/adapters/browser.py`
+7. Rebuild nanobot-01 + sovereign-core; test: ask Rex to search the web
+
+**AUTH_PROFILES note**: `_build_fetch_payload` auth injection was dead code (a2a-browser `FetchRequest` has no `auth` field). Skip for now — add when a2a-browser supports it.
+
+---
+
+### Phase 2: WebDAV
+
+**Nanobot already covers all operations** via `sovereign-nextcloud-fs` (nc_fs.py) and `openclaw-nextcloud` (nextcloud.py).
+
+| Engine intent | Old call | New nanobot call |
+|---|---|---|
+| `file_navigate` | `webdav.navigate(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_list", {"path": path})` |
+| `list_files` | `webdav.list(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_list", {"path": path})` |
+| `read_file` | `webdav.read(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_read", {"path": path})` |
+| `write_file` | `webdav.write(path, content)` | `nanobot.run("openclaw-nextcloud", "files_write", {"path": path, "content": content})` |
+| `delete_file` | `webdav.delete(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_delete", {"path": path})` |
+| `create_folder` | `webdav.mkdir(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_mkdir", {"path": path})` |
+| `search_files` | `webdav.search(query, path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_search", {"query": query, "path": path})` |
+| `list_files_recursive` | already nanobot ✓ | unchanged |
+| `read_files_recursive` | already nanobot ✓ | unchanged |
+
+**RAID path exception** — keep as-is: `list_files`/`read_file` for `/home/sovereign/` and `/docker/sovereign/` paths → `broker.read_host_file()`. No WebDAVAdapter involved.
+
+Steps:
+1. Rewire engine.py `domain == "webdav"` block — replace each `self.webdav.*` with nanobot calls per table above; preserve RAID path exception for broker
+2. Remove `from adapters.webdav import WebDAVAdapter` and `self.webdav = WebDAVAdapter()` from engine.py
+3. Delete `core/app/adapters/webdav.py`
+4. Rebuild sovereign-core; test: list/read/write/delete Nextcloud file
+
+---
+
+### Phase 3: CalDAV
+
+**Nanobot already covers all operations** via `openclaw-nextcloud` (nextcloud.py).
+
+| Engine intent | Old call | New nanobot call |
+|---|---|---|
+| `list_calendars` | `caldav.list_calendars()` | `nanobot.run("openclaw-nextcloud", "calendar_list", {})` |
+| `list_events` | `caldav.list_events(cal, from, to)` | `nanobot.run("openclaw-nextcloud", "calendar_list", {"calendar": cal, "from_date": from, "to_date": to})` |
+| `create_event` | `caldav.create_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_create", {...})` |
+| `update_event` | `caldav.update_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_update", {...})` |
+| `delete_event` | `caldav.delete_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_delete", {"uid": uid})` |
+| `create_task` | `caldav.create_task(...)` | `nanobot.run("openclaw-nextcloud", "tasks_create", {...})` |
+| `complete_task` | `caldav.complete_task(cal, uid)` | `nanobot.run("openclaw-nextcloud", "tasks_complete", {"uid": uid})` |
+| `delete_task` | `caldav.delete_task(cal, uid)` | `nanobot.run("openclaw-nextcloud", "tasks_delete", {"uid": uid})` |
+
+**Note**: All event field extraction (summary, start, end, UID, calendar name) from specialist output stays in engine.py — only the final adapter call changes.
+
+Steps:
+1. Rewire engine.py `domain == "caldav"` block — replace each `self.caldav.*` with nanobot calls; pass pre-processed fields as nanobot payload
+2. Remove `from adapters.caldav import CalDAVAdapter` and `self.caldav = CalDAVAdapter()` from engine.py
+3. Delete `core/app/adapters/caldav.py`
+4. Rebuild sovereign-core; test: list events, create event, complete task

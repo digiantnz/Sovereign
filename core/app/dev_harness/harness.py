@@ -16,7 +16,7 @@ Phase 4 (Execute): Director has approved. Generates CC runsheet. Writes
   runsheet to prospective memory with _dev_runsheet=True. Director pastes to CC.
 
 WM session key:  dev_harness:session
-WM flag:         _dev_harness_checkpoint
+WM flag:         _developer_harness_checkpoint
 PROSPECTIVE key: _dev_plan (Phase 3), _dev_runsheet (Phase 4)
 
 LLM/deterministic boundary invariant:
@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 # Working memory checkpoint flag — identifies this harness's session record.
-_WM_FLAG        = "_dev_harness_checkpoint"
+_WM_FLAG        = "_developer_harness_checkpoint"
 _WM_CONTENT_KEY = "dev_harness:session"
 
 # Broker timeout for the full analysis run (pylint + semgrep + boundary can be slow).
@@ -134,7 +134,7 @@ class DevHarness:
             # Embed and write fresh checkpoint
             await self.qdrant.store(
                 content=_WM_CONTENT_KEY,
-                metadata={**checkpoint, _WM_FLAG: True, "type": "dev_harness_checkpoint"},
+                metadata={**checkpoint, _WM_FLAG: True, "type": "developer_harness_checkpoint"},
                 collection=WORKING,
             )
         except Exception as e:
@@ -180,7 +180,7 @@ class DevHarness:
     # Phase 1 — Analyse
     # ──────────────────────────────────────────────────────────────────────
 
-    async def run_phase1(self, trigger: str = "explicit") -> dict:
+    async def run_phase1(self, trigger: str = "explicit", skill_snapshot: dict | None = None, harness_snapshot: dict | None = None) -> dict:
         """
         Phase 1: Analyse. Deterministic — no LLM calls.
 
@@ -315,6 +315,7 @@ class DevHarness:
             "session_id_short": session_id_short,
             "trigger":          trigger,
             "current_step":     "analyse",
+            "phase_index":      0,  # 0-based index into phases array; DAG renderer uses this directly
             "step_results": {
                 "analyse": {
                     "total_score":        result.total_score,
@@ -330,6 +331,9 @@ class DevHarness:
                 },
             },
             "last_checkpoint_ts": now,
+            # Self-awareness snapshots — fetched before analysis, passed by engine.py
+            "developer_harness:skill_snapshot":   skill_snapshot or {},
+            "developer_harness:harness_snapshot": harness_snapshot or {},
         }
         await self._save_checkpoint(checkpoint)
 
@@ -396,9 +400,12 @@ class DevHarness:
                        This is an explicit flag, not inferred from context — a future
                        code change MUST pass trigger="nightly" to suppress Phase 3.
         """
+        _skill_snap   = checkpoint.get("developer_harness:skill_snapshot", {})
+        _harness_snap = checkpoint.get("developer_harness:harness_snapshot", {})
         try:
             from dev_harness.classifier import classify as _classify
-            classification = await _classify(result, self.qdrant, cog=self.cog)
+            classification = await _classify(result, self.qdrant, cog=self.cog,
+                                             skill_snapshot=_skill_snap, harness_snapshot=_harness_snap)
         except ImportError:
             logger.info(
                 "DevHarness Phase2: classifier.py not yet available (step 7) — using stub"
@@ -418,7 +425,8 @@ class DevHarness:
             "suggested_fixes":      classification.get("suggested_fixes", []),
             "ts":                   now,
         }
-        checkpoint["current_step"]      = "classify"
+        checkpoint["current_step"]       = "classify"
+        checkpoint["phase_index"]        = 1  # classify is phase index 1
         checkpoint["last_checkpoint_ts"] = now
         await self._save_checkpoint(checkpoint)
 
@@ -509,6 +517,7 @@ class DevHarness:
             "ts":                   now,
         }
         checkpoint["current_step"]       = "plan"
+        checkpoint["phase_index"]        = 2  # plan is phase index 2
         checkpoint["last_checkpoint_ts"]  = now
         await self._save_checkpoint(checkpoint)
 
@@ -623,6 +632,7 @@ class DevHarness:
             "ts":               now,
         }
         cp["current_step"]       = "execute"
+        cp["phase_index"]        = 4  # execute is phase index 4 (after HITL Approve at index 3)
         cp["last_checkpoint_ts"]  = now
         await self._save_checkpoint(cp)
 

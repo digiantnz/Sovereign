@@ -72,7 +72,7 @@ class ClassificationResult:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-async def classify(result, qdrant, cog=None) -> dict:
+async def classify(result, qdrant, cog=None, skill_snapshot: dict | None = None, harness_snapshot: dict | None = None) -> dict:
     """
     Phase 2 classification. Returns ClassificationResult.to_dict().
 
@@ -94,7 +94,7 @@ async def classify(result, qdrant, cog=None) -> dict:
     should_escalate = has_boundary or score_escalates
 
     # ── Phase 2a: Ollama local advisory ───────────────────────────────────
-    ollama_advisory = await _ollama_classify(result, cog)
+    ollama_advisory = await _ollama_classify(result, cog, skill_snapshot=skill_snapshot, harness_snapshot=harness_snapshot)
 
     # ── Phase 2b: Claude escalation (DCL-gated) ───────────────────────────
     escalated      = False
@@ -140,7 +140,7 @@ async def classify(result, qdrant, cog=None) -> dict:
 # Ollama local classification
 # ---------------------------------------------------------------------------
 
-async def _ollama_classify(result, cog) -> str:
+async def _ollama_classify(result, cog, skill_snapshot: dict | None = None, harness_snapshot: dict | None = None) -> str:
     """
     Ask Ollama for a plain-English advisory summary of Phase 1 findings.
 
@@ -152,7 +152,17 @@ async def _ollama_classify(result, cog) -> str:
     """
     findings_block = _format_findings_for_prompt(result.findings)
 
+    # Build system state context block from snapshots (trusted internal data — no untrusted wrapper)
+    _skill_names    = [s["name"] for s in (skill_snapshot or {}).get("skills", [])][:20]
+    _active_h       = [h["harness"] for h in (harness_snapshot or {}).get("harnesses", []) if h.get("active")]
+    _system_ctx = (
+        f"## Rex System State (trusted — fetched before analysis)\n"
+        f"Loaded skills ({len(_skill_names)}): {', '.join(_skill_names) or 'none'}\n"
+        f"Active harnesses: {', '.join(_active_h) or 'none'}\n\n"
+    ) if (_skill_names or _active_h) else ""
+
     prompt = (
+        f"{_system_ctx}"
         f"You are reviewing static analysis output for a Python codebase.\n\n"
         f"Gate decision (FINAL — you cannot change this): {result.gate_decision.value.upper()}\n"
         f"Total score: {result.total_score}\n"
