@@ -91,8 +91,26 @@ INTENT_ACTION_MAP = {
     "web_search":         {"domain": "browser", "operation": "search", "name": "browser_search"},
     "fetch_url":          {"domain": "browser", "operation": "fetch",  "name": "browser_fetch"},
     "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
+    "news_brief":         {"domain": "news",    "operation": "brief"},
+    # Tax ingest harness intents (Phase 1 — continuous hourly ingest)
+    "tax_status":        {"domain": "tax", "operation": "status"},
+    "tax_ingest_run":    {"domain": "tax", "operation": "run"},
+    "tax_ingest_store":  {"domain": "tax", "operation": "store"},
+    "tax_list_events":   {"domain": "tax", "operation": "list"},
+    "tax_year_summary":  {"domain": "tax", "operation": "summary"},
+    "tax_query":         {"domain": "tax", "operation": "query"},
+    "tax_address_list":  {"domain": "tax", "operation": "addresses"},
+    "tax_ingest_status": {"domain": "tax", "operation": "ingest_status"},
+    # Tax report harness intents (Phase 2 — /do_tax report generation)
+    "tax_report_query":  {"domain": "tax", "operation": "report_query"},
+    "tax_report_ingest": {"domain": "tax", "operation": "report_ingest"},
+    "tax_report_create": {"domain": "tax", "operation": "report_create"},
+    "tax_report_notify": {"domain": "tax", "operation": "report_notify"},
+    "tax_report_clear":  {"domain": "tax", "operation": "report_clear"},
+    "tax_report_status": {"domain": "tax", "operation": "report_status"},
     # Memory intents
     "remember_fact":      {"domain": "memory",  "operation": "write"},
+    "memory_recall":      {"domain": "memory",  "operation": "recall"},   # exact content search
     "memory_synthesise":  {"domain": "memory_synthesise", "operation": "synthesise"},
     # Memory Index Protocol — deterministic directory + exact-key retrieval (MIP v1.2)
     "memory_list_keys":    {"domain": "memory_index", "operation": "list_keys"},
@@ -206,6 +224,12 @@ INTENT_TIER_MAP = {
     "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
     "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
     "read_feed": "LOW",
+    "news_brief": "LOW",
+    "tax_status": "LOW", "tax_ingest_run": "LOW", "tax_ingest_store": "MID",
+    "tax_list_events": "LOW", "tax_year_summary": "LOW",
+    "tax_query": "LOW", "tax_address_list": "LOW", "tax_ingest_status": "LOW",
+    "tax_report_query": "LOW", "tax_report_ingest": "LOW", "tax_report_create": "LOW",
+    "tax_report_notify": "LOW", "tax_report_clear": "LOW", "tax_report_status": "LOW",
     "move_email": "MID",
     "list_calendars": "LOW", "list_events": "LOW",
     "delete_event": "MID", "update_event": "MID",
@@ -214,6 +238,7 @@ INTENT_TIER_MAP = {
     "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
     "delete_file": "HIGH", "delete_email": "HIGH", "delete_task": "HIGH",
     "remember_fact": "LOW",
+    "memory_recall": "LOW",
     "memory_list_keys": "LOW",
     "memory_retrieve_key": "LOW",
     "memory_synthesise": "LOW",
@@ -683,6 +708,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "skill status", "harness status", "what skills", "what harnesses",
         "list skills", "show skills", "installed skills", "loaded skills",
         "harness state", "show harnesses",
+        # Tax harness
+        "tax event", "tax events", "tax ingest", "tax harness", "tax status",
+        "tax summary", "tax year", "tax report", "my taxes", "staking reward",
+        "staking rewards", "disposal event", "income event", "wirex tax",
+        "swyftx tax", "tax address", "taxable wallet", "tax wallet",
     )
     prior_has_system = prior_domain is not None
 
@@ -752,6 +782,60 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "research_agent", "intent": "query",
             "target": None, "tier": "LOW",
             "reasoning_summary": "No system domain signals — conversational query",
+        }
+
+    # ── News brief — routes to news harness (RSS + Grok + browser, parallel) ──
+    # Must be checked BEFORE the RSS block — overlapping keywords like "news feed" would
+    # otherwise route to rss-digest only. Generic "news" requests → news harness.
+    _news_kw = (
+        "what's in the news", "whats in the news",
+        "news brief", "news update", "news summary",
+        "what's happening", "whats happening",
+        "current events", "what's trending", "whats trending",
+        "morning news", "today's news", "todays news",
+        "latest headlines", "news today", "news briefing",
+    )
+    _is_news_brief = any(w in u for w in _news_kw)
+    if _is_news_brief:
+        return {
+            "intent": "news_brief", "delegate_to": "research_agent",
+            "tier": "LOW", "confidence": 0.90,
+            "reasoning_summary": "News brief request — news harness",
+        }
+
+    # ── Tax harness — query / status / run ────────────────────────────────────
+    _tax_kw = (
+        "tax event", "tax events", "tax ingest", "tax harness",
+        "tax summary", "tax year", "tax report", "tax status",
+        "my taxes", "staking reward", "staking rewards",
+        "disposal event", "income event", "wirex tax", "swyftx tax",
+        "tax address", "taxable wallet", "tax wallet",
+        "do tax", "run tax report", "tax ingest status",
+    )
+    _is_tax = any(w in u for w in _tax_kw)
+    if _is_tax:
+        # Pick the most specific sub-intent
+        if any(w in u for w in ("run harness", "ingest run", "run tax", "trigger tax")):
+            _tax_intent = "tax_ingest_run"
+        elif any(w in u for w in ("store", "save tax", "persist")):
+            _tax_intent = "tax_ingest_store"
+        elif any(w in u for w in ("ingest status", "tax status check", "preflight", "pre-flight")):
+            _tax_intent = "tax_ingest_status"
+        elif any(w in u for w in ("list events", "show events", "all events", "list tax")):
+            _tax_intent = "tax_list_events"
+        elif any(w in u for w in ("summary", "year summary", "annual", "total")):
+            _tax_intent = "tax_year_summary"
+        elif any(w in u for w in ("address", "wallet address", "taxable wallet")):
+            _tax_intent = "tax_address_list"
+        elif any(w in u for w in ("query", "find event", "look up", "search tax")):
+            _tax_intent = "tax_query"
+        else:
+            _tax_intent = "tax_status"
+        return {
+            "intent": _tax_intent, "delegate_to": "business_agent",
+            "tier": "MID" if _tax_intent == "tax_ingest_store" else "LOW",
+            "confidence": 0.88,
+            "reasoning_summary": f"Tax harness request — {_tax_intent}",
         }
 
     # ── RSS feed — identified as system domain, must reach CEO LLM + PASS 3 ──
@@ -1085,6 +1169,17 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Memory/reminder request — deterministic pre-classifier",
         }
 
+    # "please remember X" without "that/this" — direct command, not a task reminder.
+    # _please_prefix already passed the conversational guard; if the message contains
+    # "remember" but NOT "remember to" (prospective task), treat it as a fact store.
+    # Excludes "please remember to check/do/run X" which should route to scheduler.
+    if _please_prefix and _re_mem.search(r"\bremember\b", u) and not _re_mem.search(r"\bremember\s+to\b", u, _re_mem.IGNORECASE):
+        return {
+            "delegate_to": "research_agent", "intent": "remember_fact",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "please+remember direct command — deterministic pre-classifier",
+        }
+
     # Memory Index Protocol — list all keys (directory scan, no vector search)
     # ── Rex's own ETH address — deterministic read, no memory lookup ────────
     _rex_eth_kw = (
@@ -1102,11 +1197,27 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _mem_list_kw = (
         "list my memories", "list all memories", "show my memories",
         "show memory", "memory keys", "memory index", "memory directory",
-        "what do you remember", "what's in memory", "what is in memory",
+        "what do you remember", "do you remember", "what's in memory", "what is in memory",
         "look up in memory", "retrieve from memory",
+        # Address recall — "what is this address", "do you know this address", etc.
+        "what is this address", "what address is this", "do you know this address",
+        "do you know what this address", "what is that address", "what's this address",
+        "which address is", "which wallet is",
         # Specific endpoint lookups — route to MIP not web_search
         "validator queue url", "validator queue link", "validatorqueue",
     )
+    # 0x hex address in question context → exact content recall from semantic memory.
+    # "do you remember 0x...", "what is this address 0x...", "do you know 0x..." etc.
+    # Extracts the address and passes it as target for MatchText search — no LLM involved.
+    import re as _re_addr
+    _addr_match = _re_addr.search(r'\b(0x[0-9a-fA-F]{40})\b', u)
+    _is_question = any(w in u for w in ("what", "which", "who", "do you", "is this", "is that", "know", "remember"))
+    if _addr_match and _is_question:
+        return {
+            "delegate_to": "memory_agent", "intent": "memory_recall",
+            "target": _addr_match.group(1), "tier": "LOW",
+            "reasoning_summary": "0x address recall — deterministic MatchText search in semantic",
+        }
     if any(w in u for w in _mem_list_kw):
         return {
             "delegate_to": "memory_agent", "intent": "memory_list_keys",
@@ -2198,6 +2309,12 @@ class ExecutionEngine:
             return await self._run_portfolio_harness()
         if _harness_cmd == "pm":
             return {"director_message": "PM harness not yet built. Pending Director approval of the PM-Harness proposal."}
+        if _harness_cmd == "tax_report":
+            return await self._run_tax_report_harness(
+                user_input=user_input,
+                confirmed=confirmed,
+                delegation=pending_delegation or {},
+            )
 
         # Track whether the pre-LLM scanner already evaluated security
         _scanner_evaluated = False
@@ -2779,9 +2896,16 @@ class ExecutionEngine:
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "research",
             "memory_list_keys", "memory_retrieve_key",  # MIP — pass structured index directly
-            "remember_fact",   # confirmation with mip_key passes directly to translator
+            "memory_recall",   # exact content search — found/not-found result passes directly
+            # remember_fact intentionally excluded — raw execution_result leaks point_id/collection
+            # to the translator; let PASS 4 → translator produce plain-English confirmation instead
             # Dev-Harness — all phases return structured dicts; bypass LLM summarisation
             "dev_analyse", "dev_status", "dev_approve", "dev_reject", "dev_verify", "dev_clear",
+            # Tax harness — structured results + multi-turn prompts pass directly to Director
+            "tax_status", "tax_ingest_run", "tax_ingest_store", "tax_list_events",
+            "tax_year_summary", "tax_query", "tax_address_list", "tax_ingest_status",
+            "tax_report_query", "tax_report_ingest", "tax_report_create",
+            "tax_report_notify", "tax_report_clear", "tax_report_status",
             # Wallet — structured results, pass directly to translator
             "wallet_get_address", "wallet_read_config", "wallet_get_btc_xpub",
             "wallet_list_addresses", "wallet_portfolio", "wallet_check_address",
@@ -3523,6 +3647,7 @@ class ExecutionEngine:
             clawhub_certified=bool(selected.get("certified", False)),
             proposed_by="devops_agent",
             reason=f"Director confirmed /install — goal: {goal}",
+            raw_url=selected.get("raw_url"),
         )
 
         await self._skill_harness_clear_all()
@@ -3622,6 +3747,24 @@ class ExecutionEngine:
         }
         dm = await self.cog.translator_pass(_rft)
         return {"director_message": dm}
+
+    async def _run_tax_report_harness(
+        self, user_input: str, confirmed: bool, delegation: dict
+    ) -> dict:
+        """/do_tax — advance the tax report harness state machine by one turn.
+
+        Reads checkpoint from working_memory to determine which step to run.
+        Passes user_input (CSV names or confirm reply) and confirmed flag.
+        """
+        from tax_harness.report_harness import TaxReportHarness
+        tax_year = delegation.get("tax_year") or ""
+        harness  = TaxReportHarness(self.cog, self.nanobot, self.qdrant, tax_year or None)
+        result   = await harness.run(user_input=user_input, confirmed=confirmed)
+        return {
+            "status":           result.get("status", "ok"),
+            "director_message": result.get("response", ""),
+            "_translator_bypass": True,
+        }
 
     # ── Cognitive loop helpers ───────────────────────────────────────────────
 
@@ -4626,8 +4769,7 @@ class ExecutionEngine:
         if domain == "ollama":
             if not prompt:
                 return {"error": "prompt required"}
-            # Wrap with Rex context so the 8b model doesn't revert to its training persona.
-            # Without this, Ollama answers as a generic assistant ("I'm a text-based AI...").
+            # Wrap with Rex context so the model doesn't revert to its training persona.
             _rex_ctx = (
                 "You are Rex, the Sovereign AI operated by Matt. "
                 "Rex has internet access via browser tools, email (IMAP/SMTP), "
@@ -4635,8 +4777,162 @@ class ExecutionEngine:
                 "Rex does NOT say 'I don't have access to the internet' or 'I'm a text-based AI'. "
                 "Answer as Rex. If you don't know the answer, say so plainly.\n\n"
             )
+            # Only route to Grok/Claude when the Director explicitly requests it.
+            # Auto-signal routing (latest/news/current/complexity) is intentionally NOT applied
+            # here — those signals already govern PASS 2/3a LLM selection for planning.
+            # Firing Grok automatically at execution would duplicate RSS, browser, and feed
+            # paths that PASS 1 may have already chosen, overwhelming the 8b model with
+            # redundant inputs.
+            import re as _re_ext
+            # Explicit Grok: direct requests only.
+            # "trending" and "current events" removed — they now route to the news harness
+            # via PASS 1 _quick_classify before reaching this code.
+            # "latest/today/recent" intentionally excluded — too ambiguous.
+            _EXPLICIT_GROK   = _re_ext.compile(
+                r'\b(use grok|ask grok|via grok)\b',
+                _re_ext.IGNORECASE,
+            )
+            _EXPLICIT_CLAUDE = _re_ext.compile(r'\b(use claude|ask claude|via claude)\b', _re_ext.IGNORECASE)
+            if _EXPLICIT_GROK.search(prompt):
+                routed = await self.cog.route_cognition(_rex_ctx + prompt, agent="research_agent",
+                                                        provider="grok", user_input=prompt)
+                return {"status": "ok", "model": "grok", "response": routed.get("response", ""),
+                        "_routed_external": True, "_provider": "grok"}
+            if _EXPLICIT_CLAUDE.search(prompt):
+                routed = await self.cog.route_cognition(_rex_ctx + prompt, agent="research_agent",
+                                                        provider="claude", user_input=prompt)
+                return {"status": "ok", "model": "claude", "response": routed.get("response", ""),
+                        "_routed_external": True, "_provider": "claude"}
             result = await self.cog.ask_local(_rex_ctx + prompt)
             return {"status": "ok", "model": result.get("model"), "response": result.get("response")}
+
+        if domain == "news":
+            from monitoring.news_harness import run_news_brief
+            return await run_news_brief(self.cog, self.nanobot, self.qdrant, prompt or "")
+
+        if domain == "tax":
+            from tax_harness.harness import TaxIngestHarness
+            _harness = TaxIngestHarness(self.cog, self.nanobot, self.qdrant)
+
+            if operation == "run":
+                result = await _harness.run()
+                return {
+                    "status":   result.get("status", "ok"),
+                    "response": result.get("summary", "Tax ingest complete."),
+                    "detail":   result,
+                    "_translator_bypass": True,
+                }
+
+            if operation == "store":
+                # Alias for run — Director-confirmed explicit store
+                result = await _harness.run()
+                return {
+                    "status":   result.get("status", "ok"),
+                    "response": result.get("summary", "Tax events stored."),
+                    "detail":   result,
+                    "_translator_bypass": True,
+                }
+
+            if operation == "status":
+                return {
+                    "status":   "ok",
+                    "response": (
+                        "Tax Ingest Harness: LIVE. "
+                        "Hourly cron (0 * * * *) — pending_approval until Director activates. "
+                        "Files: /Tax folder on Nextcloud. "
+                        "Wallet events: wired via /wallet_event endpoint."
+                    ),
+                    "_translator_bypass": True,
+                }
+
+            if operation in ("list", "summary", "query", "addresses"):
+                # Delegate to Qdrant semantic search for tax events
+                tax_year = action.get("tax_year") or payload.get("tax_year") or ""
+                query_str = (
+                    f"tax events {tax_year}" if tax_year else "tax events income disposal"
+                )
+                try:
+                    from qdrant_client.models import Filter, FieldCondition, MatchValue
+                    hits = await self.qdrant.archive_client.search(
+                        collection_name="semantic",
+                        query_vector=await self.qdrant._embed(query_str),
+                        query_filter=Filter(must=[
+                            FieldCondition(key="domain", match=MatchValue(value="tax")),
+                        ]),
+                        limit=20,
+                        with_payload=True,
+                    )
+                    events = [dict(h.payload or {}) for h in hits]
+                    if tax_year:
+                        events = [e for e in events if e.get("tax_year") == tax_year]
+                    return {
+                        "status":   "ok",
+                        "response": f"Found {len(events)} tax event(s).",
+                        "events":   events,
+                        "_translator_bypass": True,
+                    }
+                except Exception as _te:
+                    return {"status": "error", "error": str(_te)}
+
+            if operation == "ingest_status":
+                # Pre-flight check: counts for current FY from semantic + unprocessed files
+                from .adapters.qdrant import QdrantAdapter as _QA
+                from tax_harness.models import resolve_tax_year as _rty
+                from datetime import datetime as _dt, timezone as _tz
+                _now_ts  = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                _cur_year = _rty(_now_ts)
+                _year_int = int(_cur_year)
+                _start = f"{_year_int - 1}-04-01T00:00:00Z"
+                _end   = f"{_year_int}-03-31T23:59:59Z"
+                try:
+                    from qdrant_client.models import Filter, FieldCondition, MatchValue as _MV
+                    _hits, _ = await self.qdrant.archive_client.scroll(
+                        collection_name="semantic",
+                        scroll_filter=Filter(must=[
+                            FieldCondition(key="domain", match=_MV(value="tax")),
+                            FieldCondition(key="type",   match=_MV(value="tax_event")),
+                        ]),
+                        limit=2000,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    from tax_harness.report_harness import _in_range as _ir
+                    _in_fy     = [h for h in _hits if _ir((h.payload or {}).get("timestamp",""), _start, _end)]
+                    _n_crypto  = sum(1 for h in _in_fy if (h.payload or {}).get("event_tag") == "tax:crypto")
+                    _n_expense = sum(1 for h in _in_fy if (h.payload or {}).get("event_tag") == "tax:expense")
+                    _n_unpriced = sum(1 for h in _in_fy if not (h.payload or {}).get("nzd_value"))
+                    _dates     = sorted(
+                        [(h.payload or {}).get("timestamp", "") for h in _in_fy if (h.payload or {}).get("timestamp")],
+                        reverse=True,
+                    )
+                    _latest    = _dates[0][:10] if _dates else "none"
+                    return {
+                        "status":   "ok",
+                        "response": (
+                            f"Tax ingest status — FY{_cur_year} "
+                            f"(01 Apr {_year_int-1} – 31 Mar {_year_int}):\n"
+                            f"  tax:crypto events: {_n_crypto}\n"
+                            f"  tax:expense events: {_n_expense}\n"
+                            f"  unpriced (nzd_value null): {_n_unpriced}\n"
+                            f"  most recent event: {_latest}\n"
+                            f"Run /do_tax {_cur_year} to generate the report."
+                        ),
+                        "_translator_bypass": True,
+                    }
+                except Exception as _ise:
+                    return {"status": "error", "error": str(_ise)}
+
+            if operation in ("report_query", "report_ingest", "report_create",
+                             "report_notify", "report_clear", "report_status"):
+                # Delegate to report harness via _run_tax_report_harness
+                _ty = action.get("tax_year") or payload.get("tax_year") or ""
+                return await self._run_tax_report_harness(
+                    user_input=user_input,
+                    confirmed=confirmed,
+                    delegation={"tax_year": _ty},
+                )
+
+            return {"status": "error", "error": f"unknown tax operation: {operation}"}
 
         if domain == "browser":
             if operation == "fetch":
@@ -4896,6 +5192,7 @@ class ExecutionEngine:
                     clawhub_certified=bool(action.get("clawhub_certified", False)),
                     proposed_by=proposed_by,
                     reason=reason,
+                    raw_url=action.get("raw_url"),
                 )
 
             if op == "audit":
@@ -5135,6 +5432,7 @@ class ExecutionEngine:
                             "clawhub_slug": _h_slug,
                             "clawhub_certified": bool(_h_cand.get("certified", False)),
                             "_harness_candidate_id": _h_cid,
+                            "raw_url": _h_cand.get("raw_url"),
                         }
                         _h_escalated = _h_review.get("escalate_to_director", False)
                         _h_dec = _h_review.get("verdict", "review")
@@ -5186,6 +5484,7 @@ class ExecutionEngine:
                         clawhub_certified=bool(_h_dl.get("clawhub_certified", False)),
                         proposed_by=(delegation or {}).get("delegate_to", "devops_agent"),
                         reason=f"Director confirmed harness install of candidate {_h_cid}.",
+                        raw_url=_h_dl.get("raw_url"),
                     )
                     if _h_install_result.get("status") == "installed":
                         _h_ts = _dt_inst.datetime.now(_dt_inst.timezone.utc).isoformat()
@@ -5217,6 +5516,7 @@ class ExecutionEngine:
                         clawhub_certified=bool(_dl_pending.get("clawhub_certified", False)),
                         proposed_by=(delegation or {}).get("delegate_to", "devops_agent"),
                         reason="Director confirmed skill installation after review.",
+                        raw_url=_dl_pending.get("raw_url"),
                     )
 
                 # Step 1: search for candidates
@@ -5296,6 +5596,7 @@ class ExecutionEngine:
                     "review_result": review_result,
                     "clawhub_slug": top.get("slug"),
                     "clawhub_certified": bool(top.get("certified", False)),
+                    "raw_url": top.get("raw_url"),
                 }
                 _decision = review_result.get("decision", "review")
                 _escalated = review_result.get("escalate_to_director", False)
@@ -5350,6 +5651,7 @@ class ExecutionEngine:
                         clawhub_certified=bool(pending.get("clawhub_certified", False)),
                         proposed_by=(delegation or {}).get("delegate_to", "devops_agent"),
                         reason="Director confirmed skill installation after review.",
+                        raw_url=pending.get("raw_url"),
                     )
 
                 return resp
@@ -5428,6 +5730,51 @@ class ExecutionEngine:
                     "point_id": point_id,
                     "mip_key": _mip_key,
                     "collection": coll,
+                }
+
+            if op == "recall":
+                # Exact content substring match — answers "do you remember / know this?"
+                # Uses MatchText (Qdrant full-text index) rather than vector search so the
+                # result is deterministic: address found = yes, not found = no.
+                query = (action.get("query")
+                         or (delegation or {}).get("target")
+                         or (specialist or {}).get("query")
+                         or prompt or "").strip()
+                if not query:
+                    return {"status": "error", "message": "recall requires a query term"}
+                from qdrant_client.models import Filter, FieldCondition, MatchText as _MatchText
+                _recall_results: list = []
+                try:
+                    _scroll_pts, _ = await self.qdrant.archive_client.scroll(
+                        collection_name="semantic",
+                        scroll_filter=Filter(must=[
+                            FieldCondition(key="content", match=_MatchText(text=query))
+                        ]),
+                        limit=5,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    _recall_results = [
+                        {k: v for k, v in pt.payload.items()
+                         if k not in ("_vector", "embedding")}
+                        for pt in _scroll_pts
+                    ]
+                except Exception as _recall_err:
+                    import logging as _rl
+                    _rl.getLogger(__name__).warning("memory_recall error: %s", _recall_err)
+                if _recall_results:
+                    return {
+                        "status": "ok",
+                        "found": True,
+                        "query": query,
+                        "count": len(_recall_results),
+                        "results": _recall_results,
+                    }
+                return {
+                    "status": "ok",
+                    "found": False,
+                    "query": query,
+                    "message": f"No memory entry found containing '{query}'.",
                 }
 
             return {"error": f"Unknown memory operation: {op}"}

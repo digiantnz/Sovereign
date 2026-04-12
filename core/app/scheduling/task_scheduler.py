@@ -251,8 +251,11 @@ class TaskScheduler:
     # ── Task storage ──────────────────────────────────────────────────────
 
     async def find_active_by_title(self, title: str) -> dict | None:
-        """Return the first active PROSPECTIVE entry whose title contains any word
-        from *title* (≥5 chars) — used to detect duplicate recurring tasks.
+        """Return the first active PROSPECTIVE entry whose title shares ALL significant
+        words (≥5 chars) with *title* — used to detect duplicate recurring tasks.
+
+        Requires ALL significant words to match (not just any one) to avoid false
+        positives where unrelated tasks share a single common word like "nightly".
         Returns the point payload or None.
         """
         try:
@@ -270,7 +273,7 @@ class TaskScheduler:
             )
             for pt in results:
                 pt_title = (pt.payload.get("title") or "").lower()
-                if any(w in pt_title for w in words):
+                if all(w in pt_title for w in words):
                     return {"point_id": str(pt.id), **pt.payload}
         except Exception as e:
             logger.warning("TaskScheduler: find_active_by_title failed: %s", e)
@@ -579,6 +582,92 @@ class TaskScheduler:
             )
             return False
 
+    async def seed_tax_ingest_task(self) -> bool:
+        """Seed the hourly tax ingest harness task at startup. Idempotent.
+
+        Registers a cron task (0 * * * * — hourly UTC) with status
+        pending_approval. The task does NOT run until Director activates it
+        via Rex (set status → active).
+
+        Idempotency: checks PROCEDURAL for an existing entry with
+        intent=tax_ingest_run step.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Tax Ingest Harness (Hourly)"
+
+        try:
+            proc_items, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROCEDURAL,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="type", match=MatchValue(value="task_procedure")),
+                ]),
+                limit=50,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for _pi in proc_items:
+                _pp = dict(_pi.payload or {})
+                _existing_tid = _pp.get("task_id")
+                if not _existing_tid:
+                    continue
+                for _step in _pp.get("steps", []):
+                    if _step.get("intent") == "tax_ingest_run":
+                        # Found — check any status (pending or active both count as seeded)
+                        prosp_items, _ = await self.qdrant.archive_client.scroll(
+                            collection_name=PROSPECTIVE,
+                            scroll_filter=Filter(must=[
+                                FieldCondition(key="task_id", match=MatchValue(value=_existing_tid)),
+                            ]),
+                            limit=2,
+                            with_payload=False,
+                            with_vectors=False,
+                        )
+                        if prosp_items:
+                            logger.info(
+                                "TaskScheduler: tax ingest task already seeded (task_id=%s) — skipping",
+                                _existing_tid[:8],
+                            )
+                            return False
+        except Exception as _e:
+            logger.debug("seed_tax_ingest_task: idempotency check failed: %s", _e)
+
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                "cron": "0 * * * *",   # hourly UTC
+            },
+            "steps": [
+                {
+                    "intent": "tax_ingest_run",
+                    "params": {},
+                    "description": (
+                        "Run the tax ingest harness: scan /Tax Nextcloud folder for "
+                        "unprocessed CSV/PDF files, classify pending wallet events, "
+                        "enrich with NZD pricing (CoinGecko), store in SEMANTIC collection. "
+                        "Status pending_approval — activate via Director to enable."
+                    ),
+                }
+            ],
+            "notify_when": "on_change",  # notify only when events are stored
+            "stop_condition": None,
+            "status": "pending_approval",  # Director must activate before it runs
+        }
+
+        result = await self.store_task(task_def, human_confirmed=True)
+        if result.get("status") in ("ok", "partial"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s (pending_approval)",
+                _TASK_TITLE, result.get("task_id"),
+            )
+            return True
+        else:
+            logger.warning(
+                "TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result
+            )
+            return False
+
     # ── Task listing ──────────────────────────────────────────────────────
 
     async def list_tasks(self, status_filter: str = "active") -> dict:
@@ -821,7 +910,11 @@ class TaskScheduler:
         def _format_step_content(r: dict) -> str:
             """Expand step result into readable content lines for briefing output."""
             if r.get("status") != "ok":
-                return r.get("error", "no detail")
+                _res = r.get("result", {}) or {}
+                return (
+                    _res.get("error") or _res.get("raw_error") or _res.get("note")
+                    or r.get("error", "no detail")
+                )
             res = r.get("result", {})
             if not isinstance(res, dict):
                 return "no detail"
@@ -831,7 +924,8 @@ class TaskScheduler:
             if messages:
                 lines = [f"{len(messages)} messages"]
                 for i, m in enumerate(messages[:25], 1):
-                    uid = m.get("uid") or m.get("message_id") or m.get("id", "?")
+                    uid = (m.get("databaseId") or m.get("uid") or
+                           m.get("message_id") or m.get("id", "?"))
                     sender = (m.get("from") or m.get("sender") or "?")[:60]
                     subject = m.get("subject", "(no subject)")[:80]
                     lines.append(f"  {i}. {sender} — {subject} [uid:{uid}]")

@@ -70,6 +70,14 @@ async def lifespan(app: FastAPI):
     scanner.load()
     logger.info("SecurityScanner: patterns loaded")
 
+    # ── API key sanity checks (warn early so failures are diagnosable)
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.warning("ANTHROPIC_API_KEY is not set — Claude API calls will fail with 401. "
+                       "Set it in secrets/claude.env and rebuild.")
+    if not os.environ.get("GROK_API_KEY"):
+        logger.warning("GROK_API_KEY is not set — Grok API calls will fail with 401. "
+                       "Set it in secrets/grok.env and rebuild.")
+
     guardrail = GuardrailEngine(scanner, ledger)
 
     # ── Step 2: Core services
@@ -316,6 +324,43 @@ async def lifespan(app: FastAPI):
             "metadata": {"protocol": "http", "chain": "btc", "status": "pending", "host": "start9", "port": None},
         },
         {
+            "seed_id": "static_v1_claude_api",
+            "key": "semantic:network:service:claude-api",
+            "title": "Anthropic Claude API (external LLM provider)",
+            "content": (
+                "Claude API endpoint: https://api.anthropic.com/v1/messages. "
+                "Model: claude-sonnet-4-6 (DEFAULT_MODEL in adapters/claude.py). "
+                "Auth: ANTHROPIC_API_KEY env var from secrets/claude.env. "
+                "Called via CognitionEngine.ask_claude() — DCL-gated, audit-logged. "
+                "Used for high-complexity PASS 2 routing (architectural/plan/review/design/strategy signals). "
+                "Reachability: probed by collect_external_reachability() in monitoring/metrics.py as 'claude_api'. "
+                "If blank API key: all calls return HTTP 401 — sovereign-core falls back to Ollama silently. "
+                "To check status: ask Rex for system metrics or check the portal dashboard external section."
+            ),
+            "domain": "network.service",
+            "label": "claude-api",
+            "value": "https://api.anthropic.com/v1/messages",
+            "metadata": {"provider": "anthropic", "model": "claude-sonnet-4-6", "auth": "ANTHROPIC_API_KEY", "status": "active"},
+        },
+        {
+            "seed_id": "static_v1_grok_api",
+            "key": "semantic:network:service:grok-api",
+            "title": "xAI Grok API (external LLM provider)",
+            "content": (
+                "Grok API endpoint: https://api.x.ai/v1. "
+                "Model: grok-3 (default). "
+                "Auth: GROK_API_KEY env var from secrets/grok.env. "
+                "Called via CognitionEngine.ask_grok() — DCL-gated, audit-logged. "
+                "Used for current-events/news/market PASS 2 routing (current/latest/news/today/recent/market signals). "
+                "Reachability: probed by collect_external_reachability() in monitoring/metrics.py as 'grok_api'. "
+                "To check status: ask Rex for system metrics or check the portal dashboard external section."
+            ),
+            "domain": "network.service",
+            "label": "grok-api",
+            "value": "https://api.x.ai/v1",
+            "metadata": {"provider": "xai", "model": "grok-3", "auth": "GROK_API_KEY", "status": "active"},
+        },
+        {
             "seed_id": "backfill_v1_net_a2a_browser",
             # Key changed from :endpoints: → :service: to force delete-and-reseed of the
             # stale v1 entry that contained "POST /run" — Ollama was regurgitating that
@@ -368,6 +413,23 @@ async def lifespan(app: FastAPI):
         "value": "https://api.coingecko.com/api/v3/simple/price",
         "metadata": {"provider": "coingecko", "status": "active", "auth": "none"},
     })
+    # Director news preferences — used by news_harness to weight synthesis
+    _static_facts.append({
+        "seed_id": "static_v1_news_preferences",
+        "key": "semantic:preferences:news",
+        "title": "Director news preferences",
+        "content": (
+            "Matt's news interests: technology and open source (Hacker News), "
+            "artificial intelligence and LLMs, cryptocurrency particularly Ethereum and "
+            "Rocket Pool staking, New Zealand local news and current events, "
+            "cybersecurity and infosec. "
+            "Prefer: substantive technical items over hype; NZ relevance where available. "
+            "Avoid: celebrity/entertainment, sports (unless NZ), pure marketing."
+        ),
+        "domain": "preferences.news",
+        "metadata": {"category": "preferences", "subject": "news"},
+    })
+
     _backfilled = await qdrant.seed_static_facts(_static_facts)
     if _backfilled:
         logger.info("MIP static backfill: %d high-value facts seeded with proper keys", _backfilled)
@@ -402,11 +464,22 @@ async def lifespan(app: FastAPI):
 
     # ── Step 2d: Intent / skill / harness semantic entry seed (Beta-1)
     # Writes a semantic:intent:{slug} entry for every INTENT_ACTION_MAP entry,
-    # every installed RAID skill, and the 3 harnesses. Idempotent via _backfill_seed_id.
+    # every installed RAID skill, and the 4 harnesses. Idempotent via _backfill_seed_id.
+    # v2 skill seeds: include description + operations I/O; _prev_seed_id triggers v1 cleanup.
+    # Tax address placeholders: semantic:tax:taxable_wallets / staking_contracts
     try:
-        from memory.semantic_seeds import build_intent_seeds, build_skill_seeds, build_harness_seeds
+        from memory.semantic_seeds import (
+            build_intent_seeds, build_skill_seeds, build_harness_seeds,
+            build_tax_address_seeds, build_crypto_domain_seeds,
+        )
         from execution.engine import INTENT_ACTION_MAP as _IAM
-        _sem_seeds = build_intent_seeds(_IAM) + build_skill_seeds() + build_harness_seeds()
+        _sem_seeds = (
+            build_intent_seeds(_IAM)
+            + build_skill_seeds()
+            + build_harness_seeds()
+            + build_tax_address_seeds()
+            + build_crypto_domain_seeds()
+        )
         _sem_audit = await qdrant.seed_intent_semantic_entries(_sem_seeds)
         logger.info(
             "Intent semantic seed: total=%d created=%d existed=%d errors=%d",
@@ -569,6 +642,7 @@ async def lifespan(app: FastAPI):
     # Runs at 14:00 UTC (02:00 NZST) with trigger="nightly" explicit in step params.
     await task_scheduler.seed_nightly_dev_task()
     await task_scheduler.seed_nightly_synthesis_task()
+    await task_scheduler.seed_tax_ingest_task()
 
     # ── Step 3c: Credential proxy — session-scoped token delegation for nanobot-01
     credential_proxy = CredentialProxy(default_ttl=60, ledger=ledger)
@@ -982,6 +1056,16 @@ async def wallet_event(request: Request):
 
         except Exception as _a2ae:
             logger.error("wallet_event: a2a credit dispatch error: %s", _a2ae)
+
+    # ── Tax harness — classify wallet event in background ────────────────────
+    if qdrant:
+        async def _run_tax_classify():
+            try:
+                from tax_harness.wallet_events import handle_wallet_event as _hwev
+                await _hwev(event, qdrant)
+            except Exception as _txe:
+                logger.warning("wallet_event: tax classify failed: %s", _txe)
+        asyncio.create_task(_run_tax_classify())
 
     return {
         "status":     "ok",

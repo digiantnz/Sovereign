@@ -121,8 +121,14 @@ async def _dispatch_and_reply(
     except httpx.TimeoutException:
         await bot.send_message(chat_id=chat_id, text="Core timed out — the cognitive loop took too long.")
         return
+    except httpx.ConnectError:
+        await bot.send_message(chat_id=chat_id, text="Could not reach sovereign-core — it may be restarting. Try again in a few seconds.")
+        return
+    except httpx.HTTPStatusError as e:
+        await bot.send_message(chat_id=chat_id, text=f"Core returned HTTP {e.response.status_code}: {e.response.text[:200]}")
+        return
     except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"Core error: {e}")
+        await bot.send_message(chat_id=chat_id, text=f"Core error ({type(e).__name__}): {e}")
         return
 
     # Security guardrail confirmation
@@ -489,6 +495,49 @@ async def handle_pm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("PM harness not yet built — pending Director approval of the proposal.")
 
 
+async def handle_do_tax(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /do_tax [year] — NZ tax report harness.
+
+    Advances the tax report harness state machine by one turn.
+    On first call: queries semantic memory for the FY, reports counts, asks for
+    supplementary expense CSV names.
+    On second call: parses named CSVs (or proceeds on 'none'), asks for confirmation.
+    On third call (confirmed): generates income{year}.csv and expenses{year}.csv
+    in /Digiant/Tax/FY{year}/ on Nextcloud.
+
+    Usage:
+      /do_tax        — uses current NZ financial year
+      /do_tax 2026   — uses FY2026 (01 Apr 2025 – 31 Mar 2026)
+
+    NOTE: Register this command with BotFather manually:
+      /setcommands → add:  do_tax - Generate NZ tax report for a financial year
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+
+    # Optional year argument — e.g. /do_tax 2026
+    year_arg = context.args[0].strip() if context.args else ""
+    # Validate: must be a 4-digit year if provided
+    if year_arg and (not year_arg.isdigit() or len(year_arg) != 4):
+        await update.message.reply_text(
+            "Usage: /do_tax [year]\nExample: /do_tax 2026\nYear must be a 4-digit NZ tax year."
+        )
+        return
+
+    session = store.get_or_create(chat_id)
+    payload = {
+        "input":        year_arg or "do_tax",
+        "_harness_cmd": "tax_report",
+        "tax_year":     year_arg,
+        "context_window": session.history,
+    }
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, f"/do_tax {year_arg}".strip(), chat_id, context.bot, session)
+
+
 async def handle_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /remember and /memorise slash commands."""
     user = update.effective_user
@@ -604,6 +653,7 @@ def main():
     app.add_handler(CommandHandler("devcheck", handle_devcheck))
     app.add_handler(CommandHandler("portfolio", handle_portfolio))
     app.add_handler(CommandHandler("pm", handle_pm))
+    app.add_handler(CommandHandler("do_tax", handle_do_tax))
     app.add_handler(CommandHandler(["remember", "memorise", "memorize"], handle_remember))
     app.add_handler(CommandHandler("verify", handle_verify))
     app.add_handler(MessageHandler(

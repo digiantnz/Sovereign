@@ -183,6 +183,26 @@ PASS 5  Translator              → plain English director_message (always local
 - All nanobot results stamped `_trust: "untrusted_external"`; scanner runs before PASS 3b
 - InternalMessage envelope (`cognition/message.py`): Director input hashed at PASS 1, never stored raw; append-only history (output_hash only)
 
+### PASS 2 External Routing — Provider Selection
+
+Two separate routing layers. Do not conflate them.
+
+#### PASS 2/3a — LLM selection for planning (auto-routing applies)
+`_routing_decision` in `cognition/engine.py` selects which LLM writes the specialist's action plan:
+1. **Explicit override**: `use grok|ask grok|via grok|use claude|ask claude|via claude|external llm/model/ai` → forces external
+2. **Provider signals** on raw user message: `current/latest/news/today/recent/market/trending` → Grok; `architectural/architecture/plan/review/design/strategy/strategic` → Claude; default → Grok
+3. **Complexity ≥ 0.50** → external Grok. Operational penalty (`restart/container/service/deploy/compose/nginx/redis/mariadb/subnet`) subtracts 0.20.
+4. **DCL gate** — PRIVATE/SECRET → force local
+
+#### `domain: ollama` execution — explicit-only external routing
+When `_dispatch_inner` reaches `domain: ollama`, Grok/Claude are only called on **explicit** triggers. Auto-signals are intentionally excluded to avoid firing Grok alongside RSS/browser paths PASS 1 may have already chosen.
+
+- **Grok**: `use grok` · `ask grok` · `via grok` · `trending` · `current events`
+- **Claude**: `use claude` · `ask claude` · `via claude`
+- Everything else → Ollama (local, fast, no billing)
+
+**Preferred external provider: Grok** — Claude API key is set but plan may not cover usage costs.
+
 ---
 
 ## Installed Skills
@@ -254,6 +274,22 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 - `_is_pronoun_ref`: uses word-boundary regex — substring `"it"` in `"with"` must NOT trigger pronoun resolution
 - File delete fast-path (`_file_delete_kw` + slash-path regex) must remain BEFORE safety-net at line ~935 — without it, delete falls through to `intent: query` and Ollama hallucinates success
 - PASS 2 security skipped when `confirmed=True` — double-confirmation IS the security gate for HIGH tier
+- `_please_prefix` (`u.startswith("please ")`) bypasses the conversational guard — but does NOT route to `remember_fact` on its own; the `_memory_re` check runs first (requires `remember that/this`), then a secondary `please + remember (not to)` check catches bare `please remember X` without losing prospective-task routing for `please remember to X`
+- `0x[0-9a-fA-F]{40}` address in a question context → `memory_recall` (exact MatchText search in semantic); extracted address passed as `target` — never sent to Ollama
+- `memory_recall` intent: `domain: memory, operation: recall` — synchronous MatchText scroll on `qdrant-archive` semantic collection; returns `{found, query, count, results}` or `{found: false}`; in `_DIAGNOSTIC_INTENTS` so result passes directly to translator
+- `remember_fact` is NOT in `_DIAGNOSTIC_INTENTS` — raw execution result (`point_id`, `mip_key`, `collection`) must not reach translator; PASS 4 → translator produces plain-English confirmation instead
+
+### Semantic memory seeding — principle
+- **Seed only for critical blind spots**: only seed domain knowledge when Rex has a complete vocabulary gap that prevents basic function (e.g. address format recognition, zero knowledge of a domain the harness depends on)
+- **Never seed conceptual relationships**: relationships between concepts (ETH ↔ staking_reward ↔ income) should emerge organically via the associative synthesis pass (`run_synthesis()` Passes 1–3, nightly 15:00 UTC), not hand-crafted entries
+- **Before adding a seed**: check semantic memory first — Rex may already have the knowledge from prior conversations; hand-stitching what he already knows is expensive and bypasses the learning process
+- **Minimal footprint**: seed vocabulary and format recognition; leave reasoning and relationship-building to synthesis
+
+### Memory task scheduler invariants
+- `find_active_by_title()` uses ALL-word matching (≥5 chars) — not ANY — to avoid false dedup positives where unrelated tasks share a single common word (e.g. "nightly")
+- `seed_nightly_synthesis_task()` idempotency: checks PROCEDURAL for `intent=memory_synthesise` step; falls through to `store_task` if not found; `store_task` ALL-match dedup is the second gate
+- Synthesis cron: `0 15 * * *` (15:00 UTC = 03:00 NZST) — runs Passes 1–3 of `run_synthesis()` (episodic scan → associative/relational); structural Pass 4 fires inline on every semantic write (no schedule needed)
+- Associative memory (`associative` collection) is populated ONLY by `run_synthesis()` Passes 1–3 — not by structural Pass 4, not by curate, not by seeding
 
 ---
 
@@ -326,6 +362,12 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | PM-Harness | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Full SDLC project management harness against sovereign semantic memory. Proposal in prospective memory. Requires Dev-Harness first. |
 | Retry-Logic | **PROPOSAL — PENDING DIRECTOR APPROVAL** | Exponential backoff (max 3) for all harnesses, surface failure to Director. Proposal in prospective memory. |
 | Adapter-Removal | **COMPLETE** | Removed BrowserAdapter, WebDAVAdapter, CalDAVAdapter from sovereign-core. All application I/O through nanobot-01 only. Phase 1 Browser 2026-04-03, Phase 2 WebDAV 2026-04-03, Phase 3 CalDAV 2026-04-03. |
+| Ops-Fixes-Apr8 | **COMPLETE** | Runaway scheduler task cancelled; ANTHROPIC_API_KEY startup warning; translator_pass failure detail improved; gateway ConnectError/HTTPStatusError handlers; soul guardian 7 files rebaselined; Grok explicit-only routing in domain:ollama; semantic entries for claude-api/grok-api. 2026-04-08. |
+| News-Harness | **COMPLETE** | `monitoring/news_harness.py`. Parallel RSS+Grok+browser fetch; 60% word-set dedup; single synthesis pass. `news_brief` intent in INTENT_ACTION_MAP. `_news_kw` block in `_quick_classify` (14 patterns). Reads `semantic:preferences:news`. Returns `{"brief": "..."}`. 2026-04-08. |
+| Morning-Brief-Refactor | **PENDING DIRECTOR ORDER** | Replace `read_feed` step with `news_brief` harness; add `list_nc_tasks` step. 3 changes: engine.py (INTENT_ACTION_MAP + dispatch), task_scheduler.py (`_format_step_content` brief key), qdrant-archive PROCEDURAL point `c6ee061f` steps array. See memory/project_sovereign.md for full spec. |
+| Skill-Seed-v2 | **COMPLETE** | `semantic_seeds.py` enriched: `build_skill_seeds()` now parses SKILL.md frontmatter (description, operations with inputs/outputs, specialists, tier) into rich content. `seed_id` bumped to `v2_` with `_prev_seed_id` for v1 cleanup on next restart. `seed_intent_semantic_entries()` in qdrant.py handles `_prev_seed_id` delete-then-create upgrade. `lifecycle.load()` passes description + operations to `make_skill_semantic_seed()`. `build_tax_address_seeds()` writes `semantic:tax:taxable_wallets`, `semantic:tax:staking_contracts`, `semantic:tax:internal_addresses` placeholder entries. 2026-04-10. |
+| Tax-Ingest-Harness | **COMPLETE** | Hourly NZ tax event ingestion: Nextcloud /Digiant/Tax/ CSV/PDF files + on-chain wallet events. Two tags: tax:crypto, tax:expense. CoinGecko NZD pricing. Scheduled cron `0 * * * *` — pending_approval until Director activates. |
+| Tax-Report-Harness | **COMPLETE** | /do_tax [year] command. 3-turn human-in-the-loop: query semantic (date range) → Director provides expense CSVs → confirm → generates income{year}.csv + expenses{year}.csv in /Digiant/Tax/FY{year}/. Classifier labels crypto events. FIFO stub (Phase 3). |
 
 Full phase history: `docs/CLAUDE-archive.md`
 
@@ -454,6 +496,8 @@ All harness intents are added to the translator bypass list so structured output
 | Skill-Harness (`/install`) | `_skill_harness_checkpoint` | search → LLM select → confirm → scan → install | Single Director gate: confirm before scan+install |
 | SI-Harness | `_self_improvement_session` | observe (daily auto) → propose (auto-triggered) | Director approves proposals; never self-modifies |
 | Dev-Harness | `_developer_harness_checkpoint` | analyse → status → approve/reject → verify → clear | Nightly cron; Director approves findings |
+| Tax-Ingest-Harness | `_tax_ingest_harness_checkpoint` | check → ingest → enrich → store → notify → clear | Hourly cron; continuous tax event ingestion |
+| Tax-Report-Harness (`/do_tax`) | `_tax_report_harness_checkpoint` | query → ingest → create → notify → clear | 3-turn human-in-the-loop; generates income + expenses CSVs |
 
 ### /command harness architecture
 
@@ -478,6 +522,7 @@ All harness intents are added to the translator bypass list so structured output
 | `/selfimprove` | SI-Harness | Run observe+propose cycle; surface pending proposals to Director |
 | `/devcheck` | Dev-Harness | Run full analysis cycle; surface findings requiring approval |
 | `/portfolio` | Portfolio-Harness | Trigger snapshot; return current balances + NZD/USD value |
+| `/do_tax [year]` | Tax-Report-Harness | Generate NZ tax report for FY; 3-turn human-in-the-loop; produces income+expenses CSVs |
 
 **Pending /commands** — build when harnesses are ready:
 
@@ -491,6 +536,138 @@ All /commands:
 - Pass `_harness_cmd` field to `/chat` endpoint
 - Are recovered from `pending_delegation._harness_cmd` on confirmed continuation
 - Have a single Director confirmation gate at the action point, not at every step
+
+---
+
+## Tax Ingest Harness — Canonical Reference (Phase 1 refactored 2026-04-12)
+
+**Files**: `core/app/tax_harness/` — `__init__.py`, `models.py`, `pricing.py`, `ingest.py`, `wallet_events.py`, `harness.py`
+
+**Design principle**: Ingestion is dumb and fast — records what happened faithfully.
+All tax treatment (income / disposal / internal transfer) is determined at report time by `/do_tax`,
+which has full access to the known address lists in semantic memory.
+
+### Event tags (exactly two)
+
+**`tax:crypto`** — any on-chain or exchange transaction involving a known address.
+Stores: timestamp, from_address, to_address, asset, amount, tx_hash, nzd_value (None if unavailable), tax_year, source, reference.
+
+**`tax:expense`** — a receipt, invoice PDF, or fiat card spend row from CSV.
+Stores: timestamp, vendor, amount_nzd, source (filename), reference (row external_id or filename), tax_year.
+
+No other event tags exist at ingest time.
+
+### Canonical TaxEvent schema
+```
+id:           UUID5(NAMESPACE_URL, "tax:{reference}") — deterministic dedup
+event_tag:    "tax:crypto" | "tax:expense"
+timestamp:    ISO8601 UTC
+tax_year:     NZ FY e.g. "2026" (Apr 1 YYYY → Mar 31 YYYY+1 → tax_year = YYYY+1)
+source:       filename (CSV/PDF) or chain identifier (on-chain)
+reference:    tx_hash (on-chain) or "{source}:{external_id}" (CSV)
+nzd_value:    "$X.XX NZD" or None — None → tag pricing_unresolved (crypto only)
+
+# tax:crypto fields
+from_address: str — wallet address or "wirex:account" / "swyftx:account" for exchange trades
+to_address:   str — wallet address or exchange account identifier
+asset:        ETH | BTC | etc.
+amount:       "0.001000 ETH" formatted string
+tx_hash:      str — on-chain hash or exchange order ID
+
+# tax:expense fields
+vendor:       merchant name or PDF source label
+amount_nzd:   "$X.XX NZD" formatted string
+```
+
+### Ingestion rules
+
+**wallet_events.py** (on-chain):
+- Every event pushed by the wallet watcher → write tax:crypto event unconditionally
+- No address filtering — the wallet watcher is the filter (only pushes watched-address txs)
+- No classification, no address list lookup
+
+**ingest.py** (CSV/PDF):
+- Wirex CSV — crypto currency rows → tax:crypto (from/to = "wirex:account"); NZD rows → tax:expense
+- Swyftx CSV — all rows → tax:crypto (from/to = "swyftx:account")
+- PDF receipts → tax:expense
+
+### Semantic address lists
+- `semantic:tax:taxable_wallets` — Director-populated; used by the **wallet watcher** to decide what to push; also used by `/do_tax` at report time to identify which transaction side belongs to the Director
+- `semantic:tax:staking_contracts` — Director-populated; used by `/do_tax` at report time only
+- `semantic:tax:internal_addresses` — NOT seeded; internal/external classification is report-time only
+
+### Director data required (before harness is useful)
+- `semantic:tax:taxable_wallets`: Rex ETH `0x623061184E86914C07985c847773Ee8e7ac6d508`; mining address `0x2c228a2d04d65E54dE6b24885C1D3626098C776e`
+- `semantic:tax:staking_contracts`: Rocket Pool deposit pool address
+
+### Harness steps
+| Step | Tier | Notes |
+|------|------|-------|
+| check | LOW | skill calls returned without error (empty = valid) |
+| ingest | LOW | files + pending wallet events from working_memory |
+| enrich | LOW | CoinGecko NZD pricing for tax:crypto; expense nzd_value = amount_nzd |
+| store | MID | UUID5 upsert to SEMANTIC; partial failure → log + continue |
+| notify | LOW | reports tax:crypto count, tax:expense count, nzd_value null count |
+| clear | LOW | deletes _tax_ingest_harness_checkpoint entries from working_memory |
+
+Session flag: `_tax_ingest_harness_checkpoint`
+Session key: `tax_ingest:session`
+Scheduled task: cron `0 * * * *` (hourly UTC), status `pending_approval` until Director activates
+
+### Dedup
+`uuid.uuid5(uuid.NAMESPACE_URL, f"tax:{reference}")` — deterministic.
+Same event arriving twice → same UUID → Qdrant silently overwrites, no duplicate.
+
+---
+
+## Tax Report Harness — Canonical Reference (Phase 2, 2026-04-12)
+
+**Trigger**: `/do_tax [year]` Telegram command — bypasses NL routing entirely.
+**Module**: `core/app/tax_harness/report_harness.py`
+**Session flag**: `_tax_report_harness_checkpoint`
+
+### NZ tax year date range
+Tax year YYYY = `{YYYY-1}-04-01T00:00:00Z` → `{YYYY}-03-31T23:59:59Z`
+e.g. `/do_tax 2026` → 01 Apr 2025 to 31 Mar 2026
+
+### Human-in-the-loop flow (3 turns)
+
+| Turn | Director action | Rex action |
+|------|----------------|------------|
+| 1 | `/do_tax [year]` | Query semantic by date range; classify crypto; report counts; ask for expense CSV names |
+| 2 | CSV filenames or "none" | Fetch+parse CSVs from Nextcloud (not stored); merge expense array; report counts; ask confirm |
+| 3 | Confirm | Generate + save income{year}.csv and expenses{year}.csv; notify; clear |
+
+### Classifier labels (income.csv Classification column)
+`staking_reward` · `exchange_acquisition` · `exchange_disposal` · `internal_transfer` · `unknown_inbound` · `unknown_outbound` · `unknown`
+
+### Output files (saved to /Digiant/Tax/FY{year}/)
+- `income{year}.csv` — Date, Classification, From Address, To Address, Asset, Amount, NZD Value, Source, Reference
+- `expenses{year}.csv` — Date, Vendor, Amount NZD, Source, Reference
+
+### Expense data sources
+1. Semantic memory `tax:expense` events in date range (Phase 1 ingested from /Digiant/Tax/)
+2. Director-specified CSVs parsed at report time — merged into array, NOT stored to memory, NOT tagged
+
+### New modules
+- `classifier.py` — `classify_events(events, qdrant) -> ClassifiedEventSet`; pure Python, no LLM
+- `fifo.py` — stub; `run_fifo()` returns empty `FifoResult`; FIFO calculations deferred to Phase 3
+- `report_harness.py` — `TaxReportHarness`; 5 steps (query → ingest → create → notify → clear)
+
+### Step intents
+| Step | Intent | Tier |
+|------|--------|------|
+| query | `tax_report_query` | LOW |
+| ingest | `tax_report_ingest` | LOW |
+| create | `tax_report_create` | LOW |
+| notify | `tax_report_notify` | LOW |
+| clear | `tax_report_clear` | LOW |
+| pre-flight | `tax_ingest_status` | LOW |
+
+### Prerequisites
+- `semantic:tax:taxable_wallets` — must be populated for accurate classifier output
+- `semantic:tax:staking_contracts` — must be populated for staking_reward classification
+- `/do_tax` must be registered with BotFather manually (CC cannot do this)
 
 ---
 
