@@ -17,6 +17,7 @@
 
 const rpc       = require('./wallet-rpc');
 const watchlist = require('./wallet-watchlist');
+const lightning = require('./wallet-harness-lightning');
 
 const QDRANT_URL   = process.env.QDRANT_URL || 'http://qdrant-archive:6333';
 const EPISODIC_COL = 'episodic';
@@ -26,6 +27,17 @@ const warn = (...a) => console.warn('[watcher]', ...a);
 
 // seenTx: Set<"chain:txHash"> — idempotency across events
 const seenTx = new Set();
+
+// Per-chain watcher state — updated by poll loops, exported for /health
+const _chainState = {};
+function _initChainState(chain) {
+  if (!_chainState[chain]) _chainState[chain] = { failures: 0, lastOk: null };
+}
+function getChainState() {
+  return Object.fromEntries(
+    Object.entries(_chainState).map(([k, v]) => [k, { ...v }])
+  );
+}
 
 // pendingConfs: Map<"chain:txHash", {event, seenAtBlock}> — waiting for confirmations
 const pendingConfs = new Map();
@@ -145,13 +157,13 @@ async function _pollEthChain(chain, state) {
     current = await rpc.ethBlockNumber(chain);
   } catch (e) {
     warn(`${chain} blockNumber failed:`, e.message);
-    return;
+    return false;
   }
 
   if (state.lastBlock === null) {
     state.lastBlock = current;
     log(`${chain} connected at block ${current}, watching ${watched.size} addresses`);
-    return;
+    return true;
   }
 
   // Scan new blocks (cap at 20 per cycle to avoid burst)
@@ -194,88 +206,132 @@ async function _pollEthChain(chain, state) {
       await _emit(event);
     }
   }
+  return true;
 }
 
 // ── BTC watcher ───────────────────────────────────────────────────────────────
 
 async function _pollBtc(state) {
-  const watched = watchlist.getByChain('btc');
-  if (!watched.length) return;
+  const cfg     = watchlist.getConfig();
+  const watched = new Set(watchlist.getByChain('btc').map(e => e.value.toLowerCase()));
+  const labels  = new Map(watchlist.getByChain('btc').map(e => [e.value.toLowerCase(), e.label]));
+  if (!watched.size) return;
 
-  const labels = new Map(watched.map(e => [e.value.toLowerCase(), e]));
-
-  let result;
+  let currentHeight;
   try {
-    result = await rpc.btcListSinceBlock(state.lastBlockhash || '');
+    currentHeight = await rpc.btcGetBlockCount();
   } catch (e) {
-    warn('BTC listsinceblock failed:', e.message);
+    warn('BTC getblockcount failed:', e.message);
+    return false;
+  }
+
+  if (state.lastBlock === null) {
+    state.lastBlock = currentHeight;
+    log(`BTC connected at block ${currentHeight}, watching ${watched.size} addresses`);
     return;
   }
 
-  const { transactions = [], lastblock } = result;
-  if (lastblock) state.lastBlockhash = lastblock;
+  const from = state.lastBlock + 1;
+  const to   = Math.min(currentHeight, state.lastBlock + 6);  // cap at 6 blocks/cycle
 
-  for (const tx of transactions) {
-    if (tx.category !== 'receive' && tx.category !== 'send') continue;
-    const addr  = (tx.address || '').toLowerCase();
-    const entry = labels.get(addr);
-    if (!entry) continue;
-
-    const reqConfs = entry.metadata?.zero_conf ? 0
-      : (entry.metadata?.btc_confirmations || watchlist.getConfig().btc_confirmations_default || 1);
-
-    if (tx.confirmations < reqConfs) continue;
-
-    const event = {
-      chain:        'btc',
-      tx_hash:      tx.txid,
-      from_address: tx.category === 'send' ? entry.value : '',
-      to_address:   tx.category === 'receive' ? entry.value : '',
-      amount:       Math.abs(tx.amount).toFixed(8),
-      currency:     'BTC',
-      confirmations: tx.confirmations,
-      timestamp:    tx.blocktime
-        ? new Date(tx.blocktime * 1000).toISOString()
-        : new Date().toISOString(),
-      block_number: tx.blockheight || 0,
-      label:        entry.label,
-    };
-    await _emit(event);
-  }
-
-  if (!state.lastBlockhash) {
+  for (let bn = from; bn <= to; bn++) {
+    let hash, block;
     try {
-      state.lastBlockhash = await rpc.btcGetBestBlockHash();
-      log(`BTC connected, starting from block ${state.lastBlockhash?.slice(0, 16)}…`);
+      hash  = await rpc.btcGetBlockHash(bn);
+      block = await rpc.btcGetBlock(hash);
     } catch (e) {
-      warn('BTC connection failed:', e.message);
+      warn(`BTC getblock(${bn}) failed:`, e.message);
+      continue;
+    }
+    if (!block?.tx) continue;
+
+    const blockTime = block.time
+      ? new Date(block.time * 1000).toISOString()
+      : new Date().toISOString();
+
+    for (const tx of block.tx) {
+      for (const vout of (tx.vout || [])) {
+        const addr = (vout.scriptPubKey?.address || '').toLowerCase();
+        if (!watched.has(addr)) continue;
+
+        const entry    = watchlist.getByAddress(addr);
+        const reqConfs = entry?.metadata?.zero_conf ? 0
+          : (entry?.metadata?.btc_confirmations ?? cfg.btc_confirmations_default ?? 1);
+        const confs = currentHeight - bn + 1;
+        if (confs < reqConfs) continue;
+
+        await _emit({
+          chain:        'btc',
+          tx_hash:      tx.txid,
+          from_address: '',
+          to_address:   vout.scriptPubKey.address,
+          amount:       vout.value.toFixed(8),
+          currency:     'BTC',
+          confirmations: confs,
+          timestamp:    blockTime,
+          block_number: bn,
+          label:        labels.get(addr) || addr.slice(0, 10) + '…',
+        });
+      }
     }
   }
+  state.lastBlock = to;
+  return true;
 }
 
 // ── Watcher loops ─────────────────────────────────────────────────────────────
 
 async function _ethLoop(chain, pollMs) {
   const state = { lastBlock: null };
+  _initChainState(chain);
   while (true) {
+    let ok;
     try {
-      await _pollEthChain(chain, state);
+      ok = await _pollEthChain(chain, state);
     } catch (e) {
       warn(`${chain} poll error:`, e.message);
+      ok = false;
     }
-    await new Promise(r => setTimeout(r, pollMs));
+    if (ok === false) {
+      _chainState[chain].failures++;
+      const f = _chainState[chain].failures;
+      if (f === 1 || f % 5 === 0)
+        warn(`${chain} node unreachable (${f} consecutive failure${f === 1 ? '' : 's'})`);
+    } else {
+      if (_chainState[chain].failures > 0)
+        log(`${chain} reconnected after ${_chainState[chain].failures} failure(s)`);
+      _chainState[chain].failures = 0;
+      _chainState[chain].lastOk = new Date().toISOString();
+    }
+    const sleepMs = pollMs * Math.min(16, Math.max(1, 2 ** _chainState[chain].failures));
+    await new Promise(r => setTimeout(r, sleepMs));
   }
 }
 
 async function _btcLoop(pollMs) {
-  const state = { lastBlockhash: null };
+  const state = { lastBlock: null };
+  _initChainState('btc');
   while (true) {
+    let ok;
     try {
-      await _pollBtc(state);
+      ok = await _pollBtc(state);
     } catch (e) {
       warn('btc poll error:', e.message);
+      ok = false;
     }
-    await new Promise(r => setTimeout(r, pollMs));
+    if (ok === false) {
+      _chainState.btc.failures++;
+      const f = _chainState.btc.failures;
+      if (f === 1 || f % 5 === 0)
+        warn(`BTC node unreachable (${f} consecutive failure${f === 1 ? '' : 's'})`);
+    } else {
+      if (_chainState.btc.failures > 0)
+        log(`BTC reconnected after ${_chainState.btc.failures} failure(s)`);
+      _chainState.btc.failures = 0;
+      _chainState.btc.lastOk = new Date().toISOString();
+    }
+    const sleepMs = pollMs * Math.min(16, Math.max(1, 2 ** _chainState.btc.failures));
+    await new Promise(r => setTimeout(r, sleepMs));
   }
 }
 
@@ -292,6 +348,12 @@ async function start() {
   _ethLoop('arb', ethMs * 2);   // ARB polls less frequently
   _ethLoop('op',  ethMs * 2);   // OP polls less frequently
   _btcLoop(btcMs);
+
+  // Lightning: poll BTCPay invoices at same interval as BTC
+  lightning.startInvoiceWatcher(_emit, seenTx, btcMs);
+
+  // Lightning: poll BTCPay channel state every 5 minutes — emits on new channel open
+  lightning.startChannelWatcher(_emit, seenTx, 300_000);
 }
 
 // ── On-demand check ───────────────────────────────────────────────────────────
@@ -302,8 +364,8 @@ async function checkNow(address) {
   const label = entry?.label || address.slice(0, 10) + '…';
 
   if (chain === 'btc') {
-    const received = await rpc.btcGetReceivedByAddress(address, 0);
-    return { chain, address, label, balance_btc: received ?? 'unavailable' };
+    const scan = await rpc.btcScanTxOutSet([address]);
+    return { chain, address, label, balance_btc: scan?.total_amount?.toFixed(8) ?? 'unavailable' };
   }
 
   try {
@@ -314,4 +376,4 @@ async function checkNow(address) {
   }
 }
 
-module.exports = { start, registerHarness, checkNow };
+module.exports = { start, registerHarness, checkNow, getChainState };

@@ -13,6 +13,7 @@ COPY wallet-api.js \
      wallet-watcher.js \
      wallet-harness-a2a.js \
      wallet-harness-portfolio.js \
+     wallet-harness-lightning.js \
      ./
 
 EXPOSE 3001

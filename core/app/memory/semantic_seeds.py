@@ -306,6 +306,27 @@ def build_harness_seeds() -> list[dict]:
             "trigger_point": "harness:tax_ingest",
         },
         {
+            "name": "learning-harness",
+            "description": (
+                "Autonomous document learning harness in monitoring/learning_harness.py. "
+                "Triggered by: (1) Telegram attachment upload to /downloads/ — immediate, no time gate; "
+                "(2) hourly poll during synthesis window (UTC hours 15–17). "
+                "Processing: read document → extract keywords → build ranked semantic context array "
+                "(paginated scroll, up to 500 entries, sorted by confidence desc) → "
+                "chunk text (~1500 tokens/chunk) → run semantic+relational confidence loop "
+                "until plateau (zero delta per full cycle) → write sentinel. "
+                "Writes: semantic (new concepts/facts), relational (structural links). "
+                "Does NOT write associative — synthesis cron (15:00 UTC) handles associative links. "
+                "Sentinel key format: episodic:learning:processed:{slug} (MIP). "
+                "Unsupported formats (.pdf, .docx, etc.): Telegram alert + skipped_no_extractor sentinel. "
+                "Hard failures: Telegram alert + pending_approval prospective entry. "
+                "Gaps: pending_approval prospective entry (no Telegram on success). "
+                "Last-run summary: _last_run_summary module dict, injected into morning briefing. "
+                "Status intent: learning_harness_status (LOW tier)."
+            ),
+            "trigger_point": "harness:learning",
+        },
+        {
             "name": "tax-report-harness",
             "description": (
                 "NZ tax report generator in tax_harness/report_harness.py. "
@@ -368,41 +389,68 @@ def build_tax_address_seeds() -> list[dict]:
     """
     return [
         {
-            "seed_id": "tax_seed_v1_taxable_wallets",
+            "seed_id":      "tax_seed_v2_taxable_wallets",
+            "_prev_seed_id": "tax_seed_v1_taxable_wallets",
             "key":     "semantic:tax:taxable_wallets",
-            "title":   "Tax: Taxable wallet addresses",
+            "title":   "Tax: Taxable wallet addresses (Director-owned)",
             "content": (
-                "List of ETH wallet addresses watched for tax purposes. "
-                "The wallet watcher uses this list to decide which on-chain transactions to push "
-                "to the /wallet_event endpoint. Every event the wallet watcher pushes is stored "
-                "as a tax:crypto event — no further filtering by the harness. "
-                "Also used by /do_tax at report time to identify which side of a transaction "
-                "belongs to the Director. "
-                "Director must populate this list. Current entries: [] (empty — awaiting Director)."
+                "Director-owned wallet addresses for NZ tax purposes. "
+                "Every on-chain transaction involving these addresses is a potential taxable event. "
+                "The wallet watcher pushes transactions on these addresses to /wallet_event, "
+                "which stores them as tax:crypto events. "
+                "/do_tax uses this list at report time to determine which side of each transaction "
+                "belongs to the Director (income vs disposal vs internal transfer). "
+                "ETH addresses: "
+                "0x623061184E86914C07985c847773Ee8e7ac6d508 (Rex EOA — sovereign-core signing key), "
+                "0x50BF8f009ECC10DB65262c65d729152e989A9323 (Safe Multisig — 2-of-3 P2WSH), "
+                "0x2c228a2d04d65E54dE6b24885C1D3626098C776e (Digiant Mining — GPU mining rewards), "
+                "0x0d0e588ad69c237f3963092bbb415e455d4ecbff (Digiant Investment). "
+                "BTC addresses: "
+                "bc1qyf9k459dxpt2j4se5tldjpm9zf08m8athrwgte93d03f87clgexsqjh6md (BTC Multisig — 2-of-3 P2WSH, derives child addresses for BTCPay invoices), "
+                "bc1q993lm40r67s5gsd626lyd0sk97sfapgh0vmmnk (Director BTC personal address)."
             ),
             "domain": "tax",
             "extra_meta": {
-                "addresses":      [],
-                "populated":      False,
+                "addresses": [
+                    "0x623061184E86914C07985c847773Ee8e7ac6d508",
+                    "0x50BF8f009ECC10DB65262c65d729152e989A9323",
+                    "0x2c228a2d04d65E54dE6b24885C1D3626098C776e",
+                    "0x0d0e588ad69c237f3963092bbb415e455d4ecbff",
+                    "bc1qyf9k459dxpt2j4se5tldjpm9zf08m8athrwgte93d03f87clgexsqjh6md",
+                    "bc1q993lm40r67s5gsd626lyd0sk97sfapgh0vmmnk",
+                ],
+                "populated":      True,
                 "intent_signals": ["taxable wallets", "tax wallets"],
                 "owner":          "director",
             },
         },
         {
-            "seed_id": "tax_seed_v1_staking_contracts",
+            "seed_id":      "tax_seed_v2_staking_contracts",
+            "_prev_seed_id": "tax_seed_v1_staking_contracts",
             "key":     "semantic:tax:staking_contracts",
-            "title":   "Tax: Known staking contract addresses",
+            "title":   "Tax: Rocket Pool staking contract addresses",
             "content": (
-                "List of known staking contract addresses (e.g. Rocket Pool deposit pool, "
-                "Rocket Pool node operator). Used by /do_tax at report time to classify "
-                "inbound ETH from these addresses as staking income. "
-                "Director must populate this list. Current entries: [] (empty — awaiting Director)."
+                "Known Rocket Pool staking contract addresses on ETH mainnet. "
+                "Used by /do_tax at report time to classify inbound ETH from these addresses "
+                "as staking_reward income rather than unknown_inbound. "
+                "RocketDepositPool: 0xDD3f50F8A6CafbE9b31a427582963f465E745AF8 — "
+                "protocol-level contract where ETH flows through during node operation. "
+                "RocketStorage: 0x1d8f8f00cfa6758d7bE78336684788Fb0ee0Fa46 — "
+                "registry contract for the Rocket Pool protocol. "
+                "Node02 minipool address: not yet recorded — Director should add the node02 "
+                "minipool contract address (visible in Rocket Pool dashboard or etherscan "
+                "for the node operator address). Minipool is the source address for staking rewards "
+                "paid to the node operator."
             ),
             "domain": "tax",
             "extra_meta": {
-                "addresses":      [],
-                "populated":      False,
-                "intent_signals": ["staking contracts", "rocket pool"],
+                "addresses": [
+                    "0xDD3f50F8A6CafbE9b31a427582963f465E745AF8",
+                    "0x1d8f8f00cfa6758d7bE78336684788Fb0ee0Fa46",
+                ],
+                "populated":      True,
+                "minipool_pending": True,
+                "intent_signals": ["staking contracts", "rocket pool", "staking rewards"],
                 "owner":          "director",
             },
         },

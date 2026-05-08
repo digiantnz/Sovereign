@@ -71,6 +71,7 @@ BASELINE_METRIC_NAMES = [
     "audit_entries_24h",
     "prospective_task_exec_rate",
     "container_running_count",
+    "wallet_chains_failing",
 ]
 
 MONITORED_REPOS = [
@@ -635,6 +636,7 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
         gpu_vram_pct = round(gpu["vram_used_mb"] / gpu["vram_total_mb"] * 100, 1)
 
     running_count = len([c for c in ctrs if isinstance(c, dict) and c.get("status") == "running"])
+    wallet = sys_metrics.get("wallet", {})
 
     metrics_snapshot = {
         "inference_latency_p50_ms": float(olm.get("last_inference_latency_ms") or 0),
@@ -643,6 +645,7 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
         "audit_entries_24h":        float(aud.get("last_24h_entries") or 0),
         "prospective_task_exec_rate": float(prospective_stats.get("execution_rate") or 1.0),
         "container_running_count":  float(running_count),
+        "wallet_chains_failing":    float(wallet.get("chains_failing", 0)),
     }
 
     # 3. Load (or establish) baseline
@@ -694,11 +697,16 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
     trigger_count = len(skill_failure_triggers) + len(never_exec_triggers)
 
     gpu_str = f"VRAM {gpu_vram_pct:.1f}%" if gpu_vram_pct else "GPU N/A"
+    wallet_chains_failing = int(metrics_snapshot.get("wallet_chains_failing", 0))
+    wallet_str = (
+        f"wallet chains failing: {wallet_chains_failing}" if wallet_chains_failing > 0
+        else "wallet chains: ok"
+    )
     obs_content = (
         f"Self-improvement observe cycle {session['cycle_count']} at {ts_now[:16]} UTC. "
         f"System: RAM {ram.get('percent','?')}% {gpu_str}, "
         f"Ollama latency {olm.get('last_inference_latency_ms','?')}ms, "
-        f"containers running {running_count}. "
+        f"containers running {running_count}, {wallet_str}. "
         f"Skills: {len(skill_stats)} intents tracked, "
         f"{len(skill_failure_triggers)} failing (>={SKILL_FAILURE_THRESHOLD}/7d). "
         f"Prospective: {prospective_stats.get('active_count',0)} active tasks, "
@@ -1022,6 +1030,7 @@ def _hypothesis_for_metric(metric: str, value: float, mean: float) -> str:
         "audit_entries_24h":        f"Audit log volume is {direction}. Elevated activity may indicate unusual operation patterns or errors.",
         "prospective_task_exec_rate": f"Prospective task execution rate is {direction}. Scheduled tasks may be failing or not firing.",
         "container_running_count":  f"Running container count is {direction}. A container may have crashed or been added/removed.",
+        "wallet_chains_failing":    f"Wallet chain connectivity is {direction}. One or more chain watchers (ETH/BTC/Lightning) are failing to reach their node endpoints.",
     }
     return hypotheses.get(metric, f"Metric '{metric}' is {direction} vs baseline. Unknown root cause — investigation required.")
 
@@ -1034,6 +1043,7 @@ def _suggest_action_for_metric(metric: str, value: float, mean: float) -> str:
         "audit_entries_24h":        "Review security-ledger.jsonl for unusual event patterns in last 24h.",
         "prospective_task_exec_rate": "Run list_tasks and review next_due dates. Check task scheduler logs.",
         "container_running_count":  "Run list_containers to identify which container(s) are not running.",
+        "wallet_chains_failing":    "Check sov-wallet /health for chain status. Inspect docker logs sov-wallet for connectivity errors. Check node endpoints (BTC: Start9, ETH: node01/node02, Lightning: BTCPay).",
     }
     return suggestions.get(metric, f"Investigate '{metric}' anomaly. Check relevant logs and system state.")
 

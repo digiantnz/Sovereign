@@ -133,11 +133,12 @@ services:
     networks:
       - ai_net
       - business_net  # Dual-homed per §3
-    # No host port — gateway uses Docker DNS (sovereign-core:8000); portal exposed via nextcloud-rp nginx
+    # No host port — gateway uses Docker DNS (sovereign-core:8000); portal exposed via nginx
     volumes:
       - /home/sovereign/sovereign/core/app:/app:ro  # Source on RAID — restart picks up changes, no rebuild
       - /home/sovereign/governance/governance.json:/app/governance/governance.json:ro
       - /home/sovereign/governance:/home/sovereign/governance:ro
+      - /home/sovereign/governance/sovereign-config.yaml:/home/sovereign/governance/sovereign-config.yaml:rw
       - /home/sovereign/governance/wallet-config.json:/home/sovereign/governance/wallet-config.json:rw
       - /home/sovereign/governance/browser-auth-profiles.yaml:/home/sovereign/governance/browser-auth-profiles.yaml:rw
       - /home/sovereign/personas:/home/sovereign/personas:ro
@@ -315,6 +316,9 @@ services:
     restart: always
     networks: [ai_net, browser_net]
     # No host port binding — Safe proxy API accessible on ai_net only (port 3001)
+    depends_on:
+      qdrant-archive:
+        condition: service_healthy
     env_file:
       - ./secrets/wallet.env
     healthcheck:
@@ -394,12 +398,18 @@ services:
           memory: 512m
     cpuset: "8-11,20-23"
 
-  nextcloud-rp:
+  nginx:
     image: nginx:alpine
-    container_name: nextcloud-rp
+    container_name: nginx
     restart: always
-    depends_on: [nextcloud]
-    networks: [business_net]
+    depends_on:
+      nextcloud:
+        condition: service_healthy
+    networks: [business_net, browser_net]
+    extra_hosts:
+      - "fh5cflagwhegmfxgd2bjdbj4ykahqnjz6bwtweoqrhtvco27d7w4siid.local:172.16.201.5"
+      - "qw3yplotmsvrs2hfr3ssc44j3lqpvyvsqqthprg646i4pjwc7hqzqvid.local:172.16.201.5"
+      - "lpgcfdmen44ygyckkeywhlui7nni4ttz6x3d5i25x3rhad3ab2gl5zyd.local:172.16.201.5"
     ports:
       - "127.0.0.1:8080:80"
       - "100.111.130.60:80:80"
@@ -407,6 +417,7 @@ services:
       - "8000:8000"  # Sovereign portal — all interfaces (LAN + Tailscale)
     volumes:
       - ./nginx/nextcloud.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/start9.conf:/etc/nginx/conf.d/start9.conf:ro
       - ./nginx/sovereign.tail887d2b.ts.net.crt:/etc/nginx/certs/sovereign.tail887d2b.ts.net.crt:ro
       - ./nginx/sovereign.tail887d2b.ts.net.key:/etc/nginx/certs/sovereign.tail887d2b.ts.net.key:ro
 

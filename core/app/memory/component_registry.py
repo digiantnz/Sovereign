@@ -821,15 +821,15 @@ _COMPONENTS: list[dict] = [
         "location": "compose.yml:nanobot-01",
     },
     {
-        "name": "container-nextcloud-rp",
+        "name": "container-nginx",
         "component_type": "container",
-        "title": "Container: nextcloud-rp (nginx reverse proxy)",
+        "title": "Container: nginx (reverse proxy)",
         "content": (
-            "nextcloud-rp container: nginx reverse proxy for Nextcloud Tailscale access. "
+            "nginx container: reverse proxy for Nextcloud Tailscale access. "
             "Also proxies sovereign-core management portal routes (port 8000). "
             "Blocks /chat (403). cpuset: 8-11,20-23. mem_limit: 128m."
         ),
-        "location": "compose.yml:nextcloud-rp",
+        "location": "compose.yml:nginx",
     },
     {
         "name": "container-a2a-browser",

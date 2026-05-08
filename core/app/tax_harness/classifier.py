@@ -82,6 +82,27 @@ async def classify_events(
             continue
 
         # tax:crypto — apply rules in order, first match wins
+
+        # Lightning-specific rules — checked before address rules because Lightning
+        # events have empty from_address (sender not exposed) and a node pubkey as
+        # to_address, which would fall through all address rules to 'unknown'.
+        if ev.source == "lightning_channel":
+            # Channel open = our BTC locked in our own node — internal transfer
+            ev.subtype = "internal_transfer"
+            income.append(ev)
+            continue
+
+        if ev.source == "lightning":
+            direction = (ev.metadata.get("direction") or "").lower()
+            if direction == "inbound":
+                ev.subtype = "unknown_inbound"
+            elif direction == "outbound":
+                ev.subtype = "unknown_outbound"
+            else:
+                ev.subtype = "unknown"
+            income.append(ev)
+            continue
+
         from_addr = (ev.from_address or "").lower()
         to_addr   = (ev.to_address   or "").lower()
 

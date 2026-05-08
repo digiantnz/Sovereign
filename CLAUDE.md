@@ -51,7 +51,7 @@ These rules apply in every session. They are not negotiable and cannot be overri
 
 ### Networks
 - `ai_net`: ollama, ollama-embed, sovereign-core, docker-broker, qdrant, qdrant-archive, gateway, nanobot-01
-- `business_net`: nextcloud, nc-redis, nc-db, nextcloud-rp, sovereign-core (dual-homed)
+- `business_net`: nextcloud, nc-redis, nc-db, nginx, sovereign-core (dual-homed)
 - `browser_net`: (no local container; compose-managed for future use)
 - sovereign-core dual-homed (ai_net + business_net); a2a-browser on node04 (172.16.201.4:8001, external)
 
@@ -90,7 +90,7 @@ These rules apply in every session. They are not negotiable and cannot be overri
 | nextcloud | 2g | |
 | nc-db | 512m | |
 | nc-redis | 256m | |
-| nextcloud-rp | 128m | |
+| nginx | 128m | |
 **Total ~22.5GB** — leaves ~9.5GB for OS (4GB target) + page cache.
 
 ### 64GB RAM upgrade path
@@ -101,7 +101,7 @@ These rules apply in every session. They are not negotiable and cannot be overri
 ### CPU pinning (AMD Ryzen 9 9900X — 12 physical cores, 24 logical CPUs)
 - Core-to-CPU mapping: Core N → CPU N, CPU N+12 (e.g. Core 0 → CPU 0,12; Core 11 → CPU 11,23)
 - **sovereign-core, qdrant, qdrant-archive**: cpuset `0-7,12-19` — first 8 physical cores (both threads each); memory queries are on the critical path of the cognitive loop
-- **adapter services** (broker, gateway, nanobot-01, sov-wallet, ollama-embed, nc-db, nc-redis, nextcloud, nextcloud-rp): cpuset `8-11,20-23` — last 4 physical cores
+- **adapter services** (broker, gateway, nanobot-01, sov-wallet, ollama-embed, nc-db, nc-redis, nextcloud, nginx): cpuset `8-11,20-23` — last 4 physical cores
 - ollama: no cpuset (GPU-bound; CPU threads used for tokenisation and KV cache management)
 
 ---
@@ -264,7 +264,7 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 
 ### Nextcloud access
 - LAN direct: `http://172.16.201.25` (port 80, no reverse proxy) — `nextcloud` service, `business_net`
-- Tailscale: `https://sovereign.tail887d2b.ts.net` (via `nextcloud-rp` nginx, ports 80/8443 on 100.111.130.60)
+- Tailscale: `https://sovereign.tail887d2b.ts.net` (via `nginx`, ports 80/8443 on 100.111.130.60)
 - `nextcloud` Docker hostname is a trusted domain (added 2026-03-21) — required for nanobot-01 WebDAV access
 - `nextcloud.env` is NOT in sovereign-core env_file — CredentialProxy reads `NEXTCLOUD_ADMIN_USER`/`NEXTCLOUD_ADMIN_PASSWORD` from nanobot-01's static env; `NEXTCLOUD_URL` defaults to `http://nextcloud` in the script
 
@@ -368,6 +368,9 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | Skill-Seed-v2 | **COMPLETE** | `semantic_seeds.py` enriched: `build_skill_seeds()` now parses SKILL.md frontmatter (description, operations with inputs/outputs, specialists, tier) into rich content. `seed_id` bumped to `v2_` with `_prev_seed_id` for v1 cleanup on next restart. `seed_intent_semantic_entries()` in qdrant.py handles `_prev_seed_id` delete-then-create upgrade. `lifecycle.load()` passes description + operations to `make_skill_semantic_seed()`. `build_tax_address_seeds()` writes `semantic:tax:taxable_wallets`, `semantic:tax:staking_contracts`, `semantic:tax:internal_addresses` placeholder entries. 2026-04-10. |
 | Tax-Ingest-Harness | **COMPLETE** | Hourly NZ tax event ingestion: Nextcloud /Digiant/Tax/ CSV/PDF files + on-chain wallet events. Two tags: tax:crypto, tax:expense. CoinGecko NZD pricing. Scheduled cron `0 * * * *` — pending_approval until Director activates. |
 | Tax-Report-Harness | **COMPLETE** | /do_tax [year] command. 3-turn human-in-the-loop: query semantic (date range) → Director provides expense CSVs → confirm → generates income{year}.csv + expenses{year}.csv in /Digiant/Tax/FY{year}/. Classifier labels crypto events. FIFO stub (Phase 3). |
+| Learning-Harness | **COMPLETE** | `monitoring/learning_harness.py`. Autonomous document learning from /downloads/. Two triggers: (1) Telegram attachment upload → immediate background run; (2) hourly poll → synthesis window gate (UTC 15–17). Confidence loop: semantic→relational round-robin until plateau. Writes semantic + relational only (associative left to nightly synthesis). Sentinel: `episodic:learning:processed:{slug}`. Last-run summary injected into morning briefing news_brief step. |
+| Smart-Bootstrap | **COMPLETE** | `startup_load()` in `qdrant.py` upgraded to two-phase boot. Phase 1: targeted slots — Slot 2 (all canonical MIP keys: semantic:wallet/network/networking/infrastructure/governance prefixes, two-pass payload scan + batch vector retrieve), Slot 3 (PROSPECTIVE due today, status=active, next_due<=today), Slot 6 (open SI proposals, pending_director_review), Slot 7 (active PROCEDURAL, human_confirmed=true, last_updated desc). Phase 2: vector similarity fill (remaining capacity). Dedup via `_loaded_ids` set. Returns stats dict. Telegram notification on completion. `bootstrap_working_memory()` removed. Step 2h in main.py removed. Typical result: ~15 targeted + ~295 similarity = 310-380 total entries ~1.1-1.3 MB. 2026-04-17. |
+| Memory-Consultation-Pass | **COMPLETE** | PASS 0 in `execution/engine.py` `handle_chat()`. `_memory_consultation_pass()`: deterministic working_memory scroll (no LLM), keyword relevance scoring, top-15 ranked (slot priority + term overlap), formatted as COGNITIVE CONTEXT block injected into PASS 1 prompt via `prompts.classify(cognitive_context=...)`. Timing: 7-14ms typical (target <100ms, WARNING >200ms). Wired: `handle_chat` → `orchestrator_classify(cognitive_context=)` → `ceo_classify(cognitive_context=)` → `prompts.classify(cognitive_context=)`. 2026-04-17. |
 
 Full phase history: `docs/CLAUDE-archive.md`
 
@@ -498,6 +501,7 @@ All harness intents are added to the translator bypass list so structured output
 | Dev-Harness | `_developer_harness_checkpoint` | analyse → status → approve/reject → verify → clear | Nightly cron; Director approves findings |
 | Tax-Ingest-Harness | `_tax_ingest_harness_checkpoint` | check → ingest → enrich → store → notify → clear | Hourly cron; continuous tax event ingestion |
 | Tax-Report-Harness (`/do_tax`) | `_tax_report_harness_checkpoint` | query → ingest → create → notify → clear | 3-turn human-in-the-loop; generates income + expenses CSVs |
+| Learning-Harness | `_run_in_progress` (module bool, not WM) | poll → read → keywords → doc_array → chunk → confidence loop → sentinel | Writes semantic+relational; associative via synthesis cron; morning briefing injection |
 
 ### /command harness architecture
 

@@ -75,7 +75,7 @@ _CONFIDENTIAL_PATTERNS = [
     re.compile(r"/home/sovereign\b"),
     re.compile(r"/docker/sovereign\b"),
     re.compile(r"\bsovereign-core\b|\bdocker-broker\b|\ba2a-browser\b|"
-               r"\bsearxng\b|\bqdrant\b|\bnextcloud-rp\b", re.IGNORECASE),
+               r"\bsearxng\b|\bqdrant\b|\bnginx\b", re.IGNORECASE),
 ]
 
 # Inline marker patterns for all tiers
@@ -97,7 +97,7 @@ _ABSTRACT_SUBS = [
     (re.compile(r"\bsovereign-core\b", re.IGNORECASE),    "internal-service"),
     (re.compile(r"\bdocker-broker\b", re.IGNORECASE),     "internal-service"),
     (re.compile(r"\ba2a-browser\b",   re.IGNORECASE),     "internal-service"),
-    (re.compile(r"\bnextcloud-rp\b",  re.IGNORECASE),     "internal-service"),
+    (re.compile(r"\bnginx\b",          re.IGNORECASE),     "internal-service"),
     (re.compile(r"\bsearxng\b",       re.IGNORECASE),     "internal-service"),
     (re.compile(r"\bqdrant\b",        re.IGNORECASE),     "internal-service"),
 ]

@@ -56,10 +56,13 @@ def cmd_search(args):
         r = requests.post(f"{_BASE_URL}/search", json=body, headers=_headers(), timeout=_TIMEOUT)
         r.raise_for_status()
         # Output flat — a2a-browser SearchResponse fields at top level.
-        # Explicitly exclude a2a-browser's own "status" field (may be "failed" for degraded
-        # enrichment) so our wrapper status="ok" (HTTP 200) is not overridden.
+        # Strip internal/diagnostic fields: status (avoid override), ClawSec scanner
+        # metadata (wrap_applied, validation_failures, wrap_failures) — security gate
+        # diagnostics that should not reach the translator LLM.
+        _strip = {"status", "wrap_applied", "validation_failures", "wrap_failures",
+                  "scan_result", "scanner_flags", "clawsec_verdict"}
         result = r.json()
-        flat = {k: v for k, v in result.items() if k != "status"}
+        flat = {k: v for k, v in result.items() if k not in _strip}
         print(json.dumps({"status": "ok", **flat}))
     except requests.HTTPError as e:
         print(json.dumps({"status": "error", "error": f"a2a-browser HTTP {e.response.status_code}"}))
@@ -83,9 +86,13 @@ def cmd_fetch(args):
         r = requests.post(f"{_BASE_URL}/fetch", json=body, headers=_headers(), timeout=_TIMEOUT)
         r.raise_for_status()
         # Output flat — a2a-browser FetchResponse fields at top level.
-        # Exclude a2a-browser's own "status" field to avoid overriding our wrapper status.
+        # Strip internal/diagnostic fields: status (avoid override), ClawSec scanner
+        # metadata (wrap_applied, validation_failures, wrap_failures) — security gate
+        # diagnostics that should not reach the translator LLM.
+        _strip = {"status", "wrap_applied", "validation_failures", "wrap_failures",
+                  "scan_result", "scanner_flags", "clawsec_verdict"}
         result = r.json()
-        flat = {k: v for k, v in result.items() if k != "status"}
+        flat = {k: v for k, v in result.items() if k not in _strip}
         print(json.dumps({"status": "ok", **flat}))
     except requests.HTTPError as e:
         print(json.dumps({"status": "error", "error": f"a2a-browser HTTP {e.response.status_code}"}))

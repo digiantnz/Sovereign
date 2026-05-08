@@ -26,6 +26,7 @@ const watchlist = require('./wallet-watchlist');
 const watcher   = require('./wallet-watcher');
 const harnessA2A       = require('./wallet-harness-a2a');
 const harnessPortfolio = require('./wallet-harness-portfolio');
+const harnessLightning = require('./wallet-harness-lightning');
 
 const app  = express();
 app.use(express.json());
@@ -49,14 +50,23 @@ function _requireInternalToken(req, res, next) {
 async function _startup() {
   console.log('[sov-wallet] starting up');
 
-  // 1. Load MIP config + endpoints
+  // 0. Load wallet-config.json (source of truth for endpoints + watchlist)
+  let walletCfg = {};
+  try {
+    walletCfg = JSON.parse(require('fs').readFileSync(WALLET_CONFIG, 'utf8'));
+  } catch (e) {
+    console.warn('[sov-wallet] could not load wallet-config.json:', e.message);
+  }
+
+  // 1. Load MIP config + endpoints (endpoints now read from config, not MIP)
   watchlist.init(({ added, removed }) => {
     console.log(`[sov-wallet] watchlist updated: +${added.length} -${removed.length}`);
   });
 
   await watchlist.loadConfig();
-  const endpoints = await watchlist.loadNetworkEndpoints();
+  const endpoints = await watchlist.loadNetworkEndpoints(walletCfg);
   rpc.configure(endpoints);
+  harnessLightning.configure(walletCfg);
 
   // 2. Seed watchlist from wallet-config.json on first run
   await watchlist.seedFromConfig(WALLET_CONFIG);
@@ -84,7 +94,24 @@ async function _startup() {
 // ── Liveness ───────────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', role: 'sov-wallet' });
+  const chains = watcher.getChainState();
+  const lightning = harnessLightning.getLightningWatcherState();
+  const chainHealth = {};
+  for (const [k, v] of Object.entries(chains)) {
+    chainHealth[k] = { connected: v.failures === 0, failures: v.failures, last_ok: v.lastOk };
+  }
+  chainHealth.lightning_invoice = {
+    connected: lightning.invoice.failures === 0,
+    failures:  lightning.invoice.failures,
+    last_ok:   lightning.invoice.lastOk,
+  };
+  chainHealth.lightning_channel = {
+    connected: lightning.channel.failures === 0,
+    failures:  lightning.channel.failures,
+    last_ok:   lightning.channel.lastOk,
+  };
+  const failing = Object.values(chainHealth).filter(c => !c.connected).length;
+  res.json({ status: 'ok', role: 'sov-wallet', chains_failing: failing, chains: chainHealth });
 });
 
 // ── Portfolio + watchlist ──────────────────────────────────────────────────────

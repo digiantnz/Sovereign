@@ -538,6 +538,33 @@ async def handle_do_tax(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _dispatch_and_reply(payload, f"/do_tax {year_arg}".strip(), chat_id, context.bot, session)
 
 
+async def handle_signbtc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /signbtc — create and sign a BTC PSBT with Rex's key.
+
+    Bypasses NL routing. Calls wallet_sign_btc_psbt (HIGH tier) — requires
+    Director double-confirmation before Rex signs.
+
+    Usage:
+      /signbtc                — sign pending PSBT from working memory
+      /signbtc <psbt_base64>  — sign a specific PSBT provided inline
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    psbt_arg = " ".join(context.args).strip() if context.args else ""
+    session = store.get_or_create(chat_id)
+    payload = {
+        "input":        psbt_arg or "sign_btc",
+        "_harness_cmd": "sign_btc",
+        "psbt_b64":     psbt_arg,
+        "context_window": session.history,
+    }
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, "/signbtc", chat_id, context.bot, session)
+
+
 async def handle_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /remember and /memorise slash commands."""
     user = update.effective_user
@@ -654,6 +681,7 @@ def main():
     app.add_handler(CommandHandler("portfolio", handle_portfolio))
     app.add_handler(CommandHandler("pm", handle_pm))
     app.add_handler(CommandHandler("do_tax", handle_do_tax))
+    app.add_handler(CommandHandler("signbtc", handle_signbtc))
     app.add_handler(CommandHandler(["remember", "memorise", "memorize"], handle_remember))
     app.add_handler(CommandHandler("verify", handle_verify))
     app.add_handler(MessageHandler(

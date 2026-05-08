@@ -26,6 +26,7 @@ import httpx
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from execution.adapters.qdrant import PROSPECTIVE, PROCEDURAL, EPISODIC, WORKING
+from config import cfg as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,7 @@ async def _notify_telegram(message: str) -> None:
     if not token or not chat_id:
         return
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=_cfg.timeouts.task_scheduler_telegram_s) as client:
             await client.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
@@ -200,7 +201,7 @@ class TaskScheduler:
       _dispatch_fn — ExecutionEngine._dispatch (injected post-init via set_dispatch_fn)
     """
 
-    SCHEDULER_INTERVAL = 60  # seconds between due-task checks
+    SCHEDULER_INTERVAL = _cfg.intervals.task_scheduler_loop_s
 
     def __init__(self, qdrant, cog):
         self.qdrant = qdrant
@@ -267,7 +268,7 @@ class TaskScheduler:
                 scroll_filter=Filter(must=[
                     FieldCondition(key="status", match=MatchValue(value="active")),
                 ]),
-                limit=200,
+                limit=_cfg.limits.prospective_scroll_max,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -678,7 +679,7 @@ class TaskScheduler:
         try:
             all_items, _ = await self.qdrant.archive_client.scroll(
                 collection_name=PROSPECTIVE,
-                limit=200,
+                limit=_cfg.limits.prospective_scroll_max,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -737,7 +738,7 @@ class TaskScheduler:
             result = await self.qdrant.archive_client.scroll(
                 collection_name=EPISODIC,
                 scroll_filter=None,
-                limit=200,
+                limit=_cfg.limits.prospective_scroll_max,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -892,7 +893,10 @@ class TaskScheduler:
                 or res.get("data")        # browser fetch: {"status":"ok","data":{"content":...}}
                 or res.get("notes")       # nextcloud notes list
                 or res.get("events")      # caldav events
+                or res.get("tasks")       # nextcloud tasks list
                 or res.get("files")       # file listings
+                or res.get("brief")       # news_brief harness
+                or res.get("entries")     # RSS entries
             )
         has_content = any(
             r.get("status") == "ok" and _result_has_content(r.get("result", {}))
@@ -909,13 +913,42 @@ class TaskScheduler:
 
         def _format_step_content(r: dict) -> str:
             """Expand step result into readable content lines for briefing output."""
+            res = r.get("result", {}) or {}
+
+            # News brief — check first, before status gate.
+            # news_brief can return status "partial" when some sources failed but a
+            # brief was still synthesised.  "partial" must not fall through to error path.
+            if isinstance(res, dict) and res.get("brief"):
+                brief = res["brief"]
+                try:
+                    from monitoring.learning_harness import _last_run_summary
+                    if _last_run_summary and _last_run_summary.get("filename"):
+                        from datetime import datetime, timezone as _tz
+                        run_ts = _last_run_summary.get("completed_at", "")
+                        if run_ts:
+                            run_dt = datetime.fromisoformat(run_ts)
+                            age_h  = (datetime.now(_tz.utc) - run_dt).total_seconds() / 3600
+                            if age_h < 24:
+                                fn   = _last_run_summary.get("filename", "?")
+                                nc   = _last_run_summary.get("entries_created", 0)
+                                nu   = _last_run_summary.get("entries_updated", 0)
+                                brief += (
+                                    f"\n\n📚 *Learning*: processed `{fn}` — "
+                                    f"{nc} new entr{'y' if nc == 1 else 'ies'}, "
+                                    f"{nu} updated."
+                                )
+                except ImportError:
+                    pass
+                if res.get("status") == "partial" and res.get("sources_failed"):
+                    brief += f"\n_(partial — sources unavailable: {', '.join(res['sources_failed'])})_"
+                return brief[:1000]
+
             if r.get("status") != "ok":
-                _res = r.get("result", {}) or {}
                 return (
-                    _res.get("error") or _res.get("raw_error") or _res.get("note")
+                    res.get("error") or res.get("raw_error") or res.get("note")
                     or r.get("error", "no detail")
                 )
-            res = r.get("result", {})
+
             if not isinstance(res, dict):
                 return "no detail"
 
@@ -984,7 +1017,7 @@ class TaskScheduler:
         # Build summary for notification + episodic
         summary_parts = [f"*Scheduled task: {title}*", ""]
         for r in step_results:
-            status_icon = "✅" if r.get("status") == "ok" else "❌"
+            status_icon = "✅" if r.get("status") in ("ok", "partial") else "❌"
             content = _format_step_content(r)
             summary_parts.append(f"{status_icon} *{r['description']}*")
             summary_parts.append(content)
@@ -996,7 +1029,7 @@ class TaskScheduler:
         summary = "\n".join(summary_parts)
 
         if should_notify:
-            await _notify_telegram(summary[:4000])  # Telegram limit
+            await _notify_telegram(summary[:_cfg.limits.telegram_message_max_chars])
 
         # Write episodic memory entry
         await self._write_episodic(task_id, title, outcome, summary, len(step_results))
@@ -1051,7 +1084,7 @@ class TaskScheduler:
         try:
             items, _ = await self.qdrant.archive_client.scroll(
                 collection_name=PROSPECTIVE,
-                limit=200,
+                limit=_cfg.limits.prospective_scroll_max,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -1159,7 +1192,7 @@ class TaskScheduler:
     # ── Background loop ───────────────────────────────────────────────────
 
     async def _loop(self) -> None:
-        await asyncio.sleep(30)  # initial delay — let services settle
+        await asyncio.sleep(_cfg.intervals.task_scheduler_startup_delay_s)
         while True:
             try:
                 ran = await self.run_due_tasks()

@@ -14,6 +14,7 @@ from security.scanner import SecurityScanner
 from security.guardrail import GuardrailEngine
 from monitoring.metrics import collect_all
 from monitoring.scheduler import start_scheduler, start_archive_sync, start_observe_loop
+from monitoring.learning_harness import start_learning_loop, check_downloads
 from monitoring.eth_watcher import start_eth_watcher
 from skills.loader import scan_all_skills
 from skills.lifecycle import load_skill_watchlist
@@ -309,19 +310,26 @@ async def lifespan(app: FastAPI):
             "metadata": {"protocol": "http", "chain": "btc", "status": "active", "host": "start9"},
         },
         {
-            "seed_id": "backfill_v1_net_btcpay",
+            "seed_id": "backfill_v2_net_btcpay",
+            "_prev_seed_id": "backfill_v1_net_btcpay",
             "key": "semantic:network:endpoints:btcpay",
-            "title": "BTCPay Server endpoint (Start9 — pending configuration)",
+            "title": "BTCPay Server endpoint (Start9 — live)",
             "content": (
-                "BTCPay Server endpoint: 172.16.201.5 (port TBD). "
-                "Lightning Network payment processor on the Start9 node. "
-                "Currently being configured — port and credentials not yet assigned. "
-                "Will be used for Lightning/BTCPay wallet.lightning module. Status: pending."
+                "BTCPay Server endpoint: 172.16.201.5:3000. "
+                "Lightning Network payment processor on the Start9 node (node05). "
+                "LAN URL: http://172.16.201.5:3000 (socat forward: btcpayserver.embassy:3000). "
+                "Status: online (live 2026-04-23). "
+                "Multisig wallet connected via recv_descriptor (2-of-3 P2WSH). "
+                "Internal Lightning node online. "
+                "Lightning pubkey: 02ce2ce669c596189d074690ddfa2b1a1afcef38a95fedf96702596fcee9f3dd17. "
+                "Lightning onion: 6elyc6iya34gmk4snfibfa22jachyjzvpofkywlu4rbycmjsnanqvwqd.onion:9735. "
+                "Used by sov-wallet Lightning harness to report channel balances in portfolio snapshots. "
+                "Auth: BTCPAY_API_KEY in secrets/wallet.env (server-admin API key)."
             ),
             "domain": "network.endpoints",
             "label": "btcpay",
-            "value": "172.16.201.5",
-            "metadata": {"protocol": "http", "chain": "btc", "status": "pending", "host": "start9", "port": None},
+            "value": "172.16.201.5:3000",
+            "metadata": {"protocol": "http", "chain": "btc", "status": "active", "host": "start9", "port": 3000},
         },
         {
             "seed_id": "static_v1_claude_api",
@@ -537,17 +545,32 @@ async def lifespan(app: FastAPI):
     # Runs AFTER all seeds so startup_load() reads the corrected RAID state —
     # any stale entries deleted/reseeded by steps 2b–2f are not loaded.
     # Seeds write to RAID (archive_client) only; no working_memory dependency.
-    await qdrant.startup_load()
-
-    # ── Step 2h: Bootstrap working_memory from sovereign root seed keys
-    # Reads working_memory_seed_keys from semantic:entity:sovereign entry and
-    # pre-loads each key into working_memory with stored vectors from RAID.
-    # Runs AFTER startup_load() so targeted keys overlay the broad preload.
+    # Phase 1: targeted slots (canonical MIP keys, due-today tasks, SI proposals,
+    # active procedurals) are loaded first to guarantee presence. Phase 2: vector
+    # similarity fills remaining capacity up to VRAM budget cap.
+    _startup_stats = await qdrant.startup_load()
     try:
-        _boot_count = await qdrant.bootstrap_working_memory()
-        logger.info("Bootstrap working_memory: %d seed keys loaded", _boot_count)
-    except Exception as _boot_err:
-        logger.warning("Bootstrap working_memory failed (non-fatal): %s", _boot_err)
+        _sl = _startup_stats.get("slots", {})
+        _sl_total = _startup_stats.get("total", 0)
+        _sl_sim   = _startup_stats.get("similarity", 0)
+        _sl_mb    = _startup_stats.get("est_mb", 0.0)
+        _tg_tok  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        _tg_chat = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
+        if _tg_tok and _tg_chat:
+            import httpx as _hx
+            _notif = (
+                f"🧠 Bootstrap complete: {_sl_total} entries loaded (~{_sl_mb} MB)\n"
+                f"   {_sl.get(2,0)} canonical | {_sl.get(3,0)} due today | "
+                f"{_sl.get(6,0)} SI proposals | {_sl.get(7,0)} procedural | "
+                f"{_sl_sim} similarity"
+            )
+            async with _hx.AsyncClient(timeout=10.0) as _cl:
+                await _cl.post(
+                    f"https://api.telegram.org/bot{_tg_tok}/sendMessage",
+                    json={"chat_id": _tg_chat, "text": _notif},
+                )
+    except Exception as _boot_notif_err:
+        logger.warning("Bootstrap Telegram notification failed (non-fatal): %s", _boot_notif_err)
 
     app.state.gov      = GovernanceEngine("/app/governance/governance.json")
     app.state.cog      = CognitionEngine(qdrant, ledger=ledger)
@@ -630,7 +653,8 @@ async def lifespan(app: FastAPI):
     # Self-improvement harness — daily observe loop (baseline + anomaly detection)
     # Inject qdrant onto app.state so observe_loop() can access it
     app.state.qdrant = qdrant
-    _si_observe_task = start_observe_loop(app.state)
+    _si_observe_task   = start_observe_loop(app.state)
+    _learning_task     = start_learning_loop(app.state)
 
     # ── Step 3b: Task scheduler — data-driven recurring tasks ────────────
     task_scheduler = TaskScheduler(qdrant=qdrant, cog=app.state.cog)
@@ -800,7 +824,6 @@ async def wallet_event(request: Request):
                     "sig_prefix":  sig_prefix,
                     "event_ts":    event.get("timestamp"),
                 },
-                mem_type="episodic",
             )
         except Exception as e:
             logger.warning("wallet_event: qdrant store failed: %s", e)
@@ -826,7 +849,7 @@ async def wallet_event(request: Request):
                     f"on {event.get('chain', '').upper()} ({label})"
                 ),
             }
-            alert_text = await cog.translator_pass(result_for_translator, user_input="wallet payment alert")
+            alert_text = await cog.translator_pass(result_for_translator)
             # Send Telegram notification
             _token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             _chat_id = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
@@ -848,7 +871,8 @@ async def wallet_event(request: Request):
     _cr_chain = event.get("chain", "").lower()
     _cr_tx    = event.get("tx_hash", "")
 
-    if qdrant and _a2a_url and _a2a_key and _cr_tx:
+    # lightning_channel events are internal (channel opens) — never credit a2a-browser
+    if qdrant and _a2a_url and _a2a_key and _cr_tx and _cr_chain != "lightning_channel":
         try:
             import uuid as _uuid_mod
             import httpx as _hx_cr
@@ -891,7 +915,7 @@ async def wallet_event(request: Request):
                 )
 
                 # 3. USD normalisation via CoinGecko — failure BLOCKS dispatch, never estimate
-                _cg_coin_ids = {"eth": "ethereum", "arb": "ethereum", "op": "ethereum", "btc": "bitcoin"}
+                _cg_coin_ids = {"eth": "ethereum", "arb": "ethereum", "op": "ethereum", "btc": "bitcoin", "lightning": "bitcoin"}
                 _cg_id = _cg_coin_ids.get(_cr_chain)
                 _amount_usd: str | None = None
                 if _cg_id:
@@ -954,6 +978,11 @@ async def wallet_event(request: Request):
                                 "to_address":    event.get("to_address", ""),
                                 "confirmations": event.get("confirmations"),
                                 "timestamp":     event.get("timestamp"),
+                                "message":       event.get("message", ""),
+                                "direction":     event.get("direction", "inbound"),
+                                "amount_msat":   event.get("amount_msat"),
+                                "payment_hash":  event.get("payment_hash"),
+                                "invoice_id":    event.get("invoice_id"),
                                 "sig_prefix":    sig_prefix,
                                 "rex_sig":       sig,
                             },
@@ -1104,14 +1133,20 @@ async def attachment(payload: dict):
     Payload: {filename, content_b64, mime_type, size, source}
     Decodes base64 content and writes to Nextcloud via WebDAV.
     LOW tier — no confirmation required. Audit-logged.
+    Files landing in /downloads/ trigger an immediate learning harness check
+    as a background task (no time-window gate — Director signalled intent).
     """
-    return await app.state.exec.handle_attachment(
+    result = await app.state.exec.handle_attachment(
         filename=payload.get("filename", "unknown"),
         content_b64=payload.get("content_b64", ""),
         mime_type=payload.get("mime_type", "application/octet-stream"),
         size=int(payload.get("size", 0)),
         source=payload.get("source", "unknown"),
     )
+    # Trigger immediate learning check for files that landed in /downloads/
+    if result.get("status") == "ok" and str(result.get("path", "")).startswith("/downloads/"):
+        asyncio.create_task(check_downloads(app.state, immediate=True))
+    return result
 
 
 @app.post("/chat")

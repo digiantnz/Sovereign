@@ -12,13 +12,14 @@ from datetime import datetime, timezone
 import httpx
 
 from monitoring.metrics import collect_all
+from config import cfg as _cfg
 
 logger = logging.getLogger(__name__)
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 THRESHOLDS = {
-    "vram_used_mb_warning":          7500,    # > 7.5 GB VRAM used = warning
-    "qdrant_total_points_warning":   1_000_000,  # 1M points — size proxy (no byte count from API)
+    "vram_used_mb_warning":          _cfg.thresholds.vram_used_mb_warning,
+    "qdrant_total_points_warning":   _cfg.thresholds.qdrant_total_points_warning,
     "external_unreachable_warning":  True,    # any external service unreachable = warning
     "soul_mismatch_critical":        True,    # any drift = critical
     "container_not_running_critical": True,   # any sovereign container not running = critical
@@ -32,7 +33,7 @@ SOVEREIGN_CONTAINERS = {
    # ollama-embed added 2026-03-25 — CPU-only nomic-embed-text embedding service
    # qdrant-archive added 2026-03-25 — RAID-only sovereign collections (new architecture)
 
-SELF_CHECK_INTERVAL = 6 * 3600   # 6 hours in seconds
+SELF_CHECK_INTERVAL = _cfg.intervals.health_check_s
 
 # ── Telegram alert (same pattern as soul_guardian) ────────────────────────────
 
@@ -193,7 +194,7 @@ def start_scheduler(app_state) -> asyncio.Task:
 
 # ── Hourly RAID archive sync ───────────────────────────────────────────────────
 
-ARCHIVE_SYNC_INTERVAL = 3600  # 1 hour
+ARCHIVE_SYNC_INTERVAL = _cfg.intervals.archive_sync_s
 
 
 async def archive_sync_loop(qdrant, ledger) -> None:

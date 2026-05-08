@@ -45,13 +45,20 @@ commands:
     enabled: true
 
   nvidia_smi:
-    description: "NVIDIA GPU status. Runs inside ollama container (has GPU device access)."
-    binary: __container_exec__
-    container: ollama
+    description: "NVIDIA GPU status. Uses nsenter+su matt (NVML fails as root with open kernel module)."
+    binary: /usr/bin/nsenter
     fixed_args:
-      - nvidia-smi
-      - --query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu,power.draw
-      - --format=csv,noheader,nounits
+      - "-t"
+      - "1"
+      - "-m"
+      - "-p"
+      - "--"
+      - /bin/su
+      - "-s"
+      - /bin/sh
+      - matt
+      - "-c"
+      - "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu,power.draw --format=csv,noheader,nounits"
     params: {}
     tier: low
     enabled: true

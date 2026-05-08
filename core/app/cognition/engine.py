@@ -8,8 +8,10 @@ from adapters.claude import ClaudeAdapter
 from cognition import prompts
 from cognition.dcl import DisclosureControlLayer
 
+from config import cfg as _cfg
+
 MODEL = "llama3.1:8b-instruct-q4_K_M"
-PERSONAS_DIR = "/home/sovereign/personas"
+PERSONAS_DIR = _cfg.paths.personas_dir
 SECURITY_AGENT_PATH = os.path.join(PERSONAS_DIR, "SECURITY_AGENT.md")
 
 # ── Memory-first routing (shadow mode) ───────────────────────────────────────
@@ -17,7 +19,7 @@ SECURITY_AGENT_PATH = os.path.join(PERSONAS_DIR, "SECURITY_AGENT.md")
 # agreement/disagreement to episodic memory.  Routing itself is unchanged —
 # the LLM result is always used until Reasoning Sunday validates thresholds.
 # Flip to False to disable shadow entirely without touching routing logic.
-MEMORY_ROUTING_SHADOW_MODE = True
+MEMORY_ROUTING_SHADOW_MODE = _cfg.cognitive_loop.memory_routing_shadow_mode
 MEMORY_ROUTING_THRESHOLD   = 0.85   # score at which shadow would have overridden LLM
 
 TRANSLATOR_PATH = os.path.join(PERSONAS_DIR, "translator.md")
@@ -38,6 +40,7 @@ _TRANSLATOR_LEAK_PHRASES: tuple[str, ...] = (
     "Led with the answer",
     "per the instructions",
     "as instructed",
+    "translation rules",
 )
 
 _SENTENCE_SPLIT_RE = _re_fab.compile(r'(?<=[.!?])\s+')
@@ -346,7 +349,8 @@ class CognitionEngine:
             return ""
 
     # ── Pass 1: CEO Classification ────────────────────────────────────────
-    async def ceo_classify(self, user_input: str, context_window=None) -> dict:
+    async def ceo_classify(self, user_input: str, context_window=None,
+                           cognitive_context: str = "") -> dict:
         from execution.adapters.qdrant import classify_query_type
         query_type = classify_query_type(user_input)
         context, confidence, gaps = await self.load_memory_context(
@@ -359,6 +363,7 @@ class CognitionEngine:
             user_input=user_input,
             memory_context=context,
             context_window=context_window,
+            cognitive_context=cognitive_context,
         )
         result = await self.call_llm_json(prompt)
         result["_memory_confidence"] = confidence
@@ -471,7 +476,8 @@ class CognitionEngine:
         except Exception as exc:
             logger.debug("_write_shadow_routing_episodic: failed (non-fatal): %s", exc)
 
-    async def orchestrator_classify(self, user_input: str, context_window=None) -> dict:
+    async def orchestrator_classify(self, user_input: str, context_window=None,
+                                     cognitive_context: str = "") -> dict:
         """PASS 1: Orchestrator classification with routing memory lookup.
         New contract: adds specialist + routing_rationale fields.
         Backward compat: also sets delegate_to = specialist.
@@ -481,7 +487,9 @@ class CognitionEngine:
         and stamps shadow fields for Reasoning Sunday calibration. Actual routing
         is unchanged — LLM result is always used until thresholds are validated.
         """
-        result = await self.ceo_classify(user_input, context_window=context_window)
+        result = await self.ceo_classify(
+            user_input, context_window=context_window, cognitive_context=cognitive_context
+        )
         # Normalise: ensure both specialist and delegate_to are present
         agent = result.get("specialist") or result.get("delegate_to", "")
         result["specialist"]    = agent
@@ -752,8 +760,17 @@ class CognitionEngine:
             error_detail = (
                 result_for_translator.get("error")
                 or result_for_translator.get("outcome")
-                or "unspecified error"
+                or result_for_translator.get("message")
+                or result_for_translator.get("reason")
+                or result_for_translator.get("status")
             )
+            if not error_detail:
+                # Log the full dict so the failure is diagnosable in container logs
+                logger.warning(
+                    "translator_pass: failure result with no error/outcome — full dict: %s",
+                    json.dumps(result_for_translator)[:500],
+                )
+                error_detail = "no error detail returned (check sovereign-core logs)"
             logger.info("translator_pass: failure result — bypassing LLM")
             return f"That action failed: {error_detail}"
 

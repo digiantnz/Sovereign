@@ -27,9 +27,11 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-SKILLS_DIR = "/home/sovereign/skills"
+from config import cfg as _cfg
+
+SKILLS_DIR = _cfg.paths.skills_dir
 # Reference checksums live in the security volume (rw-mounted); separate from skills dir (ro-mounted)
-CHECKSUMS_PATH = "/home/sovereign/security/skill-checksums.json"
+CHECKSUMS_PATH = _cfg.paths.skill_checksums
 
 # Adapters always present in the running Sovereign stack (no env check required)
 _ALWAYS_AVAILABLE = {"broker", "ollama", "qdrant", "nanobot"}

@@ -107,7 +107,7 @@ nanobot-01 is a dumb executor: fires the skill, returns protocol result verbatim
 
 Scripts are stdlib/requests Python — no heavy dependencies. Credentials injected via env vars from CredentialProxy.
 
-**Future**: `lifecycle.load()` should auto-deploy `scripts/` directory at skill install time (not yet implemented).
+**Script deployment**: `lifecycle.load()` fetches script content from GitHub then POSTs to `POST /deploy-skill` (sovereign-core has no write access to the nanobot workspace — not mounted). Nanobot writes scripts to `workspace/skills/<name>/scripts/`, persists `requirements.txt` to `workspace/.pip-requirements/<name>.txt`, and pip installs packages. On container rebuild, `_reinstall_persisted_requirements()` at startup reinstalls from all `.pip-requirements/*.txt` files on RAID. Handles both Sovereign convention (scripts/ subdir) and OpenClaw convention (root-level .py/.js/.sh files).
 
 ---
 

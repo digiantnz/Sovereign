@@ -22,7 +22,9 @@ import logging
 import os
 import pathlib
 import subprocess
+import sys
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -37,13 +39,51 @@ import security
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [nanobot-01] %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="nanobot-01", docs_url=None, redoc_url=None)
+SKILLS_DIR     = os.environ.get("SKILLS_DIR",        "/skills")
+MEMORY_DIR     = os.environ.get("MEMORY_DIR",         "/memory")
+WORKSPACE      = os.environ.get("NANOBOT_WORKSPACE",  "/workspace")
+NANOBOT_CONFIG = os.environ.get("NANOBOT_CONFIG",     "/workspace/.nanobot/config.json")
+TASK_TIMEOUT   = int(os.environ.get("NANOBOT_TASK_TIMEOUT", "25"))
 
-SKILLS_DIR   = os.environ.get("SKILLS_DIR",   "/skills")
-MEMORY_DIR   = os.environ.get("MEMORY_DIR",   "/memory")
-WORKSPACE    = os.environ.get("NANOBOT_WORKSPACE", "/workspace")
-NANOBOT_CONFIG = os.environ.get("NANOBOT_CONFIG", "/workspace/.nanobot/config.json")
-TASK_TIMEOUT = int(os.environ.get("NANOBOT_TASK_TIMEOUT", "25"))
+
+def _reinstall_persisted_requirements() -> None:
+    """Re-install any pip requirements persisted from skill installs.
+
+    On container rebuild, dynamically installed packages are lost. lifecycle.load()
+    writes requirements to workspace/.pip-requirements/<skill>.txt on RAID so they
+    can be reinstalled here on every startup.
+    """
+    req_dir = pathlib.Path(WORKSPACE) / ".pip-requirements"
+    if not req_dir.exists():
+        return
+    req_files = sorted(req_dir.glob("*.txt"))
+    if not req_files:
+        return
+    logger.info("startup: reinstalling pip requirements from %d skill(s)", len(req_files))
+    for req_file in req_files:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q", "-r", str(req_file)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0:
+                logger.info("startup: pip install OK from %s", req_file.name)
+            else:
+                logger.warning(
+                    "startup: pip install from %s failed (rc=%d): %s",
+                    req_file.name, result.returncode, result.stderr[:300],
+                )
+        except Exception as _e:
+            logger.warning("startup: pip install from %s error: %s", req_file.name, _e)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _reinstall_persisted_requirements()
+    yield
+
+
+app = FastAPI(title="nanobot-01", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Filesystem path allowlists — nanobot-01 can read/write these paths
@@ -85,6 +125,16 @@ class TaskRequest(BaseModel):
 class TranslateRequest(BaseModel):
     content: str          # raw SKILL.md text (any format)
     name:    str = ""     # hint for skill name if not parseable from content
+
+
+class PipInstallRequest(BaseModel):
+    packages: list[str]   # list of pip requirement specifiers e.g. ["requests>=2.28", "pyyaml"]
+
+
+class DeploySkillRequest(BaseModel):
+    skill_name: str                          # target dir: workspace/skills/<skill_name>/scripts/
+    scripts: list[dict[str, str]] = []       # [{name: filename, content: text}]
+    requirements_txt: str | None = None      # raw requirements.txt content (persisted + installed)
 
 
 # ---------------------------------------------------------------------------
@@ -1220,6 +1270,126 @@ async def translate_skill(req: TranslateRequest, _: None = Depends(security.veri
         "name": name,
         "sovereign": sovereign_block,
         "advisory": advisory,
+    })
+
+
+@app.post("/pip-install")
+async def pip_install(req: PipInstallRequest, _: None = Depends(security.verify_secret)):
+    """Install pip packages into the nanobot Python environment.
+
+    Called by lifecycle.load() after deploying a skill's scripts/ directory.
+    Packages are installed into the running container's site-packages.
+    Requirements are persisted to workspace/.pip-requirements/ by the caller
+    so they survive container rebuilds via _reinstall_persisted_requirements().
+
+    Returns {ok: bool, installed: [pkg], failed: [pkg], error: str|None}
+    """
+    packages = [p.strip() for p in req.packages if p.strip()]
+    if not packages:
+        return JSONResponse(content={"ok": True, "installed": [], "failed": [], "error": None})
+
+    installed: list[str] = []
+    failed: list[str] = []
+
+    for pkg in packages:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q", pkg],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode == 0:
+                installed.append(pkg)
+                logger.info("pip-install: installed %r", pkg)
+            else:
+                failed.append(pkg)
+                logger.warning("pip-install: failed %r: %s", pkg, result.stderr[:200])
+        except Exception as _e:
+            failed.append(pkg)
+            logger.warning("pip-install: error installing %r: %s", pkg, _e)
+
+    ok = len(failed) == 0
+    error = f"Failed to install: {', '.join(failed)}" if failed else None
+    return JSONResponse(content={"ok": ok, "installed": installed, "failed": failed, "error": error})
+
+
+@app.post("/deploy-skill")
+async def deploy_skill(req: DeploySkillRequest, _: None = Depends(security.verify_secret)):
+    """Deploy a skill's scripts and requirements into the nanobot workspace.
+
+    Called by lifecycle.load() after installing a skill. sovereign-core cannot write
+    to the nanobot workspace directly (not mounted) so script content is fetched by
+    sovereign-core then POSTed here for nanobot to write to its own filesystem.
+
+    Writes scripts to workspace/skills/<name>/scripts/, persists requirements.txt to
+    workspace/.pip-requirements/<name>.txt (survives container rebuild via startup
+    reinstall), then pip installs any requirements.
+
+    Returns {ok, deployed, installed, failed, errors}
+    """
+    safe_name = pathlib.Path(req.skill_name).name  # strip any path traversal
+    if not safe_name:
+        return JSONResponse(content={"ok": False, "errors": ["Invalid skill_name"]})
+
+    deployed: list[str] = []
+    errors: list[str] = []
+
+    # ── Write script files ────────────────────────────────────────────────
+    if req.scripts:
+        scripts_dir = pathlib.Path(WORKSPACE) / "skills" / safe_name / "scripts"
+        try:
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as _e:
+            return JSONResponse(content={"ok": False, "errors": [f"Cannot create scripts dir: {_e}"]})
+
+        for _s in req.scripts:
+            _fname = pathlib.Path(_s.get("name", "")).name  # strip traversal
+            _content = _s.get("content", "")
+            if not _fname or not _content:
+                continue
+            try:
+                (scripts_dir / _fname).write_text(_content, encoding="utf-8")
+                deployed.append(_fname)
+                logger.info("deploy-skill: wrote %s/%s", safe_name, _fname)
+            except OSError as _we:
+                errors.append(f"Write failed for {_fname}: {_we}")
+
+    # ── Persist requirements.txt to RAID ──────────────────────────────────
+    installed: list[str] = []
+    failed: list[str] = []
+    if req.requirements_txt:
+        req_dir = pathlib.Path(WORKSPACE) / ".pip-requirements"
+        try:
+            req_dir.mkdir(parents=True, exist_ok=True)
+            (req_dir / f"{safe_name}.txt").write_text(req.requirements_txt, encoding="utf-8")
+        except OSError as _re:
+            errors.append(f"Could not persist requirements.txt: {_re}")
+
+        pkgs = [
+            ln.strip() for ln in req.requirements_txt.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        for pkg in pkgs:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q", pkg],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode == 0:
+                    installed.append(pkg)
+                else:
+                    failed.append(pkg)
+                    errors.append(f"pip install failed for {pkg}: {result.stderr[:150]}")
+            except Exception as _pe:
+                failed.append(pkg)
+                errors.append(f"pip install error for {pkg}: {_pe}")
+
+    ok = not errors
+    return JSONResponse(content={
+        "ok": ok,
+        "deployed": deployed,
+        "installed": installed,
+        "failed": failed,
+        "errors": errors,
     })
 
 

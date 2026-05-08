@@ -2,6 +2,7 @@ import json
 import os
 from datetime import datetime, timezone
 
+from config import cfg as _cfg
 from adapters.broker import BrokerAdapter
 
 
@@ -137,6 +138,7 @@ INTENT_ACTION_MAP = {
     "self_improve_observe":    {"domain": "monitoring", "operation": "observe"},
     "self_improve_proposals":  {"domain": "monitoring", "operation": "proposals"},
     "self_improve_baseline":   {"domain": "monitoring", "operation": "baseline"},
+    "learning_harness_status": {"domain": "monitoring", "operation": "learning_status"},
     # Self-diagnostic intents — all LOW, all read-only
     "read_audit_log":          {"domain": "docker", "operation": "read", "name": "host_file_read",
                                  "path": "/home/sovereign/audit/security-ledger.jsonl"},
@@ -157,6 +159,7 @@ INTENT_ACTION_MAP = {
     "search_files":  {"domain": "webdav", "operation": "search",  "name": "file_search"},
     # CalDAV extended
     "list_events":   {"domain": "caldav", "operation": "read",    "name": "calendar_list_events"},
+    "list_nc_tasks": {"domain": "caldav", "operation": "read",    "name": "tasks_list"},
     "complete_task": {"domain": "caldav", "operation": "write",   "name": "task_complete"},
     "delete_event":  {"domain": "caldav", "operation": "delete",  "name": "calendar_delete"},
     "update_event":  {"domain": "caldav", "operation": "write",   "name": "calendar_update"},
@@ -177,10 +180,12 @@ INTENT_ACTION_MAP = {
     # Wallet intents — devops_agent scope (LOW/MID/HIGH tier)
     "wallet_read_config":     {"domain": "wallet",           "operation": "read",    "name": "wallet_read_config"},
     "wallet_get_address":     {"domain": "wallet",           "operation": "read",    "name": "wallet_get_address"},
-    "wallet_sign_message":    {"domain": "wallet",           "operation": "sign",    "name": "wallet_sign_message"},
-    "wallet_propose_safe_tx": {"domain": "wallet",           "operation": "propose", "name": "wallet_propose_safe_tx"},
-    "wallet_get_proposals":   {"domain": "wallet",           "operation": "read",    "name": "wallet_get_proposals"},
-    "wallet_get_btc_xpub":    {"domain": "wallet",           "operation": "read",    "name": "wallet_get_btc_xpub"},
+    "wallet_sign_message":     {"domain": "wallet",           "operation": "sign",    "name": "wallet_sign_message"},
+    "wallet_propose_safe_tx":  {"domain": "wallet",           "operation": "propose", "name": "wallet_propose_safe_tx"},
+    "wallet_get_proposals":    {"domain": "wallet",           "operation": "read",    "name": "wallet_get_proposals"},
+    "wallet_get_btc_xpub":     {"domain": "wallet",           "operation": "read",    "name": "wallet_get_btc_xpub"},
+    "wallet_sign_btc_psbt":    {"domain": "wallet",           "operation": "sign",    "name": "wallet_sign_btc_psbt"},
+    "wallet_create_btc_psbt":  {"domain": "wallet",           "operation": "propose", "name": "wallet_create_btc_psbt"},
     # Wallet watchlist intents — watch address management via Qdrant MIP
     "wallet_list_addresses":  {"domain": "wallet_watchlist", "operation": "list",    "name": "wallet_list_addresses"},
     "wallet_add_address":     {"domain": "wallet_watchlist", "operation": "add",     "name": "wallet_add_address"},
@@ -231,7 +236,7 @@ INTENT_TIER_MAP = {
     "tax_report_query": "LOW", "tax_report_ingest": "LOW", "tax_report_create": "LOW",
     "tax_report_notify": "LOW", "tax_report_clear": "LOW", "tax_report_status": "LOW",
     "move_email": "MID",
-    "list_calendars": "LOW", "list_events": "LOW",
+    "list_calendars": "LOW", "list_events": "LOW", "list_nc_tasks": "LOW",
     "delete_event": "MID", "update_event": "MID",
     "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
     "restart_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
@@ -254,6 +259,8 @@ INTENT_TIER_MAP = {
     "wallet_get_address":     "LOW",
     "wallet_sign_message":    "MID",
     "wallet_propose_safe_tx": "HIGH",
+    "wallet_sign_btc_psbt":   "HIGH",
+    "wallet_create_btc_psbt": "HIGH",
     "wallet_get_proposals":   "MID",
     "wallet_get_btc_xpub":    "LOW",
     # Wallet watchlist tiers
@@ -279,6 +286,7 @@ INTENT_TIER_MAP = {
     "self_improve_observe":    "LOW",
     "self_improve_proposals":  "LOW",
     "self_improve_baseline":   "LOW",
+    "learning_harness_status": "LOW",
     # Self-diagnostic read intents — LOW
     "read_audit_log":          "LOW",
     "memory_promotion_status": "LOW",
@@ -369,16 +377,15 @@ def _normalise_dt(value: str, default_year: int = 2026) -> str:
 
 def _infer_prior_domain(context_window) -> str | None:
     """
-    Scan the last 2-3 turns of conversation history to identify the active domain.
-    Returns a domain hint string or None.
+    Scan the full context_window (up to HISTORY_MAX turns) to identify the active domain.
+    Most-recent signal wins — iterates newest-first and returns on first match.
     context_window: list of {user, assistant} dicts or a single dict (legacy).
     """
     if not context_window:
         return None
     turns = context_window if isinstance(context_window, list) else [context_window]
-    # Check last 2 turns (most recent signal wins)
     import re as _re_pd
-    for turn in reversed(turns[-2:]):
+    for turn in reversed(turns):
         combined = (turn.get("user", "") + " " + turn.get("assistant", "")).lower()
         if _re_pd.search(r'\b(email|inbox|subject|unread|sender|mail)\b', combined):
             return "email"
@@ -688,6 +695,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "update the watchlist", "change the label",
         "portfolio", "portfolio value", "portfolio worth", "wallet balance",
         "check address", "check wallet", "monitor this address",
+        # Learning-Harness
+        "learning harness", "learning status", "what did you learn", "last learned",
         # Dev-Harness
         "dev analyse", "dev analysis", "dev harness", "dev status",
         "approve dev", "reject dev", "verify dev", "dev clear",
@@ -713,6 +722,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "tax summary", "tax year", "tax report", "my taxes", "staking reward",
         "staking rewards", "disposal event", "income event", "wirex tax",
         "swyftx tax", "tax address", "taxable wallet", "tax wallet",
+        # Bitcoin / BTC wallet operations
+        "btc", "bitcoin", "multisig", "psbt", "propose btc", "send btc",
+        "create btc", "sign btc", "sign bitcoin", "fund lightning",
+        "lightning channel", "create bitcoin", "btc transaction", "btc send",
     )
     prior_has_system = prior_domain is not None
 
@@ -729,7 +742,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     )
     _time_signals = (
         "right now", "at the moment", "live", "real-time", "real time",
-        "current", "currently", "today", "latest", "what is it at", "what's it at",
+        "current", "currently", "today", "what is it at", "what's it at",
         "how much is it", "what's the", "what is the", "how is the",
         "2025", "2026",  # explicit year reference → current-info query
     )
@@ -757,6 +770,57 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Explicit web search phrase — deterministic direct-to-browser",
         }
 
+    # Explicit Grok/Claude provider request — must be checked BEFORE _time_signals so that
+    # "ask grok about the latest X" doesn't get sidetracked to web_search by "latest".
+    import re as _re_xprov
+    _XPROV_RE = _re_xprov.compile(
+        r'\b(use grok|ask grok|via grok|use claude|ask claude|via claude)\b',
+        _re_xprov.IGNORECASE,
+    )
+    if _XPROV_RE.search(u):
+        return {
+            "intent": "query", "delegate_to": "research_agent",
+            "tier": "LOW", "confidence": 0.95,
+            "reasoning_summary": "Explicit external provider request — routes to domain:ollama for Grok/Claude dispatch",
+        }
+
+    # ── News brief — before _time_signals so "what's the latest news" etc. aren't
+    # sidetracked to web_search by generic time-signal words like "what's the".
+    # Must remain before the RSS block — "news feed" overlaps but news harness is preferred.
+    _news_kw = (
+        "what's in the news", "whats in the news",
+        "news brief", "news update", "news summary",
+        "what's happening", "whats happening",
+        "current events", "what's trending", "whats trending",
+        "morning news", "today's news", "todays news",
+        "latest headlines", "news today", "news briefing",
+    )
+    _is_news_brief = any(w in u for w in _news_kw)
+    if _is_news_brief:
+        return {
+            "intent": "news_brief", "delegate_to": "research_agent",
+            "tier": "LOW", "confidence": 0.90,
+            "reasoning_summary": "News brief request — news harness",
+        }
+
+    # ── RSS feed — before _time_signals so "what's the latest from the news feeds"
+    # isn't sidetracked to web_search by "what's the".
+    _rss_kw = (
+        "rss feed", "rss feeds", "my feeds", "my rss", "news feed", "news feeds",
+        "news stories from", "stories from the rss", "latest from my feeds",
+        "what's in my feeds", "whats in my feeds", "from my feeds",
+        "from the news feeds", "from the rss", "from the feeds",
+        "add a feed", "add feed", "subscribe to", "unsubscribe from",
+        "list my feeds", "show my feeds",
+    )
+    _is_rss = "rss" in u or any(w in u for w in _rss_kw)
+    if _is_rss:
+        return {
+            "delegate_to": "research_agent", "intent": "read_feed",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "RSS/feed query — direct nanobot rss-digest dispatch",
+        }
+
     import re as _re_fp
     _has_file_path = bool(_re_fp.search(r"(?:^|\s)/[A-Za-z0-9_./-]+", user_input))
     if not prior_has_system and any(sig in u for sig in _time_signals) and not _has_file_path:
@@ -782,25 +846,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "research_agent", "intent": "query",
             "target": None, "tier": "LOW",
             "reasoning_summary": "No system domain signals — conversational query",
-        }
-
-    # ── News brief — routes to news harness (RSS + Grok + browser, parallel) ──
-    # Must be checked BEFORE the RSS block — overlapping keywords like "news feed" would
-    # otherwise route to rss-digest only. Generic "news" requests → news harness.
-    _news_kw = (
-        "what's in the news", "whats in the news",
-        "news brief", "news update", "news summary",
-        "what's happening", "whats happening",
-        "current events", "what's trending", "whats trending",
-        "morning news", "today's news", "todays news",
-        "latest headlines", "news today", "news briefing",
-    )
-    _is_news_brief = any(w in u for w in _news_kw)
-    if _is_news_brief:
-        return {
-            "intent": "news_brief", "delegate_to": "research_agent",
-            "tier": "LOW", "confidence": 0.90,
-            "reasoning_summary": "News brief request — news harness",
         }
 
     # ── Tax harness — query / status / run ────────────────────────────────────
@@ -838,25 +883,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": f"Tax harness request — {_tax_intent}",
         }
 
-    # ── RSS feed — identified as system domain, must reach CEO LLM + PASS 3 ──
-    # DO NOT short-circuit: "research" intent maps to ollama/query (short-circuit path),
-    # which bypasses PASS 3 and the specialist that selects rss-digest via nanobot.
-    # "rss" is already in _system_signals so the conversational guard won't fire.
-    # The safety net below is also exempted for RSS so it falls through to CEO LLM.
-    _rss_kw = (
-        "rss feed", "rss feeds", "my feeds", "my rss", "news feed", "news feeds",
-        "news stories from", "stories from the rss", "latest from my feeds",
-        "what's in my feeds", "whats in my feeds", "from my feeds",
-        "add a feed", "add feed", "subscribe to", "unsubscribe from",
-        "list my feeds", "show my feeds",
-    )
-    _is_rss = "rss" in u or any(w in u for w in _rss_kw)
-    if _is_rss:
-        return {
-            "delegate_to": "research_agent", "intent": "read_feed",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "RSS/feed query — direct nanobot rss-digest dispatch",
-        }
 
     # Pronoun-only inputs — resolve against prior domain before pattern matching
     # Use word-boundary regex to avoid substring matches (e.g. "it" inside "with", "that" inside "that's")
@@ -1162,7 +1188,13 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         r"to\s+my\s+(shopping|grocery|todo|to-do|wish)\s*list)",
         _re_mem.IGNORECASE,
     )
-    if _memory_re.search(u):
+    # Interrogative guard — "is there anything to memorise?", "should you memorise this?",
+    # "what should I remember?" are queries about memory, not store commands. Let them fall
+    # through to the LLM so it can answer from context rather than storing the question text.
+    _mem_interrogative = _re_mem.search(
+        r"^(is|are|what|do|does|should|would|can|could|anything|is there|are there)\b", u
+    )
+    if _memory_re.search(u) and not _mem_interrogative:
         return {
             "delegate_to": "research_agent", "intent": "remember_fact",
             "target": None, "tier": "LOW",
@@ -1192,6 +1224,33 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "wallet_get_address",
             "target": None, "tier": "LOW",
             "reasoning_summary": "Rex ETH address read — deterministic",
+        }
+
+    # Named-entity or Director's ETH/wallet address recall.
+    # "what is the digiant eth address?" / "rocket pool eth address" / "my eth address"
+    # Routes to memory_recall (MatchText in semantic) — never to web_search.
+    # "your eth address" / "rex eth address" are already caught above.
+    _eaddr_variants = ("eth address", "ethereum address", "eth wallet")
+    _eaddr_q_words  = ("what", "show", "find", "get", "give", "tell", "which", "do you")
+    if (any(v in u for v in _eaddr_variants)
+            and any(q in u for q in _eaddr_q_words)
+            and "your eth" not in u and "rex eth" not in u and "rex's eth" not in u):
+        _eaddr_stopwords = {"what", "is", "was", "the", "a", "an", "my", "your",
+                            "our", "their", "i", "do", "you", "have", "any",
+                            "tell", "me", "about", "get", "find", "show",
+                            "which", "of", "for", "at", "in", "are", "give"}
+        _eaddr_target = "eth address"
+        for _ev in _eaddr_variants:
+            if _ev in u:
+                _eaddr_words = [w for w in u.split(_ev)[0].split()
+                                if w not in _eaddr_stopwords]
+                if _eaddr_words:
+                    _eaddr_target = " ".join(_eaddr_words[-2:])
+                break
+        return {
+            "delegate_to": "memory_agent", "intent": "memory_recall",
+            "target": _eaddr_target, "tier": "LOW",
+            "reasoning_summary": "Named ETH/wallet address recall — MatchText in semantic",
         }
 
     _mem_list_kw = (
@@ -1334,6 +1393,34 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "business_agent", "intent": "wallet_check_address",
             "target": _waddr3, "tier": "LOW",
             "reasoning_summary": "On-demand wallet address check",
+        }
+
+    _btc_propose_kw = (
+        "propose btc", "propose bitcoin send", "create btc transaction", "create btc psbt",
+        "create bitcoin transaction", "send btc from multisig", "btc send to",
+        "send btc to", "fund lightning", "fund the lightning",
+    )
+    if any(k in u for k in _btc_propose_kw):
+        import re as _re_btcp
+        _btcp_addr_m = _re_btcp.search(r'\b(bc1[a-z0-9]{25,90}|[13][a-zA-Z0-9]{25,34})\b', u)
+        _btcp_amt_m  = _re_btcp.search(r'(\d+\.?\d*)\s*btc', u, _re_btcp.IGNORECASE)
+        _btcp_addr   = _btcp_addr_m.group(1) if _btcp_addr_m else ""
+        _btcp_amt    = _btcp_amt_m.group(1) if _btcp_amt_m else ""
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_create_btc_psbt",
+            "target": _btcp_addr, "tier": "HIGH",
+            "recipient": _btcp_addr, "amount_btc": _btcp_amt,
+            "reasoning_summary": "BTC multisig PSBT creation — deterministic pre-classifier",
+        }
+
+    _btc_sign_kw = (
+        "sign btc psbt", "sign bitcoin psbt", "sign the psbt", "sign this psbt",
+    )
+    if any(k in u for k in _btc_sign_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "wallet_sign_btc_psbt",
+            "target": u, "tier": "HIGH",
+            "reasoning_summary": "BTC PSBT signing — deterministic pre-classifier",
         }
 
     _mkdir_kw = (
@@ -1521,9 +1608,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
 
     if any(w in u for w in _ncfs_list_kw):
         # Extract path hint — "downloads" folder or explicit /path
+        # Use user_input (not u) for path extraction to preserve original case
         _ncfs_path = "/downloads" if "download" in u else "/"
         import re as _re_ncfs
-        _slash_m = _re_ncfs.search(r'(/[\w/_\-\.]+)', u)
+        _slash_m = _re_ncfs.search(r'(/[\w/_\-\.]+)', user_input)
         if _slash_m:
             _ncfs_path = _slash_m.group(1)
         return {
@@ -1533,16 +1621,16 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         }
 
     if any(w in u for w in _ncfs_read_kw):
-        # Try to extract a path from the input
+        # Use user_input (not u) for path/filename extraction to preserve original case
         import re as _re_ncfs_rd
-        _rd_slash = _re_ncfs_rd.search(r'(/[\w/_\-\.]+)', u)
-        _rd_fname = _re_ncfs_rd.search(r'(?:file\s+|read\s+)([\w\-\.]+\.\w+)', u, _re_ncfs_rd.IGNORECASE)
+        _rd_slash = _re_ncfs_rd.search(r'(/[\w/_\-\.]+)', user_input)
+        _rd_fname = _re_ncfs_rd.search(r'(?:file\s+|read\s+)([\w\-\.]+\.\w+)', user_input, _re_ncfs_rd.IGNORECASE)
         if _rd_slash:
             _ncfs_rd_path = _rd_slash.group(1)
         elif _rd_fname and "download" in u:
             _ncfs_rd_path = "/downloads/" + _rd_fname.group(1)
         else:
-            _ncfs_rd_path = u  # let specialist resolve
+            _ncfs_rd_path = user_input  # let specialist resolve
         return {
             "delegate_to": "research_agent", "intent": "ncfs_read",
             "target": _ncfs_rd_path,
@@ -1551,10 +1639,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
 
     if any(w in u for w in _ncfs_mkdir_kw):
         import re as _re_ncfs_mk
-        _mk_slash = _re_ncfs_mk.search(r'(/[\w/_\-\.]+)', u)
-        _mk_name  = _re_ncfs_mk.search(r'(?:called?|named?)\s+["\']?(\S+)["\']?', u, _re_ncfs_mk.IGNORECASE)
+        _mk_slash = _re_ncfs_mk.search(r'(/[\w/_\-\.]+)', user_input)
+        _mk_name  = _re_ncfs_mk.search(r'(?:called?|named?)\s+["\']?(\S+)["\']?', user_input, _re_ncfs_mk.IGNORECASE)
         _mk_path  = (_mk_slash.group(1) if _mk_slash else
-                     ("/" + _mk_name.group(1).strip('/') if _mk_name else u))
+                     ("/" + _mk_name.group(1).strip('/') if _mk_name else user_input))
         return {
             "delegate_to": "business_agent", "intent": "ncfs_mkdir",
             "target": _mk_path,
@@ -1563,8 +1651,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
 
     if any(w in u for w in _ncfs_delete_kw):
         import re as _re_del_nc
-        _del_slash = _re_del_nc.search(r'(/[\w/_\-\.]+)', u)
-        _del_nc_path = _del_slash.group(1) if _del_slash else u
+        _del_slash = _re_del_nc.search(r'(/[\w/_\-\.]+)', user_input)
+        _del_nc_path = _del_slash.group(1) if _del_slash else user_input
         return {
             "delegate_to": "business_agent", "intent": "ncfs_delete",
             "target": _del_nc_path,
@@ -1574,7 +1662,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     if any(w in u for w in _ncfs_move_kw):
         return {
             "delegate_to": "business_agent", "intent": "ncfs_move",
-            "target": u,
+            "target": user_input,
             "reasoning_summary": "File move/rename — ncfs_move",
         }
 
@@ -1692,6 +1780,28 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "File delete — deterministic pre-classifier",
         }
 
+    # Document follow-up — when last turn involved a file read, route content questions
+    # to Ollama so the LLM answers from context_window rather than misrouting to web search.
+    # Only fires when no new system/file-operation signal is present in the current message.
+    _doc_followup_kw = (
+        "what", "list", "summarise", "summarize", "tell me", "explain",
+        "tasks", "duties", "responsibilities", "obligations", "outline",
+        "review", "describe", "what does", "what are", "who is", "who are",
+        "key points", "main points", "observations",
+    )
+    _new_op_signal = any(w in u for w in (
+        "read", "open", "fetch", "download", "upload", "write", "create", "delete",
+        "move", "copy", "rename", "search nextcloud", "list nextcloud",
+    ))
+    if (prior_domain == "file"
+            and not _new_op_signal
+            and any(w in u for w in _doc_followup_kw)):
+        return {
+            "delegate_to": "business_agent", "intent": "query",
+            "target": user_input,
+            "reasoning_summary": "Document follow-up — answer from context_window",
+        }
+
     # Scheduler — remaining task management intents
     _list_tasks_kw = (
         "list tasks", "show tasks", "my tasks", "scheduled tasks", "list scheduled",
@@ -1765,6 +1875,18 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _dev_id   = _dev_id_m.group(1) if _dev_id_m else None
 
     # Entry point is /devcheck (Telegram command) — NL kept only for unambiguous dev-prefixed phrases.
+    # ── Learning-Harness status fast-path ────────────────────────────────────
+    _learning_kw = (
+        "learning harness", "learning status", "what did you learn",
+        "last learned", "learning harness status",
+    )
+    if any(w in u for w in _learning_kw):
+        return {
+            "delegate_to": "memory_agent", "intent": "learning_harness_status",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Learning-Harness status query — deterministic pre-classifier",
+        }
+
     _dev_analyse_kw = (
         "dev analyse", "dev analyze", "dev analysis", "run dev analysis",
         "dev harness analyse", "dev harness analyze", "dev harness run",
@@ -1967,7 +2089,7 @@ class ExecutionEngine:
                     _FC(key=self._ITEM_INDEX_FLAG, match=_MV(value=True)),
                     _FC(key="item_type",           match=_MV(value=item_type)),
                 ]),
-                limit=500,
+                limit=_cfg.limits.wm_scroll_max,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -1998,6 +2120,83 @@ class ExecutionEngine:
             )
         except Exception as e:
             logger.warning("_clear_item_index(%s): %s", item_type, e)
+
+    # ── Memory consultation pass (PASS 0) ────────────────────────────────────
+
+    async def _memory_consultation_pass(self, user_input: str) -> tuple[str, float]:
+        """Deterministic working_memory context scan injected into PASS 1 prompt.
+
+        Scrolls working_memory (RAM-resident qdrant container) and returns the top-15
+        entries by keyword relevance to user_input, formatted for PASS 1 injection.
+        Never calls Ollama. Target: < 100ms. Returns (context_str, elapsed_ms).
+        """
+        import time as _t_mod
+        import logging as _log_mod
+        _log_p0 = _log_mod.getLogger(__name__)
+        _t0 = _t_mod.monotonic()
+
+        if not self.qdrant:
+            return "", 0.0
+
+        try:
+            entries = []
+            offset = None
+            while True:
+                result, next_offset = await self.qdrant.client.scroll(
+                    collection_name="working_memory",
+                    limit=200,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for r in result:
+                    p = dict(r.payload or {})
+                    p["_wm_id"] = r.id
+                    entries.append(p)
+                if next_offset is None:
+                    break
+                offset = next_offset
+
+            if not entries:
+                elapsed = (_t_mod.monotonic() - _t0) * 1000
+                return "", elapsed
+
+            input_terms = set(user_input.lower().split())
+
+            def _relevance(e: dict) -> float:
+                content_terms = set(e.get("content", "").lower().split())
+                overlap = len(input_terms & content_terms)
+                # Slot 1 (session history) = highest priority boost
+                slot_priority = 8 - e.get("_bootstrap_slot", 7)
+                return float(overlap * 2 + slot_priority)
+
+            ranked = sorted(entries, key=_relevance, reverse=True)[:15]
+
+            lines = ["COGNITIVE CONTEXT (working memory — consult before responding):"]
+            for e in ranked:
+                source = e.get("_bootstrap_source") or e.get("source_collection", "session")
+                key    = e.get("_key", "")
+                content = e.get("content", "")[:200]
+                key_str = f"|{key}" if key else ""
+                lines.append(f"[{source}{key_str}] {content}")
+            lines.append("Prioritise this context over training knowledge when answering.")
+
+            elapsed = (_t_mod.monotonic() - _t0) * 1000
+            _log_p0.info(
+                "PASS 0 consultation: %d WM entries scanned, %d ranked, %.1fms",
+                len(entries), len(ranked), elapsed,
+            )
+            if elapsed > 200:
+                _log_p0.warning(
+                    "_memory_consultation_pass: %.1fms exceeds 200ms threshold"
+                    " — working_memory may be oversized (%d entries)",
+                    elapsed, len(entries),
+                )
+            return "\n".join(lines), elapsed
+
+        except Exception as exc:
+            _log_p0.warning("_memory_consultation_pass failed (non-fatal): %s", exc)
+            return "", 0.0
 
     # ── Notes index helpers (built on universal item index) ───────────────
 
@@ -2138,7 +2337,7 @@ class ExecutionEngine:
         import re as _re
         import base64
 
-        _MAX_SIZE = 25 * 1024 * 1024  # 25 MB
+        _MAX_SIZE = _cfg.limits.payload_dispatch_max_bytes
 
         safe_name = _re.sub(r'[/\\<>:"|?*\x00-\x1f]', "_", filename)[:255] or "unknown"
 
@@ -2280,13 +2479,13 @@ class ExecutionEngine:
         import hashlib as _hashlib
         import time as _time_mod
         _t_total = _time_mod.monotonic()
-        _PASS_TIMEOUT  = float(os.environ.get("PASS_TIMEOUT_SECONDS",  "30"))
-        _TOTAL_TIMEOUT = float(os.environ.get("TOTAL_TIMEOUT_SECONDS", "120"))
+        _PASS_TIMEOUT  = _cfg.timeouts.pass_s
+        _TOTAL_TIMEOUT = _cfg.timeouts.total_pipeline_s
         # Skill search/install involves GitHub API + multiple SKILL.md fetches + security review
-        # — give it extra headroom beyond the default 120s
+        # — give it extra headroom beyond the default pipeline timeout
         _u_lower = user_input.lower()
         if any(w in _u_lower for w in ("skill", "clawhub", "openclaw")):
-            _TOTAL_TIMEOUT = max(_TOTAL_TIMEOUT, 240.0)
+            _TOTAL_TIMEOUT = max(_TOTAL_TIMEOUT, _cfg.cognitive_loop.skills_domain_min_total_timeout_s)
 
         # ── Harness command fast-path (/install, /skills, /selfimprove, etc.) ───
         # Explicit /commands bypass all NL routing — deterministic entry point.
@@ -2315,6 +2514,16 @@ class ExecutionEngine:
                 confirmed=confirmed,
                 delegation=pending_delegation or {},
             )
+        if _harness_cmd == "sign_btc":
+            _psbt = (
+                user_input if (user_input and user_input != "sign_btc")
+                else (pending_delegation or {}).get("psbt_b64", "")
+            )
+            return await self._run_signbtc_harness(
+                psbt_b64=_psbt,
+                confirmed=confirmed,
+                delegation=pending_delegation or {},
+            )
 
         # Track whether the pre-LLM scanner already evaluated security
         _scanner_evaluated = False
@@ -2329,6 +2538,12 @@ class ExecutionEngine:
             session_id=_session_id,
             tier="LOW",  # updated after PASS 1 determines the real tier
         )
+
+        # PASS 0 — deterministic working_memory context scan (no LLM, < 100ms target)
+        _cognitive_ctx = ""
+        if not pending_delegation:
+            _cognitive_ctx, _p0_ms = await self._memory_consultation_pass(user_input)
+            self._log_pass(0, "memory_consultation", user_input, {"elapsed_ms": round(_p0_ms, 1)}, _p0_ms / 1000)
 
         # PASS 1 — Orchestrator Classification (skip if re-submitting confirmed delegation)
         if pending_delegation:
@@ -2346,7 +2561,11 @@ class ExecutionEngine:
                 _t_p1 = _time_mod.monotonic()
                 try:
                     delegation = await _asyncio.wait_for(
-                        self.cog.orchestrator_classify(user_input, context_window=context_window),
+                        self.cog.orchestrator_classify(
+                            user_input,
+                            context_window=context_window,
+                            cognitive_context=_cognitive_ctx,
+                        ),
                         timeout=_PASS_TIMEOUT,
                     )
                 except _asyncio.TimeoutError:
@@ -2537,8 +2756,27 @@ class ExecutionEngine:
         # Short-circuit paths — all pass through translator (no raw output to Director)
         if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise"):
             if action.get("domain") == "ollama":
-                conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
-                conv_text = conv_result.get("response", "")
+                import re as _re_sc
+                _SC_GROK_RE   = _re_sc.compile(r'\b(use grok|ask grok|via grok)\b',     _re_sc.IGNORECASE)
+                _SC_CLAUDE_RE = _re_sc.compile(r'\b(use claude|ask claude|via claude)\b', _re_sc.IGNORECASE)
+                # Strip the routing directive before sending to the provider so
+                # "ask grok about X" doesn't make Grok defensive about its identity.
+                _sc_clean = _re_sc.sub(
+                    r'\b(use grok|ask grok|via grok|use claude|ask claude|via claude)\b\s*',
+                    '', user_input, flags=_re_sc.IGNORECASE,
+                ).strip(" ,;:—-")
+                _sc_prompt = _sc_clean or user_input  # fallback if strip empties the string
+                if _SC_GROK_RE.search(user_input):
+                    _sc_routed = await self.cog.route_cognition(
+                        _sc_prompt, agent="research_agent", provider="grok", user_input=_sc_prompt)
+                    conv_text = _sc_routed.get("response", "")
+                elif _SC_CLAUDE_RE.search(user_input):
+                    _sc_routed = await self.cog.route_cognition(
+                        _sc_prompt, agent="research_agent", provider="claude", user_input=_sc_prompt)
+                    conv_text = _sc_routed.get("response", "")
+                else:
+                    conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
+                    conv_text = conv_result.get("response", "")
                 exec_result = {"status": "ok", "response": conv_text}
                 # Detect stated intentions and commit to memory (preserve existing Bug 4 fix)
                 import re as _re_intent
@@ -2573,7 +2811,7 @@ class ExecutionEngine:
                         "error": None, "next_action": None}
             elif action.get("domain") == "feeds":
                 # RSS/feed read — direct nanobot dispatch, no LLM planning needed
-                exec_result = await self.nanobot.run("rss-digest", "get_entries", {"limit": 10})
+                exec_result = await self.nanobot.run("rss-digest", "get_entries", {"limit": _cfg.limits.rss_headlines_per_briefing})
                 if exec_result is None:
                     exec_result = {"status": "error", "error": "nanobot returned None for rss-digest"}
                 _rft = self._build_result_for_translator(intent, exec_result)
@@ -2653,7 +2891,7 @@ class ExecutionEngine:
                     payload={"confirmed": confirmed},
                     security_confirmed=security_confirmed,
                 ),
-                timeout=_PASS_TIMEOUT * 6 if action.get("domain") == "skills" else _PASS_TIMEOUT * 3,  # skill search+review is slow; nanobot scripts are slow
+                timeout=_PASS_TIMEOUT * _cfg.cognitive_loop.skill_search_pass_multiplier if action.get("domain") == "skills" else _PASS_TIMEOUT * _cfg.cognitive_loop.nanobot_script_pass_multiplier,
             )
         except _asyncio.TimeoutError:
             execution_result = {"status": "error", "error": "execution_timeout"}
@@ -2808,7 +3046,7 @@ class ExecutionEngine:
                         specialist=sp_out,
                         security_confirmed=security_confirmed,
                     ),
-                    timeout=_PASS_TIMEOUT * 3,
+                    timeout=_PASS_TIMEOUT * _cfg.cognitive_loop.nanobot_script_pass_multiplier,
                 )
                 if _retry_result:
                     execution_result = _retry_result
@@ -2885,6 +3123,7 @@ class ExecutionEngine:
             "journalctl", "apt_check", "github_read",
             "list_files", "read_file", "navigate", "search_files",
             "list_files_recursive", "read_files_recursive",
+            "ncfs_read", "ncfs_list", "ncfs_list_recursive", "ncfs_search",
             "list_events", "list_calendars", "list_tasks", "recall_last_briefing",
             "list_notes", "read_note", "create_note", "update_note", "delete_note",
             "fetch_email", "search_email", "fetch_message",
@@ -2893,6 +3132,7 @@ class ExecutionEngine:
             "skill_list_candidates", "skill_review_candidate", "skill_clear_harness",
             "configure_browser_auth",
             "self_improve_observe", "self_improve_proposals", "self_improve_baseline",
+            "learning_harness_status",  # status query — last run summary passes directly
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "research",
             "memory_list_keys", "memory_retrieve_key",  # MIP — pass structured index directly
@@ -2910,6 +3150,7 @@ class ExecutionEngine:
             "wallet_get_address", "wallet_read_config", "wallet_get_btc_xpub",
             "wallet_list_addresses", "wallet_portfolio", "wallet_check_address",
             "wallet_add_address", "wallet_remove_address", "wallet_update_address",
+            "wallet_sign_btc_psbt", "wallet_create_btc_psbt",
             # cognitive skills — specialist synthesis passes directly to translator
             "session_wrap_up", "memory_curate",
             # Memory synthesis — structured result passes directly to translator
@@ -3076,6 +3317,21 @@ class ExecutionEngine:
                     "outcome": "Wallet address not available.",
                     "detail": {}, "error": execution_result.get("error"), "next_action": None,
                 }
+
+        elif intent == "remember_fact" and execution_result is not None:
+            # Build deterministic result_for_translator — do NOT let PASS 4 LLM invent
+            # associative connections by reading cognitive_context entries. Only surface
+            # what was actually stored. point_id and collection are intentionally excluded.
+            _rf_ok = execution_result.get("status") == "ok"
+            _rf_msg = execution_result.get("message", "Stored.")
+            _rf_key = execution_result.get("mip_key", "")
+            _rft = {
+                "success": _rf_ok,
+                "outcome": _rf_msg,
+                "detail": {"mip_key": _rf_key} if _rf_key else {},
+                "error": None if _rf_ok else _rf_msg,
+                "next_action": None,
+            }
 
         elif intent in _DIAGNOSTIC_INTENTS and execution_result:
             _raw = {k: v for k, v in execution_result.items()
@@ -3357,7 +3613,7 @@ class ExecutionEngine:
             while True:
                 result, next_offset = await self.qdrant.client.scroll(
                     collection_name=WORKING,
-                    limit=100,
+                    limit=_cfg.limits.memory_recall_max,
                     offset=offset,
                     with_payload=True,
                     with_vectors=False,
@@ -3382,7 +3638,7 @@ class ExecutionEngine:
             while True:
                 result, next_offset = await self.qdrant.client.scroll(
                     collection_name=WORKING,
-                    limit=100,
+                    limit=_cfg.limits.memory_recall_max,
                     offset=offset,
                     with_payload=True,
                     with_vectors=False,
@@ -3485,7 +3741,7 @@ class ExecutionEngine:
         if not confirmed:
             # ── Phase A: search + select ────────────────────────────────────
             search_result = await lifecycle.search(
-                query=goal, certified_only=False, limit=10
+                query=goal, certified_only=False, limit=_cfg.limits.skill_search_candidates
             )
             candidates = [c for c in search_result.get("candidates", []) if c.get("skill_md")]
 
@@ -3673,7 +3929,7 @@ class ExecutionEngine:
     async def _run_skills_browse(self, goal: str) -> dict:
         """/skills <query> — search and list skills, no install."""
         lifecycle = self._get_lifecycle()
-        search_result = await lifecycle.search(query=goal, certified_only=False, limit=10)
+        search_result = await lifecycle.search(query=goal, certified_only=False, limit=_cfg.limits.skill_search_candidates)
         candidates = search_result.get("candidates", [])
         if not candidates:
             dm = await self.cog.translator_pass({
@@ -3730,6 +3986,28 @@ class ExecutionEngine:
             "detail": result,
             "error": result.get("error"),
             "next_action": result.get("next_action") or result.get("next_step"),
+        }
+        dm = await self.cog.translator_pass(_rft)
+        return {"director_message": dm}
+
+    async def _run_signbtc_harness(self, psbt_b64: str, confirmed: bool, delegation: dict) -> dict:
+        """/signbtc — sign a BTC PSBT with Rex's key (HIGH tier, double-confirmation required)."""
+        psbt = psbt_b64 or delegation.get("psbt_b64", "")
+        if not confirmed:
+            preview = f" PSBT prefix: {psbt[:40]}..." if psbt else " No PSBT provided inline — Rex will use the latest pending PSBT."
+            return {
+                "requires_double_confirmation": True,
+                "pending_delegation": {"_harness_cmd": "sign_btc", "psbt_b64": psbt},
+                "summary": f"Sign BTC PSBT with Rex's key (1-of-3 multisig).{preview}\n\nThis is HIGH tier — confirm to proceed.",
+            }
+        action = {**INTENT_ACTION_MAP.get("wallet_sign_btc_psbt", {"domain": "wallet", "operation": "sign", "name": "wallet_sign_btc_psbt"}), "psbt_b64": psbt}
+        result = await self._dispatch_inner(action, delegation={"intent": "wallet_sign_btc_psbt"}, payload={})
+        _rft = {
+            "success": "error" not in result,
+            "outcome": result.get("message", "PSBT signed with Rex's key."),
+            "detail": result,
+            "error": result.get("error"),
+            "next_action": "Provide the signed PSBT to a second signer (Ledger or Exodus) to reach 2-of-3 threshold, then broadcast.",
         }
         dm = await self.cog.translator_pass(_rft)
         return {"director_message": dm}
@@ -3818,6 +4096,28 @@ class ExecutionEngine:
         try:
             if not memory_payload.get("lesson"):
                 return
+            # Content quality gate — reject junk before any write reaches RAID.
+            # PASS 4 (llama3.1:8b) routinely stores conversational fragments, bare
+            # questions, and "Stated intention:" hallucinations as prospective/episodic
+            # entries. These clog memory and surface as nonsense during consultation.
+            _lesson = memory_payload["lesson"].strip()
+            _coll_check = memory_payload.get("collection", "working_memory")
+            if _coll_check in ("prospective", "episodic", "semantic"):
+                import re as _re_mq
+                _reject = (
+                    len(_lesson) < 40
+                    or _lesson.startswith("Stated intention:")
+                    or (
+                        _lesson.endswith("?")
+                        and not _re_mq.search(r'\.\s+\S', _lesson)  # allow multi-sentence ending in ?
+                    )
+                )
+                if _reject:
+                    import logging as _lg_mq
+                    _lg_mq.getLogger(__name__).debug(
+                        "memory_write quality gate rejected [%s]: %r", _coll_check, _lesson[:80]
+                    )
+                    return
             coll_decision = memory_payload.get("collection", "working_memory")
             mem_type = coll_decision if coll_decision in SOVEREIGN_COLLECTIONS else "lesson"
             extra_meta: dict = {}
@@ -3927,6 +4227,10 @@ class ExecutionEngine:
                 action["url"] = target
             elif action.get("operation") == "search" and target:
                 action["query"] = target
+        elif action["domain"] == "wallet" and action.get("operation") == "propose":
+            for _wf in ("recipient", "amount_btc", "fee_rate", "memo"):
+                if delegation.get(_wf):
+                    action[_wf] = delegation[_wf]
         return action
 
     # ── Adapter dispatch ─────────────────────────────────────────────────
@@ -4263,6 +4567,11 @@ class ExecutionEngine:
                         "event"
                     ))
                 return _evts_result
+            if name == "tasks_list":
+                tasks_cal = action.get("calendar") or (specialist or {}).get("calendar") or "tasks"
+                return _nb_unwrap(await self.nanobot.run(
+                    "openclaw-nextcloud", "tasks_list", {"calendar": tasks_cal}
+                ))
             if name == "task_complete":
                 sp = specialist or {}
                 comp_calendar = sp.get("calendar") or action.get("calendar", "tasks")
@@ -4634,7 +4943,7 @@ class ExecutionEngine:
             _skill_nc_mail = "nc-mail"
 
             # Personal inbox IMAP sync can take 55s+; pass timeout=59 so nanobot subprocess has headroom
-            _NC_MAIL_TIMEOUT = 59
+            _NC_MAIL_TIMEOUT = _cfg.timeouts.nc_mail_s
 
             def _unwrap_nb(nb_resp: dict) -> dict:
                 """Return inner result dict, but preserve status/success from outer wrapper.
@@ -4689,7 +4998,7 @@ class ExecutionEngine:
                 # Route search through list_unread with filter — NC Mail has no separate search endpoint
                 nb = await self.nanobot.run(_skill_nc_mail, "list_unread", {
                     "account": account, "filter": query, "unread_only": "false",
-                    "limit": 10, "timeout": _NC_MAIL_TIMEOUT,
+                    "limit": _cfg.limits.nc_mail_list_default, "timeout": _NC_MAIL_TIMEOUT,
                 })
                 result = _unwrap_nb(nb)
                 if isinstance(result, dict) and result.get("messages") == [] and not result.get("error"):
@@ -4732,7 +5041,7 @@ class ExecutionEngine:
                     _search_nb = await self.nanobot.run(
                         _skill_nc_mail, "list_unread",
                         {"account": account, "filter": _search_hint,
-                         "unread_only": "false", "limit": 5, "timeout": _NC_MAIL_TIMEOUT},
+                         "unread_only": "false", "limit": _cfg.limits.nc_mail_unread_max, "timeout": _NC_MAIL_TIMEOUT},
                     )
                     _search_msgs = (_search_nb.get("messages") or []) if isinstance(_search_nb, dict) else []
                     for _smsg in _search_msgs:
@@ -4892,7 +5201,7 @@ class ExecutionEngine:
                             FieldCondition(key="domain", match=_MV(value="tax")),
                             FieldCondition(key="type",   match=_MV(value="tax_event")),
                         ]),
-                        limit=2000,
+                        limit=_cfg.limits.file_list_recursive_max,
                         with_payload=True,
                         with_vectors=False,
                     )
@@ -5859,6 +6168,21 @@ class ExecutionEngine:
                 return await self.wallet_control.get_pending_proposals()
             if name == "wallet_get_btc_xpub":
                 return await self.wallet_control.get_btc_xpub()
+            if name == "wallet_sign_btc_psbt":
+                psbt_b64 = (
+                    action.get("psbt") or action.get("psbt_b64")
+                    or (specialist or {}).get("psbt") or (specialist or {}).get("psbt_b64")
+                    or (delegation or {}).get("target") or ""
+                )
+                return await self.wallet_control.sign_btc_psbt(psbt_b64)
+            if name == "wallet_create_btc_psbt":
+                sp = specialist or {}
+                return await self.wallet_control.create_btc_psbt(
+                    recipient  = action.get("recipient",  sp.get("recipient",  "")),
+                    amount_btc = action.get("amount_btc", sp.get("amount_btc", "")),
+                    fee_rate   = int(action.get("fee_rate", sp.get("fee_rate", 5))),
+                    memo       = action.get("memo",       sp.get("memo",       "")),
+                )
             return {"error": f"Unknown wallet action: {name}"}
 
         if domain == "wallet_watchlist":
@@ -6174,6 +6498,9 @@ class ExecutionEngine:
 
         if domain == "monitoring":
             op = action.get("operation", "")
+            if op == "learning_status":
+                from monitoring.learning_harness import get_last_run_status
+                return get_last_run_status()
             from monitoring.self_improvement import (
                 run_manual_observe, list_pending_proposals, get_baseline_report,
             )

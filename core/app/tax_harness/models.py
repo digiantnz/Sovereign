@@ -92,6 +92,8 @@ def format_amount(value: "Decimal | float | str", asset: str) -> str:
     d = Decimal(str(value))
     if asset.upper() == "NZD":
         return f"${d:.2f} NZD"
+    if asset.upper() == "BTC":
+        return f"{d:.8f} BTC"
     return f"{d:.6f} {asset.upper()}"
 
 

@@ -112,19 +112,29 @@ function _defaultConfig() {
   };
 }
 
-async function loadNetworkEndpoints() {
+async function loadNetworkEndpoints(cfg) {
+  // Primary: read from wallet-config.json — standalone, no Qdrant dependency
+  if (cfg) {
+    const eps = {};
+    if (cfg.ethereum?.rpc_primary)   eps.eth          = cfg.ethereum.rpc_primary;
+    if (cfg.ethereum?.rpc_secondary) eps.eth_secondary = cfg.ethereum.rpc_secondary;
+    if (cfg.bitcoin?.rpc_url)        eps.btc_url       = cfg.bitcoin.rpc_url;
+    log(`endpoints from config — eth: ${eps.eth || 'n/a'} btc: ${eps.btc_url || 'n/a'}`);
+    return eps;
+  }
+  // Fallback: MIP scroll with corrected _key suffix matching
   try {
     const points = await _scroll('network.endpoints');
     const eps = {};
     for (const p of points) {
-      const label = p.payload.label || '';
+      const key  = (p.payload._key || '').split(':').pop();  // e.g. 'btc-node-rpc'
       const value = p.payload.value || '';
       const meta  = p.payload.metadata || {};
-      if (label === 'eth-node-primary')   eps.eth = `${meta.protocol || 'http'}://${value}`;
-      if (label === 'eth-node-secondary') eps.eth_secondary = `${meta.protocol || 'http'}://${value}`;
-      if (label === 'btc-node-rpc')       eps.btc_url  = `${meta.protocol || 'http'}://${value}`;
-      if (label === 'arb-node-rpc')       eps.arb = value;
-      if (label === 'op-node-rpc')        eps.op  = value;
+      if (key === 'eth-node-primary')   eps.eth          = `${meta.protocol || 'http'}://${value}`;
+      if (key === 'eth-node-secondary') eps.eth_secondary = `${meta.protocol || 'http'}://${value}`;
+      if (key === 'btc-node-rpc')       eps.btc_url       = `${meta.protocol || 'http'}://${value}`;
+      if (key === 'arb-node-rpc')       eps.arb           = value;
+      if (key === 'op-node-rpc')        eps.op            = value;
     }
     return eps;
   } catch (e) {
@@ -151,55 +161,37 @@ async function seedFromConfig(walletConfigPath) {
     return;
   }
 
-  const now  = new Date().toISOString();
+  const now   = new Date().toISOString();
   const seeds = [];
 
-  const safeAddr = cfg?.safe?.address;
-  if (safeAddr) seeds.push({
-    value:  safeAddr,
-    label:  'Safe Multisig',
-    chain:  'eth',
-    chains: ['eth', 'arb', 'op'],
-    harness: ['portfolio', 'a2a'],
-    thresholds: {},
-    zero_conf:  false,
-  });
-
-  const rexAddr = (cfg?.safe?.owners || []).find(o => o.type === 'sovereign-core')?.address;
-  if (rexAddr) seeds.push({
-    value:  rexAddr,
-    label:  'Rex EOA',
-    chain:  'eth',
-    chains: ['eth'],
-    harness: ['portfolio', 'a2a'],
-    thresholds: {},
-    zero_conf:  false,
-  });
-
-  const btcMultisig = cfg?.bitcoin?.multisig_address;
-  if (btcMultisig) seeds.push({
-    value:  btcMultisig,
-    label:  'BTC Multisig',
-    chain:  'btc',
-    chains: ['btc'],
-    harness: ['portfolio', 'a2a'],
-    thresholds: {},
-    zero_conf:  false,
-  });
-
-  const dirBtcAddr = cfg?.bitcoin?.director_btc_address;
-  if (dirBtcAddr) seeds.push({
-    value:  dirBtcAddr,
-    label:  'Director BTC',
-    chain:  'btc',
-    chains: ['btc'],
-    harness: ['portfolio'],
-    thresholds: {},
-    zero_conf:  false,
-  });
+  if (cfg.watchlist?.length) {
+    // Use explicit watchlist array
+    for (const entry of cfg.watchlist) {
+      if (!entry.address) continue;
+      seeds.push({
+        value:      entry.address,
+        label:      entry.label || entry.address.slice(0, 10) + '…',
+        chain:      entry.chain,
+        chains:     entry.chains  || [entry.chain],
+        harness:    entry.harness || ['portfolio'],
+        thresholds: entry.thresholds || {},
+        zero_conf:  entry.zero_conf  || false,
+      });
+    }
+  } else {
+    // Legacy fallback: derive from safe/bitcoin sections
+    const safeAddr = cfg?.safe?.address;
+    if (safeAddr) seeds.push({ value: safeAddr, label: 'Safe Multisig', chain: 'eth', chains: ['eth','arb','op'], harness: ['portfolio','a2a'], thresholds: {}, zero_conf: false });
+    const rexAddr = (cfg?.safe?.owners || []).find(o => o.type === 'sovereign-core')?.address;
+    if (rexAddr)  seeds.push({ value: rexAddr,  label: 'Rex EOA',       chain: 'eth', chains: ['eth'],           harness: ['portfolio','a2a'], thresholds: {}, zero_conf: false });
+    const btcMultisig = cfg?.bitcoin?.multisig_address;
+    if (btcMultisig) seeds.push({ value: btcMultisig, label: 'BTC Multisig', chain: 'btc', chains: ['btc'], harness: ['portfolio','a2a'], thresholds: {}, zero_conf: false });
+    const dirBtcAddr = cfg?.bitcoin?.director_btc_address;
+    if (dirBtcAddr)  seeds.push({ value: dirBtcAddr,  label: 'Director BTC', chain: 'btc', chains: ['btc'], harness: ['portfolio'],       thresholds: {}, zero_conf: false });
+  }
 
   for (const s of seeds) {
-    await addAddress({ ...s, source: 'seed', watch_since: now });
+    await addAddress({ ...s, source: 'config', watch_since: now });
   }
   log(`seeded ${seeds.length} addresses from wallet-config.json`);
 }

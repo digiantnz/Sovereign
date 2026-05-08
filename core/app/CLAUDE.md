@@ -22,10 +22,12 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - PASS 2 (specialist outbound) → only externally-routable pass via `_routing_decision()`
 - `_routing_decision(prompt, user_input)` scores complexity on `user_input` (NOT full specialist prompt — persona length would inflate every score)
 - DCL hard-block: tier in `{"PRIVATE","SECRET"}` → `force_local=True` regardless of explicit override
-- Provider signals: `_CLAUDE_SIGNAL_RE` (architectural/plan/review/design/strategy) → claude; `_GROK_SIGNAL_RE` (current/latest/news/today/recent/market) → grok; default → grok
-- Operational penalty: score≥0.50 AND `_OPERATIONAL_RE` (restart/container/service/deploy/port/compose/nginx) → -0.20
+- Explicit external override: `_EXPLICIT_EXTERNAL_RE` matches `use claude|use grok|ask claude|ask grok|via claude|via grok|external llm|external model|external ai` → forces external regardless of score
+- Provider signals (checked on raw user_input): `_CLAUDE_SIGNAL_RE` (architectural/architecture/plan/review/design/strategy/strategic) → claude; `_GROK_SIGNAL_RE` (use grok/ask grok/via grok + current/latest/news/today/recent/market/trending) → grok; default → grok
+- Operational penalty: score≥0.50 AND `_OPERATIONAL_RE` (restart/container/service/deploy/port/compose/nginx/redis/mariadb/healthcheck/network/subnet) → -0.20
 - `specialist_plan` always includes `_routing_reason`, `_complexity_score`, `_intended_provider` (even on local fallback)
 - Claude/Grok API unavailable → graceful fallback to Ollama; no error raised
+- **Grok is the preferred external provider** — Grok API key is active; Claude API key is set but Director's plan may not cover API usage. Default external calls go to Grok.
 
 ### Confirmed-continuation bypass
 - When `confirmed=True` and `pending_delegation._pending_load is not None`: skip PASS 2 + PASS 3 (specialist + CEO evaluation)

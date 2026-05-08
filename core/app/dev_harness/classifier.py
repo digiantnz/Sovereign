@@ -32,11 +32,13 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# Ollama model — consistent with rest of sovereign-core
-_CLASSIFY_MODEL = "llama3.1:8b-instruct-q4_K_M"
+from config import cfg as _cfg
+
+# Ollama model — consistent with rest of sovereign-core; see sovereign-config.yaml models.classifier_model
+_CLASSIFY_MODEL = _cfg.models.classifier_model
 
 # Hard cap on findings included in a single prompt — prevents context overflow
-_MAX_FINDINGS_IN_PROMPT = 20
+_MAX_FINDINGS_IN_PROMPT = _cfg.limits.dev_harness_findings_in_prompt
 
 # Escalation threshold — mirrors GateDecision.ESCALATE gate (score >= 50)
 _ESCALATE_SCORE_THRESHOLD = 50

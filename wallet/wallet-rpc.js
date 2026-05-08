@@ -50,7 +50,7 @@ async function _ethPost(url, method, params) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body,
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(20_000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
@@ -113,7 +113,7 @@ async function btcRpc(method, params = []) {
       'Authorization': `Basic ${auth}`,
     },
     body: JSON.stringify({ jsonrpc: '1.0', id: _btcId++, method, params }),
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
@@ -125,22 +125,12 @@ async function btcGetBlockCount() {
   return await btcRpc('getblockcount');
 }
 
-async function btcGetBestBlockHash() {
-  return await btcRpc('getbestblockhash');
+async function btcGetBlockHash(height) {
+  return await btcRpc('getblockhash', [height]);
 }
 
-async function btcListSinceBlock(blockhash) {
-  // Returns {transactions:[...], lastblock:"..."}
-  // Each tx: {address, category, amount, txid, confirmations, blockhash, blocktime, ...}
-  return await btcRpc('listsinceblock', [blockhash || '', 1, false]);
-}
-
-async function btcGetReceivedByAddress(address, minConf = 0) {
-  try {
-    return await btcRpc('getreceivedbyaddress', [address, minConf]);
-  } catch {
-    return null;
-  }
+async function btcGetBlock(hash, verbosity = 2) {
+  return await btcRpc('getblock', [hash, verbosity]);
 }
 
 async function btcScanTxOutSet(addresses) {
@@ -162,8 +152,7 @@ module.exports = {
   weiToEth,
   btcRpc,
   btcGetBlockCount,
-  btcGetBestBlockHash,
-  btcListSinceBlock,
-  btcGetReceivedByAddress,
+  btcGetBlockHash,
+  btcGetBlock,
   btcScanTxOutSet,
 };

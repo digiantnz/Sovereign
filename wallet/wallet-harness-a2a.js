@@ -25,14 +25,19 @@ const warn = (...a) => console.warn('[harness-a2a]', ...a);
 
 // ── Schema validation ──────────────────────────────────────────────────────────
 
+// Fields that must be present and non-empty
 const REQUIRED_FIELDS = [
-  'chain', 'tx_hash', 'from_address', 'to_address',
-  'amount', 'currency', 'confirmations', 'timestamp',
+  'chain', 'tx_hash', 'to_address', 'amount', 'currency', 'confirmations', 'timestamp',
 ];
+// Fields that must be present but may be empty string (BTC has no from_address; Lightning uses pubkey)
+const PRESENT_FIELDS = ['from_address'];
 
 function _validate(event) {
   for (const f of REQUIRED_FIELDS) {
     if (!event[f] && event[f] !== 0) return `missing field: ${f}`;
+  }
+  for (const f of PRESENT_FIELDS) {
+    if (event[f] === undefined || event[f] === null) return `missing field: ${f}`;
   }
   if (typeof event.amount !== 'string') return 'amount must be a string';
   if (typeof event.confirmations !== 'number') return 'confirmations must be a number';
@@ -73,9 +78,12 @@ async function _emitToSovereignCore(event) {
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 async function handle(event) {
-  const entry = watchlist.getByAddress(event.to_address || event.from_address || '');
-  const harnesses = entry?.metadata?.harness || [];
-  if (!harnesses.includes('a2a')) return;   // not subscribed to a2a harness
+  // Lightning payment and channel events originate from our own node — no watchlist address
+  if (event.chain !== 'lightning' && event.chain !== 'lightning_channel') {
+    const entry = watchlist.getByAddress(event.to_address || event.from_address || '');
+    const harnesses = entry?.metadata?.harness || [];
+    if (!harnesses.includes('a2a')) return;
+  }
 
   const err = _validate(event);
   if (err) {

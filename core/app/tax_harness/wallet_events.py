@@ -49,12 +49,31 @@ async def handle_wallet_event(
         )
         return None
 
+    chain = event.get("chain", "")
+    metadata: dict = {"confirmations": event.get("confirmations", 0)}
+
+    # Preserve Lightning-specific fields so the classifier and report can distinguish
+    # payment receipts (lightning) from channel opens (lightning_channel).
+    if chain in ("lightning", "lightning_channel"):
+        metadata["direction"]    = event.get("direction", "")
+        metadata["message"]      = event.get("message", "")
+        metadata["invoice_id"]   = event.get("invoice_id", "")
+        metadata["payment_hash"] = event.get("payment_hash", "")
+        if event.get("amount_msat") is not None:
+            metadata["amount_msat"] = event["amount_msat"]
+        if event.get("channel_point"):
+            metadata["channel_point"] = event["channel_point"]
+        if event.get("capacity_sat") is not None:
+            metadata["capacity_sat"] = event["capacity_sat"]
+        if event.get("channel_status"):
+            metadata["channel_status"] = event["channel_status"]
+
     tax_event = TaxEvent(
         id=make_tax_id(tx_hash),
         event_tag="tax:crypto",
         timestamp=timestamp,
         tax_year=resolve_tax_year(timestamp),
-        source=event.get("chain", ""),
+        source=chain,
         reference=tx_hash,
         nzd_value=None,   # enriched by harness enrich step
         from_address=from_addr,
@@ -62,7 +81,7 @@ async def handle_wallet_event(
         asset=currency,
         amount=format_amount(amount_d, currency),
         tx_hash=tx_hash,
-        metadata={"confirmations": event.get("confirmations", 0)},
+        metadata=metadata,
     )
 
     # Write to working_memory so harness can collect on next run

@@ -351,6 +351,7 @@ _B5_LEAK_PHRASES: tuple[str, ...] = (
     "Led with the answer",
     "per the instructions",
     "as instructed",
+    "translation rules",
 )
 
 # Pre-compile case-insensitive phrase patterns

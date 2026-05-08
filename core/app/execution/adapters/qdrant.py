@@ -52,8 +52,11 @@ SOVEREIGN_COLLECTIONS = [SEMANTIC, PROCEDURAL, EPISODIC, PROSPECTIVE, ASSOCIATIV
 
 VECTOR_DIM          = 768
 EMBED_MODEL         = "nomic-embed-text"
-AUDIT_PATH          = "/home/sovereign/audit/memory-promotions.jsonl"
-CONFIDENCE_THRESHOLD = 0.75
+
+from config import cfg as _cfg
+
+AUDIT_PATH           = _cfg.paths.audit_promotions_log
+CONFIDENCE_THRESHOLD = _cfg.thresholds.confidence
 
 # Sovereign ID namespace — single UUID5 authority for all stores.
 # Any item with a stable native_id gets a deterministic sovereign point ID
@@ -61,12 +64,20 @@ CONFIDENCE_THRESHOLD = 0.75
 # item from working_memory → RAID → backups, never reassigned.
 _SOV_NS = uuid.UUID("7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d")
 
-# Preload budget: 2GB RAM ÷ ~3.5KB per point ≈ 590K points theoretical max.
-# In practice the collections hold a few thousand entries; this is a safety valve.
-_PRELOAD_BYTES_LIMIT = 2 * 1024 * 1024 * 1024   # 2 GB
+# Preload budget: see sovereign-config.yaml memory section.
+_PRELOAD_BYTES_LIMIT = _cfg.memory.startup_preload_bytes
 _BYTES_PER_POINT     = VECTOR_DIM * 4 + 512       # ~3.5 KB (vector heap + payload overhead)
-_PRELOAD_MAX_POINTS  = _PRELOAD_BYTES_LIMIT // _BYTES_PER_POINT   # ~590K
-_PRELOAD_PER_COLLECTION = 50   # top-N per collection per preload query
+_PRELOAD_MAX_POINTS  = _PRELOAD_BYTES_LIMIT // _BYTES_PER_POINT
+_PRELOAD_PER_COLLECTION = _cfg.memory.startup_preload_per_collection
+
+# Canonical MIP key prefixes guaranteed to load in targeted slot 2.
+_CANONICAL_KEY_PREFIXES = (
+    "semantic:wallet:",
+    "semantic:network:",
+    "semantic:networking:",
+    "semantic:infrastructure:",
+    "semantic:governance:",
+)
 
 # ── Query type classification ─────────────────────────────────────────────
 _ACTION_KW = frozenset([
@@ -171,7 +182,7 @@ class QdrantAdapter:
 
     async def _embed(self, text: str) -> list[float]:
         """Embed text via CPU-only nomic-embed-text on ollama-embed service."""
-        async with httpx.AsyncClient(timeout=30.0) as http:
+        async with httpx.AsyncClient(timeout=_cfg.timeouts.embed_generation_s) as http:
             r = await http.post(f"{self._embed_url}/api/embeddings",
                                 json={"model": EMBED_MODEL, "prompt": text})
             r.raise_for_status()
@@ -202,7 +213,7 @@ class QdrantAdapter:
             f"Content: {content[:400]}"
         )
         try:
-            async with httpx.AsyncClient(timeout=10.0) as http:
+            async with httpx.AsyncClient(timeout=_cfg.timeouts.mip_key_title_gen_s) as http:
                 # MIP key generation — direct Ollama call, documented B1 exclusion.
                 # Rationale: qdrant adapter is the LLM interface layer, not a caller of it.
                 # If this pattern spreads to other files, add a B5 rule for raw /api/generate URLs.
@@ -275,70 +286,212 @@ class QdrantAdapter:
                     hnsw_config=HnswConfigDiff(on_disk=True),
                 )
 
-    async def startup_load(self):
+    async def startup_load(self) -> dict:
         """Pre-warm working_memory from RAID sovereign collections.
 
-        Loads recent + high-confidence entries (top-50 per collection, score ≥ 0.3).
-        Hard stop at 2GB estimated RAM to respect the 32GB system budget.
-        Items tagged startup_load=True so shutdown_promote() skips them (already on RAID).
+        Two-phase load — targeted slots first (guaranteed), then similarity fill:
 
-        On crash without clean shutdown: pre-warmed entries survive (already on RAID).
-        Session-new entries written after startup_load are the only at-risk data.
+        Phase 1 — targeted slots (always loaded, independent of similarity score):
+          Slot 2: canonical MIP keys (wallet/network/infrastructure/governance), up to 8
+          Slot 3: PROSPECTIVE tasks due today (active, next_due <= today), up to 5
+          Slot 6: open SI proposals (pending_director_review), up to 5
+          Slot 7: active PROCEDURAL tasks (human_confirmed=true), up to 5
+
+        Phase 2 — vector similarity fill (remaining capacity after slots):
+          Top-N per collection by semantic similarity to system overview query, score ≥ 0.3.
+          Already-loaded point IDs are skipped to avoid double-counting.
+
+        Hard stop at _PRELOAD_MAX_POINTS total to respect VRAM budget.
+        All entries tagged startup_load=True so shutdown_promote() skips them.
+
+        Returns stats dict: {total, slots, similarity, est_mb}.
         """
-        try:
-            vector = await self._embed("current system state knowledge overview")
-        except Exception as exc:
-            _log.warning("startup_load: embed failed — skipping preload: %s", exc)
-            return
-
         total_loaded = 0
+        _loaded_ids: set = set()
+        slot_counts = {2: 0, 3: 0, 6: 0, 7: 0}
+        _now = datetime.now(timezone.utc)
+        _today = _now.date().isoformat()
 
-        async def _load_one(coll: str):
+        def _make_payload(raw_payload: dict, coll: str, slot: int | None = None) -> tuple[str, dict]:
+            payload = dict(raw_payload)
+            payload["startup_load"] = True
+            payload["source_collection"] = coll
+            if slot is not None:
+                payload["_bootstrap_slot"] = slot
+                payload["_bootstrap_source"] = coll
+            _wm_id = payload.get("sov_id") or str(uuid.uuid4())
+            if "sov_id" not in payload:
+                payload["sov_id"] = _wm_id
+            return _wm_id, payload
+
+        async def _write(p, coll: str, slot: int) -> bool:
             nonlocal total_loaded
             if total_loaded >= _PRELOAD_MAX_POINTS:
-                return
-            try:
-                limit = min(_PRELOAD_PER_COLLECTION, _PRELOAD_MAX_POINTS - total_loaded)
-                response = await self.archive_client.query_points(
-                    collection_name=coll,
-                    query=vector,
-                    limit=limit,
-                    score_threshold=0.3,
+                return False
+            raw_vec = p.vector if isinstance(p.vector, list) else None
+            if raw_vec is None:
+                return False
+            _wm_id = (p.payload or {}).get("sov_id") or str(p.id)
+            if _wm_id in _loaded_ids:
+                return False
+            _wm_id, payload = _make_payload(p.payload or {}, coll, slot)
+            await self.client.upsert(
+                collection_name=WORKING,
+                points=[PointStruct(id=_wm_id, vector=raw_vec, payload=payload)],
+            )
+            _loaded_ids.add(_wm_id)
+            total_loaded += 1
+            slot_counts[slot] += 1
+            return True
+
+        # ── Phase 1: targeted slots ──────────────────────────────────────────
+
+        # Slot 2 — canonical MIP keys
+        # Two-pass: (1) payload-only full scan to find matching IDs (cheap),
+        # (2) batch retrieve with vectors for the working_memory write.
+        try:
+            _s2_offset = None
+            _s2_ids: list = []
+            while True:
+                _s2_batch, _s2_next = await self.archive_client.scroll(
+                    collection_name=SEMANTIC, limit=200,
+                    offset=_s2_offset, with_payload=True, with_vectors=False,
+                )
+                for _p in _s2_batch:
+                    _key = (_p.payload or {}).get("_key", "")
+                    if any(_key.startswith(pfx) for pfx in _CANONICAL_KEY_PREFIXES):
+                        _s2_ids.append(_p.id)
+                if _s2_next is None:
+                    break
+                _s2_offset = _s2_next
+            if _s2_ids:
+                _s2_with_vec = await self.archive_client.retrieve(
+                    collection_name=SEMANTIC,
+                    ids=_s2_ids,
                     with_payload=True,
                     with_vectors=True,
                 )
-                for r in response.points:
-                    if total_loaded >= _PRELOAD_MAX_POINTS:
-                        break
-                    raw_vec = r.vector if isinstance(r.vector, list) else None
-                    if raw_vec is None:
-                        continue
-                    payload = dict(r.payload or {})
-                    payload["startup_load"] = True
-                    payload["source_collection"] = coll
-                    # Preserve sovereign ID — use existing sov_id if present, else the RAID point ID
-                    _wm_id = payload.get("sov_id") or str(r.id)
-                    if "sov_id" not in payload:
-                        payload["sov_id"] = _wm_id
-                    await self.client.upsert(
-                        collection_name=WORKING,
-                        points=[PointStruct(
-                            id=_wm_id,
-                            vector=raw_vec,
-                            payload=payload,
-                        )],
-                    )
-                    total_loaded += 1
-            except Exception as exc:
-                _log.warning("startup_load: collection %s failed: %s", coll, exc)
+                for _p in _s2_with_vec:
+                    await _write(_p, SEMANTIC, 2)
+        except Exception as exc:
+            _log.warning("startup_load slot 2 (canonical MIP keys) failed: %s", exc)
 
-        await asyncio.gather(*[_load_one(c) for c in SOVEREIGN_COLLECTIONS])
+        # Slot 3 — PROSPECTIVE due today
+        try:
+            _s3_pts, _ = await self.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[FieldCondition(key="status", match=MatchValue(value="active"))]),
+                limit=200, with_payload=True, with_vectors=True,
+            )
+            _due = [_p for _p in _s3_pts
+                    if (_p.payload or {}).get("next_due", "")[:10] <= _today]
+            _due.sort(key=lambda _p: (_p.payload or {}).get("next_due", ""))
+            for _p in _due[:5]:
+                await _write(_p, PROSPECTIVE, 3)
+        except Exception as exc:
+            _log.warning("startup_load slot 3 (due today) failed: %s", exc)
+
+        # Slot 6 — open SI proposals
+        try:
+            _s6_pts, _ = await self.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[FieldCondition(
+                    key="status", match=MatchValue(value="pending_director_review")
+                )]),
+                limit=50, with_payload=True, with_vectors=True,
+            )
+            _s6_loaded = 0
+            for _p in _s6_pts:
+                if _s6_loaded >= 5:
+                    break
+                if (_p.payload or {}).get("proposal_type"):
+                    if await _write(_p, PROSPECTIVE, 6):
+                        _s6_loaded += 1
+        except Exception as exc:
+            _log.warning("startup_load slot 6 (SI proposals) failed: %s", exc)
+
+        # Slot 7 — active PROCEDURAL tasks
+        try:
+            _s7_pts, _ = await self.archive_client.scroll(
+                collection_name=PROCEDURAL,
+                scroll_filter=Filter(must=[FieldCondition(
+                    key="human_confirmed", match=MatchValue(value=True)
+                )]),
+                limit=50, with_payload=True, with_vectors=True,
+            )
+            _s7_pts.sort(
+                key=lambda _p: (_p.payload or {}).get("last_updated", ""), reverse=True
+            )
+            for _p in _s7_pts[:5]:
+                await _write(_p, PROCEDURAL, 7)
+        except Exception as exc:
+            _log.warning("startup_load slot 7 (active procedural) failed: %s", exc)
+
+        _log.info(
+            "startup_load: targeted slots loaded — 2=%d 3=%d 6=%d 7=%d (%d total)",
+            slot_counts[2], slot_counts[3], slot_counts[6], slot_counts[7], total_loaded,
+        )
+
+        # ── Phase 2: vector similarity fill (remaining capacity) ─────────────
+        sim_loaded = 0
+        try:
+            vector = await self._embed("current system state knowledge overview")
+        except Exception as exc:
+            _log.warning("startup_load: embed failed — skipping similarity preload: %s", exc)
+            vector = None
+
+        if vector is not None:
+            async def _load_one(coll: str):
+                nonlocal total_loaded, sim_loaded
+                if total_loaded >= _PRELOAD_MAX_POINTS:
+                    return
+                try:
+                    limit = min(_PRELOAD_PER_COLLECTION, _PRELOAD_MAX_POINTS - total_loaded)
+                    response = await self.archive_client.query_points(
+                        collection_name=coll,
+                        query=vector,
+                        limit=limit,
+                        score_threshold=0.3,
+                        with_payload=True,
+                        with_vectors=True,
+                    )
+                    for r in response.points:
+                        if total_loaded >= _PRELOAD_MAX_POINTS:
+                            break
+                        raw_vec = r.vector if isinstance(r.vector, list) else None
+                        if raw_vec is None:
+                            continue
+                        _wm_id = (r.payload or {}).get("sov_id") or str(r.id)
+                        if _wm_id in _loaded_ids:
+                            continue  # already loaded by targeted slot — skip
+                        _wm_id, payload = _make_payload(r.payload or {}, coll, slot=None)
+                        await self.client.upsert(
+                            collection_name=WORKING,
+                            points=[PointStruct(id=_wm_id, vector=raw_vec, payload=payload)],
+                        )
+                        _loaded_ids.add(_wm_id)
+                        total_loaded += 1
+                        sim_loaded += 1
+                except Exception as exc:
+                    _log.warning("startup_load: collection %s failed: %s", coll, exc)
+
+            # Exclude relational/associative — no content field, never surface in consultation pass.
+            # Loaded on-demand by retrieve_by_key(); preloading them wastes WM slots.
+            _PRELOAD_COLLECTIONS = [c for c in SOVEREIGN_COLLECTIONS if c not in (ASSOCIATIVE, RELATIONAL)]
+            await asyncio.gather(*[_load_one(c) for c in _PRELOAD_COLLECTIONS])
+
         est_mb = total_loaded * _BYTES_PER_POINT / 1024 / 1024
         _log.info(
-            "startup_load: preloaded %d entries into working_memory (~%.1f MB estimated RAM)"
-            " — sov_id preserved as working_memory point ID",
-            total_loaded, est_mb,
+            "startup_load: %d total entries (slots 2-3-6-7: %d-%d-%d-%d, similarity: %d) ~%.1f MB",
+            total_loaded, slot_counts[2], slot_counts[3], slot_counts[6], slot_counts[7],
+            sim_loaded, est_mb,
         )
+        return {
+            "total": total_loaded,
+            "slots": slot_counts,
+            "similarity": sim_loaded,
+            "est_mb": round(est_mb, 1),
+        }
 
     async def seed_skill_install_procedure(self) -> bool:
         """Seed the PROCEDURAL collection with the skill installation sequence.
@@ -964,9 +1117,25 @@ class QdrantAdapter:
             domain = fact.get("domain", "general")
             canonical_key = fact.get("key", "")
             canonical_title = fact.get("title", content[:80])
+            prev_seed_id = fact.get("_prev_seed_id", "")
             if not content or not seed_id:
                 continue
             try:
+                # Delete stale entry from a previous seed_id if requested
+                if prev_seed_id:
+                    _prev_pts, _ = await self.archive_client.scroll(
+                        collection_name=SEMANTIC,
+                        scroll_filter=Filter(must=[FieldCondition(
+                            key="_backfill_seed_id", match=MatchValue(value=prev_seed_id)
+                        )]),
+                        limit=1, with_payload=False, with_vectors=False,
+                    )
+                    if _prev_pts:
+                        await self.archive_client.delete(
+                            collection_name=SEMANTIC,
+                            points_selector=[_prev_pts[0].id],
+                        )
+
                 existing, _ = await self.archive_client.scroll(
                     collection_name=SEMANTIC,
                     scroll_filter=Filter(
@@ -1073,22 +1242,26 @@ class QdrantAdapter:
         Each seed dict: {seed_id, key, title, content, domain, extra_meta}.
         - key: canonical _key (e.g. "semantic:intent:list-files")
         - seed_id: stable dedup identifier (checked via _backfill_seed_id scroll)
+        - _prev_seed_id: optional — if present and found in SEMANTIC, the old entry
+          is deleted before the new one is written (supports v1 → v2 skill seed upgrades)
         - extra_meta: merged into stored payload (intent_signals, owner, trigger_point, etc.)
 
         Returns audit report: {"total": N, "created": N, "already_existed": N, "errors": N}
         """
+        from qdrant_client.models import PointIdsList
         total   = len(seeds)
         created = 0
         existed = 0
         errors  = 0
 
         for seed in seeds:
-            seed_id      = seed.get("seed_id", "")
+            seed_id       = seed.get("seed_id", "")
+            prev_seed_id  = seed.get("_prev_seed_id", "")
             canonical_key = seed.get("key", "")
-            content      = seed.get("content", "")
-            title        = seed.get("title", content[:80])
-            domain       = seed.get("domain", "general")
-            extra_meta   = seed.get("extra_meta") or {}
+            content       = seed.get("content", "")
+            title         = seed.get("title", content[:80])
+            domain        = seed.get("domain", "general")
+            extra_meta    = seed.get("extra_meta") or {}
 
             if not content or not seed_id or not canonical_key:
                 errors += 1
@@ -1110,6 +1283,38 @@ class QdrantAdapter:
                 if existing:
                     existed += 1
                     continue
+
+                # If a previous version seed_id is provided, clean it up before writing v2.
+                # This handles the v1→v2 skill seed upgrade: sparse v1 entries get replaced
+                # by rich v2 entries that include I/O descriptions.
+                if prev_seed_id:
+                    try:
+                        old_items, _ = await self.archive_client.scroll(
+                            collection_name=SEMANTIC,
+                            scroll_filter=Filter(
+                                must=[FieldCondition(
+                                    key="_backfill_seed_id",
+                                    match=MatchValue(value=prev_seed_id),
+                                )]
+                            ),
+                            limit=1,
+                            with_payload=False,
+                            with_vectors=False,
+                        )
+                        if old_items:
+                            await self.archive_client.delete(
+                                collection_name=SEMANTIC,
+                                points_selector=PointIdsList(points=[old_items[0].id]),
+                            )
+                            _log.debug(
+                                "seed_intent_semantic_entries: removed legacy %s before writing %s",
+                                prev_seed_id, seed_id,
+                            )
+                    except Exception as _prev_err:
+                        _log.debug(
+                            "seed_intent_semantic_entries: prev_seed cleanup failed (%s): %s",
+                            prev_seed_id, _prev_err,
+                        )
 
                 metadata = {
                     "type":              "semantic",
@@ -1408,99 +1613,6 @@ class QdrantAdapter:
             _patched,
         )
         return result
-
-    async def bootstrap_working_memory(self) -> int:
-        """Load working_memory_seed_keys from the sovereign root into working_memory.
-
-        Called after all startup seeds complete. Gives Rex immediate context at
-        session start without waiting for a Director message to trigger retrieval.
-
-        Steps:
-          1. Retrieve semantic:entity:sovereign from RAID
-          2. Read working_memory_seed_keys array
-          3. For each key: fetch full entry (with vector) from RAID → write to working_memory
-             with _bootstrap=True flag
-          4. Log bootstrap completion to episodic
-
-        Returns count of keys successfully loaded.
-        """
-        root = await self.retrieve_by_key("semantic:entity:sovereign")
-        if root is None:
-            _log.warning("bootstrap_working_memory: sovereign root not found — skipping")
-            return 0
-
-        seed_keys: list[str] = root.get("working_memory_seed_keys") or []
-        if not seed_keys:
-            _log.info("bootstrap_working_memory: no working_memory_seed_keys defined")
-            return 0
-
-        loaded = 0
-        _now = datetime.now(timezone.utc).isoformat()
-        for seed_key in seed_keys:
-            try:
-                # Fetch with vector from the appropriate RAID collection
-                for coll in SOVEREIGN_COLLECTIONS:
-                    pts, _ = await self.archive_client.scroll(
-                        collection_name=coll,
-                        scroll_filter=Filter(
-                            must=[FieldCondition(key="_key", match=MatchValue(value=seed_key))]
-                        ),
-                        limit=1,
-                        with_payload=True,
-                        with_vectors=True,
-                    )
-                    if pts:
-                        p = pts[0]
-                        raw_vec = p.vector if isinstance(p.vector, list) else None
-                        if raw_vec is None:
-                            break
-                        payload = dict(p.payload or {})
-                        payload["_bootstrap"] = True
-                        payload["startup_load"] = True   # skip re-promotion on shutdown
-                        payload["source_collection"] = coll
-                        _wm_id = payload.get("sov_id") or str(p.id)
-                        if "sov_id" not in payload:
-                            payload["sov_id"] = _wm_id
-                        await self.client.upsert(
-                            collection_name=WORKING,
-                            points=[PointStruct(
-                                id=_wm_id,
-                                vector=raw_vec,
-                                payload=payload,
-                            )],
-                        )
-                        loaded += 1
-                        _log.debug("bootstrap_working_memory: loaded %s from %s", seed_key, coll)
-                        break
-            except Exception as exc:
-                _log.warning("bootstrap_working_memory: failed to load %r: %s", seed_key, exc)
-
-        # Log bootstrap completion to episodic
-        try:
-            import uuid as _uuid_b
-            from qdrant_client.models import PointStruct as _PS_b
-            await self.archive_client.upsert(
-                collection_name=EPISODIC,
-                points=[_PS_b(
-                    id=str(_uuid_b.uuid4()),
-                    vector=[0.0] * VECTOR_DIM,
-                    payload={
-                        "type":        "episodic",
-                        "domain":      "system.bootstrap",
-                        "event":       "system_bootstrap",
-                        "keys_loaded": loaded,
-                        "seed_keys":   seed_keys,
-                        "timestamp":   _now,
-                        "_no_key":     True,
-                        "last_updated": _now,
-                    },
-                )],
-            )
-        except Exception:
-            pass  # episodic log failure is not surfaced
-
-        _log.info("bootstrap_working_memory: loaded %d/%d seed keys", loaded, len(seed_keys))
-        return loaded
 
     def _can_write(self, writer: str, collection: str) -> bool:
         return writer in WRITE_PERMISSIONS.get(collection, {"sovereign-core"})

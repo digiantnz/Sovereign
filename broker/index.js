@@ -285,15 +285,15 @@ app.all('/:methodPath(*)', async (req, res) => {
       return res.json(info);
     }
 
-    // GET /system/gpu — existing (nvidia-smi via ollama exec)
+    // GET /system/gpu — nvidia-smi via nsenter+su (NVML only works for uid≥1000 with open kernel module)
     if (req.method === 'GET' && fullPath === '/system/gpu') {
-      const raw = await execInContainer('ollama', [
-        'nvidia-smi',
-        '--query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu',
-        '--format=csv,noheader,nounits',
-      ]);
-      const line = raw.trim().split('\n').find(l => l.trim());
-      if (!line) return res.json({ error: 'no nvidia-smi output' });
+      const r = await spawnRun('/usr/bin/nsenter', [
+        '-t', '1', '-m', '-p', '--',
+        '/bin/su', '-s', '/bin/sh', 'matt', '-c',
+        'nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu --format=csv,noheader,nounits',
+      ], 10000);
+      const line = (r.stdout || '').trim().split('\n').find(l => l.trim());
+      if (!line) return res.json({ error: r.stderr || 'no nvidia-smi output' });
       const [name, mem_used, mem_total, gpu_util, mem_util, temp] = line.split(',').map(s => s.trim());
       return res.json({
         gpu_name:        name,
@@ -402,15 +402,15 @@ app.all('/:methodPath(*)', async (req, res) => {
 
     // GET /system/hardware — nvidia-smi + df + memory + cpu
     if (req.method === 'GET' && fullPath === '/system/hardware') {
-      // GPU via ollama exec
+      // GPU via nsenter+su (NVML only works for uid≥1000 with open kernel module)
       let gpu = {};
       try {
-        const raw = await execInContainer('ollama', [
-          'nvidia-smi',
-          '--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu',
-          '--format=csv,noheader,nounits',
-        ]);
-        const line = raw.trim().split('\n').find(l => l.trim());
+        const r = await spawnRun('/usr/bin/nsenter', [
+          '-t', '1', '-m', '-p', '--',
+          '/bin/su', '-s', '/bin/sh', 'matt', '-c',
+          'nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits',
+        ], 10000);
+        const line = (r.stdout || '').trim().split('\n').find(l => l.trim());
         if (line) {
           const [name, memUsed, memTotal, gpuUtil, temp] = line.split(',').map(s => s.trim());
           gpu = { gpu_name: name, vram_used_mb: parseInt(memUsed)||0, vram_total_mb: parseInt(memTotal)||0,

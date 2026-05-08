@@ -162,6 +162,10 @@ class GovernanceEngine:
                 return rules
             elif operation == 'approve' and (rules.get('skill_read', False) or rules.get('skill_load', False)):
                 return rules
+        elif domain == 'news':
+            # News harness — parallel RSS + Grok + browser fetch, synthesised brief; LOW tier
+            if operation == 'brief' and rules.get('browser_search', False):
+                return rules
         elif domain == 'monitoring':
             # SI-Harness operations — observe/baseline/proposals are read-only, write to memory
             if operation in ('observe', 'proposals', 'baseline') and rules.get('memory_write', False):

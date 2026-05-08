@@ -187,6 +187,22 @@ def _parse_skill_md_content(content: str) -> tuple[dict, str]:
     return fm, match.group(2)
 
 
+def _raw_url_to_github_api_url(raw_url: str) -> Optional[str]:
+    """Convert a raw.githubusercontent.com SKILL.md URL to a GitHub API directory URL.
+
+    raw: https://raw.githubusercontent.com/user/repo/branch/path/to/skill/SKILL.md
+    api: https://api.github.com/repos/user/repo/contents/path/to/skill?ref=branch
+    """
+    m = re.match(
+        r"https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)/SKILL\.md$",
+        raw_url,
+    )
+    if not m:
+        return None
+    user, repo, branch, path = m.groups()
+    return f"https://api.github.com/repos/{user}/{repo}/contents/{path}?ref={branch}"
+
+
 def load_skill_watchlist() -> list[str]:
     """Load the durable skill path watchlist from RAID. Called at startup."""
     if not os.path.isfile(WATCHLIST_PATH):
@@ -631,6 +647,7 @@ class SkillLifecycleManager:
         clawhub_certified: bool = False,
         proposed_by: str = "devops_agent",
         reason: str = "Director requested skill installation.",
+        raw_url: Optional[str] = None,
     ) -> dict:
         """Write a reviewed skill to RAID and register with integrity systems.
 
@@ -764,6 +781,22 @@ class SkillLifecycleManager:
         except OSError as e:
             return {"error": f"FILE_WRITE_FAILED: {e}"}
 
+        # ── Deploy scripts to nanobot workspace ───────────────────────────
+        deploy_result: dict = {}
+        if raw_url:
+            try:
+                deploy_result = await self._deploy_skill_scripts(safe_name, raw_url)
+                if deploy_result.get("deployed"):
+                    logger.info(
+                        "SkillLifecycle.load: deployed %d script(s) for %s: %s",
+                        len(deploy_result["deployed"]), safe_name, deploy_result["deployed"],
+                    )
+                for _dw in deploy_result.get("warnings", []):
+                    logger.warning("SkillLifecycle.load: deploy warning for %s: %s", safe_name, _dw)
+            except Exception as _de:
+                logger.warning("SkillLifecycle.load: script deploy failed for %s: %s", safe_name, _de)
+                deploy_result = {"warnings": [str(_de)]}
+
         # ── Register in skill-checksums.json (SkillLoader reference) ─────
         whole_file_hash = _sha256_file(skill_path)
         self._update_checksums(safe_name, whole_file_hash)
@@ -828,6 +861,8 @@ class SkillLifecycleManager:
             "file_hash": whole_file_hash[:16] + "…",
             "review_decision": review_result.get("decision"),
             "escalation_reasons": review_result.get("escalation_reasons", []),
+            "scripts_deployed": deploy_result.get("deployed", []),
+            "packages_installed": deploy_result.get("requirements", []),
         })
 
         result: dict = {
@@ -848,6 +883,20 @@ class SkillLifecycleManager:
             ),
         }
 
+        # Surface script deploy outcome
+        if deploy_result.get("deployed"):
+            result["scripts_deployed"] = deploy_result["deployed"]
+            result["message"] += (
+                f" {len(deploy_result['deployed'])} script(s) deployed to nanobot workspace."
+            )
+        if deploy_result.get("requirements"):
+            result["packages_installed"] = deploy_result["requirements"]
+            result["message"] += (
+                f" {len(deploy_result['requirements'])} pip package(s) installed."
+            )
+        if deploy_result.get("warnings"):
+            result["deploy_warnings"] = deploy_result["warnings"]
+
         # Surface any nanobot advisory so Sovereign can inform the Director
         if nanobot_advisory:
             result["nanobot_advisory"] = nanobot_advisory
@@ -863,10 +912,17 @@ class SkillLifecycleManager:
         # ── Standing Design Order: write semantic memory entry on install ────────
         # Every new skill install must have exactly one semantic:intent:{slug} entry.
         # Written here (post-install) so the entry always reflects the installed state.
+        # v2: includes description + operations list for I/O transparency in semantic memory.
         if self.qdrant is not None:
             try:
                 from memory.semantic_seeds import make_skill_semantic_seed
-                _sem_seed = make_skill_semantic_seed(safe_name, specialists, tier)
+                _skill_description = fm_dict.get("description", "")
+                _skill_op_names = list(operations.keys()) if isinstance(operations, dict) else []
+                _sem_seed = make_skill_semantic_seed(
+                    safe_name, specialists, tier,
+                    description=_skill_description,
+                    operations=_skill_op_names,
+                )
                 import asyncio as _asyncio
                 _asyncio.create_task(
                     self.qdrant.seed_intent_semantic_entries([_sem_seed])
@@ -1044,6 +1100,154 @@ class SkillLifecycleManager:
             logger.info(
                 "SkillLifecycle: registered '%s' in soul-guardian watchlist (durable)", path
             )
+
+    async def _deploy_skill_scripts(self, name: str, raw_url: str) -> dict:
+        """Fetch skill scripts from GitHub and deploy to nanobot workspace via /deploy-skill.
+
+        sovereign-core cannot write to the nanobot workspace directly (not mounted), so
+        script content is fetched here then POSTed to nanobot's /deploy-skill endpoint
+        which writes to its own /workspace/skills/<name>/scripts/.
+
+        Handles both Sovereign convention (scripts/ subdir) and OpenClaw community
+        convention (.py/.js/.sh files at the skill root).
+
+        Returns {deployed: [filenames], requirements: [pkg_specs], warnings: [str]}
+        """
+        api_url = _raw_url_to_github_api_url(raw_url)
+        if not api_url:
+            return {"deployed": [], "warnings": [f"Cannot derive GitHub API URL from {raw_url!r}"]}
+
+        warnings: list[str] = []
+        requirements: list[str] = []
+
+        # ── Fetch skill directory listing from GitHub API ─────────────────
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as _c:
+                _r = await _c.get(
+                    api_url,
+                    headers={
+                        "Accept": "application/vnd.github.v3+json",
+                        "User-Agent": "SovereignCore/1.0",
+                    },
+                )
+            if _r.status_code == 403:
+                warnings.append("GitHub API rate-limited — scripts not deployed; retry next restart")
+                return {"deployed": [], "requirements": [], "warnings": warnings}
+            if _r.status_code != 200:
+                warnings.append(f"GitHub API returned HTTP {_r.status_code} for directory listing")
+                return {"deployed": [], "requirements": [], "warnings": warnings}
+            entries = _r.json()
+        except Exception as _e:
+            warnings.append(f"GitHub API directory fetch failed: {_e}")
+            return {"deployed": [], "requirements": [], "warnings": warnings}
+
+        if not isinstance(entries, list):
+            warnings.append("GitHub API response was not a list — unexpected format")
+            return {"deployed": [], "requirements": [], "warnings": warnings}
+
+        # ── Locate scripts/ dir, root-level scripts, requirements.txt ─────
+        # Sovereign convention: scripts/ subdirectory.
+        # OpenClaw/community convention: .py/.js/.sh/.ts files at the skill root.
+        _SCRIPT_EXTS = {".py", ".js", ".sh", ".ts"}
+        scripts_api_url: Optional[str] = None
+        root_script_entries: list[dict] = []
+        requirements_download_url: Optional[str] = None
+        for _entry in entries:
+            _ename = _entry.get("name", "")
+            if _entry.get("type") == "dir" and _ename == "scripts":
+                scripts_api_url = _entry.get("url")
+            elif _entry.get("type") == "file" and _ename == "requirements.txt":
+                requirements_download_url = _entry.get("download_url")
+            elif _entry.get("type") == "file" and any(_ename.endswith(ext) for ext in _SCRIPT_EXTS):
+                root_script_entries.append(_entry)
+
+        # ── Build list of (filename, download_url) pairs ──────────────────
+        script_file_entries: list[dict] = []
+        if scripts_api_url:
+            try:
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as _c2:
+                    _r2 = await _c2.get(
+                        scripts_api_url,
+                        headers={
+                            "Accept": "application/vnd.github.v3+json",
+                            "User-Agent": "SovereignCore/1.0",
+                        },
+                    )
+                if _r2.status_code == 200:
+                    script_file_entries = [e for e in _r2.json() if e.get("type") == "file"]
+            except Exception as _e2:
+                warnings.append(f"scripts/ listing fetch failed: {_e2}")
+        script_file_entries.extend(root_script_entries)
+
+        # ── Fetch content of each script ──────────────────────────────────
+        scripts_payload: list[dict] = []
+        for _se in script_file_entries:
+            _fname = _se.get("name", "")
+            _dl_url = _se.get("download_url", "")
+            if not _fname or not _dl_url:
+                continue
+            _content = await self._fetch_raw_url(_dl_url)
+            if _content is None:
+                warnings.append(f"Could not fetch script: {_fname}")
+                continue
+            scripts_payload.append({"name": _fname, "content": _content})
+
+        if not scripts_payload:
+            logger.info(
+                "SkillLifecycle._deploy_skill_scripts: no scripts found for %s — knowledge skill",
+                name,
+            )
+
+        # ── Fetch requirements.txt content ────────────────────────────────
+        requirements_txt_content: Optional[str] = None
+        if requirements_download_url:
+            requirements_txt_content = await self._fetch_raw_url(requirements_download_url)
+            if requirements_txt_content:
+                requirements = [
+                    ln.strip() for ln in requirements_txt_content.splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+
+        # ── POST to nanobot /deploy-skill — nanobot writes its own workspace ──
+        if scripts_payload or requirements_txt_content:
+            deploy_resp = await self._nanobot_deploy_skill(
+                name, scripts_payload, requirements_txt_content
+            )
+            warnings.extend(deploy_resp.get("errors") or [])
+            return {
+                "deployed": deploy_resp.get("deployed", []),
+                "requirements": requirements,
+                "warnings": warnings,
+            }
+
+        return {"deployed": [], "requirements": [], "warnings": warnings}
+
+    async def _nanobot_deploy_skill(
+        self,
+        name: str,
+        scripts: list[dict],
+        requirements_txt: Optional[str],
+    ) -> dict:
+        """POST /deploy-skill to nanobot-01. Nanobot writes scripts to its own workspace."""
+        nanobot_url = os.environ.get("NANOBOT_01_URL", "http://nanobot-01:8080")
+        _secret = os.environ.get("NANOBOT_SHARED_SECRET", "")
+        _headers = {"X-API-Key": _secret} if _secret else {}
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as _c:
+                _r = await _c.post(
+                    f"{nanobot_url}/deploy-skill",
+                    json={
+                        "skill_name": name,
+                        "scripts": scripts,
+                        "requirements_txt": requirements_txt,
+                    },
+                    headers=_headers,
+                )
+            if _r.status_code == 200:
+                return _r.json()
+            return {"ok": False, "errors": [f"HTTP {_r.status_code}: {_r.text[:200]}"]}
+        except Exception as _e:
+            return {"ok": False, "errors": [str(_e)]}
 
     async def _translate_via_nanobot(
         self, skill_md_content: str, name: str

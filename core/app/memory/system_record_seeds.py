@@ -182,7 +182,7 @@ def build_governance_seeds() -> list[dict]:
             "content": (
                 "sovereign-core API binds to 127.0.0.1:8000 (loopback only). "
                 "No host port binding. Gateway container (ai_net) reaches it via "
-                "http://sovereign-core:8000. nextcloud-rp proxies portal routes only "
+                "http://sovereign-core:8000. nginx proxies portal routes only "
                 "(not /chat — blocked 403)."
             ),
         },

@@ -236,7 +236,7 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
         cog:    CognitionEngine instance (required for LLM inference;
                 None → skips all inference, no relational entries written)
     """
-    from execution.adapters.qdrant import SEMANTIC, RELATIONAL, EPISODIC
+    from execution.adapters.qdrant import SEMANTIC, RELATIONAL, EPISODIC, ASSOCIATIVE
 
     stats: dict = {
         "semantic_processed": 0,
@@ -399,12 +399,15 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
 
             existing = await _key_exists(qdrant, rel_key)
             if existing:
-                # Update — refresh relationship_type, insight, and score on re-synthesis
+                # Update — refresh insight/score and increment observation_count
                 try:
                     import uuid as _uuid2
                     point_id = str(_uuid2.uuid5(
                         _uuid2.UUID("7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d"), rel_key
                     ))
+                    existing_entry = await qdrant.retrieve_by_key(rel_key)
+                    cur_count = (existing_entry or {}).get("observation_count", 1) if existing_entry else 1
+                    new_count = cur_count + 1
                     await qdrant.archive_client.set_payload(
                         collection_name=RELATIONAL,
                         payload={
@@ -413,13 +416,14 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
                             "diverges":          rel_payload["diverges"],
                             "insight":           rel_payload["insight"],
                             "similarity_score":  rel_payload["similarity_score"],
+                            "observation_count": new_count,
                             "synthesis_source":  "structural",
                             "last_updated":      datetime.now(timezone.utc).isoformat(),
                         },
                         points=[point_id],
                     )
                     stats["relational_updated"] += 1
-                    logger.debug("synthesise_structural: updated %s", rel_key)
+                    logger.debug("synthesise_structural: updated %s (obs=%d)", rel_key, new_count)
                 except Exception as e:
                     logger.warning(
                         "synthesise_structural: update failed %s: %s", rel_key, e
@@ -439,21 +443,51 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
                     stats["errors"] += 1
                     continue
 
-            # ── Strong structural types → also write associative entry (strength=0.9) ──
-            # is_a / part_of / depends_on / owns are high-confidence — bidirectional
-            # associative link allows traversal in both directions from either node.
+            # ── Strong structural types → also write associative entry ──────────
+            # Strength reflects the underlying vector similarity, not a hardcoded value.
+            # Starts honest; grows toward 1.0 as observation_count accumulates.
             if rel_type in _STRONG_STRUCTURAL:
+                sim_score = round(float(nb.get("score", 0.0)), 4)
                 assoc_key = f"associative:structural:{_structural_rel_key(entry_key, nb_key).split('relational:structural:', 1)[-1]}"
-                if not await _key_exists(qdrant, assoc_key):
-                    _slug_a = _slug(entry_key)
-                    _slug_b = _slug(nb_key)
+                assoc_exists = await _key_exists(qdrant, assoc_key)
+                if assoc_exists:
+                    # Increment observation_count and nudge strength toward 1.0
+                    try:
+                        import uuid as _uuid3
+                        assoc_point_id = str(_uuid3.uuid5(
+                            _uuid3.UUID("7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d"), assoc_key
+                        ))
+                        assoc_entry = await qdrant.retrieve_by_key(assoc_key)
+                        assoc_count = (assoc_entry or {}).get("observation_count", 1) if assoc_entry else 1
+                        assoc_count += 1
+                        # strength = sim_score + bonus capped at 1.0 (each re-encounter adds 0.05)
+                        new_strength = min(round(sim_score + (assoc_count - 1) * 0.05, 3), 1.0)
+                        await qdrant.archive_client.set_payload(
+                            collection_name=ASSOCIATIVE,
+                            payload={
+                                "observation_count": assoc_count,
+                                "strength": new_strength,
+                                "last_updated": datetime.now(timezone.utc).isoformat(),
+                            },
+                            points=[assoc_point_id],
+                        )
+                        stats["associative_updated"] = stats.get("associative_updated", 0) + 1
+                        logger.debug(
+                            "synthesise_structural: assoc updated %s → %s obs=%d str=%.3f",
+                            entry_key, nb_key, assoc_count, new_strength,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "synthesise_structural: assoc update failed %s: %s", assoc_key, e,
+                        )
+                else:
                     assoc_payload = {
                         "type": "associative",
                         "_key": assoc_key,
                         "source_key": entry_key,
                         "target_key": nb_key,
                         "relationship": rel_type,
-                        "strength": 0.9,
+                        "strength": round(sim_score * 0.85, 3),  # honest initial: sim_score × 0.85
                         "observation_count": 1,
                         "synthesis_source": "structural",
                         "source": "structural_synthesis",
@@ -462,8 +496,8 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
                         await _upsert_raw(qdrant, ASSOCIATIVE, assoc_key, assoc_payload)
                         stats["associative_created"] += 1
                         logger.debug(
-                            "synthesise_structural: assoc %s → %s (%s)",
-                            entry_key, nb_key, rel_type,
+                            "synthesise_structural: assoc %s → %s (%s) str=%.3f",
+                            entry_key, nb_key, rel_type, assoc_payload["strength"],
                         )
                     except Exception as e:
                         logger.warning(
@@ -758,13 +792,71 @@ async def run_synthesis(qdrant, cog=None) -> dict:
         stats["structural_updated"]     = _structural.get("relational_updated", 0)
         stats["structural_assoc"]       = _structural.get("associative_created", 0)
 
+    # ── Pass 5: Cull low-confidence structural entries ────────────────────────
+    # Delete structural relational/associative entries that remain at observation_count=1
+    # after at least 14 days with similarity_score < 0.75. These are spurious inferences
+    # that synthesis has never re-confirmed — they add noise without value.
+    stats["culled_relational"] = 0
+    stats["culled_associative"] = 0
+    _cull_cutoff = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        from datetime import timedelta
+        _cull_age_days = 14
+        _cull_min_score = 0.75
+
+        for _cull_coll, _cull_key in ((RELATIONAL, "culled_relational"), (ASSOCIATIVE, "culled_associative")):
+            _cull_offset = None
+            _cull_ids: list[str] = []
+            while True:
+                _cull_result, _cull_next = await qdrant.archive_client.scroll(
+                    collection_name=_cull_coll,
+                    limit=200,
+                    offset=_cull_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for _pt in _cull_result:
+                    _p = dict(_pt.payload or {})
+                    if _p.get("synthesis_source") != "structural":
+                        continue
+                    if (_p.get("observation_count") or 1) > 1:
+                        continue  # already re-confirmed — keep
+                    _score = float(_p.get("similarity_score", _p.get("strength", 1.0)))
+                    if _score >= _cull_min_score:
+                        continue  # high-confidence — keep
+                    _lu = _p.get("last_updated", "")
+                    try:
+                        _lu_dt = datetime.fromisoformat(_lu).replace(tzinfo=None)
+                        if (datetime.utcnow() - _lu_dt).days < _cull_age_days:
+                            continue  # too young — keep
+                    except Exception:
+                        continue  # can't parse date — keep safe
+                    _cull_ids.append(str(_pt.id))
+
+                if _cull_next is None:
+                    break
+                _cull_offset = _cull_next
+
+            if _cull_ids:
+                await qdrant.archive_client.delete(
+                    collection_name=_cull_coll,
+                    points_selector=_cull_ids,
+                )
+                stats[_cull_key] = len(_cull_ids)
+                logger.info("synthesis cull: deleted %d from %s", len(_cull_ids), _cull_coll)
+
+    except Exception as _cull_exc:
+        logger.warning("synthesis cull: failed (non-fatal): %s", _cull_exc)
+
     logger.info(
         "synthesis: complete — assoc_created=%d assoc_updated=%d "
         "rel_created=%d rel_updated=%d skipped=%d "
-        "structural_created=%d structural_updated=%d",
+        "structural_created=%d structural_updated=%d "
+        "culled_relational=%d culled_associative=%d",
         stats["associative_created"], stats["associative_updated"],
         stats["relational_created"], stats["relational_updated"],
         stats["skipped_existing"],
         stats.get("structural_created", 0), stats.get("structural_updated", 0),
+        stats.get("culled_relational", 0), stats.get("culled_associative", 0),
     )
     return {"status": "ok", **stats}

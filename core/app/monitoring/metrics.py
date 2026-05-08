@@ -12,10 +12,14 @@ from datetime import datetime, timezone, timedelta
 
 import httpx
 
-BROKER_URL    = os.environ.get("BROKER_URL", "http://docker-broker:8088")
-OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-QDRANT_URL    = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-WEBDAV_URL    = os.environ.get("WEBDAV_URL", "http://nextcloud:80/remote.php/dav/")
+BROKER_URL         = os.environ.get("BROKER_URL", "http://docker-broker:8088")
+OLLAMA_URL         = os.environ.get("OLLAMA_URL", "http://ollama:11434")
+SOV_WALLET_URL     = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
+QDRANT_URL         = os.environ.get("QDRANT_URL", "http://qdrant-archive:6333")
+# QDRANT_URL points to qdrant-archive (all 7 sovereign RAID collections).
+# QDRANT_WM_URL points to the working_memory qdrant container (tmpfs).
+QDRANT_WM_URL      = os.environ.get("QDRANT_WM_URL", "http://qdrant:6333")
+WEBDAV_URL         = os.environ.get("WEBDAV_URL", "http://nextcloud:80/remote.php/dav/")
 TELEGRAM_URL  = "https://api.telegram.org"
 GROK_URL      = "https://api.x.ai/v1"
 
@@ -23,7 +27,7 @@ AUDIT_PATH    = "/home/sovereign/audit/security-ledger.jsonl"
 SOVEREIGN_CONTAINERS = [
     "sovereign-core", "ollama", "whisper", "qdrant",
     "docker-broker", "gateway",
-    "nextcloud", "nc-db", "nc-redis", "nextcloud-rp",
+    "nextcloud", "nc-db", "nc-redis", "nginx",
     "nanobot-01",
 ]  # a2a-browser + searxng removed 2026-03-19 (replaced by node04 172.16.201.4:8001)
 
@@ -122,25 +126,32 @@ async def collect_ollama(ollama_url: str = OLLAMA_URL) -> dict:
         return {"error": str(e)}
 
 
-async def collect_qdrant(qdrant_url: str = QDRANT_URL) -> dict:
-    """Get point counts and on-disk storage per collection."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{qdrant_url}/collections")
-            r.raise_for_status()
-            colls = r.json().get("result", {}).get("collections", [])
-            details = []
-            total_points = 0
-            for c in colls:
-                name = c["name"]
-                r2 = await client.get(f"{qdrant_url}/collections/{name}")
-                info = r2.json().get("result", {})
-                points = info.get("points_count", 0)
-                total_points += points
-                details.append({"collection": name, "points": points})
-        return {"collections": details, "total_points": total_points}
-    except Exception as e:
-        return {"error": str(e)}
+async def collect_qdrant(
+        archive_url: str = QDRANT_URL,
+        wm_url: str = QDRANT_WM_URL,
+) -> dict:
+    """Get point counts per collection from both qdrant instances.
+
+    Returns {collection_name: {points_count: N}} matching the dashboard
+    renderHeatmap() expectation. Queries qdrant-archive (7 RAID collections)
+    and qdrant (working_memory, tmpfs).
+    """
+    result: dict = {}
+    for url, label in [(archive_url, "archive"), (wm_url, "working")]:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(f"{url}/collections")
+                r.raise_for_status()
+                colls = r.json().get("result", {}).get("collections", [])
+                for c in colls:
+                    name = c["name"]
+                    r2 = await client.get(f"{url}/collections/{name}")
+                    info = r2.json().get("result", {})
+                    result[name] = {"points_count": info.get("points_count", 0)}
+        except Exception as e:
+            if label == "working":
+                result.setdefault("working_memory", {"points_count": 0, "error": str(e)})
+    return result
 
 
 def collect_audit_count(audit_path: str = AUDIT_PATH) -> dict:
@@ -208,6 +219,20 @@ async def _probe_telegram() -> tuple[str, dict]:
     return "telegram", {"reachable": ok, "latency_ms": lat}
 
 
+async def collect_wallet(wallet_url: str = SOV_WALLET_URL) -> dict:
+    """Query sov-wallet /health for chain connectivity state."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{wallet_url}/health")
+            r.raise_for_status()
+            data = r.json()
+        chains = data.get("chains", {})
+        failing = int(data.get("chains_failing", sum(1 for c in chains.values() if not c.get("connected", True))))
+        return {"reachable": True, "chains": chains, "chains_failing": failing}
+    except Exception as e:
+        return {"reachable": False, "error": str(e), "chains_failing": 0}
+
+
 async def collect_external_reachability() -> dict:
     """Probe external services concurrently. Total time = slowest single probe."""
     results = await asyncio.gather(
@@ -237,12 +262,13 @@ async def collect_all(app_state=None) -> dict:
     """Collect all metrics concurrently. app_state from FastAPI app.state (optional)."""
     ts = datetime.now(timezone.utc).isoformat()
 
-    (containers, gpu, ollama_info, qdrant_info, external) = await asyncio.gather(
+    (containers, gpu, ollama_info, qdrant_info, external, wallet) = await asyncio.gather(
         collect_containers(),
         collect_gpu(),
         collect_ollama(),
         collect_qdrant(),
         collect_external_reachability(),
+        collect_wallet(),
         return_exceptions=False,
     )
 
@@ -260,10 +286,11 @@ async def collect_all(app_state=None) -> dict:
         "timestamp":    ts,
         "containers":   containers,
         "gpu":          gpu,
-        "ram":          ram,
+        "memory":       ram,
         "ollama":       ollama_info,
         "qdrant":       qdrant_info,
         "audit":        audit,
         "soul_guardian": soul_status,
         "external":     external,
+        "wallet":       wallet,
     }

@@ -8,7 +8,8 @@ import json
 import os
 import re as _re
 
-_SKILLS_DIR = "/home/sovereign/skills"
+from config import cfg as _cfg
+_SKILLS_DIR = _cfg.paths.skills_dir
 _skill_summary_cache: str = ""
 
 def _build_skill_summary() -> str:
@@ -48,7 +49,7 @@ def _get_skill_summary() -> str:
 
 
 def classify(ceo_persona: str, user_input: str, memory_context: str,
-             context_window=None) -> str:
+             context_window=None, cognitive_context: str = "") -> str:
     context_section = ""
     if context_window:
         # Normalise: list of {user,assistant} dicts or legacy single dict
@@ -65,6 +66,7 @@ def classify(ceo_persona: str, user_input: str, memory_context: str,
             "---",
         ]
         context_section = "\n".join(lines)
+    cognitive_section = f"\n{cognitive_context}\n" if cognitive_context else ""
     from datetime import datetime as _dt, timezone as _tz
     _now = _dt.now(_tz.utc)
     _ts = _now.strftime("%Y-%m-%d %H:%M UTC (%A)")  # e.g. "2026-03-23 09:15 UTC (Monday)"
@@ -80,7 +82,7 @@ Installed skills (name: what it does):
 ---
 RECENT MEMORY CONTEXT:
 {memory_context}
-{context_section}
+{context_section}{cognitive_section}
 ---
 TASK — PASS 1: CLASSIFICATION
 

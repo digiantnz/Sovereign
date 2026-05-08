@@ -19,6 +19,7 @@
 
 const rpc       = require('./wallet-rpc');
 const watchlist = require('./wallet-watchlist');
+const lightning = require('./wallet-harness-lightning');
 
 const QDRANT_URL    = process.env.QDRANT_URL || 'http://qdrant-archive:6333';
 const EPISODIC_COL  = 'episodic';
@@ -157,18 +158,24 @@ async function _writeSnapshot(snapshot) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 async function takeSnapshot() {
-  const [balances, prices] = await Promise.all([_aggregateBalances(), _fetchPrices()]);
+  const [balances, prices, lightningBal, lightningChannels] = await Promise.all([
+    _aggregateBalances(),
+    _fetchPrices(),
+    lightning.fetchLightningBalance(),
+    lightning.fetchChannelsForSnapshot(),
+  ]);
   const totals = _calculateTotals(balances, prices);
   const snapshot = {
     timestamp: new Date().toISOString(),
     balances,
     totals,
     prices:    prices || {},
+    lightning: lightningBal,      // BTCPay node aggregate channel balances (null if unavailable)
+    channels:  lightningChannels, // individual channel states — capacity, local/remote balance, status
     // ── Extension point stubs ──────────────────────────────────────────────
     lending:   null,   // AAVE V3 positions — future build (wallet.lending module)
     yield:     null,   // Curve/Compound — future build (wallet.yield module)
     staking:   null,   // ETH/SOL staking — future build (wallet.staking module)
-    lightning: null,   // Lightning/BTCPay channels — pending BTCPay configuration
   };
   _latestSnapshot = snapshot;
   await _writeSnapshot(snapshot);
@@ -202,11 +209,14 @@ function startScheduledSnapshots() {
 // ── Payment event handler ─────────────────────────────────────────────────────
 
 async function handle(event) {
-  const entry = watchlist.getByAddress(event.to_address || event.from_address || '');
-  if (!(entry?.metadata?.harness || []).includes('portfolio')) return;
+  // Lightning events are from our own node — always refresh portfolio on any Lightning settle
+  if (event.chain !== 'lightning') {
+    const entry = watchlist.getByAddress(event.to_address || event.from_address || '');
+    if (!(entry?.metadata?.harness || []).includes('portfolio')) return;
+  }
 
-  // Trigger an immediate balance refresh on confirmed inbound payment
-  log(`inbound payment on portfolio address ${entry.label} — refreshing snapshot`);
+  const label = event.label || event.chain;
+  log(`inbound payment on ${label} — refreshing snapshot`);
   takeSnapshot().catch(e => warn('post-payment snapshot failed:', e.message));
 }
 
