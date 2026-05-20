@@ -191,6 +191,9 @@ def _make_vevent(uid, title, start, end=None, description=None):
         end_str += "T010000"
 
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # RFC 5545: newlines in property values must be escaped as \n (literal backslash-n)
+    if description:
+        description = description.replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
     desc_line = f"DESCRIPTION:{description}" if description else ""
 
     return f"""BEGIN:VCALENDAR
@@ -347,19 +350,35 @@ def cmd_tasks_list(calendar="tasks"):
         return {"status": "error", "error": f"REPORT VTODO failed: HTTP {r.status_code}",
                 "body": r.text[:300]}
 
-    # Parse VTODO blocks from calendar-data
+    # Extract per-response href + calendar-data blocks from the multistatus XML.
+    # The href is the authoritative resource path for DELETE — the UID inside the
+    # VTODO data does NOT necessarily match the filename on the server (external
+    # clients / Nextcloud UI use their own naming conventions).
+    origin_m = re.match(r"https?://[^/]+", _NC_URL)
+    origin = origin_m.group(0) if origin_m else _NC_URL
+
     tasks = []
-    for cal_data in re.findall(r"BEGIN:VCALENDAR.*?END:VCALENDAR", r.text, re.DOTALL):
-        uid_m = re.search(r"^UID:(.+)$", cal_data, re.MULTILINE)
-        sum_m = re.search(r"^SUMMARY:(.+)$", cal_data, re.MULTILINE)
-        sta_m = re.search(r"^STATUS:(.+)$", cal_data, re.MULTILINE)
-        due_m = re.search(r"^DUE:(.+)$", cal_data, re.MULTILINE)
+    for resp_block in re.findall(r"<[^:>]*:response\b.*?</[^:>]*:response>", r.text, re.DOTALL):
+        href_m   = re.search(r"<[^:>]*:href\b[^>]*>([^<]+)</[^:>]*:href>", resp_block)
+        cal_data = ""
+        cd_m     = re.search(r"BEGIN:VCALENDAR.*?END:VCALENDAR", resp_block, re.DOTALL)
+        if cd_m:
+            cal_data = cd_m.group(0)
+
+        uid_m  = re.search(r"^UID:(.+)$",     cal_data, re.MULTILINE)
+        sum_m  = re.search(r"^SUMMARY:(.+)$", cal_data, re.MULTILINE)
+        sta_m  = re.search(r"^STATUS:(.+)$",  cal_data, re.MULTILINE)
+        due_m  = re.search(r"^DUE:(.+)$",     cal_data, re.MULTILINE)
+
         if uid_m:
+            href = unquote(href_m.group(1).strip()) if href_m else None
             tasks.append({
-                "uid": uid_m.group(1).strip(),
+                "uid":     uid_m.group(1).strip(),
                 "summary": sum_m.group(1).strip() if sum_m else "",
-                "status": sta_m.group(1).strip() if sta_m else "NEEDS-ACTION",
-                "due": due_m.group(1).strip() if due_m else "",
+                "status":  sta_m.group(1).strip() if sta_m else "NEEDS-ACTION",
+                "due":     due_m.group(1).strip() if due_m else "",
+                "href":    href,                              # full resource path for DELETE
+                "delete_url": (origin + href) if href else None,
             })
 
     return {"status": "ok", "tasks": tasks, "count": len(tasks)}
@@ -392,19 +411,24 @@ def cmd_tasks_create(summary, due=None, description=None, calendar="tasks"):
     return {"status": "ok", "uid": uid, "http_status": r.status_code}
 
 
-def cmd_tasks_complete(uid, calendar="tasks"):
-    """Mark a task as COMPLETED by fetching, modifying, and re-PUTting the ICS."""
-    if not uid or not uid.strip():
-        return {"status": "error", "step": "uid_guard", "error": "uid is required"}
+def cmd_tasks_complete(uid, calendar="tasks", delete_url=None):
+    """Mark a task as COMPLETED by fetching, modifying, and re-PUTting the ICS.
 
-    cal_url, err = _caldav_discover_calendar(calendar)
-    if err:
-        return {"status": "error", **err}
-
-    task_url = f"{cal_url.rstrip('/')}/{uid.strip()}.ics"
-    if task_url.startswith("/"):
-        origin = re.match(r"https?://[^/]+", _NC_URL)
-        task_url = (origin.group(0) if origin else _NC_URL) + task_url
+    Accepts delete_url from tasks_list for the same reason as cmd_tasks_delete —
+    server resource path may differ from {cal_url}/{uid}.ics for externally-created tasks.
+    """
+    if delete_url:
+        task_url = delete_url
+    else:
+        if not uid or not uid.strip():
+            return {"status": "error", "step": "uid_guard", "error": "uid or delete_url is required"}
+        cal_url, err = _caldav_discover_calendar(calendar)
+        if err:
+            return {"status": "error", **err}
+        task_url = f"{cal_url.rstrip('/')}/{uid.strip()}.ics"
+        if task_url.startswith("/"):
+            origin = re.match(r"https?://[^/]+", _NC_URL)
+            task_url = (origin.group(0) if origin else _NC_URL) + task_url
 
     # Fetch existing ICS
     r_get = requests.get(task_url, auth=_auth(), timeout=15)
@@ -795,19 +819,25 @@ def cmd_calendar_update(uid, calendar="personal", title=None, start=None, end=No
     return {"status": "ok", "uid": uid, "http_status": r_put.status_code}
 
 
-def cmd_tasks_delete(uid, calendar="tasks"):
-    """Delete a VTODO task by UID."""
-    if not uid or not uid.strip():
-        return {"status": "error", "step": "uid_guard", "error": "uid is required"}
+def cmd_tasks_delete(uid, calendar="tasks", delete_url=None):
+    """Delete a VTODO task by UID (or by delete_url from tasks_list).
 
-    cal_url, err = _caldav_discover_calendar(calendar)
-    if err:
-        return {"status": "error", **err}
-
-    task_url = f"{cal_url.rstrip('/')}/{uid.strip()}.ics"
-    if task_url.startswith("/"):
-        origin = re.match(r"https?://[^/]+", _NC_URL)
-        task_url = (origin.group(0) if origin else _NC_URL) + task_url
+    Prefer delete_url when available — it is the server's authoritative resource path
+    returned by tasks_list. Constructing {cal_url}/{uid}.ics fails for tasks created
+    outside Rex (Nextcloud UI, external CalDAV clients) whose filenames differ from UID.
+    """
+    if delete_url:
+        task_url = delete_url
+    else:
+        if not uid or not uid.strip():
+            return {"status": "error", "step": "uid_guard", "error": "uid or delete_url is required"}
+        cal_url, err = _caldav_discover_calendar(calendar)
+        if err:
+            return {"status": "error", **err}
+        task_url = f"{cal_url.rstrip('/')}/{uid.strip()}.ics"
+        if task_url.startswith("/"):
+            origin = re.match(r"https?://[^/]+", _NC_URL)
+            task_url = (origin.group(0) if origin else _NC_URL) + task_url
 
     r = requests.delete(task_url, auth=_auth(), timeout=15)
     if r.status_code not in (200, 204):
@@ -994,6 +1024,7 @@ def main():
     # Task params
     parser.add_argument("--summary", default="")
     parser.add_argument("--due", default="")
+    parser.add_argument("--delete-url", default="", dest="delete_url")
     # File params
     parser.add_argument("--path", default="/")
     parser.add_argument("--query", default="")
@@ -1029,9 +1060,11 @@ def main():
             result = cmd_tasks_create(args.summary, args.due or None,
                                       args.description or None, args.calendar or "tasks")
         elif args.command == "tasks_complete":
-            result = cmd_tasks_complete(args.uid, args.calendar or "tasks")
+            result = cmd_tasks_complete(args.uid, args.calendar or "tasks",
+                                        delete_url=args.delete_url or None)
         elif args.command == "tasks_delete":
-            result = cmd_tasks_delete(args.uid, args.calendar or "tasks")
+            result = cmd_tasks_delete(args.uid, args.calendar or "tasks",
+                                      delete_url=args.delete_url or None)
         elif args.command == "files_list":
             result = cmd_files_list(args.path or "/")
         elif args.command == "files_search":

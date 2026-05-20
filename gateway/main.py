@@ -28,6 +28,31 @@ CHUNK_TIMEOUT = float(os.environ.get("GATEWAY_CHUNK_TIMEOUT", "1.5"))
 store = SessionStore()
 
 
+_TELEGRAM_MAX = 4000  # Telegram hard limit is 4096; 4000 gives a buffer
+
+
+def _split_for_telegram(text: str, max_len: int = _TELEGRAM_MAX) -> list[str]:
+    """Split text into Telegram-safe chunks (≤4096 chars) on paragraph boundaries."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    remaining = text
+    while len(remaining) > max_len:
+        # Find the last double-newline before the limit
+        split_at = remaining.rfind("\n\n", 0, max_len)
+        if split_at <= 0:
+            # No paragraph break — split on last single newline
+            split_at = remaining.rfind("\n", 0, max_len)
+        if split_at <= 0:
+            # No newline at all — hard split
+            split_at = max_len
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def _format_result(data: dict) -> str:
     """Format a sovereign-core /chat success response for Telegram."""
     intent = data.get("intent", "")
@@ -114,7 +139,7 @@ async def _dispatch_and_reply(
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        async with httpx.AsyncClient(timeout=360.0) as client:
             r = await client.post(f"{SOVEREIGN_URL}/chat", json=payload)
             r.raise_for_status()
             data = r.json()
@@ -209,10 +234,12 @@ async def _dispatch_and_reply(
 
     # Success — CEO translation takes priority; fallback to structured formatter
     if data.get("director_message"):
-        await bot.send_message(chat_id=chat_id, text=data["director_message"])
+        for chunk in _split_for_telegram(data["director_message"]):
+            await bot.send_message(chat_id=chat_id, text=chunk)
     else:
         reply = _format_result(data)
-        await bot.send_message(chat_id=chat_id, text=reply)
+        for chunk in _split_for_telegram(reply):
+            await bot.send_message(chat_id=chat_id, text=chunk)
 
     # Store turn in history for follow-up context (pronouns, "summarise that", etc.)
     session.push_turn(
@@ -475,16 +502,159 @@ async def handle_devcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /portfolio — trigger portfolio snapshot and return balances + value."""
+    """Handle /portfolio [category] — snapshot or deep analysis per category."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     if user.id != AUTHORIZED_USER_ID:
         return
     session = store.get_or_create(chat_id)
-    payload = {"input": "portfolio", "_harness_cmd": "portfolio", "context_window": session.history}
+    category = " ".join(context.args).lower().strip() if context.args else ""
+    if category:
+        await update.message.reply_text(
+            f"Researching your {category} portfolio — this takes several minutes. I'll message you when it's ready."
+        )
+    payload = {
+        "input": f"portfolio {category}".strip(),
+        "_harness_cmd": "portfolio",
+        "portfolio_category": category,
+        "context_window": session.history,
+    }
     lock = store.get_lock(chat_id)
     async with lock:
-        await _dispatch_and_reply(payload, "/portfolio", chat_id, context.bot, session)
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            async with httpx.AsyncClient(timeout=360.0) as client:
+                r = await client.post(f"{SOVEREIGN_URL}/chat", json=payload)
+                r.raise_for_status()
+                data = r.json()
+        except httpx.TimeoutException:
+            await context.bot.send_message(chat_id=chat_id, text="Core timed out — the cognitive loop took too long.")
+            return
+        except httpx.ConnectError:
+            await context.bot.send_message(chat_id=chat_id, text="Could not reach sovereign-core — it may be restarting.")
+            return
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"Portfolio error ({type(e).__name__}): {e}")
+            return
+
+        # Background analysis started — pre-ack already sent above, suppress second message
+        if data.get("status") == "running":
+            return
+
+        # All other outcomes: HTML parse_mode for director_message (harness uses <b>/<i> tags)
+        if data.get("director_message"):
+            for chunk in _split_for_telegram(data["director_message"]):
+                await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+        elif data.get("error"):
+            await context.bot.send_message(chat_id=chat_id, text=f"Error: {data['error']}")
+        else:
+            reply = _format_result(data)
+            for chunk in _split_for_telegram(reply):
+                await context.bot.send_message(chat_id=chat_id, text=chunk)
+
+        session.push_turn(
+            user=f"portfolio {category}".strip(),
+            assistant=data.get("director_message") or _format_result(data),
+        )
+
+
+async def handle_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /research <topic> — security, financial topic, or general research.
+
+    Routes through research_harness.run_research_gather(). Security analysis
+    runs 6 analyst agents (News → Fundamentals → Sentiment → Bull → Bear → Risk
+    Manager) and takes 5–10 minutes. Financial topics and general queries are
+    faster (single synthesis call).
+
+    After research completes, prompts to save full report to Nextcloud Notes.
+    Reply yes to save, no to discard.
+
+    NOTE: Register with BotFather:
+      research - Research a security, financial topic, or general query
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+
+    topic = " ".join(context.args).strip() if context.args else ""
+    if not topic:
+        await update.message.reply_text(
+            "Usage: /research &lt;topic&gt;\n\n"
+            "Examples:\n"
+            "  /research RocketLab\n"
+            "  /research NZ interest rates\n"
+            "  /research quantum computing",
+            parse_mode="HTML",
+        )
+        return
+
+    session = store.get_or_create(chat_id)
+    await update.message.reply_text(
+        f"Researching <b>{topic}</b> — I'll send the results when done. "
+        f"(Security analysis takes 5–10 min; topics and general queries are faster.)",
+        parse_mode="HTML",
+    )
+
+    payload = {
+        "input": f"research {topic}",
+        "context_window": session.history,
+    }
+
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            async with httpx.AsyncClient(timeout=900.0) as client:
+                r = await client.post(f"{SOVEREIGN_URL}/chat", json=payload)
+                r.raise_for_status()
+                data = r.json()
+        except httpx.TimeoutException:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Research timed out — analysis took too long. Say <b>clear research</b> and retry.",
+                parse_mode="HTML",
+            )
+            return
+        except httpx.ConnectError:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Could not reach sovereign-core — it may be restarting. Try again in a few seconds.",
+            )
+            return
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"Research error ({type(e).__name__}): {e}")
+            return
+
+        if data.get("error"):
+            await context.bot.send_message(chat_id=chat_id, text=f"Error: {data['error']}")
+            return
+
+        # Research complete — director_message has the full results + save prompt.
+        # Set confirmation state so "yes" → research_save, "no" → research_clear.
+        # Send director_message directly (not the generic "[Confirmation required]" banner).
+        if data.get("requires_confirmation"):
+            session.awaiting_confirmation = True
+            session.pending_delegation = data.get("pending_delegation")
+            session.pending_input = topic
+            msg = data.get("director_message", "Research complete. Save full report to Nextcloud Notes?")
+            for chunk in _split_for_telegram(msg):
+                await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+            return
+
+        # Stale checkpoint or other non-confirmation response
+        if data.get("director_message"):
+            for chunk in _split_for_telegram(data["director_message"]):
+                await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+        else:
+            reply = _format_result(data)
+            for chunk in _split_for_telegram(reply):
+                await context.bot.send_message(chat_id=chat_id, text=chunk)
+
+        session.push_turn(
+            user=f"research {topic}",
+            assistant=data.get("director_message") or _format_result(data),
+        )
 
 
 async def handle_pm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -679,6 +849,7 @@ def main():
     app.add_handler(CommandHandler("selfimprove", handle_selfimprove))
     app.add_handler(CommandHandler("devcheck", handle_devcheck))
     app.add_handler(CommandHandler("portfolio", handle_portfolio))
+    app.add_handler(CommandHandler("research", handle_research))
     app.add_handler(CommandHandler("pm", handle_pm))
     app.add_handler(CommandHandler("do_tax", handle_do_tax))
     app.add_handler(CommandHandler("signbtc", handle_signbtc))

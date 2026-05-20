@@ -1,8 +1,12 @@
+import asyncio
 import json
+import logging
 import os
 from datetime import datetime, timezone
 
 from config import cfg as _cfg
+
+logger = logging.getLogger(__name__)
 from adapters.broker import BrokerAdapter
 
 
@@ -31,6 +35,7 @@ _DOMAIN_SOURCE = {
     "scheduler":  "scheduler_live",
     "nanobot":    "nanobot_live",
     "monitoring":  "monitoring_live",
+    "learning":    "monitoring_live",
     "notes":       "nanobot_live",
     "ncfs":     "nanobot_live",
     "ncingest": "nanobot_live",
@@ -44,7 +49,12 @@ INTENT_ACTION_MAP = {
     "list_containers":    {"domain": "docker", "operation": "read",    "name": "docker_ps"},
     "get_logs":           {"domain": "docker", "operation": "read",    "name": "docker_logs"},
     "get_stats":          {"domain": "docker", "operation": "read",    "name": "docker_stats"},
-    "restart_container":  {"domain": "docker", "operation": "restart", "name": "docker_restart"},
+    "restart_container":  {"domain": "docker", "operation": "restart",  "name": "docker_restart"},
+    "recreate_container": {"domain": "docker", "operation": "recreate", "name": "docker_recreate"},
+    "docker_networks":    {"domain": "docker", "operation": "read",    "name": "docker_networks"},
+    "docker_volumes":     {"domain": "docker", "operation": "read",    "name": "docker_volumes"},
+    "docker_images":      {"domain": "docker", "operation": "read",    "name": "docker_images"},
+    "docker_disk":        {"domain": "docker", "operation": "read",    "name": "docker_df"},
     # Business agent intents
     "list_files":           {"domain": "webdav", "operation": "read",    "name": "file_list"},
     "read_file":            {"domain": "webdav", "operation": "read",    "name": "file_read"},
@@ -91,6 +101,13 @@ INTENT_ACTION_MAP = {
     "research":           {"domain": "ollama", "operation": "query"},
     "web_search":         {"domain": "browser", "operation": "search", "name": "browser_search"},
     "fetch_url":          {"domain": "browser", "operation": "fetch",  "name": "browser_fetch"},
+    "research_gather":    {"domain": "research", "operation": "gather"},
+    "research_save":      {"domain": "research", "operation": "save"},
+    "research_clear":     {"domain": "research", "operation": "clear"},
+    # Portfolio analysis harness intents
+    "portfolio_analysis":       {"domain": "portfolio_analysis", "operation": "gather"},
+    "portfolio_analysis_save":  {"domain": "portfolio_analysis", "operation": "save"},
+    "portfolio_analysis_clear": {"domain": "portfolio_analysis", "operation": "clear"},
     "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
     "news_brief":         {"domain": "news",    "operation": "brief"},
     # Tax ingest harness intents (Phase 1 — continuous hourly ingest)
@@ -138,7 +155,9 @@ INTENT_ACTION_MAP = {
     "self_improve_observe":    {"domain": "monitoring", "operation": "observe"},
     "self_improve_proposals":  {"domain": "monitoring", "operation": "proposals"},
     "self_improve_baseline":   {"domain": "monitoring", "operation": "baseline"},
+    "self_improve_dismiss":    {"domain": "monitoring", "operation": "dismiss"},
     "learning_harness_status": {"domain": "monitoring", "operation": "learning_status"},
+    "learn_url":               {"domain": "learning",   "operation": "queue_url"},
     # Self-diagnostic intents — all LOW, all read-only
     "read_audit_log":          {"domain": "docker", "operation": "read", "name": "host_file_read",
                                  "path": "/home/sovereign/audit/security-ledger.jsonl"},
@@ -154,6 +173,11 @@ INTENT_ACTION_MAP = {
     "apt_check":          {"domain": "docker", "operation": "read", "name": "apt_check"},
     "systemctl_status":   {"domain": "docker", "operation": "read", "name": "systemctl_status"},
     "journalctl":         {"domain": "docker", "operation": "read", "name": "journalctl"},
+    "kernel_info":        {"domain": "docker", "operation": "read", "name": "kernel_info"},
+    "disk_usage":         {"domain": "docker", "operation": "read", "name": "disk_usage"},
+    "memory_usage":       {"domain": "docker", "operation": "read", "name": "memory_usage"},
+    "docker_build":       {"domain": "docker", "operation": "rebuild", "name": "docker_build"},
+    "docker_prune":       {"domain": "docker", "operation": "prune",   "name": "docker_prune"},
     # WebDAV navigate — returns items with full paths (superset of list_files)
     "navigate":      {"domain": "webdav", "operation": "read",    "name": "file_navigate"},
     "search_files":  {"domain": "webdav", "operation": "search",  "name": "file_search"},
@@ -170,10 +194,11 @@ INTENT_ACTION_MAP = {
     "list_folders":  {"domain": "mail",   "operation": "read",    "name": "nc_list_mailboxes"},
     "list_inbox":    {"domain": "mail",   "operation": "read",    "name": "nc_list_unread"},
     # Scheduler intents — devops_agent scope
-    "schedule_task":      {"domain": "scheduler", "operation": "schedule", "name": "schedule_task"},
-    "list_tasks":         {"domain": "scheduler", "operation": "list",     "name": "list_tasks"},
-    "pause_task":         {"domain": "scheduler", "operation": "update",   "name": "pause_task"},
-    "cancel_task":        {"domain": "scheduler", "operation": "update",   "name": "cancel_task"},
+    "schedule_task":           {"domain": "scheduler", "operation": "schedule", "name": "schedule_task"},
+    "list_tasks":              {"domain": "scheduler", "operation": "list",     "name": "list_tasks"},
+    "pause_task":              {"domain": "scheduler", "operation": "update",   "name": "pause_task"},
+    "cancel_task":             {"domain": "scheduler", "operation": "update",   "name": "cancel_task"},
+    "complete_scheduled_task": {"domain": "scheduler", "operation": "update",   "name": "complete_scheduled_task"},
     "recall_last_briefing": {"domain": "scheduler", "operation": "recall", "name": "recall_last_briefing"},
     # Browser auth configuration — devops_agent scope (MID tier)
     "configure_browser_auth": {"domain": "browser_config", "operation": "configure_auth"},
@@ -212,7 +237,10 @@ INTENT_TIER_MAP = {
     "inspect_container": "LOW", "get_compose": "LOW", "read_host_file": "LOW",
     "get_hardware": "LOW", "list_processes": "LOW",
     "apt_check": "LOW", "systemctl_status": "LOW", "journalctl": "LOW",
+    "kernel_info": "LOW", "disk_usage": "LOW", "memory_usage": "LOW",
+    "docker_build": "HIGH", "docker_prune": "HIGH",
     "list_containers": "LOW", "get_logs": "LOW", "get_stats": "LOW",
+    "docker_networks": "LOW", "docker_volumes": "LOW", "docker_images": "LOW", "docker_disk": "LOW",
     "list_files": "LOW", "navigate": "LOW", "read_file": "LOW", "search_files": "LOW",
     "list_files_recursive": "LOW", "read_files_recursive": "LOW",
     "list_notes": "LOW", "read_note": "LOW",
@@ -239,7 +267,9 @@ INTENT_TIER_MAP = {
     "list_calendars": "LOW", "list_events": "LOW", "list_nc_tasks": "LOW",
     "delete_event": "MID", "update_event": "MID",
     "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
-    "restart_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
+    "research_gather": "LOW", "research_save": "MID", "research_clear": "LOW",
+    "portfolio_analysis": "LOW", "portfolio_analysis_save": "MID", "portfolio_analysis_clear": "LOW",
+    "restart_container": "MID", "recreate_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
     "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
     "delete_file": "HIGH", "delete_email": "HIGH", "delete_task": "HIGH",
     "remember_fact": "LOW",
@@ -272,10 +302,11 @@ INTENT_TIER_MAP = {
     "wallet_update_address":  "MID",
     # Scheduler tiers — all LOW: Rex managing prospective memory is internal,
     # equivalent to writing in a notebook. No Director confirmation required.
-    "schedule_task":        "LOW",
-    "list_tasks":           "LOW",
-    "pause_task":           "LOW",
-    "cancel_task":          "LOW",
+    "schedule_task":           "LOW",
+    "list_tasks":             "LOW",
+    "pause_task":             "LOW",
+    "cancel_task":            "LOW",
+    "complete_scheduled_task": "LOW",
     "recall_last_briefing": "LOW",
     # Browser auth config — MID: writes to RAID governance config
     "configure_browser_auth": "MID",
@@ -286,7 +317,9 @@ INTENT_TIER_MAP = {
     "self_improve_observe":    "LOW",
     "self_improve_proposals":  "LOW",
     "self_improve_baseline":   "LOW",
+    "self_improve_dismiss":    "LOW",
     "learning_harness_status": "LOW",
+    "learn_url":               "LOW",
     # Self-diagnostic read intents — LOW
     "read_audit_log":          "LOW",
     "memory_promotion_status": "LOW",
@@ -454,6 +487,14 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "target": user_input, "tier": "MID",
                 "reasoning_summary": "Skill install from direct URL — deterministic pre-classifier",
             }
+        # "learn from/ingest/add to knowledge" — queue URL in learning harness
+        _learn_url_kw = ("learn from", "ingest url", "add to knowledge", "ingest this", "learn this url")
+        if any(w in u for w in _learn_url_kw):
+            return {
+                "delegate_to": "memory_agent", "intent": "learn_url",
+                "target": _raw_url, "tier": "LOW",
+                "reasoning_summary": "URL with learn/ingest signal — queue for learning harness",
+            }
         # "remember/store/note this URL" — memory write, not a fetch
         _mem_url_kw = ("remember", "store", "note that", "don't forget", "memoris", "memoriz", "save this")
         if any(w in u for w in _mem_url_kw):
@@ -462,52 +503,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "research_agent", "intent": "fetch_url",
             "target": _raw_url, "tier": "LOW",
             "reasoning_summary": "Explicit URL detected — deterministic fetch_url",
-        }
-
-    # ── Calendar events — must precede scheduler and file-write checks ────
-    # These phrases are unambiguous calendar operations and must never be stolen
-    # by the scheduler ("create a task") or WebDAV ("create a note/document") paths.
-    _cal_create_kw = (
-        "add to my calendar", "add to the calendar", "add to calendar",
-        "put on my calendar", "put on the calendar", "put in my calendar",
-        "create an event", "create event", "add an event", "add event",
-        "new event", "new calendar event",
-        "schedule a meeting", "schedule meeting", "book a meeting", "book meeting",
-        "schedule an appointment", "book an appointment", "book appointment",
-        "create an appointment", "create appointment",
-        "add a meeting", "add meeting", "add appointment",
-        "create a calendar entry", "calendar entry",
-        "make an appointment", "make appointment",
-    )
-    _cal_delete_kw = (
-        "delete event", "delete the event", "delete calendar event",
-        "remove event", "remove the event", "cancel the event",
-        "remove from calendar", "delete from calendar",
-        "delete from my calendar", "remove from my calendar",
-    )
-    _cal_update_kw = (
-        "update event", "update the event", "reschedule event", "reschedule the event",
-        "move the event", "change the event", "edit the event", "edit event",
-        "change the time of", "move the meeting", "reschedule the meeting",
-        "reschedule my meeting", "change my appointment",
-    )
-    if any(w in u for w in _cal_create_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "create_event",
-            "target": None, "tier": "MID",
-            "reasoning_summary": "Calendar event creation — deterministic pre-classifier",
-        }
-    if any(w in u for w in _cal_delete_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "delete_event",
-            "target": None, "tier": "MID",
-            "reasoning_summary": "Calendar event deletion — deterministic pre-classifier",
-        }
-    if any(w in u for w in _cal_update_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "update_event",
-            "target": None, "tier": "MID",
-            "reasoning_summary": "Calendar event update — deterministic pre-classifier",
         }
 
     # ── Sovereign RAID file reads — deterministic aliases ──────────────────
@@ -654,6 +649,78 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "target": None, "tier": "LOW",
             "reasoning_summary": "Journal log — deterministic pre-classifier",
         }
+    _docker_net_kw = (
+        "docker network", "list networks", "what networks", "network list",
+        "which networks", "show networks", "docker networks",
+    )
+    if any(kw in u for kw in _docker_net_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "docker_networks",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Docker network list — deterministic pre-classifier",
+        }
+    _docker_vol_kw = (
+        "docker volume", "list volumes", "what volumes", "volume list",
+        "which volumes", "show volumes", "docker volumes",
+    )
+    if any(kw in u for kw in _docker_vol_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "docker_volumes",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Docker volume list — deterministic pre-classifier",
+        }
+    _docker_img_kw = (
+        "docker image", "list images", "what images", "image list",
+        "which images", "show images", "docker images", "installed images", "container images",
+    )
+    if any(kw in u for kw in _docker_img_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "docker_images",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Docker image list — deterministic pre-classifier",
+        }
+    _docker_disk_kw = (
+        "docker disk", "docker storage", "docker space", "docker df",
+        "docker system df", "how much docker", "docker disk usage",
+        "container disk", "image disk", "volume disk",
+    )
+    if any(kw in u for kw in _docker_disk_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "docker_disk",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Docker disk usage — deterministic pre-classifier",
+        }
+    _kernel_kw = (
+        "what kernel", "kernel version", "kernel release", "linux version",
+        "uname", "what os", "os version", "which kernel",
+    )
+    if any(kw in u for kw in _kernel_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "kernel_info",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Kernel version — deterministic pre-classifier",
+        }
+    _disk_kw = (
+        "disk usage", "disk space", "disk free", "df -h", "storage space",
+        "how full", "filesystem usage", "how much disk", "available disk",
+    )
+    if any(kw in u for kw in _disk_kw) and "docker" not in u:
+        return {
+            "delegate_to": "devops_agent", "intent": "disk_usage",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Host disk usage — deterministic pre-classifier",
+        }
+    _mem_usage_kw = (
+        "memory usage", "ram usage", "how much ram", "how much memory",
+        "free memory", "free ram", "memory free", "swap usage",
+        "memory stats", "ram stats",
+    )
+    if any(kw in u for kw in _mem_usage_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "memory_usage",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Host memory usage — deterministic pre-classifier",
+        }
 
     # ── Conversational/personal guard ──────────────────────────────────────
     # If no system-domain signal is present, route to query immediately.
@@ -662,6 +729,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _system_signals = (
         "email", "inbox", "mail", "nextcloud", "file", "folder", "document",
         "calendar", "event", "schedule", "appointment",
+        "reminder", "reminders", "my reminder", "any reminder",
+        "task", "tasks", "to-do", "todo", "my tasks", "any tasks",
         "my notes", "list notes", "show notes", "nextcloud notes", "notes list", "nc notes",
         "all notes", "the notes", "list the notes", "notes from nextcloud", "get notes",
         "create note", "create a note", "new note", "add a note", "write a note",
@@ -669,6 +738,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "delete note", "remove note",
         "read note", "open note",
         "docker", "container", "restart", "logs", "service",
+        "docker network", "docker volume", "docker image", "docker disk", "docker df",
+        "list networks", "list volumes", "list images",
         "search the web", "look online", "search online", "find on the internet",
         "web search", "look up online", "internet",
         "remember", "store", "memoris", "memoriz", "note that", "don't forget",
@@ -697,6 +768,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "check address", "check wallet", "monitor this address",
         # Learning-Harness
         "learning harness", "learning status", "what did you learn", "last learned",
+        "learn from", "ingest url", "add to knowledge",
         # Dev-Harness
         "dev analyse", "dev analysis", "dev harness", "dev status",
         "approve dev", "reject dev", "verify dev", "dev clear",
@@ -726,6 +798,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "btc", "bitcoin", "multisig", "psbt", "propose btc", "send btc",
         "create btc", "sign btc", "sign bitcoin", "fund lightning",
         "lightning channel", "create bitcoin", "btc transaction", "btc send",
+        # Research requests — pass guard so CEO LLM classifies correctly
+        "research ", "look into ", "investigate ",
     )
     prior_has_system = prior_domain is not None
 
@@ -740,10 +814,18 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "what do you know about", "find me information", "look for information",
         "search for information", "find articles", "find news about",
     )
+    # Narrowed for qwen2.5:32b — only keep phrases that are unambiguously live-data queries.
+    # "today", "current", "what's the", "what is the", "how is the" were removed:
+    # too broad — "reminders today" / "what's the file path" both fired these, routing to web_search.
+    # qwen2.5:32b + PASS 0 memory consultation handles the ambiguous cases correctly via PASS 1.
     _time_signals = (
-        "right now", "at the moment", "live", "real-time", "real time",
-        "current", "currently", "today", "what is it at", "what's it at",
-        "how much is it", "what's the", "what is the", "how is the",
+        "right now", "at the moment", "real-time", "real time",
+        "what is it at", "what's it at",
+        "how much is it", "how much is that",
+        "current price", "current rate", "current value", "current exchange",
+        "live price", "live rate", "live market", "live data",
+        "what's the price", "what is the price", "what's the rate", "what is the rate",
+        "what's the current", "what is the current",
         "2025", "2026",  # explicit year reference → current-info query
     )
     # Explicit web-search phrases always route direct-to-browser, regardless of time signals.
@@ -753,7 +835,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "find on the internet", "find online", "look it up online", "look up online",
         "web search for", "google for", "google this", "search for information about",
         "find me information about", "find information about", "look for information about",
-        "find articles about", "find news about", "find out about",
+        "find articles about", "find news about",
     )
     if any(sig in u for sig in _explicit_web_kw):
         query = user_input
@@ -794,6 +876,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "current events", "what's trending", "whats trending",
         "morning news", "today's news", "todays news",
         "latest headlines", "news today", "news briefing",
+        "latest news", "recent news", "latest updates",
     )
     _is_news_brief = any(w in u for w in _news_kw)
     if _is_news_brief:
@@ -821,13 +904,79 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "RSS/feed query — direct nanobot rss-digest dispatch",
         }
 
+    # ── Calendar / task viewing — before _time_signals ────────────────────────
+    # "Do you have any reminders for me today?" would match "today" in _time_signals
+    # and get routed to web_search. Catch these deterministically first.
+    # Reminder/task patterns → list_nc_tasks; calendar/event patterns → list_events.
+    _task_view_kw = (
+        "any reminders", "my reminders", "reminders for today", "reminders today",
+        "do i have any reminders", "do you have any reminders",
+        "what are my reminders", "what reminders do i", "list my reminders",
+        "show my reminders", "show my tasks", "list my tasks", "my tasks today",
+        "tasks for today", "tasks today", "what tasks do i have",
+        "today's tasks", "todays tasks", "what's due today", "whats due today",
+        "anything due today",
+    )
+    _event_view_kw = (
+        "what do i have today", "what do i have on today", "what have i got today",
+        "what have i got on today", "what's on today", "whats on today",
+        "calendar for today", "today's events", "todays events",
+        "today's calendar", "todays calendar",
+        "what's scheduled today", "whats scheduled today",
+        "what's on my calendar today", "whats on my calendar today",
+        "what's happening today", "whats happening today",
+        "what's on my calendar", "whats on my calendar",
+        "my calendar this week", "my calendar next week", "my calendar this month",
+        "calendar this week", "calendar next week", "calendar this month",
+        "what's this week", "whats this week", "schedule this week", "schedule next week",
+        "what have i got this week", "what do i have this week",
+        "what's coming up", "whats coming up", "upcoming events",
+    )
+    if any(w in u for w in _task_view_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "list_nc_tasks",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Task/reminder view — deterministic pre-classifier",
+        }
+    if any(w in u for w in _event_view_kw):
+        return {
+            "delegate_to": "business_agent", "intent": "list_events",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Calendar event view for today — deterministic pre-classifier",
+        }
+
+    # ── Research harness — before _time_signals so financial research requests
+    # don't get sidetracked to browser/web_search. Routes to research_gather harness.
+    _research_gather_kw = (
+        "deep financial research", "financial research on", "financial research into",
+        "investment research on", "investment research into",
+        "do deep research", "do a deep research",
+        "deep research on", "deep research into", "deep research about",
+        "deep dive into", "deep dive on",
+        "investment analysis of", "market analysis of",
+        "give me an analysis of", "give me a detailed analysis of",
+        "should i invest in", "worth investing in",
+        "due diligence on",
+        "research the company", "research this company",
+        "analyse the stock", "analyze the stock",
+        "analyse the company", "analyze the company",
+    )
+    if any(w in u for w in _research_gather_kw):
+        return {
+            "delegate_to": "research_agent", "intent": "research_gather",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Explicit research phrase — research harness",
+        }
+
     import re as _re_fp
     _has_file_path = bool(_re_fp.search(r"(?:^|\s)/[A-Za-z0-9_./-]+", user_input))
-    if not prior_has_system and any(sig in u for sig in _time_signals) and not _has_file_path:
+    _has_calendar_signal = any(w in u for w in ("calendar", "event", "schedule", "appointment"))
+    if not prior_has_system and any(sig in u for sig in _time_signals) and not _has_file_path and not _has_calendar_signal:
         # Time-sensitive query with no prior system context — route direct to browser/Grok.
         # DO NOT fall through to CEO LLM: the 8b model misroutes these when email/docker
         # history is present in context_window.
         # Exception: inputs containing a file path (e.g. /Notes/file.md) are never web searches.
+        # Exception: inputs containing calendar domain signals always go to CEO LLM.
         return {
             "delegate_to": "research_agent", "intent": "web_search",
             "target": user_input, "tier": "LOW",
@@ -841,6 +990,65 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
 
     # "Please" prefix signals a direct command/request — always pass the guard.
     _please_prefix = u.startswith("please ")
+
+    # ── Capability query fast-paths — checked before conversational guard ─────
+    # "what can you do", "available skills", "your skills" are NOT in _system_signals
+    # so they would otherwise hit the guard and return intent:query.
+    # ── Research/lookup fast-paths — before guard, route to web_search ───────
+    # "research recent X", "look into X" with a live-data qualifier are unambiguously
+    # web searches. CEO LLM maps these to intent:query (conversational) without this block.
+    _research_live_kw = (
+        "research recent", "research the latest", "research current",
+        "look into recent", "look into the latest", "investigate recent",
+    )
+    if any(w in u for w in _research_live_kw):
+        return {
+            "delegate_to": "research_agent", "intent": "web_search",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Research/live-data request — deterministic web_search pre-classifier",
+        }
+
+    _cap_skill_kw = (
+        "what can you do", "available skills", "your skills",
+        "what skills", "list skills",
+    )
+    if any(w in u for w in _cap_skill_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "skill_audit",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Capability query — deterministic skill_audit pre-classifier",
+        }
+
+    _cap_mem_kw = (
+        "what memories", "check your memories",
+    )
+    if any(w in u for w in _cap_mem_kw):
+        return {
+            "delegate_to": "memory_agent", "intent": "memory_list_keys",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Memory query — deterministic memory_list_keys pre-classifier",
+        }
+
+    _nanobot_skill_kw = ("nanobot skills", "nextcloud skills")
+    if any(w in u for w in _nanobot_skill_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "skill_audit",
+            "target": "nanobot", "tier": "LOW",
+            "reasoning_summary": "Nanobot/Nextcloud skill query — deterministic skill_audit pre-classifier",
+        }
+
+    # ── Portfolio analysis save/clear shortcuts — before conversational guard ─
+    _portfolio_save_kw = any(p in u for p in ("save portfolio", "save the portfolio", "portfolio save"))
+    _portfolio_clear_kw = any(p in u for p in ("clear portfolio", "clear portfolio analysis", "discard portfolio"))
+    if _portfolio_save_kw:
+        return {"intent": "portfolio_analysis_save", "domain": "portfolio_analysis", "operation": "save",
+                "delegate_to": "business_agent", "tier": "MID", "confidence": 0.99,
+                "reasoning_summary": "Portfolio save shortcut — deterministic pre-classifier"}
+    if _portfolio_clear_kw:
+        return {"intent": "portfolio_analysis_clear", "domain": "portfolio_analysis", "operation": "clear",
+                "delegate_to": "business_agent", "tier": "LOW", "confidence": 0.99,
+                "reasoning_summary": "Portfolio clear shortcut — deterministic pre-classifier"}
+
     if not prior_has_system and not any(sig in u for sig in _system_signals) and not _note_suffix and not _please_prefix:
         return {
             "delegate_to": "research_agent", "intent": "query",
@@ -957,7 +1165,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         _fetch_msg_kw = ("read email", "open email", "show email", "view email", "fetch email",
                          "read message", "open message", "show message", "view message", "fetch message",
                          "read the email", "open the email", "show me email", "email number",
-                         "message number", "email id", "message id", "email #", "message #")
+                         "message number", "email id", "message id", "email #", "message #",
+                         "read id", "open id", "show id", "fetch id", "read #")
         _has_id_ref = bool(_re_id.search(r'\[id:\d+\]', u)) or any(w in u for w in _fetch_msg_kw)
         if _has_id_ref:
             # Extract databaseId from [id:XXXX] tag or bare 4-5 digit number
@@ -1016,6 +1225,26 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "get_stats",
             "target": None, "tier": "LOW",
             "reasoning_summary": "Self-diagnostic request — deterministic pre-classifier",
+        }
+
+    # ── Skill / harness meta-queries — deterministic to avoid qwen2.5:32b giving
+    # training-data responses instead of routing to the actual skill/harness system.
+    # "list the skills you know" sounds like general knowledge to the LLM without this.
+    _skill_meta_kw = (
+        "list the skills", "list your skills", "what skills do you have",
+        "what skills you have", "what skills are installed", "your installed skills",
+        "skills you can run", "skills you know about", "list skills you",
+    )
+    _harness_meta_kw = (
+        "what harnesses", "list harnesses", "show harnesses",
+        "harnesses you have", "harnesses available", "available harnesses",
+        "what harnesses can you run", "which harnesses",
+    )
+    if any(w in u for w in _skill_meta_kw) or any(w in u for w in _harness_meta_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "skill_audit",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Skill/harness introspection — deterministic to bypass LLM generic response",
         }
 
     # Docker / containers — only for list/status queries, not action verbs
@@ -1102,7 +1331,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _skill_install_match = (
         any(w in u for w in _skill_install_kw)
         or bool(_re_sk_pre.search(r"\b(install|load|add)\b.{0,40}\bskill\b", u))
-        or (prior_domain == "skills" and bool(_re_sk_pre.search(r"\b(install|load|add)\b\s+\S", u)))
+        or (prior_domain == "skills" and "skill" in u and bool(_re_sk_pre.search(r"\b(install|load|add)\b\s+\S", u)))
     )
     if _skill_install_match:
         return {
@@ -1816,17 +2045,41 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         }
 
     _cancel_task_kw = ("cancel task", "cancel the task", "stop task", "delete task",
-                       "remove task", "disable task")
+                       "remove task", "disable task", "delete scheduled task",
+                       "cancel scheduled task", "remove scheduled task",
+                       "cancel reminder", "remove reminder", "delete reminder")
     if any(w in u for w in _cancel_task_kw):
         import re as _re_ct
         _ct_uuid = _re_ct.search(
             r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
             user_input, _re_ct.IGNORECASE
         )
+        # Extract task title after keyword if no UUID present — pass as target for title lookup
+        _ct_target = _ct_uuid.group(0) if _ct_uuid else user_input
         return {
             "delegate_to": "devops_agent", "intent": "cancel_task",
-            "target": _ct_uuid.group(0) if _ct_uuid else None, "tier": "LOW",
+            "target": _ct_target, "tier": "LOW",
             "reasoning_summary": "Task cancellation — deterministic pre-classifier",
+        }
+
+    # "clear the X reminder" — (clear|remove) ... reminder with words between
+    import re as _re_rem
+    if _re_rem.search(r'\b(clear|remove)\b.{0,60}\breminder\b', u):
+        return {
+            "delegate_to": "devops_agent", "intent": "cancel_task",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Cancel reminder — deterministic pre-classifier",
+        }
+
+    _complete_task_kw = ("mark task as complete", "mark as complete", "mark task complete",
+                         "mark scheduled task", "mark reminder", "reminder has passed",
+                         "reminder is past", "mark past", "task is complete",
+                         "no longer needed", "no longer required", "task no longer")
+    if any(w in u for w in _complete_task_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "complete_scheduled_task",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Task completion — deterministic pre-classifier",
         }
 
     _pause_task_kw = ("pause task", "pause the task", "suspend task", "hold task")
@@ -1848,6 +2101,9 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _si_proposals_kw = (
         "improvement proposals", "pending proposals", "list proposals",
         "show proposals", "what proposals", "si proposals",
+        "report on all findings", "all findings", "show findings",
+        "what findings", "what anomalies", "anomaly report",
+        "report on findings", "what did you find", "show me what you found",
     )
     if any(w in u for w in _si_proposals_kw):
         return {
@@ -1864,6 +2120,18 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "self_improve_baseline",
             "target": None, "tier": "LOW",
             "reasoning_summary": "Self-improvement baseline report — deterministic pre-classifier",
+        }
+
+    _si_dismiss_kw = (
+        "dismiss all proposals", "dismiss proposals", "clear proposals",
+        "dismiss si proposals", "dismiss all si", "clear si proposals",
+        "dismiss improvement proposals", "clear improvement proposals",
+    )
+    if any(w in u for w in _si_dismiss_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "self_improve_dismiss",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Dismiss SI proposals — deterministic pre-classifier",
         }
 
     # ── Dev-Harness fast-paths ─────────────────────────────────────────────
@@ -1968,6 +2236,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "target": user_input, "tier": "LOW",
                 "reasoning_summary": "Time-sensitive query after system context — direct to browser/Grok, bypass CEO LLM",
             }
+        elif prior_domain == "calendar" or _has_calendar_signal:
+            pass  # fall through to CEO LLM — calendar intents classified by qwen2.5:32b
         else:
             return {
                 "delegate_to": "research_agent", "intent": "query",
@@ -2018,6 +2288,8 @@ class ExecutionEngine:
         # MIP session tracking — True once memory_list_keys has been dispatched this boot.
         # Used to flag retrieve_key calls that skipped the mandatory list-first step.
         self._mip_listed_this_session = False
+        # Live cognitive loop state — read by /cognitive/state endpoint for dashboard
+        self._loop_state: dict = {"active": False, "pass": None, "intent": None, "tier": None, "agent": None}
 
     # ── Universal item index (working_memory, zero-vector, session-scoped) ────
     #
@@ -2123,12 +2395,19 @@ class ExecutionEngine:
 
     # ── Memory consultation pass (PASS 0) ────────────────────────────────────
 
-    async def _memory_consultation_pass(self, user_input: str) -> tuple[str, float]:
+    async def _memory_consultation_pass(self, user_input: str) -> tuple[str, list, float]:
         """Deterministic working_memory context scan injected into PASS 1 prompt.
 
-        Scrolls working_memory (RAM-resident qdrant container) and returns the top-15
+        Scrolls working_memory (RAM-resident qdrant container) and returns the top-25
         entries by keyword relevance to user_input, formatted for PASS 1 injection.
-        Never calls Ollama. Target: < 100ms. Returns (context_str, elapsed_ms).
+        Never calls Ollama. Target: < 100ms.
+
+        Scoring (MRFL): final_score = (norm_overlap × 0.6) + (norm_slot × 0.3) + (norm_weight × 0.1)
+          norm_overlap  = min(term_overlap, 20) / 20   (capped at 20 matching terms)
+          norm_slot     = (slot_priority − 1) / 7      (slot_priority = 8 − _bootstrap_slot, range 1–8)
+          norm_weight   = (_weight − 1.0) / 4.0        (_weight range 1.0–5.0)
+
+        Returns (context_str, pass0_hit_ids, elapsed_ms).
         """
         import time as _t_mod
         import logging as _log_mod
@@ -2136,7 +2415,7 @@ class ExecutionEngine:
         _t0 = _t_mod.monotonic()
 
         if not self.qdrant:
-            return "", 0.0
+            return "", [], 0.0
 
         try:
             entries = []
@@ -2151,7 +2430,7 @@ class ExecutionEngine:
                 )
                 for r in result:
                     p = dict(r.payload or {})
-                    p["_wm_id"] = r.id
+                    p["_wm_id"] = str(r.id)
                     entries.append(p)
                 if next_offset is None:
                     break
@@ -2159,27 +2438,32 @@ class ExecutionEngine:
 
             if not entries:
                 elapsed = (_t_mod.monotonic() - _t0) * 1000
-                return "", elapsed
+                return "", [], elapsed
 
             input_terms = set(user_input.lower().split())
 
             def _relevance(e: dict) -> float:
-                content_terms = set(e.get("content", "").lower().split())
-                overlap = len(input_terms & content_terms)
-                # Slot 1 (session history) = highest priority boost
-                slot_priority = 8 - e.get("_bootstrap_slot", 7)
-                return float(overlap * 2 + slot_priority)
+                content_terms  = set(e.get("content", "").lower().split())
+                overlap        = len(input_terms & content_terms)
+                slot_priority  = 8 - e.get("_bootstrap_slot", 7)
+                weight         = float(e.get("_weight", 1.0))
+                norm_overlap   = min(overlap, 20) / 20.0
+                norm_slot      = (slot_priority - 1) / 7.0
+                norm_weight    = (min(max(weight, 1.0), 5.0) - 1.0) / 4.0
+                return (norm_overlap * 0.6) + (norm_slot * 0.3) + (norm_weight * 0.1)
 
-            ranked = sorted(entries, key=_relevance, reverse=True)[:15]
+            ranked = sorted(entries, key=_relevance, reverse=True)[:25]
 
             lines = ["COGNITIVE CONTEXT (working memory — consult before responding):"]
             for e in ranked:
-                source = e.get("_bootstrap_source") or e.get("source_collection", "session")
-                key    = e.get("_key", "")
-                content = e.get("content", "")[:200]
+                source  = e.get("_bootstrap_source") or e.get("source_collection", "session")
+                key     = e.get("_key", "")
+                content = e.get("content", "")[:400]
                 key_str = f"|{key}" if key else ""
                 lines.append(f"[{source}{key_str}] {content}")
             lines.append("Prioritise this context over training knowledge when answering.")
+
+            hit_ids = [e["_wm_id"] for e in ranked if e.get("_wm_id")]
 
             elapsed = (_t_mod.monotonic() - _t0) * 1000
             _log_p0.info(
@@ -2192,11 +2476,11 @@ class ExecutionEngine:
                     " — working_memory may be oversized (%d entries)",
                     elapsed, len(entries),
                 )
-            return "\n".join(lines), elapsed
+            return "\n".join(lines), hit_ids, elapsed
 
         except Exception as exc:
             _log_p0.warning("_memory_consultation_pass failed (non-fatal): %s", exc)
-            return "", 0.0
+            return "", [], 0.0
 
     # ── Notes index helpers (built on universal item index) ───────────────
 
@@ -2380,7 +2664,8 @@ class ExecutionEngine:
                           confidence_acknowledged: bool = False,
                           security_confirmed: bool = False,
                           context_window=None,
-                          harness_cmd: str = None) -> dict:
+                          harness_cmd: str = None,
+                          portfolio_category: str = "") -> dict:
         # PROSPECTIVE + HEALTH SESSION-START CHECK — fires on first message of a new session
         # (no prior context, no pending delegation = fresh session)
         # NOTE: Do NOT pass due_items through ceo_translate — the LLM fabricates briefing
@@ -2505,7 +2790,7 @@ class ExecutionEngine:
         if _harness_cmd == "devcheck":
             return await self._run_devcheck_harness()
         if _harness_cmd == "portfolio":
-            return await self._run_portfolio_harness()
+            return await self._run_portfolio_harness(category=portfolio_category)
         if _harness_cmd == "pm":
             return {"director_message": "PM harness not yet built. Pending Director approval of the PM-Harness proposal."}
         if _harness_cmd == "tax_report":
@@ -2540,10 +2825,14 @@ class ExecutionEngine:
         )
 
         # PASS 0 — deterministic working_memory context scan (no LLM, < 100ms target)
+        self._set_pass("P0")
         _cognitive_ctx = ""
+        _p0_hits: list = []
         if not pending_delegation:
-            _cognitive_ctx, _p0_ms = await self._memory_consultation_pass(user_input)
-            self._log_pass(0, "memory_consultation", user_input, {"elapsed_ms": round(_p0_ms, 1)}, _p0_ms / 1000)
+            _cognitive_ctx, _p0_hits, _p0_ms = await self._memory_consultation_pass(user_input)
+            self._log_pass(0, "memory_consultation", user_input, {"elapsed_ms": round(_p0_ms, 1), "hits": len(_p0_hits)}, _p0_ms / 1000)
+            if _p0_hits:
+                _msg.set_pass0_hits(_p0_hits)
 
         # PASS 1 — Orchestrator Classification (skip if re-submitting confirmed delegation)
         if pending_delegation:
@@ -2552,12 +2841,14 @@ class ExecutionEngine:
             gaps = delegation.pop("_memory_gaps", [])
         else:
             # Deterministic pre-classifier — catches cases the small LLM routinely misroutes
+            self._set_pass("quick")
             quick = _quick_classify(user_input, context_window=context_window)
             if quick:
                 delegation = quick
                 delegation["_routing_source"] = "quick_classify"
                 confidence, gaps = 1.0, []
             else:
+                self._set_pass("P1")
                 _t_p1 = _time_mod.monotonic()
                 try:
                     delegation = await _asyncio.wait_for(
@@ -2572,18 +2863,32 @@ class ExecutionEngine:
                     _rft = {"success": False, "outcome": "Classification timed out.", "detail": {},
                             "error": "PASS 1 timeout — please retry.", "next_action": None}
                     _dm = await self.cog.translator_pass(_rft)
+                    self._clear_pass()
                     return {"director_message": _dm, "confidence": 0.0, "gaps": []}
                 except Exception as e:
                     _rft = {"success": False, "outcome": "Classification failed.", "detail": {},
                             "error": str(e), "next_action": None}
                     _dm = await self.cog.translator_pass(_rft)
+                    self._clear_pass()
                     return {"director_message": _dm, "confidence": 0.0, "gaps": []}
                 self._log_pass(1, "orchestrator", user_input, delegation,
                                _time_mod.monotonic() - _t_p1)
                 confidence = delegation.pop("_memory_confidence", 1.0)
                 gaps = delegation.pop("_memory_gaps", [])
+                _p1_thinking = delegation.pop("_p1_thinking", "")
+                if _p1_thinking:
+                    logger.info("P1 THINK: %s", _p1_thinking[:2000])
 
         agent = delegation.get("specialist") or delegation.get("delegate_to", "")
+
+        # Routing visibility — shows what _quick_classify or PASS 1 LLM decided
+        import logging as _lg_route
+        _lg_route.getLogger(__name__).info(
+            "ROUTE: intent=%s agent=%s src=%s",
+            delegation.get("intent", "?"),
+            agent,
+            delegation.get("_routing_source", "llm_pass1"),
+        )
 
         # Normalise intent — map to a known key
         intent = delegation.get("intent", "")
@@ -2678,12 +2983,14 @@ class ExecutionEngine:
             _rft = {"success": False, "outcome": _gov_msg, "detail": {},
                     "error": _gov_msg, "next_action": None}
             dm = await self.cog.translator_pass(_rft, tier=tier)
+            self._clear_pass()
             return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps,
                     "_governance_block": str(e)}
 
         # Confirmation gate
         if not confirmed:
             if rules.get("requires_double_confirmation"):
+                self._clear_pass()
                 return {
                     "requires_double_confirmation": True,
                     # _original_request preserved so specialist_outbound on confirmed
@@ -2695,6 +3002,7 @@ class ExecutionEngine:
                     "gaps": gaps,
                 }
             if rules.get("requires_confirmation"):
+                self._clear_pass()
                 return {
                     "requires_confirmation": True,
                     "pending_delegation": {**delegation, "intent": intent,
@@ -2708,6 +3016,7 @@ class ExecutionEngine:
         # The pre-LLM scanner fires before PASS 1 (injection detection).
         # PASS 2 adds a second LLM-based evaluation for HIGH-tier actions regardless of scanner.
         # Skip PASS 2 when confirmed=True — explicit user double-confirmation IS the security gate.
+        self._set_pass("P2", intent=intent, tier=tier, agent=agent)
         if tier == "HIGH" and not _scanner_evaluated and not security_confirmed and not confirmed:
             _t_p2 = _time_mod.monotonic()
             try:
@@ -2751,10 +3060,11 @@ class ExecutionEngine:
                         "detail": {}, "error": "Security block — HIGH tier action rejected.",
                         "next_action": None}
                 dm = await self.cog.translator_pass(_rft, tier=tier)
+                self._clear_pass()
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise"):
+        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
                 _SC_GROK_RE   = _re_sc.compile(r'\b(use grok|ask grok|via grok)\b',     _re_sc.IGNORECASE)
@@ -2815,6 +3125,24 @@ class ExecutionEngine:
                 if exec_result is None:
                     exec_result = {"status": "error", "error": "nanobot returned None for rss-digest"}
                 _rft = self._build_result_for_translator(intent, exec_result)
+            elif action.get("domain") == "research":
+                exec_result = await self._dispatch(action, user_input,
+                                                   delegation={**delegation, "intent": intent},
+                                                   payload={"confirmed": confirmed},
+                                                   security_confirmed=security_confirmed)
+                if exec_result.get("requires_confirmation"):
+                    return {
+                        "status": "ok", "intent": intent, "tier": tier, "agent": agent,
+                        "confidence": round(confidence, 3), "gaps": gaps,
+                        "requires_confirmation": True,
+                        "summary": exec_result.get("telegram_summary", ""),
+                        "pending_delegation": {
+                            **delegation,
+                            "intent": "research_save",
+                        },
+                        "director_message": exec_result.get("director_message", "Research complete. Save to Nextcloud Notes?"),
+                    }
+                _rft = self._build_result_for_translator(intent, exec_result)
             else:
                 exec_result = await self._dispatch(action, user_input,
                                                    delegation={**delegation, "intent": intent},
@@ -2829,11 +3157,13 @@ class ExecutionEngine:
             }
             if morning_briefing:
                 result_dict["morning_briefing"] = morning_briefing
+            self._clear_pass()
             return result_dict
 
         # ── PASS 3 outbound — Specialist plans the action ────────────────────
         # Confirmed continuations (skill_install confirm path): skip outbound reasoning —
         # the Director already reviewed and approved; proceed straight to execution.
+        self._set_pass("P3a", intent=intent, tier=tier, agent=agent)
         _confirmed_continuation = (
             confirmed
             and pending_delegation is not None
@@ -2859,6 +3189,7 @@ class ExecutionEngine:
                 _rft = {"success": False, "outcome": "specialist_outbound_failed",
                         "detail": {}, "error": str(e), "next_action": None}
                 _dm = await self.cog.translator_pass(_rft, tier=tier)
+                self._clear_pass()
                 return {"director_message": _dm, "confidence": round(confidence, 3), "gaps": gaps,
                         "status": "error", "intent": intent, "tier": tier, "agent": agent}
         _p3out_dur = (_time_mod.monotonic() - _t3out_start) * 1000
@@ -2882,6 +3213,7 @@ class ExecutionEngine:
             pass
 
         # ── Execution (deterministic) ─────────────────────────────────────────
+        self._set_pass("exec", intent=intent, tier=tier, agent=agent)
         try:
             execution_result = await _asyncio.wait_for(
                 self._dispatch(
@@ -2937,6 +3269,7 @@ class ExecutionEngine:
                     result_dict[_gw_key] = execution_result[_gw_key]
             if morning_briefing:
                 result_dict["morning_briefing"] = morning_briefing
+            self._clear_pass()
             return result_dict
 
         # Stamp execution_confirmed deterministically — LLM must never assert completion
@@ -3017,6 +3350,7 @@ class ExecutionEngine:
                 execution_result["_trust"] = "scan_error"
 
         # ── PASS 3 inbound — Specialist interprets the execution result ───────
+        self._set_pass("P3b", intent=intent, tier=tier, agent=agent)
         _t3in_start = _time_mod.monotonic()
         try:
             sp_in = await _asyncio.wait_for(
@@ -3059,6 +3393,7 @@ class ExecutionEngine:
                 pass  # keep original sp_in if retry fails
 
         # ── PASS 4 — Orchestrator evaluates result + makes memory decision ────
+        self._set_pass("P4", intent=intent, tier=tier, agent=agent)
         _t4_start = _time_mod.monotonic()
         try:
             orch_eval = await _asyncio.wait_for(
@@ -3094,6 +3429,7 @@ class ExecutionEngine:
                     "detail": {"feedback": orch_eval.get("feedback", "")},
                     "error": "Orchestrator rejected the plan.", "next_action": None}
             _dm = await self.cog.translator_pass(_rft, tier=tier)
+            self._clear_pass()
             return {"director_message": _dm, "confidence": round(confidence, 3), "gaps": gaps,
                     "status": "error", "intent": intent, "tier": tier, "agent": agent}
 
@@ -3108,8 +3444,13 @@ class ExecutionEngine:
             _asyncio.create_task(self._async_store_routing_decision(
                 intent, agent, tier, _execution_confirmed,
             ))
+        # MRFL: increment _weight on PASS 0 hits that contributed to a successful outcome
+        _mrfl_hits = _msg.context.pass0_hits or _p0_hits
+        if self.qdrant and _mrfl_hits and _execution_confirmed:
+            _asyncio.create_task(self._async_mrfl_increment(_mrfl_hits, intent))
 
         # ── PASS 5 — Translator (receives ONLY result_for_translator) ─────────
+        self._set_pass("P5", intent=intent, tier=tier, agent=agent)
         _rft = (orch_eval.get("result_for_translator")
                 or self._build_result_for_translator(intent, execution_result))
 
@@ -3120,7 +3461,8 @@ class ExecutionEngine:
         _DIAGNOSTIC_INTENTS = frozenset({
             "list_containers", "get_logs", "get_stats", "get_hardware", "list_processes",
             "read_host_file", "get_compose", "inspect_container", "systemctl_status",
-            "journalctl", "apt_check", "github_read",
+            "journalctl", "apt_check", "kernel_info", "disk_usage", "memory_usage", "github_read",
+            "docker_networks", "docker_volumes", "docker_images", "docker_disk",
             "list_files", "read_file", "navigate", "search_files",
             "list_files_recursive", "read_files_recursive",
             "ncfs_read", "ncfs_list", "ncfs_list_recursive", "ncfs_search",
@@ -3131,10 +3473,12 @@ class ExecutionEngine:
             "skill_audit", "skill_search",
             "skill_list_candidates", "skill_review_candidate", "skill_clear_harness",
             "configure_browser_auth",
-            "self_improve_observe", "self_improve_proposals", "self_improve_baseline",
+            "self_improve_observe", "self_improve_proposals", "self_improve_baseline", "self_improve_dismiss",
             "learning_harness_status",  # status query — last run summary passes directly
+            "learn_url",                # structured queue result — bypass translator
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
-            "research",
+            "research_gather", "research_save", "research_clear",
+            "portfolio_analysis", "portfolio_analysis_save", "portfolio_analysis_clear",
             "memory_list_keys", "memory_retrieve_key",  # MIP — pass structured index directly
             "memory_recall",   # exact content search — found/not-found result passes directly
             # remember_fact intentionally excluded — raw execution_result leaks point_id/collection
@@ -3552,6 +3896,7 @@ class ExecutionEngine:
                 result_dict[_gw_key] = execution_result[_gw_key]
         if morning_briefing:
             result_dict["morning_briefing"] = morning_briefing
+        self._clear_pass()
         return result_dict
 
     # ── Delegation → action dict ─────────────────────────────────────────
@@ -3954,27 +4299,35 @@ class ExecutionEngine:
         """/selfimprove — run SI observe cycle then surface pending proposals."""
         from monitoring.self_improvement import run_manual_observe, list_pending_proposals
         _app_state = getattr(self, "app_state", None)
-        # Observe: collect metrics, detect anomalies, generate proposals if needed
         observe_result = await run_manual_observe(self.qdrant, self.cog, self.ledger, _app_state)
-        # Surface any pending proposals regardless of whether new ones were just created
         proposals_result = await list_pending_proposals(self.qdrant)
         proposals = proposals_result.get("proposals", [])
-        _rft = {
+
+        # Translate the observe summary (LLM text) via translator, then append
+        # proposals as deterministically-formatted list (translator would squash them).
+        _rft_summary = {
             "success": True,
             "outcome": observe_result.get("summary", "Observe cycle complete."),
-            "detail": {
-                "observe": observe_result,
-                "pending_proposals": proposals,
-                "proposal_count": len(proposals),
-            },
+            "detail": {"anomalies_detected": observe_result.get("anomalies_detected", 0)},
             "error": None,
-            "next_action": (
-                f"{len(proposals)} proposal(s) pending Director approval."
-                if proposals else "No proposals pending."
-            ),
+            "next_action": None,
         }
-        dm = await self.cog.translator_pass(_rft)
-        return {"director_message": dm}
+        summary_dm = await self.cog.translator_pass(_rft_summary)
+
+        # Format all proposals as a numbered list (gateway handles Telegram chunking)
+        _lines = []
+        for i, p in enumerate(proposals, 1):
+            trigger = p.get("trigger", "unknown")
+            action  = (p.get("action") or "")[:200].strip()
+            ts      = (p.get("created_ts") or "")[:10]
+            _lines.append(f"{i}. [{trigger}] {action} _(created {ts})_")
+
+        if proposals:
+            _proposal_block = f"\n\n**{len(proposals)} proposal(s) pending approval:**\n" + "\n".join(_lines)
+        else:
+            _proposal_block = "\n\nNo proposals pending."
+
+        return {"director_message": summary_dm + _proposal_block}
 
     async def _run_devcheck_harness(self) -> dict:
         """/devcheck — run full dev harness analysis cycle."""
@@ -4012,8 +4365,15 @@ class ExecutionEngine:
         dm = await self.cog.translator_pass(_rft)
         return {"director_message": dm}
 
-    async def _run_portfolio_harness(self) -> dict:
-        """/portfolio — trigger snapshot and return current balances + value."""
+    async def _run_portfolio_harness(self, category: str = "") -> dict:
+        """/portfolio [category] — deep analysis if category given, else snapshot."""
+        if category:
+            from monitoring.portfolio_analysis_harness import run_portfolio_analysis
+            _sov_wallet_url = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
+            return await run_portfolio_analysis(
+                self.cog, self.nanobot, self.qdrant, category, _sov_wallet_url
+            )
+        # Existing snapshot path — unchanged
         action = {"domain": "wallet_watchlist", "operation": "check", "name": "wallet_portfolio"}
         result = await self._dispatch_inner(action, delegation={}, payload={})
         _rft = {
@@ -4046,6 +4406,18 @@ class ExecutionEngine:
 
     # ── Cognitive loop helpers ───────────────────────────────────────────────
 
+    def _set_pass(self, pass_id: str, intent: str = None, tier: str = None, agent: str = None) -> None:
+        self._loop_state = {
+            "active": True,
+            "pass":   pass_id,
+            "intent": intent or self._loop_state.get("intent"),
+            "tier":   tier   or self._loop_state.get("tier"),
+            "agent":  agent  or self._loop_state.get("agent"),
+        }
+
+    def _clear_pass(self) -> None:
+        self._loop_state = {"active": False, "pass": None, "intent": None, "tier": None, "agent": None}
+
     def _log_pass(self, pass_num: int, persona: str, input_data, output_data,
                   duration_s: float) -> None:
         """Audit hash per cognitive pass — structural hashes only, no raw content."""
@@ -4068,6 +4440,18 @@ class ExecutionEngine:
         if exec_result is None:
             return {"success": False, "outcome": "no_result", "detail": {},
                     "error": "dispatch returned None", "next_action": None}
+        # remember_fact: descriptive outcome so translator echoes what was stored
+        if intent == "remember_fact":
+            _rf_ok  = exec_result.get("status") == "ok"
+            _rf_msg = exec_result.get("message", "Stored.")
+            _rf_key = exec_result.get("mip_key", "")
+            return {
+                "success": _rf_ok,
+                "outcome": _rf_msg,
+                "detail": {"mip_key": _rf_key} if _rf_key else {},
+                "error": None if _rf_ok else _rf_msg,
+                "next_action": None,
+            }
         success = (
             (exec_result.get("status") == "ok" or exec_result.get("success") is True
              or exec_result.get("execution_confirmed") is True)
@@ -4174,6 +4558,86 @@ class ExecutionEngine:
         except Exception:
             pass
 
+    async def _async_mrfl_increment(self, point_ids: list, intent: str) -> None:
+        """MRFL: increment _weight on WM entries that contributed to a successful EXEC.
+
+        Writes to both working_memory and archive_client. startup_load=True entries are
+        skipped by shutdown_promote(), so archive must be updated directly here.
+        Episodic audit entry written per increment (zero-vector, deterministic ID).
+        """
+        import uuid as _uuid_m
+        from qdrant_client.models import PointStruct as _PSM
+        _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _ts    = datetime.now(timezone.utc).isoformat()
+
+        for pid in point_ids:
+            try:
+                wm_pts = await self.qdrant.client.retrieve(
+                    collection_name="working_memory",
+                    ids=[pid],
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if not wm_pts:
+                    continue
+                payload  = dict(wm_pts[0].payload or {})
+                old_w    = float(payload.get("_weight", 1.0))
+                new_w    = min(round(old_w + 0.05, 4), 5.0)
+                if new_w <= old_w:
+                    continue  # already at cap
+
+                _key     = payload.get("_key", "")
+                src_coll = payload.get("source_collection") or payload.get("type", "")
+
+                # Increment in working_memory
+                await self.qdrant.client.set_payload(
+                    collection_name="working_memory",
+                    payload={"_weight": new_w},
+                    points=[pid],
+                )
+
+                # Increment in archive (direct write — startup_load entries skip promote)
+                if src_coll and src_coll in SOVEREIGN_COLLECTIONS:
+                    try:
+                        await self.qdrant.archive_client.set_payload(
+                            collection_name=src_coll,
+                            payload={"_weight": new_w},
+                            points=[pid],
+                        )
+                    except Exception:
+                        pass  # entry not yet in archive (new session entry, promoted on shutdown)
+
+                # Episodic audit trail — zero-vector, no Ollama call, deterministic dedup
+                _audit_key = f"episodic:mrfl:weight-increment:{_today}:{_key or pid[:8]}"
+                _audit_id  = str(_uuid_m.uuid5(_uuid_m.NAMESPACE_URL, f"mrfl:{pid}:{_today}"))
+                await self.qdrant.archive_client.upsert(
+                    collection_name="episodic",
+                    points=[_PSM(
+                        id=_audit_id,
+                        vector=[0.0] * 768,
+                        payload={
+                            "type":         "episodic",
+                            "event_type":   "mrfl_weight_increment",
+                            "_key":         _audit_key,
+                            "sov_id":       _audit_id,
+                            "point_id":     str(pid),
+                            "memory_key":   _key,
+                            "old_weight":   old_w,
+                            "new_weight":   new_w,
+                            "intent":       intent,
+                            "ts":           _ts,
+                            "last_updated": _ts,
+                        },
+                    )],
+                )
+                import logging as _lg_mrfl
+                _lg_mrfl.getLogger(__name__).debug(
+                    "MRFL increment: %s %.2f→%.2f (intent=%s)",
+                    _key or pid[:8], old_w, new_w, intent,
+                )
+            except Exception:
+                pass  # MRFL never blocks
+
     async def _write_execution_episodic(
         self, intent: str, tier: str, execution_result: dict, user_input: str,
     ) -> None:
@@ -4200,7 +4664,7 @@ class ExecutionEngine:
                     "intent": intent,
                     "tier": tier,
                     "success": success,
-                    "error": str(error)[:500] if error else None,
+                    "error": str(error)[:2000] if error else None,
                     "outcome": "positive" if success else "negative",
                     "_exec_log": True,
                 },
@@ -4337,6 +4801,10 @@ class ExecutionEngine:
                 return {"status": "ok", "container": container, "stats": stats}
             if name == "docker_restart":
                 return await self.broker.restart(container)
+            if name == "docker_recreate":
+                if not container:
+                    return {"error": "recreate_container requires a container name as target"}
+                return await self.broker.recreate(container)
             if name == "inspect_container":
                 if not container:
                     return {"error": "inspect_container requires a container name as target"}
@@ -4367,6 +4835,30 @@ class ExecutionEngine:
                     params["unit"] = unit
                 params["lines"] = lines
                 return await self.broker.exec_command("journalctl", params)
+            if name == "docker_networks":
+                return await self.broker.get_networks()
+            if name == "docker_volumes":
+                return await self.broker.get_volumes()
+            if name == "docker_images":
+                return await self.broker.get_images()
+            if name == "docker_df":
+                return await self.broker.get_docker_df()
+            if name == "kernel_info":
+                return await self.broker.exec_command("uname", {})
+            if name == "disk_usage":
+                return await self.broker.exec_command("df", {})
+            if name == "memory_usage":
+                return await self.broker.exec_command("free", {})
+            if name == "docker_build":
+                svc = container or (specialist or {}).get("service") or action.get("service", "")
+                if not svc:
+                    return {"error": "docker_build requires a service name as target"}
+                return await self.broker.exec_command(
+                    "docker_build", {"service": svc},
+                    trust_override="high", timeout=620.0,
+                )
+            if name == "docker_prune":
+                return await self.broker.prune_images()
             return {"error": f"Unknown docker action: {name}"}
 
         if domain == "webdav":
@@ -4527,6 +5019,38 @@ class ExecutionEngine:
                 if not cal_end:
                     cal_end = cal_start  # point event if end omitted
 
+                # Multi-event batch: specialist outputs an "events" array when
+                # the Director provides several events in one turn.
+                _multi_evs = sp.get("events") if isinstance(sp.get("events"), list) else []
+                if len(_multi_evs) > 1:
+                    _ev_created, _ev_failed = [], []
+                    for _ev in _multi_evs:
+                        _ev_start = _normalise_dt(str(_ev.get("start", "")))
+                        _ev_end   = _normalise_dt(str(_ev.get("end", ""))) if _ev.get("end") else _ev_start
+                        _ev_title = _ev.get("summary") or _ev.get("title") or cal_summary
+                        _ev_desc  = _ev.get("description") or ""
+                        _ev_cal   = _ev.get("calendar") or cal_calendar
+                        if not _ev_start:
+                            _ev_failed.append({"event": _ev_title, "reason": "no start time"})
+                            continue
+                        _ev_res = _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_create", {
+                            "title": _ev_title,
+                            "start": _ev_start,
+                            "end": _ev_end or _ev_start,
+                            "description": _ev_desc,
+                            "calendar": _ev_cal,
+                        }))
+                        if _ev_res.get("success") or _ev_res.get("status") == "ok":
+                            _ev_created.append(_ev_title)
+                        else:
+                            _ev_failed.append({"event": _ev_title, "reason": _ev_res.get("error", "unknown")})
+                    return {
+                        "success": len(_ev_failed) == 0,
+                        "outcome": f"Created {len(_ev_created)} of {len(_multi_evs)} calendar events.",
+                        "created": _ev_created,
+                        "failed": _ev_failed,
+                    }
+
                 # Note: uid is generated by openclaw-nextcloud internally (not passed)
                 return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_create", {
                     "title": cal_summary,
@@ -4553,6 +5077,13 @@ class ExecutionEngine:
                 evt_calendar  = sp.get("calendar") or action.get("calendar", "personal")
                 evt_from_date = sp.get("from_date") or action.get("from_date", "")
                 evt_to_date   = sp.get("to_date")   or action.get("to_date",   "")
+                # Default to today → +14 days when specialist omits dates — prevents
+                # returning all historical events and triggering PASS 4 rejection.
+                if not evt_from_date and not evt_to_date:
+                    from datetime import date as _date, timedelta as _td
+                    _today = _date.today()
+                    evt_from_date = _today.isoformat()
+                    evt_to_date   = (_today + _td(days=14)).isoformat()
                 _evts_nb = await self.nanobot.run("openclaw-nextcloud", "calendar_list_events", {
                     "calendar": evt_calendar,
                     "from_date": evt_from_date,
@@ -4561,7 +5092,7 @@ class ExecutionEngine:
                 _evts_result = _nb_unwrap(_evts_nb)
                 _evts_raw = _evts_result.get("events") or []
                 if _evts_raw:
-                    _asyncio.create_task(self._index_items(
+                    asyncio.create_task(self._index_items(
                         [{"title": e.get("summary",""), "uid": e.get("uid",""), "date": e.get("dtstart",""), "calendar": evt_calendar}
                          for e in _evts_raw if e.get("uid")],
                         "event"
@@ -4574,14 +5105,16 @@ class ExecutionEngine:
                 ))
             if name == "task_complete":
                 sp = specialist or {}
-                comp_calendar = sp.get("calendar") or action.get("calendar", "tasks")
-                comp_uid      = sp.get("uid")      or action.get("uid", "")
-                if not comp_uid:
+                comp_calendar   = sp.get("calendar")   or action.get("calendar", "tasks")
+                comp_uid        = sp.get("uid")        or action.get("uid", "")
+                comp_delete_url = sp.get("delete_url") or action.get("delete_url", "")
+                if not comp_uid and not comp_delete_url:
                     return {"error": "complete_task requires a UID — please specify which task"}
-                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_complete", {
-                    "uid": comp_uid,
-                    "calendar": comp_calendar,
-                }))
+                comp_params = {"uid": comp_uid, "calendar": comp_calendar}
+                if comp_delete_url:
+                    comp_params["delete_url"] = comp_delete_url
+                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_complete",
+                                                          comp_params))
             if name == "calendar_update":
                 sp = specialist or {}
                 upd_calendar    = sp.get("calendar")    or action.get("calendar", "personal")
@@ -4605,15 +5138,17 @@ class ExecutionEngine:
                 }))
             if name in ("task_delete", "calendar_delete"):
                 sp = specialist or {}
-                del_calendar = sp.get("calendar") or action.get("calendar", "personal")
-                del_uid      = sp.get("uid")      or action.get("uid", "")
-                if not del_uid:
+                del_calendar  = sp.get("calendar")   or action.get("calendar", "personal")
+                del_uid       = sp.get("uid")        or action.get("uid", "")
+                del_delete_url = sp.get("delete_url") or action.get("delete_url", "")
+                if not del_uid and not del_delete_url:
                     return {"error": f"{name} requires a UID — please specify which item to delete"}
                 if name == "task_delete":
-                    return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_delete", {
-                        "uid": del_uid,
-                        "calendar": del_calendar,
-                    }))
+                    params = {"uid": del_uid, "calendar": del_calendar}
+                    if del_delete_url:
+                        params["delete_url"] = del_delete_url
+                    return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_delete",
+                                                              params))
                 return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_delete", {
                     "uid": del_uid,
                     "calendar": del_calendar,
@@ -4966,7 +5501,11 @@ class ExecutionEngine:
                         "account": account, "timeout": _NC_MAIL_TIMEOUT,
                     })
                     return _unwrap_nb(nb)
-                count = int(sp.get("count") or action.get("count", 20))
+                _default_count = _cfg.limits.nc_mail_list_default
+                count = max(
+                    int(sp.get("count") or action.get("count", _default_count) or _default_count),
+                    _default_count,
+                )
                 nb = await self.nanobot.run(_skill_nc_mail, "list_unread", {
                     "account": account, "limit": count, "timeout": _NC_MAIL_TIMEOUT,
                 })
@@ -5119,6 +5658,31 @@ class ExecutionEngine:
             from monitoring.news_harness import run_news_brief
             return await run_news_brief(self.cog, self.nanobot, self.qdrant, prompt or "")
 
+        if domain == "research":
+            from monitoring.research_harness import run_research_gather, run_research_save, run_research_clear
+            if operation == "gather":
+                topic = (delegation or {}).get("target") or prompt or ""
+                return await run_research_gather(self.cog, self.nanobot, self.qdrant, topic, prompt or "")
+            if operation == "save":
+                return await run_research_save(self.cog, self.nanobot, self.qdrant)
+            if operation == "clear":
+                return await run_research_clear(self.qdrant)
+            return {"status": "error", "error": f"unknown research operation: {operation}"}
+
+        if domain == "portfolio_analysis":
+            from monitoring.portfolio_analysis_harness import (
+                run_portfolio_analysis, run_portfolio_analysis_save, run_portfolio_analysis_clear,
+            )
+            if operation == "gather":
+                _pa_cat = (delegation or {}).get("category") or (delegation or {}).get("target") or prompt or ""
+                _pa_url = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
+                return await run_portfolio_analysis(self.cog, self.nanobot, self.qdrant, _pa_cat, _pa_url)
+            if operation == "save":
+                return await run_portfolio_analysis_save(self.cog, self.nanobot, self.qdrant)
+            if operation == "clear":
+                return await run_portfolio_analysis_clear(self.qdrant)
+            return {"status": "error", "error": f"unknown portfolio_analysis operation: {operation}"}
+
         if domain == "tax":
             from tax_harness.harness import TaxIngestHarness
             _harness = TaxIngestHarness(self.cog, self.nanobot, self.qdrant)
@@ -5250,7 +5814,8 @@ class ExecutionEngine:
                     return {"error": "url required for browser fetch"}
                 nb = await self.nanobot.run(
                     "sovereign-browser", "fetch",
-                    {"url": url, "extract": action.get("extract", "text"), "timeout": 60},
+                    {"url": url, "extract": action.get("extract", "text"), "timeout": int(_cfg.timeouts.browser_script_s)},
+                    http_timeout=float(_cfg.timeouts.browser_http_s),
                 )
                 if nb.get("status") == "ok":
                     # nb["result"] is the flat a2a-browser FetchResponse fields
@@ -5265,9 +5830,10 @@ class ExecutionEngine:
                     }
                 return nb
 
-            # action["query"] set by _delegation_to_action when quick_classify extracts the query;
-            # prefer it over the full prompt (which may include "search the web for..." prefix).
-            query = action.get("query") or prompt or ""
+            # Prefer specialist's refined search_query (PASS 3a strips conversational preamble
+            # and extracts a precise, scoped query). Fall back to delegation target / prompt.
+            _sp_q = (specialist or {}).get("search_query") or (specialist or {}).get("query") or ""
+            query = _sp_q or action.get("query") or prompt or ""
             if not query:
                 return {"error": "query required for browser search"}
             nb = await self.nanobot.run(
@@ -5277,8 +5843,9 @@ class ExecutionEngine:
                     "locale":        action.get("locale", payload.get("locale", "en-US")),
                     "return_format": action.get("return_format", "full"),
                     "test_mode":     payload.get("test_mode", False),
-                    "timeout":       60,
+                    "timeout":       int(_cfg.timeouts.browser_script_s),
                 },
+                http_timeout=float(_cfg.timeouts.browser_http_s),
             )
             # Synthesise a human-readable response so the gateway can render it
             if nb.get("status") == "ok":
@@ -5300,11 +5867,19 @@ class ExecutionEngine:
                 top_results = enriched.get("results", [])
                 parts = []
                 summary = synth.get("summary", "")
+                # Strip internal enrichment failure messages — node04 a2a-browser may
+                # return these when its enrichment model is unavailable. Raw results still useful.
+                _enrich_fail = (
+                    "nanobot wrap gate failed", "enrichment skipped",
+                    "enrichment unavailable", "enrichment failed", "raw results returned",
+                )
+                if summary and any(m in summary.lower() for m in _enrich_fail):
+                    summary = ""
                 if summary:
                     parts.append(summary)
                 if top_results:
                     parts.append("\nTop sources:")
-                    for r in top_results[:5]:
+                    for r in top_results[:10]:
                         title = r.get("title", "")
                         url = r.get("url", "")
                         if title and url:
@@ -5312,7 +5887,43 @@ class ExecutionEngine:
                             parts.append(f"• {title} — {host}")
                 # follow_up_queries are AI navigation metadata — not Director-facing content
                 nb["response"] = "\n".join(parts)
+
             return nb
+
+        if domain == "learning":
+            if operation == "queue_url":
+                import hashlib as _hl
+                import asyncio as _asyncio
+                _url = (action.get("url") or delegation.get("target") or "").strip()
+                if not _url or not _url.startswith(("http://", "https://")):
+                    return {"status": "error", "error": "valid http/https URL required"}
+                _slug = _hl.sha256(_url.encode()).hexdigest()[:16]
+                _nc_path = f"/downloads/{_slug}.url"
+                _content = f"[InternetShortcut]\nURL={_url}\n"
+                _nb_write = await self.nanobot.run(
+                    "openclaw-nextcloud", "files_write",
+                    {"path": _nc_path, "content": _content},
+                )
+                _write_ok = (
+                    _nb_write.get("status") == "ok"
+                    or _nb_write.get("success") is True
+                    or _nb_write.get("result", {}).get("status") == "ok"
+                )
+                if not _write_ok:
+                    return {"status": "error", "error": f"failed to write .url file: {_nb_write}"}
+                _app_state = getattr(self, "app_state", None)
+                if _app_state is not None:
+                    from monitoring.learning_harness import check_downloads as _check_dl
+                    _asyncio.create_task(_check_dl(_app_state, immediate=True))
+                return {
+                    "status":    "queued",
+                    "url":       _url,
+                    "file":      _nc_path,
+                    "url_slug":  _slug,
+                    "sentinel_processed": f"episodic:learning:processed:{_slug}",
+                    "sentinel_failed":    f"episodic:learning:failed:{_slug}",
+                }
+            return {"status": "error", "error": f"unknown learning operation: {operation}"}
 
         if domain == "security":
             op = action.get("operation")
@@ -5997,6 +6608,7 @@ class ExecutionEngine:
 
             if op in ("read", "write", "store"):
                 import re
+                _is_struct_fact = (delegation or {}).get("_structured_fact", False)
                 fact = re.sub(
                     r"^(please\s+)?(remember|store|memorise|memorize|note|save|keep in mind)\s+(that\s+)?",
                     "", prompt or "", flags=re.IGNORECASE,
@@ -6010,13 +6622,17 @@ class ExecutionEngine:
                 coll = _raw_coll if _raw_coll in SOVEREIGN_COLLECTIONS else SEMANTIC
                 mem_type = action.get("type", SEMANTIC)
                 writer = action.get("writer", "sovereign-core")
+                # Director-provided structured facts: always human-confirmed; tag source
+                _extra_meta = {"source": "director_provided"} if _is_struct_fact else None
+                _human_confirmed = confirmed or _is_struct_fact
                 try:
                     point_id = await self.cog.save_lesson(
                         fact, prompt or "",
                         collection=coll,
                         memory_type=mem_type,
                         writer=writer,
-                        human_confirmed=confirmed,
+                        human_confirmed=_human_confirmed,
+                        extra_metadata=_extra_meta,
                     )
                 except PermissionError as e:
                     return {"status": "error", "message": str(e)}
@@ -6033,9 +6649,31 @@ class ExecutionEngine:
                         _mip_key = _pts[0].payload.get("_key") or "(key generation pending)"
                 except Exception:
                     pass
+                _fact_topic = (delegation or {}).get("_fact_topic", "")
+                if not _fact_topic:
+                    # Fallback: derive topic from fact content (hotel name, cities, flight)
+                    import re as _ft_re
+                    _hotel_name_m = _ft_re.match(r'Hotel:\s*(.+)', fact, _ft_re.IGNORECASE)
+                    if _hotel_name_m:
+                        _fact_topic = _hotel_name_m.group(1).strip()[:80]
+                    else:
+                        _fc = _ft_re.findall(
+                            r'\b(Auckland|Wellington|Christchurch|Queenstown|Dunedin|Hamilton|'
+                            r'Sydney|Melbourne|Brisbane|Perth|Adelaide|London|New York|'
+                            r'Los Angeles|San Francisco|Chicago|Singapore|Hong Kong|Tokyo|'
+                            r'Dubai|Bangkok|Bali|Paris|Amsterdam|Frankfurt|Rome|Madrid)\b',
+                            fact, _ft_re.IGNORECASE,
+                        )
+                        if _fc:
+                            _fact_topic = "/".join(dict.fromkeys(c.title() for c in _fc[:4])) + " travel itinerary"
+                _store_msg = (
+                    f"Stored your {_fact_topic}."
+                    if _fact_topic else
+                    f"Stored: {fact[:80]}{'...' if len(fact) > 80 else ''}"
+                )
                 return {
                     "status": "ok",
-                    "message": f"Stored: {fact}",
+                    "message": _store_msg,
                     "point_id": point_id,
                     "mip_key": _mip_key,
                     "collection": coll,
@@ -6282,15 +6920,25 @@ class ExecutionEngine:
                 status_f = (delegation or {}).get("target") or "active"
                 return await self.task_scheduler.list_tasks(status_filter=status_f)
 
-            if name in ("pause_task", "cancel_task"):
-                task_id = (specialist or {}).get("task_id") or action.get("task_id", "")
-                if not task_id:
-                    # Try extracting from user input via delegation target
-                    task_id = (delegation or {}).get("target", "")
+            if name in ("pause_task", "cancel_task", "complete_scheduled_task"):
+                # Accept task_id (UUID) OR task title — update_task_status handles both
+                task_id = (
+                    (specialist or {}).get("task_id")
+                    or (specialist or {}).get("title")
+                    or (specialist or {}).get("task_name")
+                    or action.get("task_id", "")
+                    or (delegation or {}).get("target", "")
+                    or prompt or ""
+                )
                 if not task_id:
                     return {"status": "error",
-                            "error": f"{name} requires a task_id — use list_tasks to find it"}
-                new_status = "paused" if name == "pause_task" else "cancelled"
+                            "error": f"{name} requires a task name or ID — say the task title clearly"}
+                if name == "pause_task":
+                    new_status = "paused"
+                elif name == "complete_scheduled_task":
+                    new_status = "completed"
+                else:
+                    new_status = "cancelled"
                 return await self.task_scheduler.update_task_status(task_id, new_status)
 
             if name == "schedule_task":
@@ -6502,7 +7150,7 @@ class ExecutionEngine:
                 from monitoring.learning_harness import get_last_run_status
                 return get_last_run_status()
             from monitoring.self_improvement import (
-                run_manual_observe, list_pending_proposals, get_baseline_report,
+                run_manual_observe, list_pending_proposals, get_baseline_report, dismiss_proposals,
             )
             if op == "observe":
                 _app_state = getattr(self, "app_state", None)
@@ -6511,6 +7159,8 @@ class ExecutionEngine:
                 return await list_pending_proposals(self.qdrant)
             if op == "baseline":
                 return await get_baseline_report(self.qdrant)
+            if op == "dismiss":
+                return await dismiss_proposals(self.qdrant)
             return {"error": f"Unknown monitoring operation: {op}"}
 
         if domain == "dev_harness":
