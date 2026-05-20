@@ -344,6 +344,178 @@ INTENT_TIER_MAP = {
     "harness_status": "LOW",
 }
 
+import re as _re_cal
+
+_HOTEL_KW = frozenset({
+    "hotel", "motel", "inn", "lodge", "resort", "villa", "suites", "suite",
+    "hostel", "airbnb", "accommodation", "apartment hotel",
+    "hilton", "marriott", "hyatt", "doubletree", "sheraton", "radisson",
+    "intercontinental", "novotel", "ibis", "sofitel", "adina", "pullman",
+    "holiday inn", "rotorua", "chateau",
+})
+_FLIGHT_RE = _re_cal.compile(
+    r'\b(NZ|QF|UA|AA|BA|EK|SQ|CX|VA|JQ|NF|AR|DL|LH|AF|KL)\d{1,4}\b',
+    _re_cal.IGNORECASE,
+)
+
+
+def _event_subtype(title: str, description: str) -> str:
+    """Classify a calendar event for semantic memory tagging."""
+    combined = f"{(title or '').lower()} {(description or '').lower()}"
+    if any(kw in combined for kw in _HOTEL_KW):
+        return "accommodation"
+    if _FLIGHT_RE.search(title or ""):
+        return "flight"
+    return "event"
+
+
+async def _write_event_memory(qdrant, title: str, start: str, end: str,
+                               calendar: str, description: str = "") -> None:
+    """Write a semantic memory entry for any successfully created calendar event.
+
+    Every calendar event Rex creates is a fact about the Director's life and schedule.
+    Writing it to semantic memory means PASS 0 can surface it directly when the Director
+    asks schedule or location questions — without needing a calendar API call first.
+
+    Confidence improves naturally over time via MRFL weight increments when the entry
+    is referenced in successful responses.
+    """
+    try:
+        from datetime import date
+        today = date.today().isoformat()
+        subtype = _event_subtype(title, description)
+        slug = _re_cal.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')[:48]
+
+        # Key includes start-date prefix for chronological clustering and dedup
+        date_prefix = (start or today)[:10].replace("-", "")  # YYYYMMDD
+        key = f"semantic:calendar:{date_prefix}:{slug}"
+
+        # Build human-readable content lines so vector search finds it naturally
+        if subtype == "accommodation":
+            lines = [
+                f"Accommodation: {title}",
+                f"Check-in: {start}",
+                f"Check-out: {end}" if end and end != start else "",
+                f"Calendar: {calendar}",
+            ]
+        elif subtype == "flight":
+            lines = [
+                f"Flight: {title}",
+                f"Departure: {start}",
+                f"Arrival: {end}" if end and end != start else "",
+                f"Calendar: {calendar}",
+            ]
+        else:
+            lines = [
+                f"Event: {title}",
+                f"Start: {start}",
+                f"End: {end}" if end and end != start else "",
+                f"Calendar: {calendar}",
+                f"Details: {description}" if description else "",
+            ]
+        content = "\n".join(l for l in lines if l)
+
+        await qdrant.store(
+            collection=SEMANTIC,
+            content=content,
+            metadata={
+                "type":         "semantic",
+                "domain":       "calendar",
+                "subtype":      subtype,
+                "title":        title,
+                "start":        start,
+                "end":          end,
+                "calendar":     calendar,
+                "_key":         key,
+                "source":       "calendar_create",
+                "date_written": today,
+            },
+        )
+        logger.info("event_memory: wrote %s entry for %r (key=%s)", subtype, title, key)
+    except Exception as exc:
+        logger.warning("event_memory: write failed for %r: %s", title, exc)
+
+
+async def _write_task_memory(qdrant, summary: str, due: str, calendar: str,
+                              description: str = "") -> None:
+    """Write a semantic memory entry for any successfully created task/todo."""
+    try:
+        from datetime import date
+        today = date.today().isoformat()
+        slug = _re_cal.sub(r'[^a-z0-9]+', '-', summary.lower()).strip('-')[:48]
+        date_prefix = (due or today)[:10].replace("-", "")
+        key = f"semantic:task:{date_prefix}:{slug}"
+        lines = [
+            f"Task: {summary}",
+            f"Due: {due}" if due else "",
+            f"Details: {description}" if description else "",
+            f"Calendar: {calendar}",
+        ]
+        content = "\n".join(l for l in lines if l)
+        await qdrant.store(
+            collection=SEMANTIC,
+            content=content,
+            metadata={
+                "type":         "semantic",
+                "domain":       "task",
+                "title":        summary,
+                "due":          due,
+                "calendar":     calendar,
+                "_key":         key,
+                "source":       "tasks_create",
+                "date_written": today,
+            },
+        )
+        logger.info("task_memory: wrote task entry for %r (key=%s)", summary, key)
+    except Exception as exc:
+        logger.warning("task_memory: write failed for %r: %s", summary, exc)
+
+
+async def _write_note_memory(qdrant, title: str, category: str,
+                              content: str, note_id=None) -> None:
+    """Write a semantic memory entry for a newly created Nextcloud Note.
+
+    Stores title + category + a brief content excerpt so PASS 0 can surface
+    the note in context when relevant. Full content lives in Nextcloud Notes
+    and is retrieved via notes_read when needed.
+
+    Downloaded documents ingested by the learning harness get their own
+    semantic entries via learning_harness.py — this covers Rex-authored notes only.
+    """
+    try:
+        from datetime import date
+        today = date.today().isoformat()
+        slug = _re_cal.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')[:48]
+        key  = f"semantic:note:{today[:7].replace('-', '')}:{slug}"  # YYYYMM prefix
+        excerpt = (content or "")[:300].strip()
+        lines = [
+            f"Note: {title}",
+            f"Category: {category}" if category else "",
+            f"Note ID: {note_id}" if note_id else "",
+            f"Excerpt: {excerpt}" if excerpt else "",
+            f"Created: {today}",
+            "Full content available via Nextcloud Notes.",
+        ]
+        mem_content = "\n".join(l for l in lines if l)
+        await qdrant.store(
+            collection=SEMANTIC,
+            content=mem_content,
+            metadata={
+                "type":         "semantic",
+                "domain":       "notes",
+                "title":        title,
+                "category":     category,
+                "note_id":      str(note_id) if note_id else None,
+                "_key":         key,
+                "source":       "notes_create",
+                "date_written": today,
+            },
+        )
+        logger.info("note_memory: wrote note entry for %r (key=%s)", title, key)
+    except Exception as exc:
+        logger.warning("note_memory: write failed for %r: %s", title, exc)
+
+
 def _normalise_dt(value: str, default_year: int = 2026) -> str:
     """Normalise a freeform datetime string to ISO 8601 YYYY-MM-DDTHH:MM:SS.
 
@@ -5042,6 +5214,10 @@ class ExecutionEngine:
                         }))
                         if _ev_res.get("success") or _ev_res.get("status") == "ok":
                             _ev_created.append(_ev_title)
+                            asyncio.create_task(_write_event_memory(
+                                self.qdrant, _ev_title, _ev_start, _ev_end or _ev_start,
+                                _ev_cal, _ev_desc,
+                            ))
                         else:
                             _ev_failed.append({"event": _ev_title, "reason": _ev_res.get("error", "unknown")})
                     return {
@@ -5052,13 +5228,19 @@ class ExecutionEngine:
                     }
 
                 # Note: uid is generated by openclaw-nextcloud internally (not passed)
-                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_create", {
+                _ev_result = _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_create", {
                     "title": cal_summary,
                     "start": cal_start,
                     "end": cal_end,
                     "description": cal_description,
                     "calendar": cal_calendar,
                 }))
+                if _ev_result.get("success") or _ev_result.get("status") == "ok":
+                    asyncio.create_task(_write_event_memory(
+                        self.qdrant, cal_summary, cal_start, cal_end,
+                        cal_calendar, cal_description,
+                    ))
+                return _ev_result
             if name == "task_create":
                 d = delegation or {}
                 sp = specialist or {}
@@ -5066,12 +5248,17 @@ class ExecutionEngine:
                 task_due         = sp.get("due")         or action.get("due",         "")
                 task_calendar    = sp.get("calendar")    or action.get("calendar",    "tasks")
                 task_description = sp.get("description") or action.get("description", "")
-                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_create", {
+                _task_result = _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_create", {
                     "summary": task_summary,
                     "due": task_due,
                     "description": task_description,
                     "calendar": task_calendar,
                 }))
+                if _task_result.get("success") or _task_result.get("status") == "ok":
+                    asyncio.create_task(_write_task_memory(
+                        self.qdrant, task_summary, task_due, task_calendar, task_description,
+                    ))
+                return _task_result
             if name == "calendar_list_events":
                 sp = specialist or {}
                 evt_calendar  = sp.get("calendar") or action.get("calendar", "personal")
@@ -5198,12 +5385,20 @@ class ExecutionEngine:
 
             # ── notes_create ───────────────────────────────────────────────
             if name == "notes_create":
+                _nc_title    = sp.get("title")    or action.get("title", "")
+                _nc_content  = sp.get("content")  or action.get("content", "")
+                _nc_category = sp.get("category") or action.get("category", "")
                 nb = await self.nanobot.run(_skill_nc, "notes_create", {
-                    "title":    sp.get("title")    or action.get("title", ""),
-                    "content":  sp.get("content")  or action.get("content", ""),
-                    "category": sp.get("category") or action.get("category", ""),
+                    "title":    _nc_title,
+                    "content":  _nc_content,
+                    "category": _nc_category,
                 })
                 asyncio.create_task(self._clear_item_index("note"))
+                _nc_result = nb.get("result") if nb.get("result") is not None else nb
+                _nc_note_id = (_nc_result.get("id") or _nc_result.get("note_id")) if isinstance(_nc_result, dict) else None
+                asyncio.create_task(_write_note_memory(
+                    self.qdrant, _nc_title, _nc_category, _nc_content, _nc_note_id,
+                ))
                 return nb
 
             # ── notes_update ───────────────────────────────────────────────
