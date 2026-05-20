@@ -99,6 +99,7 @@ INTENT_ACTION_MAP = {
     # Research agent intents
     "query":              {"domain": "ollama", "operation": "query"},
     "research":           {"domain": "ollama", "operation": "query"},
+    "ollama_model_status": {"domain": "ollama", "operation": "model_status"},
     "web_search":         {"domain": "browser", "operation": "search", "name": "browser_search"},
     "fetch_url":          {"domain": "browser", "operation": "fetch",  "name": "browser_fetch"},
     "research_gather":    {"domain": "research", "operation": "gather"},
@@ -237,7 +238,7 @@ INTENT_TIER_MAP = {
     "inspect_container": "LOW", "get_compose": "LOW", "read_host_file": "LOW",
     "get_hardware": "LOW", "list_processes": "LOW",
     "apt_check": "LOW", "systemctl_status": "LOW", "journalctl": "LOW",
-    "kernel_info": "LOW", "disk_usage": "LOW", "memory_usage": "LOW",
+    "kernel_info": "LOW", "disk_usage": "LOW", "memory_usage": "LOW", "ollama_model_status": "LOW",
     "docker_build": "HIGH", "docker_prune": "HIGH",
     "list_containers": "LOW", "get_logs": "LOW", "get_stats": "LOW",
     "docker_networks": "LOW", "docker_volumes": "LOW", "docker_images": "LOW", "docker_disk": "LOW",
@@ -1145,6 +1146,40 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Host memory usage — deterministic pre-classifier",
         }
 
+    # ── Memory write — explicit store commands ("remember that/this", "don't forget", etc.) ──
+    # Must be BEFORE the conversational guard — the guard fires on messages with no system
+    # signals (e.g. "remember that I want to buy a GPU") and prevents _memory_re from running.
+    import re as _re_early_mem
+    _early_mem_m = _re_early_mem.search(
+        r"\b(remember\s+(that|this)|don'?t\s+forget|note\s+(that|this)|memoris[e]?|memoriz[e]?)",
+        u,
+        _re_early_mem.IGNORECASE,
+    )
+    _early_mem_interrogative = _re_early_mem.match(
+        r"^(is|are|what|do|does|should|would|can|could|anything|is there|are there)\b", u
+    )
+    if _early_mem_m and not _early_mem_interrogative:
+        return {
+            "delegate_to": "research_agent", "intent": "remember_fact",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Memory write — deterministic pre-classifier (pre-guard)",
+        }
+
+    # ── Ollama model / self-status queries ─────────────────────────────────
+    _model_kw = (
+        "what llm", "which llm", "what model", "which model", "what ai model",
+        "what ollama", "ollama model", "loaded model", "running model", "model running",
+        "current model", "what are you running", "model are you using",
+        "model do you use", "what language model", "primary model",
+        "inference model", "what version of", "what version are you",
+    )
+    if any(kw in u for kw in _model_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "ollama_model_status",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Ollama model status — deterministic pre-classifier",
+        }
+
     # ── Conversational/personal guard ──────────────────────────────────────
     # If no system-domain signal is present, route to query immediately.
     # Prevents personal/lifestyle statements (buying shirts, weekend plans, etc.)
@@ -1675,7 +1710,14 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                   "what services", "which services", "what's running", "whats running")
     _docker_action_kw = ("restart", "stop", "start", "kill", "remove", "delete", "update",
                          "rebuild", "redeploy", "logs", "log")
-    docker_context = any(w in u for w in _docker_kw) or (_is_pronoun_ref and prior_domain == "docker")
+    # Exclude memory/remember context from pronoun-ref docker routing — "did you remember that?"
+    # and "did you get that last memory?" contain "that" which _is_pronoun_ref catches, but they
+    # are clearly NOT about containers even when prior_domain is docker.
+    _mem_context_kw = ("remember", "memory", "forget", "recall", "memoris", "memoriz", "store that")
+    _is_mem_context = any(w in u for w in _mem_context_kw)
+    docker_context = any(w in u for w in _docker_kw) or (
+        _is_pronoun_ref and prior_domain == "docker" and not _is_mem_context
+    )
     if docker_context and not any(w in u for w in _docker_action_kw):
         return {
             "delegate_to": "devops_agent", "intent": "list_containers",
@@ -3887,7 +3929,7 @@ class ExecutionEngine:
         _DIAGNOSTIC_INTENTS = frozenset({
             "list_containers", "get_logs", "get_stats", "get_hardware", "list_processes",
             "read_host_file", "get_compose", "inspect_container", "systemctl_status",
-            "journalctl", "apt_check", "kernel_info", "disk_usage", "memory_usage", "github_read",
+            "journalctl", "apt_check", "kernel_info", "disk_usage", "memory_usage", "ollama_model_status", "github_read",
             "docker_networks", "docker_volumes", "docker_images", "docker_disk",
             "list_files", "read_file", "navigate", "search_files",
             "list_files_recursive", "read_files_recursive",
@@ -6135,6 +6177,23 @@ class ExecutionEngine:
             return {"status": "error", "error": f"Unhandled mail operation: op={op!r} name={name!r}"}
 
         if domain == "ollama":
+            if operation == "model_status":
+                from config import cfg as _cfg_ms
+                _configured = _cfg_ms.models.primary_inference_model
+                _running = await self.cog.ollama.running_models()
+                _installed = await self.cog.ollama.list_local_models()
+                _run_summary = [
+                    {"name": m.get("name"), "size_vram_mb": round(m.get("size_vram", 0) / 1_048_576, 1)}
+                    for m in _running
+                ] if _running else []
+                _installed_names = [m.get("name") for m in _installed] if _installed else []
+                return {
+                    "status": "ok",
+                    "configured_model": _configured,
+                    "currently_loaded": _run_summary,
+                    "installed_models": _installed_names,
+                    "note": "Use 'get hardware' for GPU VRAM and temperature stats.",
+                }
             if not prompt:
                 return {"error": "prompt required"}
             # Wrap with Rex context so the model doesn't revert to its training persona.

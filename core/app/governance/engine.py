@@ -76,6 +76,8 @@ class GovernanceEngine:
         elif domain == 'ollama':
             if operation == 'query' and rules.get('ollama_query', False):
                 return rules
+            elif operation == 'model_status' and rules.get('ollama_query', False):
+                return rules
         elif domain == 'memory':
             if operation in ('read', 'write', 'search', 'store') and rules.get('memory_write', False):
                 return rules

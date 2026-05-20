@@ -52,6 +52,28 @@ class OllamaAdapter:
             data["response"] = _strip_think(raw)
         return data
 
+    async def running_models(self) -> list[dict]:
+        """Query /api/ps — returns list of currently loaded models with VRAM usage."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get("http://ollama:11434/api/ps")
+                r.raise_for_status()
+                return r.json().get("models", [])
+        except Exception as exc:
+            _log.warning("ollama running_models failed: %s", exc)
+            return []
+
+    async def list_local_models(self) -> list[dict]:
+        """Query /api/tags — returns all locally installed models."""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get("http://ollama:11434/api/tags")
+                r.raise_for_status()
+                return r.json().get("models", [])
+        except Exception as exc:
+            _log.warning("ollama list_local_models failed: %s", exc)
+            return []
+
     async def chat(self, messages: list[dict], model: str = None, fmt: str = None,
                    capture_thinking: bool = False) -> dict:
         """Call /api/chat with a messages array (system/user/assistant roles).
