@@ -166,9 +166,25 @@ class GovernanceEngine:
             # News harness — parallel RSS + Grok + browser fetch, synthesised brief; LOW tier
             if operation == 'brief' and rules.get('browser_search', False):
                 return rules
+        elif domain == 'research':
+            # Research harness — gather (browser+Grok+finance), save (Nextcloud Notes), clear
+            if operation == 'gather' and rules.get('browser_search', False):
+                return rules
+            elif operation == 'save' and rules.get('webdav_write', False):
+                return rules
+            elif operation == 'clear' and rules.get('memory_write', False):
+                return rules
         elif domain == 'monitoring':
             # SI-Harness operations — observe/baseline/proposals are read-only, write to memory
             if operation in ('observe', 'proposals', 'baseline') and rules.get('memory_write', False):
+                return rules
+        elif domain == 'learning':
+            # Learning harness — queue_url writes a .url shortcut to Nextcloud /downloads/
+            if operation == 'queue_url' and rules.get('memory_write', False):
+                return rules
+        elif domain == 'memory_synthesise':
+            # Nightly associative synthesis — reads semantic, writes associative collection
+            if operation == 'synthesise' and rules.get('memory_write', False):
                 return rules
         elif domain == 'wallet_watchlist':
             # Wallet watchlist management — add/list/remove/check watched addresses
@@ -177,6 +193,12 @@ class GovernanceEngine:
             elif operation == 'add' and rules.get('memory_write', False):
                 return rules
             elif operation == 'remove' and rules.get('file_write', False):
+                return rules
+        elif domain == 'portfolio_analysis':
+            # Portfolio analysis harness — gather (browser+Grok+finance) and save (Nextcloud Notes)
+            if operation in ('gather', 'clear') and rules.get('browser_search', False):
+                return rules
+            elif operation == 'save' and rules.get('webdav_write', False):
                 return rules
 
         raise ValueError(f"Action {action} not allowed under tier {tier}")

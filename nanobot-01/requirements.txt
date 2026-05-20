@@ -13,6 +13,7 @@ caldav              # CalDAV protocol (calendar skills)
 webdav4             # WebDAV protocol (file skills)
 python-dateutil     # Date/time parsing
 PyYAML              # YAML parsing
+pypdf               # PDF text extraction (pypdf bespoke skill)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Future / planned (add when skills require)

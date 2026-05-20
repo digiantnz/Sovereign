@@ -207,7 +207,7 @@ app.post('/exec/:commandName', async (req, res) => {
           args.push(String(validated[pname]));
         }
       }
-      result = await spawnRun(cmd.binary, args);
+      result = await spawnRun(cmd.binary, args, cmd.timeout_ms || 15000);
     }
 
     return res.json({
@@ -290,11 +290,11 @@ app.all('/:methodPath(*)', async (req, res) => {
       const r = await spawnRun('/usr/bin/nsenter', [
         '-t', '1', '-m', '-p', '--',
         '/bin/su', '-s', '/bin/sh', 'matt', '-c',
-        'nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu --format=csv,noheader,nounits',
+        'nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu,power.draw --format=csv,noheader,nounits',
       ], 10000);
       const line = (r.stdout || '').trim().split('\n').find(l => l.trim());
       if (!line) return res.json({ error: r.stderr || 'no nvidia-smi output' });
-      const [name, mem_used, mem_total, gpu_util, mem_util, temp] = line.split(',').map(s => s.trim());
+      const [name, mem_used, mem_total, gpu_util, mem_util, temp, power] = line.split(',').map(s => s.trim());
       return res.json({
         gpu_name:        name,
         vram_used_mb:    parseInt(mem_used, 10)  || 0,
@@ -302,6 +302,7 @@ app.all('/:methodPath(*)', async (req, res) => {
         gpu_utilization: parseInt(gpu_util, 10)  || 0,
         mem_utilization: parseInt(mem_util, 10)  || 0,
         temperature_c:   parseInt(temp, 10)      || 0,
+        power_w:         parseFloat(power)       || 0,
       });
     }
 
@@ -408,13 +409,13 @@ app.all('/:methodPath(*)', async (req, res) => {
         const r = await spawnRun('/usr/bin/nsenter', [
           '-t', '1', '-m', '-p', '--',
           '/bin/su', '-s', '/bin/sh', 'matt', '-c',
-          'nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits',
+          'nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits',
         ], 10000);
         const line = (r.stdout || '').trim().split('\n').find(l => l.trim());
         if (line) {
-          const [name, memUsed, memTotal, gpuUtil, temp] = line.split(',').map(s => s.trim());
+          const [name, memUsed, memTotal, gpuUtil, temp, power] = line.split(',').map(s => s.trim());
           gpu = { gpu_name: name, vram_used_mb: parseInt(memUsed)||0, vram_total_mb: parseInt(memTotal)||0,
-                  gpu_util_pct: parseInt(gpuUtil)||0, temp_c: parseInt(temp)||0 };
+                  gpu_util_pct: parseInt(gpuUtil)||0, temp_c: parseInt(temp)||0, power_w: parseFloat(power)||0 };
         }
       } catch (e) { gpu = { error: e.message }; }
 
@@ -448,7 +449,89 @@ app.all('/:methodPath(*)', async (req, res) => {
         cpu = { model, cores: blocks.length, mhz };
       } catch (e) { cpu = { error: e.message }; }
 
-      return res.json({ status: 'ok', gpu, disk, memory, cpu });
+      let kernel = 'unknown';
+      try { kernel = fs.readFileSync('/proc/version', 'utf8').trim().split(' ').slice(0, 3).join(' '); }
+      catch (e) {}
+      return res.json({ status: 'ok', gpu, disk, memory, cpu, kernel });
+    }
+
+    // GET /system/networks — list all Docker networks with subnets + attached containers
+    if (req.method === 'GET' && fullPath === '/system/networks') {
+      const networks = await docker.listNetworks();
+      const detail = networks.map(n => ({
+        id:         n.Id.substring(0, 12),
+        name:       n.Name,
+        driver:     n.Driver,
+        scope:      n.Scope,
+        internal:   n.Internal || false,
+        subnets:    (n.IPAM?.Config || []).map(c => c.Subnet).filter(Boolean),
+        containers: Object.values(n.Containers || {}).map(c => ({ name: c.Name, ip: c.IPv4Address })),
+      }));
+      return res.json({ status: 'ok', count: detail.length, networks: detail });
+    }
+
+    // GET /system/network/:name — inspect a single Docker network
+    if (req.method === 'GET' && fullPath.match(/^\/system\/network\/[^/]+$/)) {
+      const nname = fullPath.replace('/system/network/', '');
+      const info  = await docker.getNetwork(nname).inspect();
+      return res.json({
+        status: 'ok', name: nname,
+        id:         info.Id.substring(0, 12),
+        driver:     info.Driver,
+        scope:      info.Scope,
+        internal:   info.Internal || false,
+        subnets:    (info.IPAM?.Config || []).map(c => c.Subnet).filter(Boolean),
+        containers: Object.entries(info.Containers || {}).map(([id, c]) => ({
+          id: id.substring(0, 12), name: c.Name, ip: c.IPv4Address,
+        })),
+      });
+    }
+
+    // GET /system/volumes — list all Docker volumes
+    if (req.method === 'GET' && fullPath === '/system/volumes') {
+      const { Volumes = [] } = await docker.listVolumes();
+      const detail = Volumes.map(v => ({
+        name:       v.Name,
+        driver:     v.Driver,
+        mountpoint: v.Mountpoint,
+        scope:      v.Scope,
+        created:    v.CreatedAt,
+      }));
+      return res.json({ status: 'ok', count: detail.length, volumes: detail });
+    }
+
+    // GET /system/images — list Docker images, size-sorted
+    if (req.method === 'GET' && fullPath === '/system/images') {
+      const images = await docker.listImages({ all: false });
+      const detail = images
+        .map(i => ({
+          id:        i.Id.replace('sha256:', '').substring(0, 12),
+          repo_tags: i.RepoTags || ['<none>:<none>'],
+          size_mb:   Math.round(i.Size / 1024 / 1024),
+          created:   new Date(i.Created * 1000).toISOString(),
+        }))
+        .sort((a, b) => b.size_mb - a.size_mb);
+      return res.json({ status: 'ok', count: detail.length, images: detail });
+    }
+
+    // GET /system/df — Docker disk usage: images, containers, volumes + reclaimable totals
+    if (req.method === 'GET' && fullPath === '/system/df') {
+      const df = await docker.df();
+      const mb  = bytes => Math.round((bytes || 0) / 1024 / 1024);
+      const imgs = df.Images     || [];
+      const ctns = df.Containers || [];
+      const vols = df.Volumes    || [];
+      return res.json({
+        status: 'ok',
+        summary: {
+          images:     { count: imgs.length, total_mb: mb(imgs.reduce((s,i) => s + i.Size, 0)),       reclaimable_mb: mb(imgs.filter(i => !i.Containers).reduce((s,i) => s + i.Size, 0))       },
+          containers: { count: ctns.length, total_mb: mb(ctns.reduce((s,c) => s + c.SizeRootFs, 0)), reclaimable_mb: mb(ctns.filter(c => c.State !== 'running').reduce((s,c) => s + c.SizeRootFs, 0)) },
+          volumes:    { count: vols.length, total_mb: mb(vols.reduce((s,v) => s + (v.UsageData?.Size||0), 0)), reclaimable_mb: mb(vols.filter(v => !(v.UsageData?.RefCount)).reduce((s,v) => s + (v.UsageData?.Size||0), 0)) },
+        },
+        images:     imgs.map(i => ({ id: i.Id.replace('sha256:','').substring(0,12), repo_tags: i.RepoTags||[], size_mb: mb(i.Size), in_use: !!i.Containers })).sort((a,b) => b.size_mb - a.size_mb),
+        containers: ctns.map(c => ({ id: c.Id.substring(0,12), name: (c.Names||[])[0]?.replace('/',''), state: c.State, size_mb: mb(c.SizeRootFs) })),
+        volumes:    vols.map(v => ({ name: v.Name, size_mb: mb(v.UsageData?.Size||0), in_use: (v.UsageData?.RefCount||0) > 0 })),
+      });
     }
 
     // GET /system/processes — ps aux (exec in ollama for broader process visibility)
@@ -465,6 +548,19 @@ app.all('/:methodPath(*)', async (req, res) => {
         } catch (e2) { processes = `error: ${e2.message}`; }
       }
       return res.json({ status: 'ok', processes });
+    }
+
+    // POST /images/prune — remove dangling images (untagged / unreferenced build layers)
+    if (req.method === 'POST' && fullPath === '/images/prune') {
+      const result = await docker.pruneImages({});
+      const mb = bytes => Math.round((bytes || 0) / 1024 / 1024);
+      const deleted = (result.ImagesDeleted || []).map(d => d.Untagged || d.Deleted || '').filter(Boolean);
+      return res.json({
+        status: 'ok',
+        images_deleted: deleted.length,
+        space_reclaimed_mb: mb(result.SpaceReclaimed || 0),
+        deleted,
+      });
     }
 
     return res.status(404).send('Endpoint not implemented');

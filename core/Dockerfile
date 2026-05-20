@@ -20,6 +20,10 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # sovereign user uid=999 matches existing RAID audit/security file ownership.
 
 RUN useradd -r -u 999 -s /bin/false sovereign
+
+# Mountpoint for RAID portfolio ledger (populated by Director)
+RUN mkdir -p /app/portfolio && chown sovereign:sovereign /app/portfolio
+
 USER sovereign
 
 EXPOSE 8000

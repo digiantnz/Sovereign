@@ -47,7 +47,7 @@ async def _notify_telegram(message: str) -> None:
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             )
     except Exception as e:
         logger.warning("Scheduler: Telegram notification failed: %s", e)
@@ -66,7 +66,7 @@ def evaluate_metrics(metrics: dict) -> list[dict]:
             anomalies.append({
                 "severity": "warning",
                 "component": "gpu",
-                "detail": f"VRAM used {gpu['vram_used_mb']} MB exceeds 7500 MB threshold",
+                "detail": f"VRAM used {gpu['vram_used_mb']} MB exceeds {THRESHOLDS['vram_used_mb_warning']} MB threshold",
             })
 
     # Containers
@@ -158,10 +158,10 @@ async def run_self_check(app_state) -> list[dict]:
 
     if anomalies:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        lines = [f"⚠️ *Sovereign self-check — {ts}*", ""]
+        lines = [f"⚠️ <b>Sovereign self-check — {ts}</b>", ""]
         for a in anomalies:
             icon = "🔴" if a["severity"] == "critical" else "🟡"
-            lines.append(f"{icon} *{a['component']}*: {a['detail']}")
+            lines.append(f"{icon} <b>{a['component']}</b>: {a['detail']}")
         lines.append("\nAll anomalies written to episodic memory.")
         await _notify_telegram("\n".join(lines))
         logger.warning("Scheduler: %d anomalies detected", len(anomalies))

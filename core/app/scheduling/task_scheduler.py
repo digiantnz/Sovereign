@@ -314,6 +314,26 @@ class TaskScheduler:
         if not next_due and schedule.get("type") != "one_time":
             return {"status": "error",
                     "error": "Cannot compute next_due from schedule — check cron/interval format"}
+        if not next_due:
+            # one_time schedule but compute_next_due returned None — time is in the past or unparseable
+            return {
+                "status": "error",
+                "error": "Could not determine a valid future time for this reminder.",
+                "message": (
+                    "I couldn't set that reminder — I wasn't able to determine a valid future time. "
+                    "Can you clarify?"
+                ),
+            }
+
+        # Fix B: derive task_status from schedule type; caller may override via task_def["status"]
+        _explicit_status = task_def.get("status")
+        if _explicit_status:
+            task_status = _explicit_status
+        elif schedule.get("type") == "one_time":
+            task_status = "active"
+        else:
+            # cron / interval: require Director approval before running
+            task_status = "pending_approval"
 
         now_iso = datetime.now(timezone.utc).isoformat()
         capabilities_needed = list({
@@ -337,7 +357,7 @@ class TaskScheduler:
                     "title": title,
                     "schedule": schedule,
                     "next_due": next_due,
-                    "status": "active",
+                    "status": task_status,
                     "notify_when": notify_when,
                     "stop_condition": stop_condition,
                     "capabilities": capabilities_needed,
@@ -382,9 +402,9 @@ class TaskScheduler:
                 "warning": f"Scheduling metadata saved but procedure not persisted: {e}",
             }
 
-        logger.info("TaskScheduler: stored task %s '%s' next_due=%s", task_id, title, next_due)
-        return {
-            "status": "ok",
+        logger.info("TaskScheduler: stored task %s '%s' next_due=%s status=%s",
+                    task_id, title, next_due, task_status)
+        _result = {
             "task_id": task_id,
             "title": title,
             "next_due": next_due,
@@ -393,6 +413,15 @@ class TaskScheduler:
             "notify_when": notify_when,
             "capabilities": capabilities_needed,
         }
+        if task_status == "pending_approval":
+            _result["status"] = "pending_approval"
+            _result["message"] = (
+                f"Recurring task '{title}' created — awaiting your approval before it activates. "
+                f"First run scheduled for {next_due} (UTC). Confirm to activate."
+            )
+        else:
+            _result["status"] = "ok"
+        return _result
 
     # ── Nightly dev-harness seed ──────────────────────────────────────────
 
@@ -483,6 +512,7 @@ class TaskScheduler:
             # harness sends its own Telegram on block/escalate; scheduler must not double-notify
             "notify_when": "never",
             "stop_condition": None,
+            "status": "active",   # programmatic seed — exempt from NL recurring-approval gate
         }
 
         result = await self.store_task(task_def, human_confirmed=True)
@@ -568,6 +598,7 @@ class TaskScheduler:
             ],
             "notify_when": "always",
             "stop_condition": None,
+            "status": "active",   # programmatic seed — exempt from NL recurring-approval gate
         }
 
         result = await self.store_task(task_def, human_confirmed=True)
@@ -708,23 +739,63 @@ class TaskScheduler:
 
     # ── Task status update ────────────────────────────────────────────────
 
+    async def find_task_by_title(self, title: str) -> dict | None:
+        """Find a scheduled_task in PROSPECTIVE by title (case-insensitive substring match).
+
+        Returns the payload dict of the first match, or None if not found.
+        """
+        try:
+            items, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                limit=_cfg.limits.prospective_scroll_max,
+                with_payload=True,
+                with_vectors=False,
+            )
+            title_lower = title.lower()
+            for item in items:
+                payload = dict(item.payload or {})
+                if payload.get("type") != "scheduled_task":
+                    continue
+                item_title = (payload.get("title") or "").lower()
+                if title_lower in item_title or item_title in title_lower:
+                    payload["_point_id"] = str(item.id)
+                    return payload
+        except Exception as e:
+            logger.warning("TaskScheduler: find_task_by_title failed: %s", e)
+        return None
+
     async def update_task_status(self, task_id: str, new_status: str) -> dict:
         """Set status on a scheduled_task in PROSPECTIVE.
 
-        new_status: "active" | "paused" | "cancelled"
-        Returns {status, task_id, new_status} or {status: "error"}.
+        task_id may be a UUID (payload.task_id) or a task title — title lookup
+        is attempted as a fallback so callers do not need to know the UUID.
+
+        new_status: "active" | "paused" | "cancelled" | "completed"
+        Returns {status, task_id, title, new_status} or {status: "error"}.
         """
+        # First try UUID-based lookup
         point_id = await self._find_point_id(PROSPECTIVE, task_id)
+        resolved_title = task_id
+
+        # Fallback: title-based lookup (specialist may pass title instead of UUID)
         if not point_id:
-            return {"status": "error", "error": f"Task {task_id} not found in PROSPECTIVE"}
+            found = await self.find_task_by_title(task_id)
+            if found:
+                point_id = found.get("_point_id")
+                task_id  = found.get("task_id", task_id)
+                resolved_title = found.get("title", task_id)
+
+        if not point_id:
+            return {"status": "error",
+                    "error": f"Task not found: '{task_id}'. Use list_tasks to see available tasks."}
         try:
             await self.qdrant.archive_client.set_payload(
                 collection_name=PROSPECTIVE,
                 payload={"status": new_status},
                 points=[point_id],
             )
-            logger.info("TaskScheduler: task %s set to %s", task_id, new_status)
-            return {"status": "ok", "task_id": task_id, "new_status": new_status}
+            logger.info("TaskScheduler: task %s ('%s') set to %s", task_id, resolved_title, new_status)
+            return {"status": "ok", "task_id": task_id, "title": resolved_title, "new_status": new_status}
         except Exception as e:
             return {"status": "error", "error": f"Failed to update status: {e}"}
 
@@ -791,11 +862,41 @@ class TaskScheduler:
             return []
 
         due = await self._get_due_tasks()
+        now = datetime.now(timezone.utc)
         ran = []
         for prospective in due:
             task_id = prospective.get("task_id")
             if not task_id or task_id in self._running:
                 continue
+
+            # Skip stale catch-up runs: if next_due is more than 4 hours in the past,
+            # advance to the next scheduled time without running. Prevents morning briefings
+            # and other time-sensitive tasks from firing unexpectedly after restarts.
+            schedule = prospective.get("schedule", {})
+            if schedule.get("type") != "one_time":
+                next_due_str = prospective.get("next_due", "")
+                if next_due_str:
+                    try:
+                        from dateutil import parser as _dtparser
+                        next_due_dt = _dtparser.parse(next_due_str)
+                        if next_due_dt.tzinfo is None:
+                            next_due_dt = next_due_dt.replace(tzinfo=timezone.utc)
+                        late_s = (now - next_due_dt).total_seconds()
+                        if late_s > _cfg.timeouts.task_catch_up_grace_s:
+                            next_due_adv = compute_next_due(schedule, after=now)
+                            logger.info(
+                                "TaskScheduler: task %s '%s' is %.0f min late — skipping catch-up, "
+                                "advancing next_due to %s",
+                                task_id, prospective.get("title"), late_s / 60, next_due_adv,
+                            )
+                            await self._update_prospective_after_run(
+                                task_id, next_due_adv, now.isoformat(),
+                                prospective.get("run_count", 0),
+                            )
+                            continue
+                    except Exception:
+                        pass
+
             procedure = await self._get_procedure(task_id)
             if not procedure:
                 logger.warning("TaskScheduler: no procedure found for task %s — skipping", task_id)
@@ -825,6 +926,21 @@ class TaskScheduler:
         schedule   = prospective.get("schedule", {})
 
         logger.info("TaskScheduler: running task %s '%s' (%d steps)", task_id, title, len(steps))
+
+        # One-time reminders fire directly — no steps, no Ollama call
+        if schedule.get("type") == "one_time":
+            reminder_msg = f"⏰ Reminder: {title}"
+            await _notify_telegram(reminder_msg)
+            await self._write_episodic(task_id, title, "positive", reminder_msg, 0)
+            point_id = await self._find_point_id(PROSPECTIVE, task_id, "scheduled_task")
+            if point_id:
+                now = datetime.now(timezone.utc)
+                await self.qdrant.archive_client.set_payload(
+                    collection_name=PROSPECTIVE,
+                    payload={"status": "completed", "last_run": now.isoformat(), "run_count": 1},
+                    points=[point_id],
+                )
+            return {"outcome": "positive", "steps_run": 0, "notified": True, "stop_triggered": False}
 
         step_results = []
         stop_triggered = False
@@ -890,7 +1006,8 @@ class TaskScheduler:
                 or res.get("messages")
                 or res.get("response")
                 or res.get("results")
-                or res.get("data")        # browser fetch: {"status":"ok","data":{"content":...}}
+                or res.get("data")        # browser fetch: legacy nested content
+                or res.get("content")     # browser fetch: flat content at top level
                 or res.get("notes")       # nextcloud notes list
                 or res.get("events")      # caldav events
                 or res.get("tasks")       # nextcloud tasks list
@@ -976,9 +1093,9 @@ class TaskScheduler:
                         lines.append(f"     {eurl}")
                 return "\n".join(lines)
 
-            # CalDAV events — show summary + start time
-            events = res.get("events", [])
-            if isinstance(events, list):
+            # CalDAV events — show summary + start time (only when result actually has events key)
+            if "events" in res:
+                events = res.get("events") or []
                 if not events:
                     return "no events"
                 lines = [f"{len(events)} events"]
@@ -998,10 +1115,10 @@ class TaskScheduler:
                     lines.append(f"  • {tsummary}" + (f" (due {tdue})" if tdue else ""))
                 return "\n".join(lines)
 
-            # Browser fetch content
-            data_content = (res.get("data") or {}).get("content", "")
-            if data_content:
-                return data_content[:600]
+            # Browser fetch content — result is flat (content at top level, not nested under data)
+            fetch_content = res.get("content", "") or (res.get("data") or {}).get("content", "")
+            if fetch_content:
+                return fetch_content[:800]
 
             # Plain response text
             response = res.get("response", "")
@@ -1042,7 +1159,7 @@ class TaskScheduler:
             await self._update_prospective_after_run(task_id, next_due, now.isoformat(), current_run_count)
         elif schedule.get("type") == "one_time" or stop_triggered:
             # Mark completed
-            point_id = await self._find_point_id(PROSPECTIVE, task_id)
+            point_id = await self._find_point_id(PROSPECTIVE, task_id, "scheduled_task")
             if point_id:
                 new_status = "completed" if not stop_triggered else "completed"
                 await self.qdrant.archive_client.set_payload(
@@ -1130,14 +1247,20 @@ class TaskScheduler:
                 return payload
         return None
 
-    async def _find_point_id(self, collection: str, task_id: str) -> str | None:
-        """Find the Qdrant point ID for a given task_id using a payload filter."""
+    async def _find_point_id(self, collection: str, task_id: str,
+                             entry_type: str | None = None) -> str | None:
+        """Find the Qdrant point ID for a given task_id using a payload filter.
+
+        entry_type filters by payload 'type' field to avoid returning coincidentally-matching
+        entries of a different type (e.g. improvement_proposal with same task_id).
+        """
+        must = [FieldCondition(key="task_id", match=MatchValue(value=task_id))]
+        if entry_type:
+            must.append(FieldCondition(key="type", match=MatchValue(value=entry_type)))
         try:
             items, _ = await self.qdrant.archive_client.scroll(
                 collection_name=collection,
-                scroll_filter=Filter(must=[
-                    FieldCondition(key="task_id", match=MatchValue(value=task_id)),
-                ]),
+                scroll_filter=Filter(must=must),
                 limit=5,
                 with_payload=False,
                 with_vectors=False,
@@ -1153,7 +1276,7 @@ class TaskScheduler:
                                              last_run: str,
                                              run_count: int = 0) -> None:
         """Update next_due, last_run, run_count in the PROSPECTIVE entry."""
-        point_id = await self._find_point_id(PROSPECTIVE, task_id)
+        point_id = await self._find_point_id(PROSPECTIVE, task_id, "scheduled_task")
         if not point_id:
             return
         updates = {"last_run": last_run, "run_count": run_count + 1}

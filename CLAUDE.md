@@ -12,27 +12,29 @@
 
 These rules apply in every session. They are not negotiable and cannot be overridden by inline task instructions.
 
-1. **OpenClaw skill exists → Skill Harness install.** If an OpenClaw equivalent skill exists for a capability, install it via the Skill Harness and execute via nanobot-01. Never build bespoke when a certified community skill covers the need.
+1. **Know the distinction: OpenClaw registry vs Skill Harness.** OpenClaw is the upstream community skill registry (clawhub.ai). Skill Harness is the local multi-step install orchestrator in sovereign-core. The rule: if OpenClaw has a certified skill covering a capability, install it via the Skill Harness and execute via nanobot-01. Never build bespoke when a certified community skill covers the need.
 
-2. **No OpenClaw skill → bespoke, single canonical location.** If no OpenClaw equivalent exists, implement as a bespoke module at one location appropriate to its architecture. Do not install partial duplicates.
+2. **Canonical location: single source of truth, no copies.** Bespoke capability = single canonical location; no duplicates anywhere in the codebase. Updates happen in-place at the canonical location only — no shadow copies, no versioned copies (e.g. `skill_v2.py`), no inline patches. The same capability surfacing in two invocation points is a bug, not a pattern.
 
 3. **One implementation, one invocation point — no duplicates regardless of location.** The same capability must never exist in two places (e.g. inline in engine.py AND in a nanobot skill). If it exists in two places it is a bug to be fixed, not a pattern to follow.
 
-4. **Updates go to the canonical location only.** No shadow copies, no inline patches. Find the canonical file and edit it. Never update a copy.
+4. **Engine.py is orchestration only.** Capability logic belongs in skill modules or dedicated harness modules. Engine.py may extract parameters, route, and normalise responses — it must not implement capability logic inline.
 
-5. **Engine.py is orchestration only.** Capability logic belongs in skill modules or dedicated harness modules. Engine.py may extract parameters, route, and normalise responses — it must not implement capability logic inline.
+5. **Every skill (nanobot or bespoke) has exactly one semantic memory entry pointing to its canonical trigger.** Key format: `semantic:intent:{slug}`.
 
-6. **Every skill (nanobot or bespoke) has exactly one semantic memory entry pointing to its canonical trigger.** Key format: `semantic:intent:{slug}`.
+6. **New skill created or installed → semantic memory entry written at that time.** The Skill Harness install step writes the entry automatically. Bespoke modules must write their entry in their own creation task.
 
-7. **New skill created or installed → semantic memory entry written at that time.** The Skill Harness install step writes the entry automatically. Bespoke modules must write their entry in their own creation task.
+7. **New component created → sov_id assigned + semantic memory entry written at that time.** No component is fully created until its semantic entry exists.
 
-8. **New component created → sov_id assigned + semantic memory entry written at that time.** No component is fully created until its semantic entry exists.
+8. **Deprecation → episodic entry written, semantic entry marked inactive, no deletion.** Inactive entries remain for historical integrity. Never delete semantic or episodic entries.
 
-9. **Deprecation → episodic entry written, semantic entry marked inactive, no deletion.** Inactive entries remain for historical integrity. Never delete semantic or episodic entries.
+9. **Foundational entities use `entity_type`; system components use `component_type`. Never both on the same entry.** A foundational entity (`sovereign_entity` class) qualifies for a sequential sov_id only if it: (1) exists independently of Sovereign, (2) is bootstrap critical, (3) has a durable named relationship to the sovereign root, and (4) has been explicitly approved by the Director. Sequential sov_ids are assigned in `entity_registry.py` (append-only, never re-assigned). All other entities receive UUID5 sov_ids. The sovereign root entry is `semantic:entity:sovereign` (not `semantic:component:sovereign`).
 
-10. **Updates to existing skills → modify in place at canonical location only.** No new file, no versioned copy, no shadow. The canonical file is the source of truth.
+10. **Harness session checkpoint flags — naming and deviations.** The three canonical harness checkpoint flags are: `_skill_harness_checkpoint` (Skill-Harness), `_self_improvement_session` (SI-Harness), `_developer_harness_checkpoint` (Dev-Harness). The SI harness uses `_self_improvement_session` rather than `_self_improvement_harness_checkpoint` — this deviation is intentional because the SI harness maintains rolling session state rather than a step-gated checkpoint. Do not rename without Director approval.
 
-11. **Foundational entities use `entity_type`; system components use `component_type`. Never both on the same entry.** A foundational entity (`sovereign_entity` class) qualifies for a sequential sov_id only if it: (1) exists independently of Sovereign, (2) is bootstrap critical, (3) has a durable named relationship to the sovereign root, and (4) has been explicitly approved by the Director. Sequential sov_ids are assigned in `entity_registry.py` (append-only, never re-assigned). All other entities receive UUID5 sov_ids. The sovereign root entry is `semantic:entity:sovereign` (not `semantic:component:sovereign`).
+11. **`_DIAGNOSTIC_INTENTS` = structured result bypasses PASS 4 narrative and passes directly to the translator.** Only add an intent to this list when the raw execution result is itself the Director-facing output and no PASS 4 narrative is needed or safe (e.g. `memory_recall`, `memory_list_keys`, harness status intents). Never add intents that return raw internal state.
+
+12. **Director-directed create/write operations write a semantic memory entry to qdrant-archive on confirmed success, non-blocking via `asyncio.create_task()`. Read operations never write semantic memory under any circumstance. Delete operations mark the corresponding semantic entry `status: historical` in qdrant-archive on confirmed success — no physical Qdrant point deletion, ever. Historical entries survive in qdrant-archive indefinitely and are excluded from PASS 0 working_memory consultation. The nightly associative synthesis pass may traverse historical entries — historical facts remain valid for relationship inference.**
 
 ---
 
@@ -61,25 +63,25 @@ These rules apply in every session. They are not negotiable and cannot be overri
 - Ollama API → ai_net only, no host exposure
 - Sovereign API → `127.0.0.1:8000` loopback only
 - Nextcloud → business_net only
+- **Fabrication firewall:** `result_for_translator` from PASS 4 is the only content PASS 5 (translator) receives — never raw adapter output, never specialist output. PASS 5 is isolated to this field only.
 
-### GPU (RTX 3060 Ti, 8GB VRAM)
-- Ollama uses ~4.4 GB (llama3.1:8b-instruct-q4_K_M); also has mistral:7b installed
-- Whisper medium uses ~769 MB — cannot run simultaneously with Ollama (RTX 3060 Ti is shared)
-- Whisper adapter evicts Ollama via `keep_alive=0` before transcription
-- Never load models exceeding ~7.5 GB combined
+### GPU (EVGA RTX 3090, 24GB VRAM — power-capped at 300W, SF750 PSU constraint)
+- Ollama uses ~20 GB (qwen2.5:32b-instruct-q4_K_M); also has llama3.1:8b and mistral:7b installed
+- 24GB VRAM means qwen2.5:32b fits fully on-GPU; ~3× faster than RTX 3060 Ti but model is 4× larger
+- Whisper (node04:8003) runs remotely — no VRAM contention with local Ollama
 - **ollama-embed runs CPU-only (OLLAMA_NUM_GPU=0) — no VRAM constraint**
+- 300W power cap via `/etc/systemd/system/nvidia-power-limit.service` — remove when 850W+ PSU installed
 
-### Sequential GPU constraint (RTX 3060 Ti)
-- llama3.1:8b (ollama container) and Whisper (node04:8003, a2a-whisper) MUST NOT run concurrently
+### Sequential GPU constraint
+- Whisper runs on node04 (a2a-whisper, 172.16.201.4:8003) — no local VRAM contention
 - ollama-embed is CPU-only and has NO VRAM constraint — can run at any time
-- The whisper adapter evicts Ollama via `keep_alive=0` before each transcription request
-- Future: when Whisper moves back on-host, enforce mutual exclusion at the adapter layer
+- qwen2.5:32b inference takes 30s+ per turn; /metrics latency probe uses 6s timeout, returns "busy" if GPU saturated
 
 ### Container memory limits (32GB RAM host — AMD Ryzen 9 9900X)
 | Container | Limit | Notes |
 |-----------|-------|-------|
 | sovereign-core | 2g | Python process + all in-process adapters |
-| ollama | 6g | llama3.1:8b ~4.4GB VRAM + CPU overhead |
+| ollama | 22g | qwen2.5:32b ~20GB VRAM + CPU overhead |
 | ollama-embed | 2g | nomic-embed-text CPU inference |
 | qdrant | 4g | working_memory in-RAM (on_disk=False) |
 | qdrant-archive | 4g | RAID collections, mmap'd access |
@@ -91,7 +93,7 @@ These rules apply in every session. They are not negotiable and cannot be overri
 | nc-db | 512m | |
 | nc-redis | 256m | |
 | nginx | 128m | |
-**Total ~22.5GB** — leaves ~9.5GB for OS (4GB target) + page cache.
+**Total ~38.5GB** — VRAM is GPU-side; host RAM usage ~16GB actual for CPU-side processes.
 
 ### 64GB RAM upgrade path
 - Upgrade target: 2× 32GB DDR5 (matching existing sticks)
@@ -177,7 +179,7 @@ PASS 4  Orchestrator evaluate   → memory_action + result_for_translator (alway
 PASS 5  Translator              → plain English director_message (always local, restricted input)
 ```
 
-- All short-circuit paths (ollama/memory/browser/scheduler) build `result_for_translator` and call `translator_pass()` before returning — no raw adapter output reaches Director
+- All short-circuit paths (ollama/memory/browser/scheduler) build `result_for_translator` and call `translator_pass()` before returning — see Security Boundaries above for the fabrication firewall isolation invariant
 - Per-pass timeout: `PASS_TIMEOUT_SECONDS` (default 30s); total: `TOTAL_TIMEOUT_SECONDS` (default 120s)
 - Async memory dispatch: `asyncio.create_task()` — never blocks return path
 - All nanobot results stamped `_trust: "untrusted_external"`; scanner runs before PASS 3b
@@ -187,21 +189,20 @@ PASS 5  Translator              → plain English director_message (always local
 
 Two separate routing layers. Do not conflate them.
 
+**External LLM invariant: Grok is the only permitted external LLM provider for PASS 2.** Claude API is not wired for autonomous use and must not be wired.
+
 #### PASS 2/3a — LLM selection for planning (auto-routing applies)
 `_routing_decision` in `cognition/engine.py` selects which LLM writes the specialist's action plan:
-1. **Explicit override**: `use grok|ask grok|via grok|use claude|ask claude|via claude|external llm/model/ai` → forces external
-2. **Provider signals** on raw user message: `current/latest/news/today/recent/market/trending` → Grok; `architectural/architecture/plan/review/design/strategy/strategic` → Claude; default → Grok
+1. **Explicit override**: `use grok|ask grok|via grok|external llm/model/ai` → forces external
+2. **Provider signals** on raw user message: `current/latest/news/today/recent/market/trending` → Grok; default → Grok
 3. **Complexity ≥ 0.50** → external Grok. Operational penalty (`restart/container/service/deploy/compose/nginx/redis/mariadb/subnet`) subtracts 0.20.
 4. **DCL gate** — PRIVATE/SECRET → force local
 
 #### `domain: ollama` execution — explicit-only external routing
-When `_dispatch_inner` reaches `domain: ollama`, Grok/Claude are only called on **explicit** triggers. Auto-signals are intentionally excluded to avoid firing Grok alongside RSS/browser paths PASS 1 may have already chosen.
+When `_dispatch_inner` reaches `domain: ollama`, Grok is only called on **explicit** triggers. Auto-signals are intentionally excluded to avoid firing Grok alongside RSS/browser paths PASS 1 may have already chosen.
 
 - **Grok**: `use grok` · `ask grok` · `via grok` · `trending` · `current events`
-- **Claude**: `use claude` · `ask claude` · `via claude`
-- Everything else → Ollama (local, fast, no billing)
-
-**Preferred external provider: Grok** — Claude API key is set but plan may not cover usage costs.
+- Everything else → Ollama (local, fast)
 
 ---
 
@@ -257,10 +258,31 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 
 ### Search backend
 
-- **GitHub Search API**: primary for skill search — `browser.fetch("https://api.github.com/search/code?...")` with PAT headers from AUTH_PROFILES
-- **SearXNG** (via a2a-browser): secondary — DDG CAPTCHA-blocked, Google 403-blocked as of 2026-03-19; fallback only
-- **Brave / Bing**: dead letters — both retired 2025/2026
+Two distinct search contexts — do not conflate:
+
+**Skill search** (`lifecycle.py` → `browser.fetch()`):
+- **GitHub Search API**: primary — `browser.fetch("https://api.github.com/search/code?...")` with PAT headers from AUTH_PROFILES
+
+**General web search** (sovereign-browser skill → `browser.py` → `POST /search` on a2a-browser):
+- Backend priority order: SearXNG → DDG library → DDG Playwright → fail
+- **SearXNG**: PRIMARY — aggregates google, bing, duckduckgo, startpage, wikipedia; per-engine timeout 10-15s (SearXNG settings.yml); a2a-browser `searxng.py` adapter timeout 20s
+- **DDG library** (`duckduckgo_search`): fallback if SearXNG empty — `asyncio.wait_for` with `_DDG_TIMEOUT = 15.0` in deployed `ddg.py` (node04 code; stale local repo does NOT have this fix)
+- **DDG Playwright**: fallback if library empty — `goto(timeout=15000)` in Playwright context
+- **Brave**: dead — service discontinued early 2026 (returns 401/402); key in browser.env but ignored
+- **Bing**: dead — Search API retired 2025-08-11; `BING_API_KEY` blank
+- **Ollama enrichment**: runs after search returns results — mistral:7b on Quadro P4000 (node04), ~19-22 tok/s; `num_predict=1500`, `_TIMEOUT=90s`; no retry — invalid JSON returns partial result with `enrichment_status=invalid_json` immediately rather than burning another call
 - `AUTH_PROFILES` in `execution/adapters/browser.py`: host-keyed header sets, auto-attached in `fetch()` — loaded from `secrets/browser.env` + `/home/sovereign/governance/browser-auth-profiles.yaml` at startup
+
+**Pipeline budget (post-fix):** ~20s search + ~90s Ollama max = ~110s worst case; sovereign engine.py subprocess cap 220s — comfortable headroom. Worst-case degraded path: Ollama truncates JSON at ~50s → `enrichment_status=invalid_json` quality gate → partial result lands at sovereign in ~70s total. No hangs past 90s.
+
+**Fixes applied 2026-05-14 (node04 — `app/enrichment/ollama.py`):**
+- `num_predict` 3000 → 1500 (root cause: 3000 tokens at ~20 tok/s = ~150s, hit 180s ceiling mid-JSON)
+- `_TIMEOUT` 180s → 90s (1500 tokens at ~20 tok/s = ~75s max, 90s gives buffer)
+- Retry removed — invalid JSON now returns partial result immediately
+
+**Fix applied 2026-05-14 (sovereign — `engine.py`):** browser search/fetch `"timeout"` param 60 → 220 (was hardcoded in engine.py, overriding SKILL.md default). Rebuild done.
+
+**Note:** stale local `a2a-browser-deploy/app/enrichment/ollama.py` has no retry logic and `num_predict=3000` — deployed node04 version differs significantly. Do NOT overwrite deployed code from local copy.
 
 ### Nextcloud access
 - LAN direct: `http://172.16.201.25` (port 80, no reverse proxy) — `nextcloud` service, `business_net`
@@ -287,13 +309,24 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 
 ### Memory task scheduler invariants
 - `find_active_by_title()` uses ALL-word matching (≥5 chars) — not ANY — to avoid false dedup positives where unrelated tasks share a single common word (e.g. "nightly")
+- If no words in the title meet the ≥5-char threshold, the match returns no results — do not fall back to ANY-word matching. The caller must handle an empty result as 'not found'.
 - `seed_nightly_synthesis_task()` idempotency: checks PROCEDURAL for `intent=memory_synthesise` step; falls through to `store_task` if not found; `store_task` ALL-match dedup is the second gate
 - Synthesis cron: `0 15 * * *` (15:00 UTC = 03:00 NZST) — runs Passes 1–3 of `run_synthesis()` (episodic scan → associative/relational); structural Pass 4 fires inline on every semantic write (no schedule needed)
 - Associative memory (`associative` collection) is populated ONLY by `run_synthesis()` Passes 1–3 — not by structural Pass 4, not by curate, not by seeding
 
+## Pending Director Decisions
+
+The following items require Director input before CC can implement them. Do not resolve unilaterally.
+
+1. **`confirmed=True` / PASS 2 bypass threat model** — The current text states PASS 2 is skipped when `confirmed=True` and that "double-confirmation IS the security gate for HIGH tier." This needs a one-paragraph explanation of the full confirmation lifecycle: when PASS 2 first fires, what the Director sees, and what `confirmed=True` represents as a re-entry. Without this, the bypass looks like a security hole. Director to draft the explanation; CC to insert it once approved.
+
+2. **DCL "soul-protected config files" — undefined term** — The DCL hard-block rule references "soul-protected config files" without definition or cross-reference. Director to confirm the correct cross-reference (likely `sovereign-soul.md` and the GovernanceEngine SHA256 verification). CC to add the cross-reference once confirmed.
+
+3. **SDO-07 split** — sov_id assignment and semantic entry creation are currently one SDO. These are independent concerns. Pending Director decision on whether to split into two separate SDOs.
+
 ---
 
-## Sovereign Wallet (Built — Pending First Boot)
+## Sovereign Wallet (Built — First Boot 2026-03-31)
 
 - `sov-wallet` container: node:18-alpine Safe Transaction Service proxy; ai_net:3001 + browser_net
 - Key material RAID: `sovereign.key/pub`, `wallet-seed.enc` (HKDF+AES-256-GCM), `wallet-seed.gpg` (GPG backup)
@@ -365,12 +398,20 @@ node04 hosts all external-facing AI services that sovereign-core cannot run loca
 | Ops-Fixes-Apr8 | **COMPLETE** | Runaway scheduler task cancelled; ANTHROPIC_API_KEY startup warning; translator_pass failure detail improved; gateway ConnectError/HTTPStatusError handlers; soul guardian 7 files rebaselined; Grok explicit-only routing in domain:ollama; semantic entries for claude-api/grok-api. 2026-04-08. |
 | News-Harness | **COMPLETE** | `monitoring/news_harness.py`. Parallel RSS+Grok+browser fetch; 60% word-set dedup; single synthesis pass. `news_brief` intent in INTENT_ACTION_MAP. `_news_kw` block in `_quick_classify` (14 patterns). Reads `semantic:preferences:news`. Returns `{"brief": "..."}`. 2026-04-08. |
 | Morning-Brief-Refactor | **PENDING DIRECTOR ORDER** | Replace `read_feed` step with `news_brief` harness; add `list_nc_tasks` step. 3 changes: engine.py (INTENT_ACTION_MAP + dispatch), task_scheduler.py (`_format_step_content` brief key), qdrant-archive PROCEDURAL point `c6ee061f` steps array. See memory/project_sovereign.md for full spec. |
+| MRFL-S1 | **COMPLETE** | Memory Relevance Feedback Loop Phase 1. PASS 0 scoring: `final_score = (norm_overlap×0.6) + (norm_slot×0.3) + (norm_weight×0.1)`. Weight range 1.0–5.0, +0.05 per successful EXEC. `pass0_hits` IDs stored in `InternalMessage.context.pass0_hits`. `_async_mrfl_increment()` writes to working_memory + archive_client directly (startup_load=True entries skip shutdown_promote). Episodic audit trail: `episodic:mrfl:weight-increment:{date}:{key}`, UUID5 dedup. Slot 8 in `startup_load()` pre-warms all `semantic:intent:*` entries (`_bootstrap_slot=5`). Phase 2 decay deferred. 2026-05-14. |
+| Think-Tag-Strip | **COMPLETE** | Universal `<think>` tag stripping in `adapters/ollama.py`. `_strip_think()` strips tags, logs think content at DEBUG level (`llm_thinking:`). Applied to all `generate()` and `chat()` calls. `/no_think` directive sent to qwen3 for extraction-only prompts; never sent to Grok (Grok treats it as user content). 2026-05-14. |
+| Email-List-Floor | **COMPLETE** | `nc_mail_list_default` (10) applied as minimum floor in email list dispatch: `count = max(count, _default_count)`. Prevents specialist LLM from returning fewer emails than the configured default. 2026-05-14. |
+| News-Grok-Fix | **COMPLETE** | News synthesis: `_synthesise()` now uses clean `body` prompt for both local and Grok paths. `/no_think\n` prepended only for local Ollama path. Grok no longer receives the Ollama-specific directive. Removed redundant `_THINK_RE` from news_harness.py (adapter handles stripping). 2026-05-14. |
 | Skill-Seed-v2 | **COMPLETE** | `semantic_seeds.py` enriched: `build_skill_seeds()` now parses SKILL.md frontmatter (description, operations with inputs/outputs, specialists, tier) into rich content. `seed_id` bumped to `v2_` with `_prev_seed_id` for v1 cleanup on next restart. `seed_intent_semantic_entries()` in qdrant.py handles `_prev_seed_id` delete-then-create upgrade. `lifecycle.load()` passes description + operations to `make_skill_semantic_seed()`. `build_tax_address_seeds()` writes `semantic:tax:taxable_wallets`, `semantic:tax:staking_contracts`, `semantic:tax:internal_addresses` placeholder entries. 2026-04-10. |
 | Tax-Ingest-Harness | **COMPLETE** | Hourly NZ tax event ingestion: Nextcloud /Digiant/Tax/ CSV/PDF files + on-chain wallet events. Two tags: tax:crypto, tax:expense. CoinGecko NZD pricing. Scheduled cron `0 * * * *` — pending_approval until Director activates. |
 | Tax-Report-Harness | **COMPLETE** | /do_tax [year] command. 3-turn human-in-the-loop: query semantic (date range) → Director provides expense CSVs → confirm → generates income{year}.csv + expenses{year}.csv in /Digiant/Tax/FY{year}/. Classifier labels crypto events. FIFO stub (Phase 3). |
-| Learning-Harness | **COMPLETE** | `monitoring/learning_harness.py`. Autonomous document learning from /downloads/. Two triggers: (1) Telegram attachment upload → immediate background run; (2) hourly poll → synthesis window gate (UTC 15–17). Confidence loop: semantic→relational round-robin until plateau. Writes semantic + relational only (associative left to nightly synthesis). Sentinel: `episodic:learning:processed:{slug}`. Last-run summary injected into morning briefing news_brief step. |
+| Learning-Harness | **COMPLETE** | `monitoring/learning_harness.py`. Autonomous document learning from /downloads/. Two triggers: (1) Telegram attachment upload → immediate background run; (2) hourly poll → synthesis window gate (UTC 15–17). Confidence loop: semantic→relational round-robin until plateau. Writes semantic + relational only (associative left to nightly synthesis). Sentinel: `episodic:learning:processed:{slug}`. Last-run summary injected into morning briefing news_brief step. Supported formats: text/md/csv/json/py/etc + `.pdf` (pypdf bespoke skill) + `.url` (browser fetch). No file-size gate. |
+| pypdf-Skill | **COMPLETE** | Bespoke `pypdf` skill (nanobot-01). `extract_text` op: downloads PDF from Nextcloud via WebDAV, returns extracted text. Active for research_agent + memory_agent. Semantic entry: `semantic:intent:pypdf`. |
+| learn_url-Intent | **COMPLETE** | `learn_url` intent (`domain: learning, operation: queue_url`). Director says "learn from https://..." → writes `.url` shortcut to `/downloads/{slug}.url` → fires `check_downloads(immediate=True)`. URL-based sentinel slug: `sha256(url)[:16]`. Failed fetches → `episodic:learning:failed:{slug}` (no retry). `source_url` in all new semantic entries from URL processing. |
 | Smart-Bootstrap | **COMPLETE** | `startup_load()` in `qdrant.py` upgraded to two-phase boot. Phase 1: targeted slots — Slot 2 (all canonical MIP keys: semantic:wallet/network/networking/infrastructure/governance prefixes, two-pass payload scan + batch vector retrieve), Slot 3 (PROSPECTIVE due today, status=active, next_due<=today), Slot 6 (open SI proposals, pending_director_review), Slot 7 (active PROCEDURAL, human_confirmed=true, last_updated desc). Phase 2: vector similarity fill (remaining capacity). Dedup via `_loaded_ids` set. Returns stats dict. Telegram notification on completion. `bootstrap_working_memory()` removed. Step 2h in main.py removed. Typical result: ~15 targeted + ~295 similarity = 310-380 total entries ~1.1-1.3 MB. 2026-04-17. |
 | Memory-Consultation-Pass | **COMPLETE** | PASS 0 in `execution/engine.py` `handle_chat()`. `_memory_consultation_pass()`: deterministic working_memory scroll (no LLM), keyword relevance scoring, top-15 ranked (slot priority + term overlap), formatted as COGNITIVE CONTEXT block injected into PASS 1 prompt via `prompts.classify(cognitive_context=...)`. Timing: 7-14ms typical (target <100ms, WARNING >200ms). Wired: `handle_chat` → `orchestrator_classify(cognitive_context=)` → `ceo_classify(cognitive_context=)` → `prompts.classify(cognitive_context=)`. 2026-04-17. |
+| Director-Fact-Capture | **COMPLETE** | Auto-detection of Director-provided structured facts in `_quick_classify`. Five detection conditions: (1) 2+ airline codes, (2) 1 flight + hotel keyword, (3) hotel block >200 chars + multiline, (4) 1 flight + city-to-city route OR HH:MM time range + multiline, (5) Air NZ app share header "Here are my flight details" + multiline, (6) Booking.com share "I just booked...PIN code" pattern. Flight regex allows single-digit codes (`\d{1,4}` — covers NZ1, NZ6, QF1 etc). Topic extraction: `_booking_share` extracts hotel name + `bn=` ref from URL; else city extraction from curated list; fallback in `_dispatch_inner` derives topic from `Hotel:` line or city names in fact content. `_dispatch_inner` forces `human_confirmed=True` + `extra_metadata={"source": "director_provided"}`. Confirmation: "Stored your Doubletree By Hilton New York Times Square West." 2026-05-14. |
+| Travel-Fact-Fixes | **COMPLETE** | (1) `governance/engine.py`: added `elif domain == 'memory_synthesise':` handler — "run nightly memory synthesis" was governance-blocked. (2) `monitoring/learning_harness.py`: `asyncio.TimeoutError` now caught explicitly with message "Ollama timed out on cycle N (pass_type) — GPU busy" instead of empty string. Notes quality gate: skip notes < 80 chars (writes `skipped_too_short` sentinel). (3) `main.py`: `/chat` endpoint wrapped in try/except catching `httpx.ReadTimeout`, `httpcore.ReadTimeout`, generic Exception — returns graceful JSON instead of HTTP 500. (4) `_quick_classify`: skill install false-positive fix — `"skill" in u` guard prevents "add a note to NextCloud" misrouting to skill install when `prior_domain=="skills"`. 2026-05-14. |
 
 Full phase history: `docs/CLAUDE-archive.md`
 
@@ -440,6 +481,8 @@ Any new prospective memory entry representing a **recurring scheduled task** mus
 
 ## Harness Pattern — Standard Structure for All Multi-Step Capabilities
 
+> **Crash note — working_memory is ephemeral (tmpfs).** A container crash or unclean shutdown clears all checkpoints. Harness implementations must not assume checkpoint survival across restarts. If a checkpoint is missing on a non-first step after a restart, the caller must restart the harness from step 1 — there is no recovery path.
+
 All future multi-step capabilities in sovereign-core follow this pattern. A harness is a **stateful step orchestrator** implemented in `execution/engine.py` (or a dedicated module imported by it), backed by `working_memory` session keys.
 
 ### Session key naming convention
@@ -501,7 +544,7 @@ All harness intents are added to the translator bypass list so structured output
 | Dev-Harness | `_developer_harness_checkpoint` | analyse → status → approve/reject → verify → clear | Nightly cron; Director approves findings |
 | Tax-Ingest-Harness | `_tax_ingest_harness_checkpoint` | check → ingest → enrich → store → notify → clear | Hourly cron; continuous tax event ingestion |
 | Tax-Report-Harness (`/do_tax`) | `_tax_report_harness_checkpoint` | query → ingest → create → notify → clear | 3-turn human-in-the-loop; generates income + expenses CSVs |
-| Learning-Harness | `_run_in_progress` (module bool, not WM) | poll → read → keywords → doc_array → chunk → confidence loop → sentinel | Writes semantic+relational; associative via synthesis cron; morning briefing injection |
+| Learning-Harness | `_run_in_progress` (module bool, not WM) | poll → read → keywords → doc_array → chunk → confidence loop → sentinel | Formats: text/pdf/url. PDF via pypdf skill. URL via browser fetch + URL-based sentinel. No size gate. Writes semantic+relational; associative via synthesis cron; morning briefing injection |
 
 ### /command harness architecture
 
@@ -511,12 +554,6 @@ All harness intents are added to the translator bypass list so structured output
 - Security pattern scanning → deterministic (scanner.scan)
 - Security verdict → LLM (interprets scanner + SKILL.md intent)
 - Install/write/delete → deterministic (adapter call after confirmed)
-
-**Implemented /commands** (registered in gateway.py + BotFather):
-
-| Command | Harness | Behaviour |
-|---------|---------|-----------|
-| `/install <goal>` | Skill-Harness | Autonomous: search → LLM picks best → confirm gate → scan → install |
 
 **Implemented /commands:**
 
@@ -704,77 +741,3 @@ curl -s -X POST http://localhost:8000/query \
   -d '{"action":{"domain":"docker","operation":"workflow","name":"restart"},"tier":"MID"}'
 ```
 
----
-
-## Plan: Adapter Removal — Browser → WebDAV → CalDAV
-
-**Principle**: No duplicate of what nanobot does. All application I/O (browser, Nextcloud files, calendar/tasks) routes through nanobot-01. Direct adapters in sovereign-core are legacy and must be removed.
-
-**Context**: BrowserAdapter was calling `POST /run` (non-existent on a2a-browser) — fixed to use `POST /search` / `POST /fetch` in session 2026-04-01. Adapters exist at `core/app/execution/adapters/browser.py`, `core/app/adapters/webdav.py`, `core/app/adapters/caldav.py`.
-
----
-
-### Phase 1: Browser (do first)
-
-**What needs adding to nanobot** — `sovereign-browser` SKILL.md exists but has no python3_exec script; currently routes through BrowserAdapter.
-
-1. Add `secrets/browser.env` to nanobot-01 `env_file` in `compose.yml` — injects `A2A_BROWSER_URL` + `A2A_SHARED_SECRET`
-2. Create `nanobot-01/workspace/skills/sovereign-browser/scripts/browser.py` — stdlib+requests, commands: `search` (POST `/search`) and `fetch` (POST `/fetch`) against a2a-browser; read `A2A_BROWSER_URL` + `A2A_SHARED_SECRET` from env; output flat JSON matching a2a-browser response schema
-3. Update `/home/sovereign/skills/sovereign-browser/SKILL.md` — change `tool: browser` → `tool: python3_exec`, add `script: scripts/browser.py`, update args for search/fetch commands
-4. Update `engine.py` `domain == "browser"` dispatch — replace `self.browser.search()`/`self.browser.fetch()` with `self.nanobot.run("sovereign-browser", "search"|"fetch", params)`; result data is in `nb["result"]` not `nb["data"]`; keep existing ledger logging and response formatting
-5. Remove `from execution.adapters.browser import BrowserAdapter` and `self.browser = BrowserAdapter()` from engine.py
-6. Delete `core/app/execution/adapters/browser.py`
-7. Rebuild nanobot-01 + sovereign-core; test: ask Rex to search the web
-
-**AUTH_PROFILES note**: `_build_fetch_payload` auth injection was dead code (a2a-browser `FetchRequest` has no `auth` field). Skip for now — add when a2a-browser supports it.
-
----
-
-### Phase 2: WebDAV
-
-**Nanobot already covers all operations** via `sovereign-nextcloud-fs` (nc_fs.py) and `openclaw-nextcloud` (nextcloud.py).
-
-| Engine intent | Old call | New nanobot call |
-|---|---|---|
-| `file_navigate` | `webdav.navigate(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_list", {"path": path})` |
-| `list_files` | `webdav.list(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_list", {"path": path})` |
-| `read_file` | `webdav.read(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_read", {"path": path})` |
-| `write_file` | `webdav.write(path, content)` | `nanobot.run("openclaw-nextcloud", "files_write", {"path": path, "content": content})` |
-| `delete_file` | `webdav.delete(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_delete", {"path": path})` |
-| `create_folder` | `webdav.mkdir(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_mkdir", {"path": path})` |
-| `search_files` | `webdav.search(query, path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_search", {"query": query, "path": path})` |
-| `list_files_recursive` | already nanobot ✓ | unchanged |
-| `read_files_recursive` | already nanobot ✓ | unchanged |
-
-**RAID path exception** — keep as-is: `list_files`/`read_file` for `/home/sovereign/` and `/docker/sovereign/` paths → `broker.read_host_file()`. No WebDAVAdapter involved.
-
-Steps:
-1. Rewire engine.py `domain == "webdav"` block — replace each `self.webdav.*` with nanobot calls per table above; preserve RAID path exception for broker
-2. Remove `from adapters.webdav import WebDAVAdapter` and `self.webdav = WebDAVAdapter()` from engine.py
-3. Delete `core/app/adapters/webdav.py`
-4. Rebuild sovereign-core; test: list/read/write/delete Nextcloud file
-
----
-
-### Phase 3: CalDAV
-
-**Nanobot already covers all operations** via `openclaw-nextcloud` (nextcloud.py).
-
-| Engine intent | Old call | New nanobot call |
-|---|---|---|
-| `list_calendars` | `caldav.list_calendars()` | `nanobot.run("openclaw-nextcloud", "calendar_list", {})` |
-| `list_events` | `caldav.list_events(cal, from, to)` | `nanobot.run("openclaw-nextcloud", "calendar_list", {"calendar": cal, "from_date": from, "to_date": to})` |
-| `create_event` | `caldav.create_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_create", {...})` |
-| `update_event` | `caldav.update_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_update", {...})` |
-| `delete_event` | `caldav.delete_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_delete", {"uid": uid})` |
-| `create_task` | `caldav.create_task(...)` | `nanobot.run("openclaw-nextcloud", "tasks_create", {...})` |
-| `complete_task` | `caldav.complete_task(cal, uid)` | `nanobot.run("openclaw-nextcloud", "tasks_complete", {"uid": uid})` |
-| `delete_task` | `caldav.delete_task(cal, uid)` | `nanobot.run("openclaw-nextcloud", "tasks_delete", {"uid": uid})` |
-
-**Note**: All event field extraction (summary, start, end, UID, calendar name) from specialist output stays in engine.py — only the final adapter call changes.
-
-Steps:
-1. Rewire engine.py `domain == "caldav"` block — replace each `self.caldav.*` with nanobot calls; pass pre-processed fields as nanobot payload
-2. Remove `from adapters.caldav import CalDAVAdapter` and `self.caldav = CalDAVAdapter()` from engine.py
-3. Delete `core/app/adapters/caldav.py`
-4. Rebuild sovereign-core; test: list events, create event, complete task

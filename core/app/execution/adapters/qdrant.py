@@ -20,7 +20,7 @@ Memory promotion service:
   Crash without clean shutdown = working_memory entries not yet promoted are LOST.
 
 Embeddings: nomic-embed-text (768-dim) via CPU-only ollama-embed service (http://ollama-embed:11434).
-Inference (key generation): llama3.1:8b via GPU ollama service (http://ollama:11434).
+Inference (key generation): qwen2.5:32b via GPU ollama service (http://ollama:11434).
 Write permissions enforced per collection. All sovereign writes audited to JSONL.
 """
 import asyncio
@@ -54,6 +54,9 @@ VECTOR_DIM          = 768
 EMBED_MODEL         = "nomic-embed-text"
 
 from config import cfg as _cfg
+
+_GPU_NAME    = "EVGA RTX 3090"
+_GPU_VRAM_GB = 24
 
 AUDIT_PATH           = _cfg.paths.audit_promotions_log
 CONFIDENCE_THRESHOLD = _cfg.thresholds.confidence
@@ -138,7 +141,7 @@ class QdrantAdapter:
         self.client = AsyncQdrantClient(url=qdrant_url)
         # All 7 sovereign collections live in qdrant-archive (RAID, durable)
         self.archive_client = AsyncQdrantClient(url=qdrant_archive_url)
-        self._ollama_url = ollama_url   # GPU — llama3.1:8b for inference/key generation
+        self._ollama_url = ollama_url   # GPU — primary_inference_model for inference/key generation
         # CPU-only embed service — falls back to GPU ollama if not configured
         self._embed_url = (
             ollama_embed_url
@@ -193,7 +196,7 @@ class QdrantAdapter:
     ) -> tuple[str | None, str | None]:
         """Generate a deterministic _key and title for a memory entry via a single Ollama call.
 
-        Uses GPU ollama (llama3.1:8b) for inference — separate from the CPU embed service.
+        Uses GPU ollama (qwen2.5:32b) for inference — separate from the CPU embed service.
         Key format: {type}:{domain}:{slug} — the type and domain prefix is assembled here from
         known fields so Ollama cannot deviate from it. Only the slug is LLM-generated.
         Returns (key, title) on success, (None, None) on any failure or timeout.
@@ -205,6 +208,7 @@ class QdrantAdapter:
         _prefix = f"{_type}:{_dom}:"
 
         _prompt = (
+            f"/no_think\n"
             f"Given the memory item below, respond with ONLY valid JSON containing two fields:\n"
             f"- \"slug\": 2-5 lowercase hyphen-separated words that uniquely and specifically "
             f"identify this memory item's content (not the category — the specific subject). "
@@ -220,14 +224,19 @@ class QdrantAdapter:
                 r = await http.post(
                     f"{self._ollama_url}/api/generate",
                     json={
-                        "model": "llama3.1:8b-instruct-q4_K_M",
+                        "model": _cfg.models.primary_inference_model,
                         "prompt": _prompt,
                         "stream": False,
-                        "format": "json",
                     },
                 )
                 r.raise_for_status()
                 raw = r.json().get("response", "{}")
+                # Strip markdown code fences if present
+                import re as _re_key
+                raw = _re_key.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
+                # Extract JSON object if wrapped in prose
+                _m = _re_key.search(r'\{[^{}]*\}', raw, _re_key.DOTALL)
+                raw = _m.group() if _m else raw
                 parsed = json.loads(raw)
                 # Sanitise slug: lowercase, only a-z 0-9 hyphens, collapse multiples
                 _raw_slug = str(parsed.get("slug", "")).lower().strip()
@@ -308,7 +317,7 @@ class QdrantAdapter:
         """
         total_loaded = 0
         _loaded_ids: set = set()
-        slot_counts = {2: 0, 3: 0, 6: 0, 7: 0}
+        slot_counts = {2: 0, 3: 0, 6: 0, 7: 0, 8: 0}
         _now = datetime.now(timezone.utc)
         _today = _now.date().isoformat()
 
@@ -427,9 +436,40 @@ class QdrantAdapter:
         except Exception as exc:
             _log.warning("startup_load slot 7 (active procedural) failed: %s", exc)
 
+        # Slot 8 — semantic:intent:* routing seeds (MRFL bootstrap targets)
+        # Always loaded so intent routing entries can accumulate weight via MRFL.
+        try:
+            _s8_offset = None
+            _s8_ids: list = []
+            while True:
+                _s8_batch, _s8_next = await self.archive_client.scroll(
+                    collection_name=SEMANTIC, limit=200,
+                    offset=_s8_offset, with_payload=True, with_vectors=False,
+                )
+                for _p in _s8_batch:
+                    if (_p.payload or {}).get("_key", "").startswith("semantic:intent:"):
+                        _s8_ids.append(_p.id)
+                if _s8_next is None:
+                    break
+                _s8_offset = _s8_next
+            if _s8_ids:
+                _s8_with_vec = await self.archive_client.retrieve(
+                    collection_name=SEMANTIC, ids=_s8_ids,
+                    with_payload=True, with_vectors=True,
+                )
+                for _p in _s8_with_vec:
+                    # Use _bootstrap_slot=5 (slot_priority=3, norm_slot≈0.29) so intent
+                    # seeds rank above similarity-fill entries (slot 7, norm_slot=0) in PASS 0.
+                    if _p.payload:
+                        _p.payload["_bootstrap_slot"] = 5
+                    await _write(_p, SEMANTIC, 8)
+        except Exception as exc:
+            _log.warning("startup_load slot 8 (intent seeds) failed: %s", exc)
+
         _log.info(
-            "startup_load: targeted slots loaded — 2=%d 3=%d 6=%d 7=%d (%d total)",
-            slot_counts[2], slot_counts[3], slot_counts[6], slot_counts[7], total_loaded,
+            "startup_load: targeted slots loaded — 2=%d 3=%d 6=%d 7=%d 8=%d (%d total)",
+            slot_counts[2], slot_counts[3], slot_counts[6], slot_counts[7], slot_counts[8],
+            total_loaded,
         )
 
         # ── Phase 2: vector similarity fill (remaining capacity) ─────────────
@@ -482,9 +522,9 @@ class QdrantAdapter:
 
         est_mb = total_loaded * _BYTES_PER_POINT / 1024 / 1024
         _log.info(
-            "startup_load: %d total entries (slots 2-3-6-7: %d-%d-%d-%d, similarity: %d) ~%.1f MB",
+            "startup_load: %d total entries (slots 2-3-6-7-8: %d-%d-%d-%d-%d, similarity: %d) ~%.1f MB",
             total_loaded, slot_counts[2], slot_counts[3], slot_counts[6], slot_counts[7],
-            sim_loaded, est_mb,
+            slot_counts[8], sim_loaded, est_mb,
         )
         return {
             "total": total_loaded,
@@ -1382,7 +1422,7 @@ class QdrantAdapter:
             f"Sovereign system root. {_DESCRIPTION} "
             "Director: Matt. Location: New Zealand. Birthday: 2026-03-03. "
             "Hardware: semantic:entity:sovereign-server "
-            "(AMD Ryzen 9 9900X, 32GB RAM, RTX 3060 Ti, RAID5). "
+            f"(AMD Ryzen 9 9900X, 32GB RAM, {_GPU_NAME} {_GPU_VRAM_GB}GB, RAID5). "
             "Memory: 7 Qdrant RAID collections + working_memory (tmpfs). "
             "Bootstrap sequence loads critical semantic keys into working_memory at startup."
         )

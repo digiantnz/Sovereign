@@ -10,7 +10,7 @@ from cognition.dcl import DisclosureControlLayer
 
 from config import cfg as _cfg
 
-MODEL = "llama3.1:8b-instruct-q4_K_M"
+MODEL = _cfg.models.primary_inference_model
 PERSONAS_DIR = _cfg.paths.personas_dir
 SECURITY_AGENT_PATH = os.path.join(PERSONAS_DIR, "SECURITY_AGENT.md")
 
@@ -23,6 +23,7 @@ MEMORY_ROUTING_SHADOW_MODE = _cfg.cognitive_loop.memory_routing_shadow_mode
 MEMORY_ROUTING_THRESHOLD   = 0.85   # score at which shadow would have overridden LLM
 
 TRANSLATOR_PATH = os.path.join(PERSONAS_DIR, "translator.md")
+MAX_TELEGRAM_CHARS = 12000  # Gateway splits at 4000 chars — allow longer responses
 
 # ---------------------------------------------------------------------------
 # Translator output sanitiser — deterministic post-processing (no LLM calls)
@@ -139,13 +140,15 @@ def _translator_sanitise(text: str) -> tuple[str, int, int]:
 
 
 class CognitionEngine:
-    def __init__(self, qdrant=None, ledger=None):
+    def __init__(self, qdrant=None, ledger=None, inference_queue=None):
         self.ollama  = OllamaAdapter()
         self.grok    = GrokAdapter()
         self.claude  = ClaudeAdapter()
         self.dcl     = DisclosureControlLayer()
         self.qdrant  = qdrant
         self.ledger  = ledger   # AuditLedger — injected from main lifespan
+        self._queue  = inference_queue
+        self._had_queue_wait = False
         self._security_persona: str = self._load_security_persona()
 
     def _load_security_persona(self) -> str:
@@ -245,7 +248,7 @@ class CognitionEngine:
             # Retrieve up to 4 matched keys (most specific first — longer slug = more specific)
             matched_keys.sort(key=lambda k: len(k), reverse=True)
             lines: list[str] = []
-            for key in matched_keys[:4]:
+            for key in matched_keys[:10]:
                 entry = await self.qdrant.retrieve_by_key(key)
                 if entry:
                     content = entry.get("content", "")
@@ -314,17 +317,105 @@ class CognitionEngine:
             return []
         return await self.qdrant.get_due_prospective()
 
+    # ── LLM routing helpers (queue-aware) ────────────────────────────────
+    async def _llm_generate(self, prompt: str, model: str = MODEL,
+                            fmt: "str | None" = None,
+                            priority: "int | None" = None,
+                            timeout: float = 200.0,
+                            capture_thinking: bool = False) -> dict:
+        if self._queue is not None:
+            from adapters.inference_queue import InferenceQueue
+            p = priority if priority is not None else InferenceQueue.HIGH
+            result = await self._queue.generate(
+                prompt, model=model, fmt=fmt, priority=p, timeout=timeout,
+                capture_thinking=capture_thinking,
+            )
+            if result.get("_queue_waited"):
+                self._had_queue_wait = True
+            return result
+        return await self.ollama.generate(prompt, model=model, fmt=fmt,
+                                          capture_thinking=capture_thinking)
+
+    async def _llm_chat(self, messages: "list[dict]", model: str = MODEL,
+                        fmt: "str | None" = None,
+                        priority: "int | None" = None,
+                        timeout: float = 200.0) -> dict:
+        if self._queue is not None:
+            from adapters.inference_queue import InferenceQueue
+            p = priority if priority is not None else InferenceQueue.HIGH
+            result = await self._queue.chat(
+                messages, model=model, fmt=fmt, priority=p, timeout=timeout
+            )
+            if result.get("_queue_waited"):
+                self._had_queue_wait = True
+            return result
+        return await self.ollama.chat(messages, model=model, fmt=fmt)
+
     # ── JSON-enforced LLM call with one retry ────────────────────────────
-    async def call_llm_json(self, prompt: str) -> dict:
+    async def call_llm_json(self, prompt: str, priority: "int | None" = None) -> dict:
+        import re as _re_json
         for attempt in range(2):
-            result = await self.ollama.generate(prompt, model=MODEL, fmt="json")
-            raw = result.get("response", "")
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
+            # No fmt="json" — Qwen3 grammar-constrained mode returns empty responses.
+            # Rely on prompt instruction + extraction fallback instead.
+            result = await self._llm_generate("/no_think\n" + prompt, model=MODEL, priority=priority)
+            if result.get("status") == "llm_timeout":
+                raise ValueError("LLM timed out during JSON call")
+            raw = result.get("response", "").strip()
+            if not raw:
                 if attempt == 0:
-                    continue  # retry once
+                    continue
+                raise ValueError("LLM returned empty response after retry")
+            cleaned = _re_json.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                m = _re_json.search(r'\{.*\}', cleaned, _re_json.DOTALL)
+                if m:
+                    try:
+                        return json.loads(m.group())
+                    except json.JSONDecodeError:
+                        pass
+                if attempt == 0:
+                    continue
                 raise ValueError(f"LLM returned invalid JSON after retry: {raw[:200]}")
+
+    # ── Universal LLM output parser ───────────────────────────────────────
+    def _parse_llm_output(self, raw: str, required: list[str], defaults: dict) -> dict:
+        """Robust JSON parser for LLM pass outputs.
+
+        Steps: strip markdown fences → json.loads → regex {…} extraction → defaults.
+        Validates each required key and fills missing ones from defaults.
+        Logs audit events on schema failure and missing fields.
+        Never raises — always returns a usable dict.
+        """
+        import re as _re_parse
+        cleaned = _re_parse.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
+        result = None
+        try:
+            result = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        if result is None:
+            m = _re_parse.search(r'\{.*\}', cleaned, _re_parse.DOTALL)
+            if m:
+                try:
+                    result = json.loads(m.group())
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        if result is None:
+            logger.warning("_parse_llm_output: schema failure — raw=%s", raw[:200])
+            if self.ledger:
+                self.ledger.append("llm_schema_failure", "cognition",
+                                   {"raw_preview": raw[:200]})
+            return dict(defaults)
+        for key in required:
+            if result.get(key) is None:
+                if key in defaults:
+                    logger.warning("_parse_llm_output: missing field %r — filling from defaults", key)
+                    if self.ledger:
+                        self.ledger.append("llm_field_missing", "cognition", {"field": key})
+                    result[key] = defaults[key]
+        return result
 
     # ── Routing history for PASS 1 ───────────────────────────────────────
     async def load_routing_history(self, intent: str) -> str:
@@ -365,9 +456,18 @@ class CognitionEngine:
             context_window=context_window,
             cognitive_context=cognitive_context,
         )
-        result = await self.call_llm_json(prompt)
+        _raw1 = await self._llm_generate(prompt, model=MODEL, capture_thinking=True)
+        result = self._parse_llm_output(
+            _raw1.get("response", ""),
+            required=["intent", "delegate_to", "tier"],
+            defaults={"intent": "query", "delegate_to": "research_agent", "tier": "LOW"},
+        )
         result["_memory_confidence"] = confidence
         result["_memory_gaps"] = gaps
+        _p1_thinking = _raw1.get("thinking", "")
+        if _p1_thinking:
+            logger.info("[P1 THINK] %s", _p1_thinking[:2000])
+            result["_p1_thinking"] = _p1_thinking
         return result
 
     async def _memory_route_shadow(self, user_input: str) -> dict:
@@ -643,7 +743,12 @@ class CognitionEngine:
             except Exception as exc:
                 _log.warning("specialist_outbound[%s]: external failed (%s) — falling back", agent_name, exc)
 
-        result = await self.call_llm_json(prompt)
+        _raw3a = await self._llm_generate("/no_think\n" + prompt, model=MODEL)
+        result = self._parse_llm_output(
+            _raw3a.get("response", ""),
+            required=["skill", "operation"],
+            defaults={"skill": "", "operation": "query"},
+        )
         result.setdefault("mode", "outbound")
         result["_routed_external"] = False
         result["_provider"] = "ollama"
@@ -664,7 +769,12 @@ class CognitionEngine:
             outbound=outbound,
             execution_result=execution_result,
         )
-        result = await self.call_llm_json(prompt)
+        _raw3b = await self._llm_generate("/no_think\n" + prompt, model=MODEL)
+        result = self._parse_llm_output(
+            _raw3b.get("response", ""),
+            required=["success", "outcome"],
+            defaults={"success": False, "outcome": "No result available."},
+        )
         result.setdefault("mode", "inbound")
         result.setdefault("success", False)
         result.setdefault("outcome", "")
@@ -684,7 +794,28 @@ class CognitionEngine:
             delegation=delegation,
             specialist_inbound_result=specialist_inbound_result,
         )
-        result = await self.call_llm_json(prompt)
+        _raw4 = await self._llm_generate("/no_think\n" + prompt, model=MODEL)
+        result = self._parse_llm_output(
+            _raw4.get("response", ""),
+            required=["result_for_translator"],
+            defaults={"result_for_translator": {
+                "success": False, "outcome": "Evaluation failed.",
+                "detail": {}, "error": None, "next_action": None,
+            }},
+        )
+        # Validate result_for_translator structure — PASS 4 sometimes emits {} or omits outcome
+        _rft_check = result.get("result_for_translator", {})
+        if not isinstance(_rft_check, dict) or "outcome" not in _rft_check:
+            result["result_for_translator"] = {
+                "success": specialist_inbound_result.get("success", False),
+                "outcome": specialist_inbound_result.get("outcome", "Research complete."),
+                "detail": specialist_inbound_result.get("detail", {}),
+                "error": None,
+                "next_action": None,
+            }
+            if self.ledger:
+                self.ledger.append("pass4_rft_fallback", "internal",
+                                   {"reason": "invalid_rft_structure"})
         result.setdefault("approved", True)
         result.setdefault("feedback", None)
         result.setdefault("memory_action", "none")
@@ -746,6 +877,8 @@ class CognitionEngine:
         Post-check: after LLM translation, verify all numbers in output exist in the
         result.  Any invented number is a fabrication violation → block + fallback.
         """
+        _had_wait = self._had_queue_wait
+        self._had_queue_wait = False
         success  = result_for_translator.get("success", True)
         has_error = bool(result_for_translator.get("error"))
 
@@ -768,7 +901,7 @@ class CognitionEngine:
                 # Log the full dict so the failure is diagnosable in container logs
                 logger.warning(
                     "translator_pass: failure result with no error/outcome — full dict: %s",
-                    json.dumps(result_for_translator)[:500],
+                    json.dumps(result_for_translator)[:2000],
                 )
                 error_detail = "no error detail returned (check sovereign-core logs)"
             logger.info("translator_pass: failure result — bypassing LLM")
@@ -781,12 +914,12 @@ class CognitionEngine:
 
         # ── Has data — call translator LLM ────────────────────────────────────
         try:
-            prompt = prompts.translate_from_orchestrator(
+            prompt = "/no_think\n" + prompts.translate_from_orchestrator(
                 translator_persona=self.load_translator(),
                 result_for_translator=result_for_translator,
                 tier=tier,
             )
-            raw = await self.ollama.generate(prompt, model=MODEL)
+            raw = await self._llm_generate(prompt, model=MODEL)
             text = raw.get("response", "").strip()
 
             # ── Post-check: fabrication detection (numbers) ───────────────────
@@ -832,18 +965,34 @@ class CognitionEngine:
                 ))
                 # Retry — same prompt, one more attempt
                 try:
-                    raw2 = await self.ollama.generate(prompt, model=MODEL)
+                    raw2 = await self._llm_generate(prompt, model=MODEL)
                     text2 = raw2.get("response", "").strip()
                     # Apply all same deterministic strips to retry output
                     if not allow_urgent:
                         text2 = self._URGENT_STRIP_RE.sub("", text2).strip()
                     text2, _, _ = _translator_sanitise(text2)
+                    if len(text2) > MAX_TELEGRAM_CHARS:
+                        _t2c = text2[:MAX_TELEGRAM_CHARS]
+                        _t2s = max(_t2c.rfind('. '), _t2c.rfind('.\n'))
+                        text2 = (_t2c[:_t2s + 1] if _t2s > MAX_TELEGRAM_CHARS // 2 else _t2c)
+                        text2 += "\n\n[Response truncated — ask for more detail if needed]"
                     if text2:
                         return text2
                 except Exception:
                     pass
                 # Retry failed or empty — use the already-sanitised first attempt
 
+            if len(text) > MAX_TELEGRAM_CHARS:
+                truncated = text[:MAX_TELEGRAM_CHARS]
+                last_sentence = max(truncated.rfind('. '), truncated.rfind('.\n'))
+                if last_sentence > MAX_TELEGRAM_CHARS // 2:
+                    text = truncated[:last_sentence + 1]
+                else:
+                    text = truncated
+                text += "\n\n[Response truncated — ask for more detail if needed]"
+
+            if _had_wait:
+                text = "_Your request was queued briefly — the GPU was busy with a background task._\n\n" + text
             return text
         except Exception:
             return result_for_translator.get("detail", {}).get("outcome", "")
@@ -912,7 +1061,7 @@ class CognitionEngine:
             security_persona=self._security_persona,
             scan_categories=scan_result.categories,
             matched_phrases=scan_result.matched_phrases,
-            content_preview=content[:500],
+            content_preview=content[:2000],
             phrase_contexts=phrase_contexts,
         )
         result = await self.call_llm_json(prompt)
@@ -947,7 +1096,7 @@ class CognitionEngine:
                 result=result,
                 tier=tier,
             )
-            raw = await self.ollama.generate(prompt, model=MODEL)
+            raw = await self._llm_generate(prompt, model=MODEL)
             text = raw.get("response", "").strip()
             # Strip spurious urgency prefix unless this is a HIGH-tier error result.
             # Urgency mapping: LOW = informational, MID = action required, HIGH = time-sensitive.
@@ -995,15 +1144,17 @@ class CognitionEngine:
         # Inject prior turns so follow-ups like "summarise that" resolve correctly
         if context_window:
             turns = context_window if isinstance(context_window, list) else [context_window]
-            for t in turns[-3:]:
+            for t in turns[-8:]:
                 messages.append({"role": "user", "content": t.get("user", "")})
                 messages.append({"role": "assistant", "content": t.get("assistant", "")})
         messages.append({"role": "user", "content": user_input})
-        return await self.ollama.chat(messages, model=MODEL)
+        return await self._llm_chat(messages, model=MODEL)
 
     # ── Direct query (existing /query route) ─────────────────────────────
-    async def ask_local(self, prompt: str, model: str = MODEL) -> dict:
-        return await self.ollama.generate(prompt, model=model)
+    async def ask_local(self, prompt: str, model: str = MODEL,
+                        priority: "int | None" = None,
+                        timeout: float = 200.0) -> dict:
+        return await self._llm_generate(prompt, model=model, priority=priority, timeout=timeout)
 
     # ── External cognition — Grok ─────────────────────────────────────────
     async def ask_grok(
@@ -1205,10 +1356,12 @@ class CognitionEngine:
         Returns {response, provider_used, complexity_score, routed_external}.
         """
         decision = self._routing_decision(prompt, user_input=user_input)
-        # Explicit provider arg overrides keyword-based selection
+        # Explicit provider arg overrides keyword-based selection.
+        # An explicit provider always forces external routing regardless of complexity score.
         chosen = provider or decision["provider"]
+        use_external = decision["use_external"] or (provider is not None)
 
-        if decision["use_external"]:
+        if use_external:
             if chosen == "claude":
                 result = await self.ask_claude(prompt, agent=agent, system=system)
             else:
@@ -1221,7 +1374,7 @@ class CognitionEngine:
             result["routing_reason"]     = decision["reason"]
             return result
         else:
-            raw = await self.ollama.generate(prompt, model=MODEL)
+            raw = await self._llm_generate(prompt, model=MODEL)
             return {
                 "response":          raw.get("response", ""),
                 "provider_used":     "ollama",

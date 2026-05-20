@@ -1,10 +1,12 @@
-"""Sovereign Learning Harness — autonomous document learning from /downloads/
+"""Sovereign Learning Harness — autonomous document learning from /downloads/ and Notes
 
-Trigger (two paths):
+Trigger (three paths):
   1. Hourly poll — lists /downloads/, processes new files during synthesis window
      (UTC hours 15–17) to avoid Ollama contention.
   2. Immediate — Telegram attachment upload to /downloads/ calls
      check_downloads(app_state, immediate=True) as a background task; no time gate.
+  3. Hourly poll (same window) — check_notes() queries Nextcloud Notes API and processes
+     notes not yet seen. No immediate trigger; synthesis window gate always active.
 
 Confidence loop (per file):
   Round-robin: semantic pass → relational pass over all chunks.
@@ -21,9 +23,14 @@ Collections NOT written by this harness:
                 (associative entries ARE read for context in doc_array)
 
 Sentinel: episodic:learning:processed:{slug} (MIP format)
-  slug = sha256(file_path + "|" + str(size) + "|" + last_modified)[:16]
+  Regular files: slug = sha256(file_path + "|" + str(size) + "|" + last_modified)[:16]
+  .url files:    slug = sha256(url.strip())[:16] — keyed to URL, not file metadata
+                 failed fetch → episodic:learning:failed:{slug} (prevents retry)
+  Notes API:     slug = sha256("notes-api:{id}|{modified}")[:16] — keyed to note ID + timestamp
   Written on successful plateau AND on format-skip. Prevents re-processing.
-  Hard failures do NOT write sentinel — file is retried next tick.
+  Hard failures do NOT write sentinel — retried next tick.
+
+No file-size gate — documents of any size are accepted; the chunker handles splitting.
 
 Last-run summary: _last_run_summary module dict, read by task_scheduler morning briefing.
 """
@@ -53,6 +60,7 @@ _MAX_DOC_ARRAY    = _cfg.learning_harness.max_doc_array
 _SCROLL_BATCH     = _cfg.learning_harness.scroll_batch
 _MAX_CYCLES       = _cfg.learning_harness.max_cycles
 _MAX_FILE_BYTES   = _cfg.learning_harness.max_file_bytes
+_NOTES_ENABLED    = getattr(_cfg.learning_harness, "notes_enabled", True)
 
 _STOPWORDS = frozenset({
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of",
@@ -70,7 +78,11 @@ _STOPWORDS = frozenset({
 _SUPPORTED_TEXT_EXT = frozenset({
     ".txt", ".md", ".csv", ".json", ".py", ".rst", ".log",
     ".html", ".yaml", ".yml", ".toml", ".xml",
+    ".pdf",
 })
+
+# URL shortcut files — fetched via browser, not read directly
+_URL_EXT = frozenset({".url"})
 
 # ── Module-level state ─────────────────────────────────────────────────────────
 
@@ -139,6 +151,13 @@ def _chunk_text(text: str) -> list:
 def _sentinel_key(file_path: str, size: int, last_modified: str) -> str:
     """MIP-format sentinel key: episodic:learning:processed:{slug}"""
     raw  = f"{file_path}|{size}|{last_modified}"
+    slug = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return f"episodic:learning:processed:{slug}"
+
+
+def _notes_api_sentinel_key(note_id: int, modified: int) -> str:
+    """MIP-format sentinel key for Notes API notes: keyed to note ID + modified timestamp."""
+    raw  = f"notes-api:{note_id}|{modified}"
     slug = hashlib.sha256(raw.encode()).hexdigest()[:16]
     return f"episodic:learning:processed:{slug}"
 
@@ -466,7 +485,8 @@ def _parse_proposals(raw: str) -> list:
 
 # ── Memory write dispatcher ───────────────────────────────────────────────────
 
-async def _write_proposed(proposal: dict, qdrant, doc_array: list) -> int:
+async def _write_proposed(proposal: dict, qdrant, doc_array: list,
+                          extra_metadata: dict = None) -> int:
     """Execute a single proposed memory write. Returns delta: 0 or 1."""
     op         = proposal.get("operation")
     collection = proposal.get("collection")
@@ -488,6 +508,7 @@ async def _write_proposed(proposal: dict, qdrant, doc_array: list) -> int:
                     "confidence": confidence,
                     "source":     "learning_harness",
                     "ts":         datetime.now(timezone.utc).isoformat(),
+                    **(extra_metadata or {}),
                 },
             )
             logger.debug("LearningHarness: created %s:%s (conf=%.2f)", collection, key, confidence)
@@ -523,10 +544,37 @@ async def _write_proposed(proposal: dict, qdrant, doc_array: list) -> int:
     return 0
 
 
+async def _log_learning_timeout(cog, timeout_result: dict, cycle: int, pass_type: str) -> None:
+    """Write a GPU timeout event to episodic memory (async, non-blocking)."""
+    if not cog.qdrant:
+        return
+    from datetime import datetime, timezone
+    from execution.adapters.qdrant import EPISODIC
+    import uuid
+    ts = datetime.now(timezone.utc).isoformat()
+    try:
+        await cog.qdrant.store(
+            collection=EPISODIC,
+            content=f"Learning harness GPU timeout — cycle {cycle} pass {pass_type}",
+            metadata={
+                "type": "episodic",
+                "event_type": "learning_timeout",
+                "cycle": cycle,
+                "pass_type": pass_type,
+                "priority": timeout_result.get("priority", "LOW"),
+                "timeout_seconds": timeout_result.get("timeout_seconds", 90),
+                "ts": ts,
+            },
+        )
+    except Exception:
+        pass
+
+
 # ── Confidence loop ───────────────────────────────────────────────────────────
 
 async def _run_confidence_loop(chunks: list, doc_array: list,
-                               cog, qdrant, nanobot) -> dict:
+                               cog, qdrant, nanobot, source_url: str = "",
+                               source_note_id: int | None = None) -> dict:
     """Run semantic→relational round-robin until plateau or safety cap.
 
     Returns: {cycles, created, updated, gaps}
@@ -535,6 +583,12 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
     total_updated    = 0
     all_gaps: list   = []
     supplemental_ctx: dict = {}
+    if source_note_id is not None:
+        _extra_meta = {"source_note_id": source_note_id}
+    elif source_url:
+        _extra_meta = {"source_url": source_url}
+    else:
+        _extra_meta = None
 
     for cycle in range(1, _MAX_CYCLES + 1):
         cycle_delta = 0
@@ -545,8 +599,25 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
                 prompt  = _build_llm_prompt(chunk, pass_type, context, supplemental_ctx)
 
                 try:
-                    result = await cog.ask_local(prompt)
-                    raw    = result.get("response", "") if isinstance(result, dict) else str(result)
+                    from adapters.inference_queue import InferenceQueue
+                    result = await cog.ask_local(
+                        prompt, priority=InferenceQueue.LOW, timeout=90.0
+                    )
+                    if result.get("status") == "llm_timeout":
+                        logger.warning(
+                            "LearningHarness: GPU timeout on cycle %d %s — retrying once",
+                            cycle, pass_type,
+                        )
+                        import asyncio as _aq
+                        _aq.create_task(_log_learning_timeout(cog, result, cycle, pass_type))
+                        result = await cog.ask_local(
+                            prompt, priority=InferenceQueue.LOW, timeout=90.0
+                        )
+                        if result.get("status") == "llm_timeout":
+                            raise Exception(
+                                f"Ollama timed out on cycle {cycle} ({pass_type}) — GPU busy"
+                            )
+                    raw = result.get("response", "") if isinstance(result, dict) else str(result)
                 except Exception as e:
                     logger.error("LearningHarness: Ollama call failed (cycle %d %s): %s",
                                  cycle, pass_type, e)
@@ -584,7 +655,7 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
                             "gap_description": p.get("gap_description", ""),
                         })
                         continue
-                    delta = await _write_proposed(p, qdrant, doc_array)
+                    delta = await _write_proposed(p, qdrant, doc_array, _extra_meta)
                     if delta > 0:
                         cycle_delta += 1
                         if p.get("operation") == "create":
@@ -628,8 +699,16 @@ def _extract_text(content_raw, filename: str) -> str | None:  # noqa: F821
 
 # ── Single file processor ─────────────────────────────────────────────────────
 
-async def _process_file(app_state, file_info: dict) -> None:
-    """Full learning pipeline for one file."""
+async def _process_file(app_state, file_info: dict,
+                        content: str | None = None,
+                        sentinel_override: str | None = None,
+                        source_note_id: int | None = None) -> None:
+    """Full learning pipeline for one file.
+
+    content: if provided, skip fs_read and use directly (Notes API path).
+    sentinel_override: if provided, use instead of computing from file_info.
+    source_note_id: if provided, inject into semantic entry and sentinel metadata.
+    """
     qdrant  = app_state.qdrant
     cog     = app_state.cog
     nanobot = app_state.exec.nanobot
@@ -639,11 +718,13 @@ async def _process_file(app_state, file_info: dict) -> None:
     last_modified = str(file_info.get("last_modified") or file_info.get("modified", ""))
     filename      = file_path.split("/")[-1] if "/" in file_path else file_path
 
-    sentinel = _sentinel_key(file_path, file_size, last_modified)
+    sentinel     = sentinel_override if sentinel_override else _sentinel_key(file_path, file_size, last_modified)
+    _source_meta = {"source": "notes_api", "note_id": source_note_id} if source_note_id is not None else {}
 
     # ── Format gate ───────────────────────────────────────────────────────
+    # Skipped when content is injected directly (Notes API) — already plain text.
     ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
-    if ext and ext not in _SUPPORTED_TEXT_EXT:
+    if content is None and ext and ext not in _SUPPORTED_TEXT_EXT and ext not in _URL_EXT:
         logger.info("LearningHarness: unsupported format %s — %s", ext, filename)
         await _notify_telegram(
             f"⚠️ *Learning Harness*: `{filename}` is a `{ext}` file — "
@@ -657,34 +738,109 @@ async def _process_file(app_state, file_info: dict) -> None:
         })
         return
 
-    # ── Size gate ─────────────────────────────────────────────────────────
-    if file_size > _MAX_FILE_BYTES:
-        size_kb = file_size // 1024
-        logger.info(
-            "LearningHarness: file too large (%dKB > %dKB limit) — %s",
-            size_kb, _MAX_FILE_BYTES // 1024, filename,
-        )
-        await _notify_telegram(
-            f"⚠️ *Learning Harness*: `{filename}` is {size_kb}KB — "
-            f"exceeds the {_MAX_FILE_BYTES // 1024}KB limit. "
-            f"Split the file or raise the limit to process it."
-        )
-        await _write_sentinel(qdrant, sentinel, {
-            "outcome":   "skipped_too_large",
-            "file_path": file_path,
-            "file_size": file_size,
-        })
-        return
+    _source_url = ""  # set in .url branch; carries source URL through pipeline
 
     # ── Step 1: Read file ─────────────────────────────────────────────────
     try:
-        nb_read = await nanobot.run(
-            "sovereign-nextcloud-fs", "fs_read", {"path": file_path}
-        )
-        raw_result    = nb_read.get("result") if nb_read.get("result") is not None else nb_read
-        document_text = _extract_text(raw_result, filename)
+        if content is not None:
+            document_text = content
+        elif ext == ".pdf":
+            nb_read = await nanobot.run(
+                "pypdf", "extract_text", {"path": file_path}
+            )
+            raw_result = nb_read.get("result") if nb_read.get("result") is not None else nb_read
+            document_text = raw_result.get("text", "") if isinstance(raw_result, dict) else ""
+
+        elif ext == ".url":
+            # Read the shortcut file to extract the target URL
+            nb_read = await nanobot.run(
+                "sovereign-nextcloud-fs", "fs_read", {"path": file_path}
+            )
+            raw_result    = nb_read.get("result") if nb_read.get("result") is not None else nb_read
+            shortcut_text = _extract_text(raw_result, filename) or ""
+            # fs_read may return base64-encoded content for non-text MIME types
+            if isinstance(raw_result, dict) and raw_result.get("binary") and shortcut_text:
+                try:
+                    import base64 as _b64
+                    shortcut_text = _b64.b64decode(shortcut_text).decode("utf-8", errors="replace")
+                except Exception:
+                    shortcut_text = ""
+
+            # Parse URL — supports Windows .url format (URL=https://...) and bare URLs
+            target_url = None
+            for line in shortcut_text.splitlines():
+                line = line.strip()
+                if line.lower().startswith("url="):
+                    target_url = line[4:].strip()
+                    break
+                if line.startswith("http://") or line.startswith("https://"):
+                    target_url = line
+                    break
+
+            if not target_url:
+                logger.warning("LearningHarness: no URL found in %s", filename)
+                await _write_sentinel(qdrant, sentinel, {
+                    "outcome":   "skipped_no_url",
+                    "file_path": file_path,
+                })
+                return
+
+            if not target_url.startswith(("http://", "https://")):
+                logger.warning("LearningHarness: invalid URL in %s — %s", filename, target_url)
+                await _write_sentinel(qdrant, sentinel, {
+                    "outcome":    "skipped_invalid_url",
+                    "file_path":  file_path,
+                    "target_url": target_url,
+                })
+                return
+
+            # Sentinel slug keyed to URL content, not file metadata
+            url_slug     = hashlib.sha256(target_url.strip().encode()).hexdigest()[:16]
+            url_sentinel = f"episodic:learning:processed:{url_slug}"
+            url_failed   = f"episodic:learning:failed:{url_slug}"
+
+            if await _has_sentinel(qdrant, url_sentinel) or await _has_sentinel(qdrant, url_failed):
+                logger.info("LearningHarness: URL already processed/failed — %s", target_url)
+                return
+
+            # Override sentinel to URL-based key; set source_url for metadata
+            sentinel    = url_sentinel
+            _source_url = target_url
+
+            logger.info("LearningHarness: fetching URL %s from %s", target_url, filename)
+            nb_fetch = await nanobot.run(
+                "sovereign-browser", "fetch",
+                {"url": target_url, "extract": "text", "timeout": 60},
+            )
+            flat          = nb_fetch.get("result") if nb_fetch.get("result") is not None else nb_fetch
+            document_text = flat.get("content", "") if isinstance(flat, dict) else ""
+            page_title    = flat.get("title",   "") if isinstance(flat, dict) else ""
+
+            if not document_text or not document_text.strip():
+                logger.warning("LearningHarness: URL fetch returned empty — %s", target_url)
+                await _write_sentinel(qdrant, url_failed, {
+                    "outcome":    "fetch_empty",
+                    "target_url": target_url,
+                })
+                return
+
+            if page_title:
+                filename = f"{page_title} [{filename}]"
+
+        else:
+            nb_read = await nanobot.run(
+                "sovereign-nextcloud-fs", "fs_read", {"path": file_path}
+            )
+            raw_result    = nb_read.get("result") if nb_read.get("result") is not None else nb_read
+            document_text = _extract_text(raw_result, filename)
     except Exception as e:
-        reason = f"fs_read failed: {e}"
+        if ext == ".pdf":
+            op = "pdf_extract"
+        elif ext == ".url":
+            op = "browser_fetch"
+        else:
+            op = "fs_read"
+        reason = f"{op} failed: {e}"
         logger.error("LearningHarness: %s — %s", filename, reason)
         await _notify_telegram(
             f"⚠️ *Learning Harness* failed [read]: {reason} — `{filename}`"
@@ -697,6 +853,7 @@ async def _process_file(app_state, file_info: dict) -> None:
         await _write_sentinel(qdrant, sentinel, {
             "outcome":   "skipped_empty",
             "file_path": file_path,
+            **_source_meta,
         })
         return
 
@@ -709,6 +866,7 @@ async def _process_file(app_state, file_info: dict) -> None:
         await _write_sentinel(qdrant, sentinel, {
             "outcome":   "skipped_no_keywords",
             "file_path": file_path,
+            **_source_meta,
         })
         return
 
@@ -731,6 +889,7 @@ async def _process_file(app_state, file_info: dict) -> None:
         await _write_sentinel(qdrant, sentinel, {
             "outcome":   "skipped_no_chunks",
             "file_path": file_path,
+            **_source_meta,
         })
         return
 
@@ -739,7 +898,10 @@ async def _process_file(app_state, file_info: dict) -> None:
 
     # ── Step 5: Confidence loop ───────────────────────────────────────────
     try:
-        loop_result = await _run_confidence_loop(chunks, doc_array, cog, qdrant, nanobot)
+        loop_result = await _run_confidence_loop(
+            chunks, doc_array, cog, qdrant, nanobot,
+            source_url=_source_url, source_note_id=source_note_id,
+        )
     except Exception as e:
         reason = f"confidence loop error: {e}"
         logger.error("LearningHarness: %s — %s", filename, reason)
@@ -747,6 +909,12 @@ async def _process_file(app_state, file_info: dict) -> None:
             f"⚠️ *Learning Harness* failed [loop]: {reason} — `{filename}`"
         )
         await _write_failure_prospective(qdrant, "loop", reason, filename)
+        await _write_sentinel(qdrant, sentinel, {
+            "outcome":   "loop_failed",
+            "file_path": file_path,
+            "reason":    reason,
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+        })
         return
 
     cycles          = loop_result["cycles"]
@@ -765,6 +933,7 @@ async def _process_file(app_state, file_info: dict) -> None:
         "entries_updated":  entries_updated,
         "gaps_flagged":     len(gaps),
         "completed_at":     datetime.now(timezone.utc).isoformat(),
+        **_source_meta,
     })
 
     # ── Step 7: Update last-run summary ──────────────────────────────────
@@ -859,6 +1028,124 @@ async def check_downloads(app_state, immediate: bool = False) -> None:
         _run_in_progress = False
 
 
+# ── Notes checker ─────────────────────────────────────────────────────────────
+
+async def check_notes(app_state) -> None:
+    """Check Nextcloud Notes API for unprocessed notes; runs in synthesis window only."""
+    global _run_in_progress
+
+    if not _NOTES_ENABLED:
+        logger.debug("LearningHarness: notes ingestion disabled — skipping")
+        return
+
+    current_hour = datetime.now(timezone.utc).hour
+    if current_hour not in _PROCESSING_HOURS:
+        logger.debug(
+            "LearningHarness: outside processing window (UTC %02d:xx) — deferring notes",
+            current_hour,
+        )
+        return
+
+    if _run_in_progress:
+        logger.debug("LearningHarness: run already in progress — skipping check_notes")
+        return
+
+    qdrant  = app_state.qdrant
+    nanobot = app_state.exec.nanobot
+
+    # ── List all notes ────────────────────────────────────────────────────
+    try:
+        nb_list    = await nanobot.run("openclaw-nextcloud", "notes_list", {})
+        raw        = nb_list.get("result") if nb_list.get("result") is not None else nb_list
+        notes_raw  = (raw.get("notes") if isinstance(raw, dict) else None) or []
+    except Exception as e:
+        logger.warning("LearningHarness: notes_list failed: %s", e)
+        return  # no sentinel — retry next window
+
+    if not notes_raw:
+        logger.debug("LearningHarness: no notes found")
+        return
+
+    # ── Find unprocessed notes ────────────────────────────────────────────
+    pending = []
+    for n in notes_raw:
+        if not isinstance(n, dict):
+            continue
+        note_id  = n.get("id")
+        modified = n.get("modified")
+        title    = n.get("title") or f"note-{note_id}"
+        if note_id is None or modified is None:
+            continue
+        sentinel = _notes_api_sentinel_key(note_id, modified)
+        if await _has_sentinel(qdrant, sentinel):
+            logger.debug("LearningHarness: note already processed — %s", title)
+            continue
+        pending.append({"id": note_id, "modified": modified, "title": title, "sentinel": sentinel})
+
+    if not pending:
+        logger.debug("LearningHarness: all notes already processed")
+        return
+
+    logger.info("LearningHarness: %d pending note(s) found", len(pending))
+
+    _run_in_progress = True
+    try:
+        for note_meta in pending:
+            note_id  = note_meta["id"]
+            modified = note_meta["modified"]
+            title    = note_meta["title"]
+            sentinel = note_meta["sentinel"]
+
+            # Read note content
+            try:
+                nb_read     = await nanobot.run("openclaw-nextcloud", "notes_read", {"note-id": str(note_id)})
+                read_raw    = nb_read.get("result") if nb_read.get("result") is not None else nb_read
+                note_content = (read_raw.get("content") if isinstance(read_raw, dict) else None) or ""
+            except Exception as e:
+                logger.warning(
+                    "LearningHarness: notes_read failed (note %s '%s'): %s",
+                    note_id, title, e,
+                )
+                continue  # no sentinel — retry next window
+
+            if not note_content or not note_content.strip():
+                logger.info("LearningHarness: empty note — %s", title)
+                await _write_sentinel(qdrant, sentinel, {
+                    "outcome":   "skipped_empty",
+                    "file_path": f"/Notes/{title}",
+                    "source":    "notes_api",
+                    "note_id":   note_id,
+                })
+                continue
+
+            if len(note_content.strip()) < 80:
+                logger.info(
+                    "LearningHarness: note too short (%d chars) — skipping '%s'",
+                    len(note_content.strip()), title,
+                )
+                await _write_sentinel(qdrant, sentinel, {
+                    "outcome":   "skipped_too_short",
+                    "file_path": f"/Notes/{title}",
+                    "source":    "notes_api",
+                    "note_id":   note_id,
+                })
+                continue
+
+            file_info = {
+                "path":          f"/Notes/{title}",
+                "size":          len(note_content),
+                "last_modified": str(modified),
+            }
+            await _process_file(
+                app_state, file_info,
+                content=note_content,
+                sentinel_override=sentinel,
+                source_note_id=note_id,
+            )
+    finally:
+        _run_in_progress = False
+
+
 # ── Status query (learning_harness_status intent) ────────────────────────────
 
 def get_last_run_status() -> dict:
@@ -895,13 +1182,17 @@ def get_last_run_status() -> dict:
 # ── Hourly background loop ────────────────────────────────────────────────────
 
 async def learning_loop(app_state) -> None:
-    """Hourly asyncio loop: poll /downloads/ for new files."""
+    """Hourly asyncio loop: poll /downloads/ and Nextcloud Notes for new content."""
     await asyncio.sleep(60)   # settle delay after startup
     while True:
         try:
             await check_downloads(app_state, immediate=False)
         except Exception as e:
-            logger.error("LearningHarness: unhandled error in poll loop: %s", e)
+            logger.error("LearningHarness: unhandled error in downloads poll: %s", e)
+        try:
+            await check_notes(app_state)
+        except Exception as e:
+            logger.error("LearningHarness: unhandled error in notes poll: %s", e)
         await asyncio.sleep(3600)
 
 

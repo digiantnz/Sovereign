@@ -4,6 +4,83 @@ Completed phases moved here to keep the root CLAUDE.md lean. Content is historic
 
 ---
 
+## Archived: Adapter Removal Plan — Browser → WebDAV → CalDAV (COMPLETE 2026-04-03)
+
+Archived from root CLAUDE.md 2026-05-15. All three phases completed. See Phase Status table and as-built.md for the completed record.
+
+**Principle**: No duplicate of what nanobot does. All application I/O (browser, Nextcloud files, calendar/tasks) routes through nanobot-01. Direct adapters in sovereign-core are legacy and must be removed.
+
+**Context**: BrowserAdapter was calling `POST /run` (non-existent on a2a-browser) — fixed to use `POST /search` / `POST /fetch` in session 2026-04-01. Adapters exist at `core/app/execution/adapters/browser.py`, `core/app/adapters/webdav.py`, `core/app/adapters/caldav.py`.
+
+---
+
+### Phase 1: Browser (COMPLETE)
+
+**What needs adding to nanobot** — `sovereign-browser` SKILL.md exists but has no python3_exec script; currently routes through BrowserAdapter.
+
+1. Add `secrets/browser.env` to nanobot-01 `env_file` in `compose.yml` — injects `A2A_BROWSER_URL` + `A2A_SHARED_SECRET`
+2. Create `nanobot-01/workspace/skills/sovereign-browser/scripts/browser.py` — stdlib+requests, commands: `search` (POST `/search`) and `fetch` (POST `/fetch`) against a2a-browser; read `A2A_BROWSER_URL` + `A2A_SHARED_SECRET` from env; output flat JSON matching a2a-browser response schema
+3. Update `/home/sovereign/skills/sovereign-browser/SKILL.md` — change `tool: browser` → `tool: python3_exec`, add `script: scripts/browser.py`, update args for search/fetch commands
+4. Update `engine.py` `domain == "browser"` dispatch — replace `self.browser.search()`/`self.browser.fetch()` with `self.nanobot.run("sovereign-browser", "search"|"fetch", params)`; result data is in `nb["result"]` not `nb["data"]`; keep existing ledger logging and response formatting
+5. Remove `from execution.adapters.browser import BrowserAdapter` and `self.browser = BrowserAdapter()` from engine.py
+6. Delete `core/app/execution/adapters/browser.py`
+7. Rebuild nanobot-01 + sovereign-core; test: ask Rex to search the web
+
+**AUTH_PROFILES note**: `_build_fetch_payload` auth injection was dead code (a2a-browser `FetchRequest` has no `auth` field). Skip for now — add when a2a-browser supports it.
+
+---
+
+### Phase 2: WebDAV (COMPLETE)
+
+**Nanobot already covers all operations** via `sovereign-nextcloud-fs` (nc_fs.py) and `openclaw-nextcloud` (nextcloud.py).
+
+| Engine intent | Old call | New nanobot call |
+|---|---|---|
+| `file_navigate` | `webdav.navigate(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_list", {"path": path})` |
+| `list_files` | `webdav.list(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_list", {"path": path})` |
+| `read_file` | `webdav.read(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_read", {"path": path})` |
+| `write_file` | `webdav.write(path, content)` | `nanobot.run("openclaw-nextcloud", "files_write", {"path": path, "content": content})` |
+| `delete_file` | `webdav.delete(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_delete", {"path": path})` |
+| `create_folder` | `webdav.mkdir(path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_mkdir", {"path": path})` |
+| `search_files` | `webdav.search(query, path)` | `nanobot.run("sovereign-nextcloud-fs", "fs_search", {"query": query, "path": path})` |
+| `list_files_recursive` | already nanobot ✓ | unchanged |
+| `read_files_recursive` | already nanobot ✓ | unchanged |
+
+**RAID path exception** — keep as-is: `list_files`/`read_file` for `/home/sovereign/` and `/docker/sovereign/` paths → `broker.read_host_file()`. No WebDAVAdapter involved.
+
+Steps:
+1. Rewire engine.py `domain == "webdav"` block — replace each `self.webdav.*` with nanobot calls per table above; preserve RAID path exception for broker
+2. Remove `from adapters.webdav import WebDAVAdapter` and `self.webdav = WebDAVAdapter()` from engine.py
+3. Delete `core/app/adapters/webdav.py`
+4. Rebuild sovereign-core; test: list/read/write/delete Nextcloud file
+
+---
+
+### Phase 3: CalDAV (COMPLETE)
+
+**Nanobot already covers all operations** via `openclaw-nextcloud` (nextcloud.py).
+
+| Engine intent | Old call | New nanobot call |
+|---|---|---|
+| `list_calendars` | `caldav.list_calendars()` | `nanobot.run("openclaw-nextcloud", "calendar_list", {})` |
+| `list_events` | `caldav.list_events(cal, from, to)` | `nanobot.run("openclaw-nextcloud", "calendar_list", {"calendar": cal, "from_date": from, "to_date": to})` |
+| `create_event` | `caldav.create_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_create", {...})` |
+| `update_event` | `caldav.update_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_update", {...})` |
+| `delete_event` | `caldav.delete_event(...)` | `nanobot.run("openclaw-nextcloud", "calendar_delete", {"uid": uid})` |
+| `create_task` | `caldav.create_task(...)` | `nanobot.run("openclaw-nextcloud", "tasks_create", {...})` |
+| `complete_task` | `caldav.complete_task(cal, uid)` | `nanobot.run("openclaw-nextcloud", "tasks_complete", {"uid": uid})` |
+| `delete_task` | `caldav.delete_task(cal, uid)` | `nanobot.run("openclaw-nextcloud", "tasks_delete", {"uid": uid})` |
+
+**Note**: All event field extraction (summary, start, end, UID, calendar name) from specialist output stays in engine.py — only the final adapter call changes.
+
+Steps:
+1. Rewire engine.py `domain == "caldav"` block — replace each `self.caldav.*` with nanobot calls; pass pre-processed fields as nanobot payload
+2. Remove `from adapters.caldav import CalDAVAdapter` and `self.caldav = CalDAVAdapter()` from engine.py
+3. Delete `core/app/adapters/caldav.py`
+4. Rebuild sovereign-core; test: list events, create event, complete task
+
+---
+
 ## Phase 0 Validated Capabilities
 
 - `docker ps`, `docker logs`, `docker stats` → observer status (read-only) ✓

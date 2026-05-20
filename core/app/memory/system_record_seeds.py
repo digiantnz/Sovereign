@@ -172,8 +172,8 @@ def build_governance_seeds() -> list[dict]:
             "content": (
                 "ollama-embed runs CPU-only (OLLAMA_NUM_GPU=0) at http://ollama-embed:11434. "
                 "nomic-embed-text (768-dim) — no VRAM constraint, can run at any time. "
-                "ollama (GPU) runs llama3.1:8b on RTX 3060 Ti. "
-                "Whisper (node04:8003) and ollama MUST NOT run concurrently — GPU contention."
+                "ollama (GPU) runs qwen2.5:32b on EVGA RTX 3090 (24GB VRAM). "
+                "Whisper runs on node04 (Quadro P4000) — no local GPU contention."
             ),
         },
         {

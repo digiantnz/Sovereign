@@ -98,7 +98,7 @@ _ENTITIES: list[dict] = [
         "tailscale_ip": "100.111.130.60",
         "os":           "Ubuntu 24",
         "cpu":          "Ryzen 9900X",
-        "gpu":          "RTX 3060 Ti 8GB",
+        "gpu":          "EVGA RTX 3090 24GB",
         "ram_gb":       32,
         "storage_nvme": "512GB",
         "storage_raid": "6TB RAID5",
@@ -107,7 +107,7 @@ _ENTITIES: list[dict] = [
         "status":       "active",
         "content": (
             "Sovereign Server — primary hardware host for the Sovereign AI system. "
-            "AMD Ryzen 9900X, 32GB RAM, RTX 3060 Ti 8GB GPU, 512GB NVMe, 6TB RAID5. "
+            "AMD Ryzen 9900X, 32GB RAM, EVGA RTX 3090 24GB GPU, 512GB NVMe, 6TB RAID5. "
             "LAN IP: 172.16.201.25. Tailscale: 100.111.130.60. OS: Ubuntu 24. "
             "Located in New Zealand. Hosts all core Docker containers: "
             "sovereign-core, ollama, qdrant, qdrant-archive, nanobot-01, gateway, "

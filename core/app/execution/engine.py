@@ -516,6 +516,257 @@ async def _write_note_memory(qdrant, title: str, category: str,
         logger.warning("note_memory: write failed for %r: %s", title, exc)
 
 
+async def _write_email_sent_memory(qdrant, recipient: str, subject: str) -> None:
+    """Write a semantic memory entry when Rex sends an email on the Director's behalf."""
+    try:
+        import hashlib
+        from datetime import date
+        today = date.today().isoformat()
+        slug = hashlib.sha256(f"{recipient}|{subject}|{today}".encode()).hexdigest()[:12]
+        key = f"semantic:action:email-sent:{slug}"
+        content = f"Sent email to {recipient} about '{subject}' on {today}."
+        await qdrant.store(
+            collection=SEMANTIC,
+            content=content,
+            metadata={
+                "type":         "semantic",
+                "domain":       "action",
+                "subtype":      "email_sent",
+                "_key":         key,
+                "recipient":    recipient,
+                "subject":      subject,
+                "date_sent":    today,
+                "source":       "director_action",
+                "status":       "active",
+                "_weight":      1.0,
+                "date_written": today,
+            },
+        )
+        logger.info("email_sent_memory: wrote entry for recipient=%r (key=%s)", recipient, key)
+    except Exception as exc:
+        logger.warning("email_sent_memory: write failed: %s", exc)
+
+
+async def _write_file_write_memory(qdrant, path: str) -> None:
+    """Write a semantic memory entry when Rex creates or updates a file in Nextcloud."""
+    try:
+        import hashlib
+        from datetime import date
+        today = date.today().isoformat()
+        slug = hashlib.sha256(path.encode()).hexdigest()[:12]
+        key = f"semantic:action:file-write:{slug}"
+        content = f"Created/updated file at {path} on {today}."
+        await qdrant.store(
+            collection=SEMANTIC,
+            content=content,
+            metadata={
+                "type":         "semantic",
+                "domain":       "action",
+                "subtype":      "file_write",
+                "_key":         key,
+                "path":         path,
+                "date_written": today,
+                "source":       "director_action",
+                "status":       "active",
+                "_weight":      1.0,
+            },
+        )
+        logger.info("file_write_memory: wrote entry for path=%r (key=%s)", path, key)
+    except Exception as exc:
+        logger.warning("file_write_memory: write failed: %s", exc)
+
+
+async def _write_folder_create_memory(qdrant, path: str) -> None:
+    """Write a semantic memory entry when Rex creates a folder in Nextcloud."""
+    try:
+        import hashlib
+        from datetime import date
+        today = date.today().isoformat()
+        slug = hashlib.sha256(path.encode()).hexdigest()[:12]
+        key = f"semantic:action:folder-create:{slug}"
+        content = f"Created folder {path} on {today}."
+        await qdrant.store(
+            collection=SEMANTIC,
+            content=content,
+            metadata={
+                "type":         "semantic",
+                "domain":       "action",
+                "subtype":      "folder_create",
+                "_key":         key,
+                "path":         path,
+                "date_written": today,
+                "source":       "director_action",
+                "status":       "active",
+                "_weight":      1.0,
+            },
+        )
+        logger.info("folder_create_memory: wrote entry for path=%r (key=%s)", path, key)
+    except Exception as exc:
+        logger.warning("folder_create_memory: write failed: %s", exc)
+
+
+async def _write_skill_install_memory(qdrant, skill_name: str, description: str = "") -> None:
+    """Write an action-record semantic entry when Rex installs a skill.
+
+    Companion to lifecycle.load() → make_skill_semantic_seed() which writes the capability
+    descriptor (semantic:intent:{slug}). This records the install event itself.
+    """
+    try:
+        from datetime import date
+        today = date.today().isoformat()
+        key = f"semantic:component:skill-{skill_name}"
+        content = f"Installed skill '{skill_name}' on {today}."
+        if description:
+            content += f" Purpose: {description}"
+        await qdrant.store(
+            collection=SEMANTIC,
+            content=content,
+            metadata={
+                "type":           "semantic",
+                "domain":         "component",
+                "subtype":        "skill_install",
+                "_key":           key,
+                "skill_name":     skill_name,
+                "date_installed": today,
+                "description":    description,
+                "source":         "director_action",
+                "status":         "active",
+                "_weight":        1.0,
+                "date_written":   today,
+            },
+        )
+        logger.info("skill_install_memory: wrote action record for skill=%r (key=%s)", skill_name, key)
+    except Exception as exc:
+        logger.warning("skill_install_memory: write failed: %s", exc)
+
+
+async def _mark_semantic_historical(
+    qdrant,
+    mip_key: str | None,
+    *,
+    key_prefix: str | None = None,
+    deletion_slug: str | None = None,
+    note_id: str | None = None,
+    episodic_context: str = "",
+) -> None:
+    """Mark a semantic archive entry status: historical after a confirmed Director-directed deletion.
+
+    Three lookup strategies (tried in order):
+      1. Exact key lookup via retrieve_by_key(mip_key) — used when path or full key is known.
+      2. note_id payload match — used for notes_delete (numeric note ID in semantic payload).
+      3. Prefix scroll — used for calendar/task deletes where event date is unknown;
+         scrolls semantic collection and matches _key.startswith(prefix) and slug in _key.
+
+    Always writes an episodic deletion audit entry regardless of whether a semantic entry exists.
+    Physical Qdrant point is never deleted — status: historical is the terminal state.
+    """
+    import hashlib
+    from datetime import datetime, timezone as _tz
+    now_iso = datetime.now(_tz.utc).isoformat()
+
+    found_collection: str | None = None
+    found_point_id: str | None   = None
+    found_key: str               = ""
+
+    try:
+        # Strategy 1: exact MIP key lookup
+        if mip_key:
+            hit = await qdrant.retrieve_by_key(mip_key)
+            if hit:
+                found_collection = hit["collection"]
+                found_point_id   = hit["point_id"]
+                found_key        = hit.get("_key", mip_key)
+
+        # Strategy 2: note_id payload match (notes_delete — numeric ID stored in semantic payload)
+        if not found_point_id and note_id:
+            try:
+                from qdrant_client.models import Filter as _F, FieldCondition as _FC, MatchValue as _MV
+                _pts, _ = await qdrant.archive_client.scroll(
+                    collection_name="semantic",
+                    scroll_filter=_F(must=[_FC(key="note_id", match=_MV(value=str(note_id)))]),
+                    limit=1,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if _pts:
+                    found_collection = "semantic"
+                    found_point_id   = str(_pts[0].id)
+                    found_key        = (_pts[0].payload or {}).get("_key", "")
+            except Exception:
+                pass
+
+        # Strategy 3: prefix scroll (calendar/task — exact date unknown, match by title slug)
+        if not found_point_id and key_prefix and deletion_slug:
+            try:
+                _off = None
+                while True:
+                    _batch, _next = await qdrant.archive_client.scroll(
+                        collection_name="semantic",
+                        limit=200,
+                        offset=_off,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    for _r in _batch:
+                        _k = (_r.payload or {}).get("_key", "")
+                        if _k.startswith(key_prefix) and deletion_slug in _k:
+                            found_collection = "semantic"
+                            found_point_id   = str(_r.id)
+                            found_key        = _k
+                            break
+                    if found_point_id or _next is None:
+                        break
+                    _off = _next
+            except Exception:
+                pass
+
+        # Mark historical (never physically delete the Qdrant point)
+        if found_collection and found_point_id:
+            await qdrant.archive_client.set_payload(
+                collection_name=found_collection,
+                payload={
+                    "status":           "historical",
+                    "deleted_at":       now_iso,
+                    "deletion_reason":  "director_directed",
+                },
+                points=[found_point_id],
+            )
+            logger.info(
+                "mark_semantic_historical: %s in %s marked historical (key=%s)",
+                found_point_id, found_collection, found_key,
+            )
+
+    except Exception as exc:
+        logger.warning("mark_semantic_historical: lookup/set_payload failed: %s", exc)
+
+    # Episodic deletion audit — always written, whether or not semantic entry existed
+    try:
+        _ep_slug = hashlib.sha256(episodic_context.encode()).hexdigest()[:12]
+        _sem_status = "marked_historical" if found_point_id else "not_found"
+        await qdrant.store(
+            collection=EPISODIC,
+            content=(
+                f"Director-directed deletion: {episodic_context} at {now_iso}. "
+                f"Semantic entry {_sem_status}."
+                + (f" Key: {found_key}." if found_key else "")
+            ),
+            metadata={
+                "type":              "episodic",
+                "domain":            "action",
+                "subtype":           "deletion",
+                "outcome":           "ok",
+                "_key":              f"episodic:action:deletion:{_ep_slug}",
+                "deletion_context":  episodic_context,
+                "semantic_found":    bool(found_point_id),
+                "semantic_key":      found_key,
+                "timestamp":         now_iso,
+                "source":            "director_action",
+            },
+        )
+    except Exception as exc:
+        logger.warning("mark_semantic_historical: episodic write failed: %s", exc)
+
+
 def _normalise_dt(value: str, default_year: int = 2026) -> str:
     """Normalise a freeform datetime string to ISO 8601 YYYY-MM-DDTHH:MM:SS.
 
@@ -2590,11 +2841,14 @@ class ExecutionEngine:
             return "", [], 0.0
 
         try:
+            from qdrant_client.models import Filter as _F0, FieldCondition as _FC0, MatchValue as _MV0
+            _p0_filter = _F0(must_not=[_FC0(key="status", match=_MV0(value="historical"))])
             entries = []
             offset = None
             while True:
                 result, next_offset = await self.qdrant.client.scroll(
                     collection_name="working_memory",
+                    scroll_filter=_p0_filter,
                     limit=200,
                     offset=offset,
                     with_payload=True,
@@ -5063,9 +5317,12 @@ class ExecutionEngine:
                     "sovereign-nextcloud-fs", "fs_read", {"path": path}
                 ))
             if name == "folder_create":
-                return _nb_unwrap(await self.nanobot.run(
+                _fc_result = _nb_unwrap(await self.nanobot.run(
                     "sovereign-nextcloud-fs", "fs_mkdir", {"path": path}
                 ))
+                if _fc_result.get("status") == "ok":
+                    asyncio.create_task(_write_folder_create_memory(self.qdrant, path))
+                return _fc_result
             if name == "file_search":
                 sp = specialist or {}
                 query = sp.get("query") or action.get("query") or prompt or ""
@@ -5089,13 +5346,27 @@ class ExecutionEngine:
                     m = _re.search(r"(?:content|text|body)\s*[:=]\s*['\"]?(.+)", prompt, _re.IGNORECASE)
                     if m:
                         content = m.group(1).strip().strip("'\"")
-                return _nb_unwrap(await self.nanobot.run(
+                _fw_result = _nb_unwrap(await self.nanobot.run(
                     "openclaw-nextcloud", "files_write", {"path": path, "content": content}
                 ))
+                if _fw_result.get("status") == "ok":
+                    asyncio.create_task(_write_file_write_memory(self.qdrant, path))
+                return _fw_result
             if name == "file_delete":
-                return _nb_unwrap(await self.nanobot.run(
+                import hashlib as _hlib_fd
+                _fd_result = _nb_unwrap(await self.nanobot.run(
                     "sovereign-nextcloud-fs", "fs_delete", {"path": path}
                 ))
+                if _fd_result.get("status") == "ok":
+                    _fd_mip_key = (
+                        f"semantic:action:file-write:{_hlib_fd.sha256(path.encode()).hexdigest()[:12]}"
+                    )
+                    asyncio.create_task(_mark_semantic_historical(
+                        self.qdrant,
+                        mip_key=_fd_mip_key,
+                        episodic_context=f"file deleted: {path}",
+                    ))
+                return _fd_result
             if name == "file_list_recursive":
                 return _nb_unwrap(await self.nanobot.run(
                     "openclaw-nextcloud", "files_list_recursive", {"path": path}
@@ -5330,16 +5601,47 @@ class ExecutionEngine:
                 del_delete_url = sp.get("delete_url") or action.get("delete_url", "")
                 if not del_uid and not del_delete_url:
                     return {"error": f"{name} requires a UID — please specify which item to delete"}
+                # Title slug for semantic historical lookup (prefix scroll approach)
+                _del_title = (sp.get("summary") or sp.get("title")
+                              or sp.get("event_title") or sp.get("task_title") or "")
+                _del_hist_slug = (
+                    _re_cal.sub(r'[^a-z0-9]+', '-', _del_title.lower()).strip('-')[:48]
+                    if _del_title else None
+                )
                 if name == "task_delete":
                     params = {"uid": del_uid, "calendar": del_calendar}
                     if del_delete_url:
                         params["delete_url"] = del_delete_url
-                    return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_delete",
-                                                              params))
-                return _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_delete", {
+                    _td_result = _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "tasks_delete",
+                                                                    params))
+                    if _td_result.get("status") == "ok":
+                        asyncio.create_task(_mark_semantic_historical(
+                            self.qdrant,
+                            mip_key=None,
+                            key_prefix="semantic:task:",
+                            deletion_slug=_del_hist_slug,
+                            episodic_context=(
+                                f"task deleted: uid={del_uid} calendar={del_calendar}"
+                                + (f" title={_del_title}" if _del_title else "")
+                            ),
+                        ))
+                    return _td_result
+                _cd_result = _nb_unwrap(await self.nanobot.run("openclaw-nextcloud", "calendar_delete", {
                     "uid": del_uid,
                     "calendar": del_calendar,
                 }))
+                if _cd_result.get("status") == "ok":
+                    asyncio.create_task(_mark_semantic_historical(
+                        self.qdrant,
+                        mip_key=None,
+                        key_prefix="semantic:calendar:",
+                        deletion_slug=_del_hist_slug,
+                        episodic_context=(
+                            f"calendar event deleted: uid={del_uid} calendar={del_calendar}"
+                            + (f" title={_del_title}" if _del_title else "")
+                        ),
+                    ))
+                return _cd_result
 
         if domain == "notes":
             sp = specialist or {}
@@ -5436,6 +5738,14 @@ class ExecutionEngine:
                     return {"error": err or "delete_note requires a note ID or title — please specify which note"}
                 nb = await self.nanobot.run(_skill_nc, "notes_delete", {"note-id": note_id})
                 asyncio.create_task(self._clear_item_index("note"))
+                if (nb.get("status") == "ok"
+                        or (nb.get("result") or {}).get("status") == "ok"):
+                    asyncio.create_task(_mark_semantic_historical(
+                        self.qdrant,
+                        mip_key=None,
+                        note_id=note_id,
+                        episodic_context=f"note deleted: id={note_id}",
+                    ))
                 return nb
 
             return {"status": "error", "error": f"Unhandled notes operation: name={name!r}"}
@@ -5488,9 +5798,17 @@ class ExecutionEngine:
                 if not src or not dest:
                     return {"error": f"{name} requires src and dest"}
                 return await self.nanobot.run(_skill_ncfs, _ncfs_op, {"src": src, "dest": dest})
-            if name in ("ncfs_mkdir", "ncfs_delete"):
+            if name == "ncfs_mkdir":
                 if not path:
-                    return {"error": f"{name} requires a path"}
+                    return {"error": "ncfs_mkdir requires a path"}
+                _nmk_result = await self.nanobot.run(_skill_ncfs, _ncfs_op, {"path": path})
+                if (_nmk_result.get("status") == "ok"
+                        or (_nmk_result.get("result") or {}).get("status") == "ok"):
+                    asyncio.create_task(_write_folder_create_memory(self.qdrant, path))
+                return _nmk_result
+            if name == "ncfs_delete":
+                if not path:
+                    return {"error": "ncfs_delete requires a path"}
                 return await self.nanobot.run(_skill_ncfs, _ncfs_op, {"path": path})
             if name in ("ncfs_tag", "ncfs_untag"):
                 if not path:
@@ -5796,16 +6114,23 @@ class ExecutionEngine:
                 s = specialist or {}
                 _dlg = delegation or {}
                 draft = s.get("draft_content", "")
+                _send_to      = s.get("to")      or _dlg.get("to")      or action.get("to", "")
+                _send_subject = s.get("subject") or _dlg.get("subject") or action.get("subject", "")
                 nb = await self.nanobot.run(
                     _skill_nc_mail, "send",
                     {
                         "account": account,
-                        "to":      (s.get("to")      or _dlg.get("to")      or action.get("to", "")),
-                        "subject": (s.get("subject") or _dlg.get("subject") or action.get("subject", "")),
+                        "to":      _send_to,
+                        "subject": _send_subject,
                         "body":    (draft or s.get("body") or _dlg.get("body") or action.get("body", "")),
                     }
                 )
-                return _unwrap_nb(nb)
+                _send_result = _unwrap_nb(nb)
+                if _send_result.get("status") == "ok" or _send_result.get("success"):
+                    asyncio.create_task(_write_email_sent_memory(
+                        self.qdrant, _send_to, _send_subject,
+                    ))
+                return _send_result
 
             return {"status": "error", "error": f"Unhandled mail operation: op={op!r} name={name!r}"}
 
@@ -6605,9 +6930,10 @@ class ExecutionEngine:
                         _h_ts = _dt_inst.datetime.now(_dt_inst.timezone.utc).isoformat()
                         _h_cp_up = dict(_h_cp)
                         _h_sr = dict(_h_cp.get("step_results", {}))
+                        _h_installed_name = _h_dl.get("name") or _h_slug
                         _h_sr["install"] = {
                             "candidate_id": _h_cid,
-                            "skill_name": _h_dl.get("name") or _h_slug,
+                            "skill_name": _h_installed_name,
                             "path": _h_install_result.get("path", ""),
                             "ts": _h_ts,
                         }
@@ -6615,6 +6941,11 @@ class ExecutionEngine:
                         _h_cp_up["current_step"] = "complete"
                         _h_cp_up["last_checkpoint_ts"] = _h_ts
                         await self._skill_harness_save_checkpoint(_h_cp_up)
+                        asyncio.create_task(_write_skill_install_memory(
+                            self.qdrant,
+                            _h_installed_name,
+                            _h_cand.get("summary", ""),
+                        ))
                     return _h_install_result
 
                 # ── Legacy composite 3-step flow: search → review → load ────
@@ -6622,8 +6953,9 @@ class ExecutionEngine:
                 # delegation, skip search+review and go straight to load.
                 _dl_pending = (delegation or {}).get("_pending_load")
                 if confirmed and _dl_pending:
-                    return await lifecycle.load(
-                        name=_dl_pending.get("name", ""),
+                    _leg_name = _dl_pending.get("name", "")
+                    _leg_install_result = await lifecycle.load(
+                        name=_leg_name,
                         skill_md_content=_dl_pending.get("skill_md", ""),
                         review_result=_dl_pending.get("review_result", {}),
                         confirmed=True,
@@ -6633,6 +6965,9 @@ class ExecutionEngine:
                         reason="Director confirmed skill installation after review.",
                         raw_url=_dl_pending.get("raw_url"),
                     )
+                    if _leg_install_result.get("status") == "installed":
+                        asyncio.create_task(_write_skill_install_memory(self.qdrant, _leg_name))
+                    return _leg_install_result
 
                 # Step 1: search for candidates
                 # If the original request contained a direct URL (in delegation.target),

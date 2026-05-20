@@ -164,6 +164,7 @@ async def _ollama_classify(result, cog, skill_snapshot: dict | None = None, harn
     ) if (_skill_names or _active_h) else ""
 
     prompt = (
+        f"/no_think\n"
         f"{_system_ctx}"
         f"You are reviewing static analysis output for a Python codebase.\n\n"
         f"Gate decision (FINAL — you cannot change this): {result.gate_decision.value.upper()}\n"
@@ -182,7 +183,19 @@ async def _ollama_classify(result, cog, skill_snapshot: dict | None = None, harn
 
     try:
         if cog is not None and hasattr(cog, "ask_local"):
-            resp = await cog.ask_local(prompt, model=_CLASSIFY_MODEL)
+            from adapters.inference_queue import InferenceQueue
+            resp = await cog.ask_local(
+                prompt, model=_CLASSIFY_MODEL,
+                priority=InferenceQueue.LOW, timeout=90.0,
+            )
+            if resp.get("status") == "llm_timeout":
+                logger.warning("DevHarness classifier: GPU timeout — retrying once")
+                resp = await cog.ask_local(
+                    prompt, model=_CLASSIFY_MODEL,
+                    priority=InferenceQueue.LOW, timeout=90.0,
+                )
+                if resp.get("status") == "llm_timeout":
+                    raise RuntimeError("DevHarness classifier: GPU timed out after retry")
         else:
             # Direct Ollama call — only used if cog not available
             import httpx as _httpx

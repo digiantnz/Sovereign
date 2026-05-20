@@ -50,9 +50,10 @@ _DOMAIN_META: dict[str, tuple[str, str]] = {
     "monitoring":        ("harness", "harness:self_improvement"),
     "dev_harness":       ("harness", "harness:dev_harness"),
     "portal":            ("engine",  "engine:portal_handler"),
-    "tax":               ("harness", "harness:tax_ingest"),
-    "tax_report":        ("harness", "harness:tax_report"),
-    "news":              ("harness", "harness:news_harness"),
+    "tax":                 ("harness", "harness:tax_ingest"),
+    "tax_report":          ("harness", "harness:tax_report"),
+    "news":                ("harness", "harness:news_harness"),
+    "portfolio_analysis":  ("harness", "harness:portfolio_analysis"),
 }
 
 
@@ -348,6 +349,51 @@ def build_harness_seeds() -> list[dict]:
             ),
             "trigger_point": "harness:tax_report",
         },
+        {
+            "name": "research-harness",
+            "description": (
+                "Multi-source research harness in monitoring/research_harness.py. "
+                "Triggered by intent: research_gather (LOW) — routes via research_agent. "
+                "Intent signals: 'research on/into/about', 'deep research', 'financial research', "
+                "'investment research', 'company analysis', 'market analysis', 'should I buy/sell/invest', "
+                "'analyse/analyze [company]', 'due diligence on', 'deep dive into'. "
+                "Processing: parallel gather (browser search + Yahoo Finance price data + Grok context) "
+                "→ qwen2.5:32b synthesis (180s timeout) → structured output with full_report, "
+                "telegram_summary, confidence score → confirmation gate asking Director to save. "
+                "Saves to Nextcloud Notes via intent: research_save (MID — requires Director confirm). "
+                "Domain scope classification: exchange-prefixed ticker (NZX:PEB → securities), "
+                "commodity keywords (gold/oil/gas → commodities), bare CAPS ticker + financial context "
+                "(AAPL → securities), fallback (general). "
+                "Working memory checkpoint flag: _research_harness_checkpoint. "
+                "Clear via intent: research_clear (LOW). "
+                "Intents: research_gather (LOW), research_save (MID), research_clear (LOW)."
+            ),
+            "trigger_point": "harness:research",
+        },
+        {
+            "name": "portfolio-analysis-harness",
+            "description": (
+                "Per-category portfolio analysis harness in monitoring/portfolio_analysis_harness.py. "
+                "Triggered by gateway command: /portfolio <category> (not NL-routed). "
+                "Categories: crypto, retirement-fund, property. "
+                "Asset ledger files stored in Nextcloud at /portfolios/<category-slug>.md. "
+                "Accessed via openclaw-nextcloud nanobot skill (files_read / files_write). "
+                "YAML blocks per asset identified by slug field; purchase history is append-only. "
+                "Harness-maintained fields written after each analysis run: "
+                "current_value_nzd, unrealised_pnl_nzd, unrealised_pnl_pct, last_analysis, "
+                "last_verdict, last_confidence, last_verdict_rationale. "
+                "Processing: sov-wallet /portfolio for live crypto prices → parallel gather "
+                "(browser + Grok + Yahoo Finance per security) → sequential Qwen3 synthesis per security "
+                "(180s timeout each, InferenceQueue.NORMAL) → overall synthesis → write-back to Nextcloud ledger. "
+                "Background task pattern: run_portfolio_analysis() spawns asyncio.create_task() and returns immediately. "
+                "In-progress guard: _portfolio_analysis_running flag in working_memory. "
+                "Notifies Director via Telegram when analysis completes. "
+                "Say 'save portfolio' to save analysis to Nextcloud Notes; 'clear portfolio' to discard. "
+                "Intents: portfolio_analysis (LOW), portfolio_analysis_save (MID), portfolio_analysis_clear (LOW). "
+                "Crypto path validated; retirement-fund and property activate when Director creates ledger files."
+            ),
+            "trigger_point": "harness:portfolio_analysis",
+        },
     ]
     seeds = []
     for h in harnesses:
@@ -368,6 +414,54 @@ def build_harness_seeds() -> list[dict]:
                 "failure_count":  0,
             },
         })
+
+    # TradingAgents upstream watchlist — design inspiration for security_analysis_engine
+    seeds.append({
+        "seed_id": "tradingagents_upstream_v1",
+        "key":     "semantic:research:tradingagents-upstream",
+        "title":   "TradingAgents Upstream Repo — research engine inspiration",
+        "content": (
+            "Monitor https://github.com/TauricResearch/TradingAgents for new releases, "
+            "agent role updates, prompt engineering improvements, and new data source integrations. "
+            "This repo is the design inspiration for Sovereign's security_analysis_engine "
+            "(6-agent adversarial pipeline: News Analyst, Fundamentals Analyst, Sentiment Analyst, "
+            "Bull Researcher, Bear Researcher, Risk Manager). "
+            "Do NOT install as a dependency — implement natively using existing adapters. "
+            "New techniques from this repo should be surfaced as self-improvement proposals."
+        ),
+        "domain": "research",
+        "extra_meta": {
+            "intent_signals": ["tradingagents", "research engine", "security analysis engine"],
+            "action":         "monitor:upstream",
+            "trigger_point":  "harness:research",
+            "owner":          "research_agent",
+            "upstream_url":   "https://github.com/TauricResearch/TradingAgents",
+        },
+    })
+
+    # Portfolio harness pointer seed — fixed key for MIP retrieval
+    seeds.append({
+        "seed_id": "portfolio_harness_pointer_v1",
+        "key":     "semantic:portfolio:harness",
+        "title":   "Portfolio Analysis Harness — ledger location",
+        "content": (
+            "Asset ledger files stored in Nextcloud at /portfolios/<category-slug>.md "
+            "(openclaw-nextcloud files_read/files_write via nanobot-01). "
+            "Categories: crypto (crypto.md), retirement-fund (retirement-fund.md), property (property.md). "
+            "YAML blocks per asset identified by slug field. Harness-maintained fields written after each "
+            "analysis run. Purchase history is append-only — Director appends, Rex can append on instruction. "
+            "Trigger: /portfolio <category> Telegram command. "
+            "Background task: returns immediately, pushes result via Telegram when done. "
+            "Say 'save portfolio' to save to Nextcloud Notes; 'clear portfolio' to discard."
+        ),
+        "domain": "portfolio",
+        "extra_meta": {
+            "intent_signals": ["portfolio ledger", "portfolio analysis", "asset ledger"],
+            "action":         "harness:portfolio_analysis",
+            "trigger_point":  "harness:portfolio_analysis",
+            "owner":          "harness",
+        },
+    })
     return seeds
 
 

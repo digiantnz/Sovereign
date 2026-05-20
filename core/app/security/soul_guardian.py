@@ -136,23 +136,25 @@ class SoulGuardian:
         self._write_checksums(checksums)
         logger.info("SoulGuardian: baseline recorded for %d files", len(checksums))
 
-    def verify(self) -> list[str]:
+    def verify(self) -> tuple[list[str], dict[str, bool]]:
         """Compare current SHA256s against stored baseline synchronously.
-        Returns list of drifted file paths (empty = all good).
+        Returns (drifted_paths, restore_results) where restore_results maps
+        each drifted path to True if it was successfully restored.
         Records baseline on first run. Auto-restores Sovereign-soul.md if drifted."""
         stored = self._load_stored()
 
         if not stored:
             logger.info("SoulGuardian: no baseline found — recording initial checksums")
             self.record_baseline()
-            return []
+            return [], {}
 
-        drifted = []
+        drifted: list[str] = []
+        restore_results: dict[str, bool] = {}
         for path in self._files:
             if not os.path.exists(path):
                 logger.warning("SoulGuardian: protected file missing: %s", path)
                 drifted.append(path)
-                self._attempt_restore(path, auto_reason="file_missing")
+                restore_results[path] = self._attempt_restore(path, auto_reason="file_missing")
                 continue
             current = _sha256(path)
             expected = stored.get(path)
@@ -163,30 +165,32 @@ class SoulGuardian:
             elif current != expected:
                 logger.warning("SoulGuardian: drift detected: %s", path)
                 drifted.append(path)
-                self._attempt_restore(path, auto_reason="hash_mismatch")
+                restore_results[path] = self._attempt_restore(path, auto_reason="hash_mismatch")
 
-        return drifted
+        return drifted, restore_results
 
-    def _attempt_restore(self, path: str, auto_reason: str):
-        """Restore from backup if a restore source is available."""
+    def _attempt_restore(self, path: str, auto_reason: str) -> bool:
+        """Restore from backup if a restore source is available. Returns True if successful."""
         backup = RESTORABLE.get(path)
         if not backup or not os.path.exists(backup):
             logger.warning(
                 "SoulGuardian: no restorable backup for %s — alert only", path
             )
-            return
+            return False
         try:
             shutil.copy2(backup, path)
             logger.warning(
                 "SoulGuardian: AUTO-RESTORED %s from %s (reason: %s)",
                 path, backup, auto_reason,
             )
+            return True
         except Exception as e:
             logger.error("SoulGuardian: restore failed for %s: %s", path, e)
+            return False
 
     async def verify_and_notify(self, ledger=None) -> list[str]:
         """Async wrapper: verify checksums, auto-restore soul, send Telegram notification."""
-        drifted = self.verify()
+        drifted, restore_results = self.verify()
         if not drifted:
             return []
 
@@ -199,8 +203,13 @@ class SoulGuardian:
         for path in drifted:
             short = path.split("/")[-1]
             is_critical = path in CRITICAL_FILES
-            restored = path in RESTORABLE and os.path.exists(RESTORABLE[path])
-            status = "✅ AUTO-RESTORED" if restored else "❌ NO BACKUP — manual check required"
+            actually_restored = restore_results.get(path, False)
+            if actually_restored:
+                status = "✅ AUTO-RESTORED"
+            elif path in RESTORABLE:
+                status = "❌ RESTORE FAILED (read-only mount) — manual check required"
+            else:
+                status = "❌ NO BACKUP — manual check required"
             prefix = "🔴 CRITICAL" if is_critical else "•"
             msg_lines.append(f"{prefix} `{short}`: {status}")
         if soul_drifted:
@@ -210,13 +219,20 @@ class SoulGuardian:
                 "Any intended modifications require Director acknowledgement + double confirmation.",
             ]
         if governance_drifted:
-            gov_restored = GOVERNANCE_PATH in RESTORABLE and os.path.exists(RESTORABLE[GOVERNANCE_PATH])
+            gov_restored = restore_results.get(GOVERNANCE_PATH, False)
+            gov_backup_exists = os.path.exists(GOVERNANCE_BACKUP_PATH)
             if gov_restored:
                 msg_lines += [
                     "",
                     "⚠️ *governance.json was modified outside governance channels.* "
                     "Tier policy has been restored from backup.",
                     "If this was an intended change, re-apply it through the governed write path.",
+                ]
+            elif gov_backup_exists:
+                msg_lines += [
+                    "",
+                    "⚠️ *governance.json was modified.* Restore failed (read-only mount). "
+                    "If this was an intentional change, run `record_baseline()` to accept the new version.",
                 ]
             else:
                 msg_lines += [
@@ -237,11 +253,10 @@ class SoulGuardian:
         if ledger:
             for path in drifted:
                 short = path.split("/")[-1]
-                restored = path in RESTORABLE
                 ledger.append("soul_guardian_drift", "startup", {
                     "file": path,
                     "short_name": short,
-                    "auto_restored": restored,
+                    "auto_restored": restore_results.get(path, False),
                     "reason": "hash_mismatch",
                 })
 

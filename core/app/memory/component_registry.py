@@ -35,6 +35,10 @@ pre-defined system component sov_ids.
 """
 import uuid
 from datetime import datetime, timezone
+from config import cfg as _cfg
+
+_GPU_NAME    = "EVGA RTX 3090"
+_GPU_VRAM_GB = 24
 
 # Same namespace used for Universal Item Index and all sov_id derivations.
 _SOV_NS = uuid.UUID("7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d")
@@ -345,8 +349,8 @@ _COMPONENTS: list[dict] = [
         "component_type": "adapter",
         "title": "Adapter: OllamaAdapter — local GPU LLM inference",
         "content": (
-            "OllamaAdapter: HTTP client to ollama:11434 on ai_net. "
-            "Model: llama3.1:8b-instruct-q4_K_M on RTX 3060 Ti (8GB VRAM). "
+            f"OllamaAdapter: HTTP client to ollama:11434 on ai_net. "
+            f"Model: {_cfg.models.primary_inference_model} on {_GPU_NAME} ({_GPU_VRAM_GB}GB VRAM). "
             "Used for all PASS 1/3/4/5 LLM calls and conversational queries. "
             "Separate ollama-embed service (CPU-only) handles embeddings."
         ),
@@ -425,9 +429,8 @@ _COMPONENTS: list[dict] = [
         "component_type": "adapter",
         "title": "Adapter: WhisperAdapter — transcription via a2a-whisper",
         "content": (
-            "WhisperAdapter: client to a2a-whisper on node04 (172.16.201.4:8003). "
-            "faster-whisper-server; evicts Ollama via keep_alive=0 before transcription "
-            "to avoid GPU contention on RTX 3060 Ti."
+            f"WhisperAdapter: client to a2a-whisper on node04 (172.16.201.4:8003). "
+            "faster-whisper-server; no local GPU contention — Whisper runs on node04 (Quadro P4000)."
         ),
         "location": "execution/adapters/whisper.py",
     },
@@ -735,10 +738,10 @@ _COMPONENTS: list[dict] = [
         "component_type": "container",
         "title": "Container: ollama (GPU LLM inference)",
         "content": (
-            "ollama container: local GPU-accelerated LLM inference. "
-            "Model: llama3.1:8b-instruct-q4_K_M (~4.4GB VRAM). "
-            "Also has mistral:7b installed. RTX 3060 Ti passthrough. "
-            "mem_limit: 6g. Networks: ai_net."
+            f"ollama container: local GPU-accelerated LLM inference. "
+            f"Primary model: {_cfg.models.primary_inference_model} (~20GB VRAM). "
+            f"Also has llama3.1:8b and mistral:7b installed. {_GPU_NAME} ({_GPU_VRAM_GB}GB VRAM). "
+            "mem_limit: 22g. Networks: ai_net."
         ),
         "location": "compose.yml:ollama",
     },

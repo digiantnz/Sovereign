@@ -72,7 +72,12 @@ BASELINE_METRIC_NAMES = [
     "prospective_task_exec_rate",
     "container_running_count",
     "wallet_chains_failing",
+    "external_unreachable_count",
 ]
+
+# Services that generate an immediate proposal when unreachable (hard path).
+# Others contribute only to the soft external_unreachable_count baseline metric.
+_CRITICAL_EXTERNAL_SERVICES = frozenset({"a2a_browser"})
 
 MONITORED_REPOS = [
     # ClawSec injection patterns repo — check for new releases
@@ -385,6 +390,62 @@ async def _collect_prospective_stats(qdrant) -> dict:
         return {"never_executed": [], "execution_rate": 1.0, "active_count": 0}
 
 
+async def _collect_scheduler_health(qdrant) -> dict:
+    """Detect stuck scheduled tasks and task_id collisions in PROSPECTIVE.
+
+    Stuck: active scheduled_task with next_due > 2 days in the past and run_count == 0.
+    Collision: a task_id that appears in PROSPECTIVE under multiple entry types
+    (e.g. scheduled_task + improvement_proposal) — causes _find_point_id to update the
+    wrong entry, leaving the task looping forever.
+    Returns {stuck: [...], collisions: [...]}.
+    """
+    from execution.adapters.qdrant import PROSPECTIVE
+    threshold = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    stuck, collisions = [], []
+    try:
+        items, _ = await qdrant.archive_client.scroll(
+            collection_name=PROSPECTIVE,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="type",   match=MatchValue(value="scheduled_task")),
+                FieldCondition(key="status", match=MatchValue(value="active")),
+            ]),
+            limit=100,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for item in items:
+            pl = dict(item.payload or {})
+            task_id = pl.get("task_id") or str(item.id)
+            nd = pl.get("next_due", "")
+            rc = pl.get("run_count") or 0
+            title = pl.get("title", "unknown")[:60]
+            if nd and nd < threshold and rc == 0:
+                stuck.append({"task_id": task_id, "title": title, "next_due": nd})
+            # Check for collision: any other PROSPECTIVE entry sharing this task_id
+            siblings, _ = await qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="task_id", match=MatchValue(value=task_id)),
+                ]),
+                limit=5,
+                with_payload=True,
+                with_vectors=False,
+            )
+            other_types = [
+                s.payload.get("type") for s in siblings
+                if s.payload and s.payload.get("type") != "scheduled_task"
+            ]
+            if other_types:
+                collisions.append({
+                    "task_id": task_id,
+                    "title": title,
+                    "conflicting_types": other_types,
+                })
+    except Exception as e:
+        logger.warning("SIHarness: _collect_scheduler_health failed: %s", e)
+    return {"stuck": stuck, "collisions": collisions}
+
+
 async def _collect_audit_hard_failures(ledger) -> list[dict]:
     """Scan the security ledger for hard failure events in the last 24 hours.
     Returns list of {event_type, detail, ts} dicts.
@@ -425,6 +486,28 @@ async def _collect_audit_hard_failures(ledger) -> list[dict]:
     except Exception as e:
         logger.warning("SIHarness: _collect_audit_hard_failures failed: %s", e)
     return hard_failures
+
+
+def _collect_external_failures(sys_metrics: dict) -> list[dict]:
+    """Inspect external reachability data already collected by collect_all().
+
+    Returns hard-failure trigger dicts for critical services that are unreachable.
+    Non-critical services contribute only to the external_unreachable_count metric.
+    """
+    external = sys_metrics.get("external", {})
+    failures = []
+    for service, status in external.items():
+        if not isinstance(status, dict):
+            continue
+        if status.get("reachable", True):
+            continue
+        if service in _CRITICAL_EXTERNAL_SERVICES:
+            failures.append({
+                "type": "external_service_down",
+                "service": service,
+                "error": status.get("error", "unreachable"),
+            })
+    return failures
 
 
 # ── Anomaly detection ─────────────────────────────────────────────────────────
@@ -589,6 +672,122 @@ async def _check_recovery(qdrant, cog, session: dict, metrics_snapshot: dict, ba
     return recovered
 
 
+# ── Memory ceiling monitor ────────────────────────────────────────────────────
+
+async def check_memory_ceiling(qdrant) -> dict:
+    """Estimate qdrant-archive storage across all 7 sovereign collections.
+
+    Estimation: points_count × (768 × 4 bytes for float32 vectors) + 512 bytes payload overhead
+    per point. Compares against cfg.memory.qdrant_ceiling_gb × cfg.memory.cull_trigger_pct.
+
+    If below threshold: logs result to META collection, no further action.
+    If at or above threshold: logs to META + sends Telegram alert to Director.
+
+    Never culls. Warns only. Director manually triggers /curate on receipt of warning.
+
+    # Future cull logic when Director triggers /curate:
+    # 1. Scroll all qdrant-archive collections
+    # 2. Sort by: last_updated ASC, _weight ASC (oldest + least useful first)
+    # 3. Historical entries (status="historical") naturally sort to top of cull list
+    #    due to weight=1.0 (no MRFL increments after marking historical)
+    # 4. Delete bottom N entries until storage drops below cull_trigger_pct * 0.70
+    # 5. Log all culled MIP keys to episodic before deletion
+    # 6. Notify Director with summary
+    """
+    from config import cfg as _cfg
+    from execution.adapters.qdrant import SOVEREIGN_COLLECTIONS, META
+    from datetime import datetime, timezone as _tz
+
+    _VECTOR_DIM     = 768        # nomic-embed-text — fixed for Qdrant lifetime
+    _BYTES_PER_VEC  = _VECTOR_DIM * 4   # float32
+    _PAYLOAD_BYTES  = 512        # rough per-point payload overhead estimate
+    _BYTES_PER_PT   = _BYTES_PER_VEC + _PAYLOAD_BYTES   # 3584 bytes per point
+
+    ceiling_gb      = float(getattr(getattr(_cfg, "memory", object()), "qdrant_ceiling_gb", 500))
+    cull_trigger    = float(getattr(getattr(_cfg, "memory", object()), "cull_trigger_pct", 0.80))
+    ceiling_bytes   = ceiling_gb * (1024 ** 3)
+    trigger_bytes   = ceiling_bytes * cull_trigger
+
+    now_iso         = datetime.now(_tz.utc).isoformat()
+    collection_sizes: dict[str, int] = {}
+    total_points    = 0
+
+    for coll in SOVEREIGN_COLLECTIONS:
+        try:
+            info = await qdrant.archive_client.get_collection(collection_name=coll)
+            pts  = getattr(info, "points_count", None) or 0
+            collection_sizes[coll] = pts
+            total_points += pts
+        except Exception as exc:
+            logger.warning("check_memory_ceiling: failed to query collection %s: %s", coll, exc)
+            collection_sizes[coll] = -1
+
+    estimated_bytes = total_points * _BYTES_PER_PT
+    estimated_gb    = estimated_bytes / (1024 ** 3)
+    trigger_pct     = (estimated_bytes / ceiling_bytes * 100) if ceiling_bytes else 0.0
+    at_ceiling      = estimated_bytes >= trigger_bytes
+
+    result = {
+        "total_points":     total_points,
+        "estimated_gb":     round(estimated_gb, 3),
+        "ceiling_gb":       ceiling_gb,
+        "cull_trigger_pct": cull_trigger,
+        "trigger_pct":      round(trigger_pct, 1),
+        "at_ceiling":       at_ceiling,
+        "collection_sizes": collection_sizes,
+        "checked_at":       now_iso,
+    }
+
+    # Log to META (atomic set_payload pattern)
+    try:
+        from qdrant_client.models import Filter as _F, FieldCondition as _FC, MatchValue as _MV
+        _existing, _ = await qdrant.archive_client.scroll(
+            collection_name=META,
+            scroll_filter=_F(must=[_FC(key="_key", match=_MV(value="meta:memory-ceiling:state"))]),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        _meta_payload = {
+            "_key":         "meta:memory-ceiling:state",
+            "type":         "meta",
+            "last_updated": now_iso,
+            **result,
+        }
+        if _existing:
+            await qdrant.archive_client.set_payload(
+                collection_name=META,
+                payload=_meta_payload,
+                points=[str(_existing[0].id)],
+            )
+        else:
+            await qdrant.store(
+                collection=META,
+                content=f"Memory ceiling monitor state as of {now_iso}.",
+                metadata=_meta_payload,
+            )
+    except Exception as exc:
+        logger.warning("check_memory_ceiling: META write failed: %s", exc)
+
+    if at_ceiling:
+        _pct_str = f"{trigger_pct:.1f}"
+        _msg = (
+            f"⚠️ *Memory ceiling warning*: Qdrant archive at {_pct_str}% "
+            f"of {ceiling_gb:.0f} GB ceiling "
+            f"(~{estimated_gb:.1f} GB estimated, {total_points:,} points). "
+            f"Manual cull required — send /curate when ready."
+        )
+        logger.warning("check_memory_ceiling: %s", _msg.replace("*", ""))
+        await _notify_director(_msg)
+    else:
+        logger.info(
+            "check_memory_ceiling: archive ~%.2f GB (%d total points, %.1f%% of ceiling) — OK",
+            estimated_gb, total_points, trigger_pct,
+        )
+
+    return result
+
+
 # ── Main observe function ─────────────────────────────────────────────────────
 
 async def observe(qdrant, cog, ledger, app_state=None) -> dict:
@@ -622,7 +821,15 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
 
     skill_stats = await _collect_skill_stats(qdrant)
     prospective_stats = await _collect_prospective_stats(qdrant)
+    scheduler_health = await _collect_scheduler_health(qdrant)
     hard_failures = await _collect_audit_hard_failures(ledger)
+    external_failures = _collect_external_failures(sys_metrics)
+
+    # 2.5. Memory ceiling check — non-blocking; logs to META; alerts Director if near ceiling
+    try:
+        await check_memory_ceiling(qdrant)
+    except Exception as e:
+        logger.warning("SIHarness: memory ceiling check failed (non-fatal): %s", e)
 
     # Build normalised metrics snapshot (scalar values only — for baseline comparison)
     ram  = sys_metrics.get("ram",  {})
@@ -630,6 +837,7 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
     olm  = sys_metrics.get("ollama", {})
     ctrs = sys_metrics.get("containers", [])
     aud  = sys_metrics.get("audit", {})
+    ext  = sys_metrics.get("external", {})
 
     gpu_vram_pct = 0.0
     if gpu.get("vram_total_mb") and gpu.get("vram_used_mb"):
@@ -637,6 +845,10 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
 
     running_count = len([c for c in ctrs if isinstance(c, dict) and c.get("status") == "running"])
     wallet = sys_metrics.get("wallet", {})
+    unreachable_count = float(sum(
+        1 for s in ext.values()
+        if isinstance(s, dict) and not s.get("reachable", True)
+    ))
 
     metrics_snapshot = {
         "inference_latency_p50_ms": float(olm.get("last_inference_latency_ms") or 0),
@@ -646,6 +858,7 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
         "prospective_task_exec_rate": float(prospective_stats.get("execution_rate") or 1.0),
         "container_running_count":  float(running_count),
         "wallet_chains_failing":    float(wallet.get("chains_failing", 0)),
+        "external_unreachable_count": unreachable_count,
     }
 
     # 3. Load (or establish) baseline
@@ -692,9 +905,18 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
     # 7. Identify prospective tasks never executed
     never_exec_triggers = prospective_stats.get("never_executed", [])
 
+    # Auto-close stale proposals for tasks that have since run or been cancelled/completed
+    _never_exec_ids = {t["task_id"] for t in never_exec_triggers}
+    await _auto_close_resolved_never_exec_proposals(qdrant, _never_exec_ids)
+
     # 8. Build observation content for episodic storage
+    stuck_tasks    = scheduler_health.get("stuck", [])
+    task_collisions = scheduler_health.get("collisions", [])
     anomaly_count = len(hard_failures) + len(soft_anomalies)
-    trigger_count = len(skill_failure_triggers) + len(never_exec_triggers)
+    trigger_count = (
+        len(skill_failure_triggers) + len(never_exec_triggers)
+        + len(stuck_tasks) + len(task_collisions) + len(external_failures)
+    )
 
     gpu_str = f"VRAM {gpu_vram_pct:.1f}%" if gpu_vram_pct else "GPU N/A"
     wallet_chains_failing = int(metrics_snapshot.get("wallet_chains_failing", 0))
@@ -702,16 +924,27 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
         f"wallet chains failing: {wallet_chains_failing}" if wallet_chains_failing > 0
         else "wallet chains: ok"
     )
+    unreachable_names = [
+        svc for svc, s in ext.items()
+        if isinstance(s, dict) and not s.get("reachable", True)
+    ]
+    ext_str = (
+        f"external unreachable: {', '.join(unreachable_names)}" if unreachable_names
+        else "external services: ok"
+    )
     obs_content = (
         f"Self-improvement observe cycle {session['cycle_count']} at {ts_now[:16]} UTC. "
         f"System: RAM {ram.get('percent','?')}% {gpu_str}, "
         f"Ollama latency {olm.get('last_inference_latency_ms','?')}ms, "
-        f"containers running {running_count}, {wallet_str}. "
+        f"containers running {running_count}, {wallet_str}, {ext_str}. "
         f"Skills: {len(skill_stats)} intents tracked, "
         f"{len(skill_failure_triggers)} failing (>={SKILL_FAILURE_THRESHOLD}/7d). "
         f"Prospective: {prospective_stats.get('active_count',0)} active tasks, "
-        f"{len(never_exec_triggers)} never executed. "
+        f"{len(never_exec_triggers)} never executed, "
+        f"{len(stuck_tasks)} stuck (overdue+run_count=0), "
+        f"{len(task_collisions)} task_id collisions. "
         f"Hard failures last 24h: {len(hard_failures)}. "
+        f"External service failures: {len(external_failures)}. "
         f"Soft anomalies: {len(soft_anomalies)}. "
         f"Proposal triggers: {trigger_count}."
     )
@@ -790,6 +1023,14 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
             "ts": hf["ts"],
         })
 
+    # External service down triggers (critical services only — others via soft baseline)
+    for ef in external_failures:
+        proposal_triggers.append({
+            "type": "external_service_down",
+            "service": ef["service"],
+            "error": ef["error"],
+        })
+
     # Skill failure triggers
     for sf in skill_failure_triggers:
         proposal_triggers.append({
@@ -805,6 +1046,24 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
             "type": "prospective_never_executed",
             "task_id": ne["task_id"],
             "title": ne["title"],
+        })
+
+    # Scheduler stuck-task triggers
+    for st in stuck_tasks:
+        proposal_triggers.append({
+            "type": "scheduler_stuck_task",
+            "task_id": st["task_id"],
+            "title": st["title"],
+            "next_due": st["next_due"],
+        })
+
+    # Scheduler task_id collision triggers
+    for tc in task_collisions:
+        proposal_triggers.append({
+            "type": "scheduler_task_id_collision",
+            "task_id": tc["task_id"],
+            "title": tc["title"],
+            "conflicting_types": tc["conflicting_types"],
         })
 
     # Soft anomaly triggers (only if ready after SOFT_ANOMALY_CYCLES consecutive cycles)
@@ -864,6 +1123,40 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
 
 # ── Propose function ──────────────────────────────────────────────────────────
 
+async def _auto_close_resolved_never_exec_proposals(qdrant, current_never_exec_ids: set) -> int:
+    """Close pending prospective_never_executed proposals for tasks that have since run or been removed."""
+    from execution.adapters.qdrant import PROSPECTIVE
+    try:
+        items, _ = await qdrant.archive_client.scroll(
+            collection_name=PROSPECTIVE,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="type",            match=MatchValue(value="improvement_proposal")),
+                FieldCondition(key="trigger",         match=MatchValue(value="prospective_never_executed")),
+                FieldCondition(key="proposal_status", match=MatchValue(value="pending_approval")),
+            ]),
+            limit=100,
+            with_payload=True,
+            with_vectors=False,
+        )
+        closed = 0
+        ts = datetime.now(timezone.utc).isoformat()
+        for item in items:
+            task_id = (item.payload or {}).get("task_id")
+            if task_id and task_id not in current_never_exec_ids:
+                await qdrant.archive_client.set_payload(
+                    collection_name=PROSPECTIVE,
+                    payload={"proposal_status": "auto_closed_recovery", "closed_ts": ts},
+                    points=[item.id],
+                )
+                closed += 1
+        if closed:
+            logger.info("SIHarness: auto-closed %d stale never_exec proposals", closed)
+        return closed
+    except Exception as e:
+        logger.warning("SIHarness: _auto_close_resolved_never_exec_proposals failed: %s", e)
+        return 0
+
+
 async def _existing_pending_proposal(qdrant, trigger_type: str, dedup_key: str | None) -> bool:
     """Return True if a pending_approval proposal with the same trigger + dedup_key exists.
 
@@ -884,6 +1177,7 @@ async def _existing_pending_proposal(qdrant, trigger_type: str, dedup_key: str |
                 "skill_failure_pattern":      "intent",
                 "hard_failure":               "event_type",
                 "soft_anomaly":               "metric",
+                "external_service_down":      "service",
             }.get(trigger_type)
             if _key_field:
                 must.append(FieldCondition(key=_key_field, match=MatchValue(value=dedup_key)))
@@ -923,6 +1217,22 @@ async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
             action = _suggest_action_for_hard_failure(event)
             tier = "MID"
             outcome = f"Eliminate recurrence of {event} events; restore stable operation."
+
+        elif ttype == "external_service_down":
+            service = trigger.get("service", "unknown")
+            error   = trigger.get("error", "unreachable")
+            obs = f"External service '{service}' is unreachable (error: {error})."
+            hypothesis = (
+                f"'{service}' failed its health probe. Possible causes: "
+                "service crash, network partition, or node04 offline."
+            )
+            action = (
+                f"Check '{service}' health endpoint manually. "
+                f"If node04-hosted: SSH to node04 and inspect docker logs. "
+                f"If network issue: verify VLAN 172.16.201.0/24 routing from sovereign host."
+            )
+            tier = "LOW"
+            outcome = f"'{service}' health probe returns reachable on next observe cycle."
 
         elif ttype == "skill_failure_pattern":
             intent = trigger.get("intent", "unknown")
@@ -974,6 +1284,7 @@ async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
             "skill_failure_pattern":      trigger.get("intent"),
             "hard_failure":               trigger.get("event_type"),
             "soft_anomaly":               trigger.get("metric"),
+            "external_service_down":      trigger.get("service"),
         }.get(ttype)
         if await _existing_pending_proposal(qdrant, ttype, _dedup_key):
             logger.info("SIHarness: skipping duplicate proposal for %s / %s", ttype, _dedup_key)
@@ -992,6 +1303,7 @@ async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
                 "skill_failure_pattern":      "intent",
                 "hard_failure":               "event_type",
                 "soft_anomaly":               "metric",
+                "external_service_down":      "service",
             }.get(ttype)) and _dedup_key else None,
         )
         proposal_ids.append(pid)
@@ -1031,6 +1343,7 @@ def _hypothesis_for_metric(metric: str, value: float, mean: float) -> str:
         "prospective_task_exec_rate": f"Prospective task execution rate is {direction}. Scheduled tasks may be failing or not firing.",
         "container_running_count":  f"Running container count is {direction}. A container may have crashed or been added/removed.",
         "wallet_chains_failing":    f"Wallet chain connectivity is {direction}. One or more chain watchers (ETH/BTC/Lightning) are failing to reach their node endpoints.",
+        "external_unreachable_count": f"Number of unreachable external services is {direction}. One or more external dependencies (a2a_browser, a2a_whisper, grok_api, claude_api, nextcloud_webdav, telegram) have become unreachable.",
     }
     return hypotheses.get(metric, f"Metric '{metric}' is {direction} vs baseline. Unknown root cause — investigation required.")
 
@@ -1043,6 +1356,7 @@ def _suggest_action_for_metric(metric: str, value: float, mean: float) -> str:
         "audit_entries_24h":        "Review security-ledger.jsonl for unusual event patterns in last 24h.",
         "prospective_task_exec_rate": "Run list_tasks and review next_due dates. Check task scheduler logs.",
         "container_running_count":  "Run list_containers to identify which container(s) are not running.",
+        "external_unreachable_count": "Run get_hardware or check dashboard external reachability section. For node04 services (a2a_browser, a2a_whisper): SSH to node04 and inspect docker logs. For API services: check network connectivity from sovereign host.",
         "wallet_chains_failing":    "Check sov-wallet /health for chain status. Inspect docker logs sov-wallet for connectivity errors. Check node endpoints (BTC: Start9, ETH: node01/node02, Lightning: BTCPay).",
     }
     return suggestions.get(metric, f"Investigate '{metric}' anomaly. Check relevant logs and system state.")
@@ -1080,6 +1394,44 @@ async def list_pending_proposals(qdrant) -> dict:
         return {"status": "ok", "count": len(proposals), "proposals": proposals}
     except Exception as e:
         logger.warning("SIHarness: list_pending_proposals failed: %s", e)
+        return {"status": "error", "error": str(e)}
+
+
+async def dismiss_proposals(qdrant, proposal_ids: list | None = None) -> dict:
+    """Dismiss pending improvement proposals. If proposal_ids is None/empty, dismiss all pending."""
+    from execution.adapters.qdrant import PROSPECTIVE
+    try:
+        items, _ = await qdrant.archive_client.scroll(
+            collection_name=PROSPECTIVE,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="type",            match=MatchValue(value="improvement_proposal")),
+                FieldCondition(key="proposal_status", match=MatchValue(value="pending_approval")),
+            ]),
+            limit=100,
+            with_payload=True,
+            with_vectors=False,
+        )
+        ts = datetime.now(timezone.utc).isoformat()
+        dismissed = 0
+        for item in items:
+            p = item.payload or {}
+            pid = p.get("proposal_id", str(item.id))
+            pid_short = pid[:8] if len(pid) >= 8 else pid
+            if (
+                not proposal_ids
+                or pid in proposal_ids
+                or pid_short in proposal_ids
+            ):
+                await qdrant.archive_client.set_payload(
+                    collection_name=PROSPECTIVE,
+                    payload={"proposal_status": "dismissed_by_director", "closed_ts": ts},
+                    points=[item.id],
+                )
+                dismissed += 1
+        logger.info("SIHarness: Director dismissed %d proposals", dismissed)
+        return {"status": "ok", "dismissed": dismissed}
+    except Exception as e:
+        logger.warning("SIHarness: dismiss_proposals failed: %s", e)
         return {"status": "error", "error": str(e)}
 
 

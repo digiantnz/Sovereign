@@ -122,6 +122,58 @@ class BrokerAdapter:
             r.raise_for_status()
             return r.json()
 
+    async def recreate(self, container: str) -> dict:
+        """Force-recreate a container via docker compose — fixes network attachment failures."""
+        result = await self.exec_command(
+            "docker_recreate", {"container": container},
+            trust_override="medium", timeout=130.0,
+        )
+        if result.get("return_code", -1) != 0:
+            return {"status": "error", "container": container, "error": result.get("stderr", "recreate failed")}
+        return {"status": "recreated", "container": container}
+
+    async def get_networks(self) -> dict:
+        """List all Docker networks with subnets and attached containers."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{BROKER_URL}/system/networks", headers={"X-Trust-Level": "low"})
+            r.raise_for_status()
+            return r.json()
+
+    async def inspect_network(self, name: str) -> dict:
+        """Inspect a Docker network by name."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{BROKER_URL}/system/network/{name}", headers={"X-Trust-Level": "low"})
+            r.raise_for_status()
+            return r.json()
+
+    async def get_volumes(self) -> dict:
+        """List all Docker volumes."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{BROKER_URL}/system/volumes", headers={"X-Trust-Level": "low"})
+            r.raise_for_status()
+            return r.json()
+
+    async def get_images(self) -> dict:
+        """List Docker images (size-sorted)."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"{BROKER_URL}/system/images", headers={"X-Trust-Level": "low"})
+            r.raise_for_status()
+            return r.json()
+
+    async def get_docker_df(self) -> dict:
+        """Docker disk usage — images, containers, volumes with reclaimable totals."""
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(f"{BROKER_URL}/system/df", headers={"X-Trust-Level": "low"})
+            r.raise_for_status()
+            return r.json()
+
+    async def prune_images(self) -> dict:
+        """Remove dangling Docker images (untagged / unreferenced build layers). HIGH tier."""
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{BROKER_URL}/images/prune", headers={"X-Trust-Level": "high"})
+            r.raise_for_status()
+            return r.json()
+
     async def exec_command(
         self,
         command_name: str,

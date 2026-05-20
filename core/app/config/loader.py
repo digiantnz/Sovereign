@@ -5,6 +5,11 @@ Reads /home/sovereign/governance/sovereign-config.yaml at startup and exposes a
 `cfg` singleton.  Never raises — every missing or malformed key falls back to the
 hardcoded default that was previously baked into the source file.  A Python WARNING
 is emitted for missing keys; startup continues regardless.
+
+Model override priority (highest wins):
+  1. SOVEREIGN_INFERENCE_MODEL env var (set in compose.yml or secrets/ollama.env)
+  2. sovereign-config.yaml models.primary_inference_model
+  3. Hardcoded default in _DEFAULTS
 """
 
 import logging
@@ -17,8 +22,8 @@ _CONFIG_PATH = "/home/sovereign/governance/sovereign-config.yaml"
 # ── Hardcoded fallbacks — must match current source defaults exactly ────────────
 _DEFAULTS: dict = {
     "models": {
-        "classifier_model": "llama3.1:8b-instruct-q4_K_M",
-        "primary_inference_model": "llama3.1:8b-instruct-q4_K_M",
+        "classifier_model": "qwen2.5:32b-instruct-q4_K_M",
+        "primary_inference_model": "qwen2.5:32b-instruct-q4_K_M",
         "embed_model": "nomic-embed-text",
     },
     "cognitive_loop": {
@@ -28,9 +33,11 @@ _DEFAULTS: dict = {
         "skills_domain_min_total_timeout_s": 240.0,
     },
     "memory": {
-        "startup_preload_bytes": 2 * 1024 * 1024 * 1024,   # 2 GB
-        "startup_preload_per_collection": 50,
+        "startup_preload_bytes": 8 * 1024 * 1024 * 1024,   # 8 GB
+        "startup_preload_per_collection": 200,
         "sov_uuid_namespace": "7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d",
+        "qdrant_ceiling_gb": 500,       # warn when archive storage estimate exceeds this
+        "cull_trigger_pct": 0.80,       # trigger warning at this fraction of ceiling
     },
     "thresholds": {
         "confidence": 0.75,
@@ -38,17 +45,17 @@ _DEFAULTS: dict = {
         "complexity_routing": 0.50,
         "operational_routing_penalty": 0.20,
         "dev_harness_escalation_score": 50,
-        "vram_used_mb_warning": 7500,
+        "vram_used_mb_warning": 22000,
         "qdrant_total_points_warning": 1000000,
         "gap_auto_create": 0.50,
     },
     "timeouts": {
-        "pass_s": 30.0,
-        "total_pipeline_s": 120.0,
+        "pass_s": 60.0,
+        "total_pipeline_s": 200.0,
         "embed_generation_s": 30.0,
-        "mip_key_title_gen_s": 10.0,
+        "mip_key_title_gen_s": 60.0,
         "nc_mail_s": 59,
-        "gateway_dispatch_s": 180.0,
+        "gateway_dispatch_s": 260.0,
         "gateway_chunk_debounce_s": 1.5,
         "health_probe_s": 5.0,
         "ollama_inference_probe_s": 30.0,
@@ -59,6 +66,8 @@ _DEFAULTS: dict = {
         "nanobot_shell_script_s": 30,
         "nanobot_subprocess_launch_s": 120,
         "nanobot_config_load_s": 120,
+        "browser_script_s": 220,
+        "browser_http_s": 230,
         "task_scheduler_telegram_s": 10.0,
     },
     "limits": {
@@ -94,12 +103,13 @@ _DEFAULTS: dict = {
     },
     "learning_harness": {
         "processing_hours_utc": [15, 16, 17],
-        "chunk_chars": 6000,
-        "context_chars": 2000,
+        "chunk_chars": 12000,
+        "context_chars": 6000,
         "max_doc_array": 500,
         "scroll_batch": 200,
-        "max_cycles": 10,
-        "max_file_bytes": 200_000,
+        "max_cycles": 5,
+        "max_file_bytes": 500_000,
+        "notes_enabled": True,
     },
     "portal": {
         "log_containers": ["sovereign-core", "gateway", "nanobot-01"],
@@ -212,5 +222,15 @@ def _load() -> SovereignConfig:
         return SovereignConfig({})
 
 
+def _apply_env_overrides(config: SovereignConfig) -> SovereignConfig:
+    """Apply env var overrides to the loaded config. Highest-priority source wins."""
+    model_env = os.environ.get("SOVEREIGN_INFERENCE_MODEL", "").strip()
+    if model_env:
+        config._data.setdefault("models", {})["primary_inference_model"] = model_env
+        config._data.setdefault("models", {})["classifier_model"] = model_env
+        _log.info("sovereign-config: SOVEREIGN_INFERENCE_MODEL override → %s", model_env)
+    return config
+
+
 # Module-level singleton — runs exactly once at first import
-cfg: SovereignConfig = _load()
+cfg: SovereignConfig = _apply_env_overrides(_load())

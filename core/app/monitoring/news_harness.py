@@ -168,21 +168,31 @@ async def _synthesise(cog, items: list[dict], prefs_text: str, use_grok: bool = 
         f"{i+1}. {item['title']} — {item['summary']}"
         for i, item in enumerate(items[:30])
     )
-    prompt = (
+    body = (
         f"Director preferences: {prefs_text}\n\n"
         "Here are today's news items from multiple sources:\n"
         f"{numbered}\n\n"
-        "Synthesise these into a concise news brief of 5–8 bullet points. "
+        "Synthesise ONLY the items listed above into a concise news brief of 5–8 bullet points. "
+        "Use only the titles and summaries provided — do not add information from your training data. "
         "Weight items toward the Director's stated preferences. "
         "Write each bullet as one clear sentence. "
         "Do NOT include source names, URLs, or metadata — only the synthesised content. "
         "Start each bullet with •"
     )
     if use_grok:
-        result = await cog.ask_grok(prompt, agent="research_agent")
+        result = await cog.ask_grok(body, agent="research_agent")
         return result.get("response", "") if isinstance(result, dict) else str(result)
-    result = await cog.ask_local(prompt)
-    return result.get("response", "") if isinstance(result, dict) else str(result)
+    # /no_think suppresses qwen3 extended reasoning for this extraction-only step
+    from adapters.inference_queue import InferenceQueue
+    result = await cog.ask_local(
+        "/no_think\n" + body, priority=InferenceQueue.NORMAL, timeout=180.0
+    )
+    if result.get("status") == "llm_timeout":
+        logger.warning("news_harness: synthesis timed out")
+        return ""
+    raw = result.get("response", "") if isinstance(result, dict) else str(result)
+    logger.debug("news_harness: synthesis produced %d chars", len(raw))
+    return raw
 
 
 # ── Episodic write (non-blocking) ──────────────────────────────────────────

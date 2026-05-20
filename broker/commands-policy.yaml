@@ -1,6 +1,5 @@
 # Broker CLI command execution allowlist
-# POST /exec/{command_name} — read-only diagnostics only.
-# Destructive/write commands are explicitly out of scope until Director requests.
+# POST /exec/{command_name} — system diagnostics and controlled workflows.
 #
 # Each entry:
 #   binary:       absolute path to executable in broker container, OR __container_exec__ / __script__
@@ -37,7 +36,7 @@ commands:
     enabled: true
 
   ps:
-    description: "Process list visible to broker container. Not host-wide — use nvidia_smi or system/processes for broader view."
+    description: "Process list visible to broker container."
     binary: /bin/ps
     fixed_args: ["aux"]
     params: {}
@@ -45,7 +44,7 @@ commands:
     enabled: true
 
   nvidia_smi:
-    description: "NVIDIA GPU status. Uses nsenter+su matt (NVML fails as root with open kernel module)."
+    description: "NVIDIA GPU status including power draw. Uses nsenter+su matt (NVML fails as root with open kernel module)."
     binary: /usr/bin/nsenter
     fixed_args:
       - "-t"
@@ -81,6 +80,8 @@ commands:
           - nfs-server
           - cron
           - unattended-upgrades
+          - nvidia-power-limit
+          - sovereign-stack
     tier: low
     enabled: true
 
@@ -103,6 +104,8 @@ commands:
           - kernel
           - cron
           - syslog
+          - nvidia-power-limit
+          - sovereign-stack
       lines:
         type: integer
         flag: "-n"
@@ -124,390 +127,57 @@ commands:
     tier: low
     enabled: true
 
-  script:
+  # ── Docker lifecycle ──────────────────────────────────────────────────────
+
+  docker_recreate:
     description: >
-      Run an approved read-only script from the broker scripts/ directory.
-      Scripts must be present on disk — name allowlist below controls which are callable.
-      Add script name to allowlist only after Director review. No scripts initially.
-    binary: __script__
+      Force-recreate a named container via docker compose up -d --force-recreate.
+      Fixes containers that started without network interfaces (e.g. nginx).
+      Uses nsenter to run docker compose on the host. MID tier — requires confirmation.
+    binary: /usr/bin/nsenter
+    fixed_args:
+      - "-t"
+      - "1"
+      - "-m"
+      - "-p"
+      - "--"
+      - "/usr/bin/docker"
+      - "compose"
+      - "-f"
+      - "/docker/sovereign/compose.yml"
+      - "up"
+      - "-d"
+      - "--force-recreate"
+    timeout_ms: 120000
     params:
-      name:
+      container:
         type: string
         required: true
-        allowlist: []   # populated as scripts are reviewed and approved
+        allowlist:
+          - nginx
+          - nextcloud
+          - ollama
+          - ollama-embed
+          - nanobot-01
+          - gateway
+          - qdrant
+          - qdrant-archive
+          - nc-db
+          - nc-redis
+          - sov-wallet
+          - docker-broker
+          - sovereign-core
     tier: medium
-    enabled: true
-
-  # ── IMAP/SMTP community skill commands (imap-smtp-email, gzlicanyi) ──────────
-  # Node.js scripts via wrapper that maps PERSONAL_IMAP_* → IMAP_* format.
-  # Broker must have imap-personal.env and imap-business.env in env_file.
-
-  imap_personal_check:
-    description: "Check personal mailbox (e.email) for new/unread emails. Returns JSON array of messages."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "check"]
-    params:
-      limit:
-        type: integer
-        flag: "--limit"
-        required: false
-        default: 10
-        min: 1
-        max: 100
-    tier: low
-    enabled: true
-
-  imap_personal_fetch:
-    description: "Fetch full content of a personal email by UID."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "fetch"]
-    params:
-      uid:
-        type: string
-        required: true
-    tier: low
-    enabled: true
-
-  imap_personal_search:
-    description: "Search personal mailbox with filters (subject, from, since, unseen)."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "search"]
-    params:
-      subject:
-        type: string
-        flag: "--subject"
-        required: false
-      from_addr:
-        type: string
-        flag: "--from"
-        required: false
-      since:
-        type: string
-        flag: "--since"
-        required: false
-      limit:
-        type: integer
-        flag: "--limit"
-        required: false
-        default: 20
-      unseen:
-        type: string
-        flag: "--unseen"
-        required: false
-    tier: low
-    enabled: true
-
-  imap_personal_mark_read:
-    description: "Mark a personal email as read by UID."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "mark-read"]
-    params:
-      uid:
-        type: string
-        required: true
-    tier: low
-    enabled: true
-
-  imap_personal_mark_unread:
-    description: "Mark a personal email as unread by UID."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "mark-unread"]
-    params:
-      uid:
-        type: string
-        required: true
-    tier: low
-    enabled: true
-
-  imap_personal_list_mailboxes:
-    description: "List all IMAP mailboxes/folders in the personal account."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_personal.sh", "imap.js", "list-mailboxes"]
-    params: {}
-    tier: low
-    enabled: true
-
-  smtp_send_personal:
-    description: "Send email from personal account (e.email) via SMTP."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_personal.sh", "smtp.js", "send"]
-    params:
-      to:
-        type: string
-        flag: "--to"
-        required: true
-      subject:
-        type: string
-        flag: "--subject"
-        required: true
-      body:
-        type: string
-        flag: "--body"
-        required: true
-      cc:
-        type: string
-        flag: "--cc"
-        required: false
-      bcc:
-        type: string
-        flag: "--bcc"
-        required: false
-    tier: medium
-    enabled: true
-
-  imap_business_check:
-    description: "Check business mailbox (digiant.co.nz) for new/unread emails."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_business.sh", "imap.js", "check"]
-    params:
-      limit:
-        type: integer
-        flag: "--limit"
-        required: false
-        default: 10
-        min: 1
-        max: 100
-    tier: low
-    enabled: true
-
-  imap_business_fetch:
-    description: "Fetch full content of a business email by UID."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_business.sh", "imap.js", "fetch"]
-    params:
-      uid:
-        type: string
-        required: true
-    tier: low
-    enabled: true
-
-  imap_business_search:
-    description: "Search business mailbox with filters."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_business.sh", "imap.js", "search"]
-    params:
-      subject:
-        type: string
-        flag: "--subject"
-        required: false
-      from_addr:
-        type: string
-        flag: "--from"
-        required: false
-      since:
-        type: string
-        flag: "--since"
-        required: false
-      limit:
-        type: integer
-        flag: "--limit"
-        required: false
-        default: 20
-    tier: low
-    enabled: true
-
-  imap_business_mark_read:
-    description: "Mark a business email as read by UID."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_business.sh", "imap.js", "mark-read"]
-    params:
-      uid:
-        type: string
-        required: true
-    tier: low
-    enabled: true
-
-  smtp_send_business:
-    description: "Send email from business account (digiant.co.nz) via SMTP."
-    binary: /bin/sh
-    fixed_args: ["/scripts/mail_business.sh", "smtp.js", "send"]
-    params:
-      to:
-        type: string
-        flag: "--to"
-        required: true
-      subject:
-        type: string
-        flag: "--subject"
-        required: true
-      body:
-        type: string
-        flag: "--body"
-        required: true
-      cc:
-        type: string
-        flag: "--cc"
-        required: false
-      bcc:
-        type: string
-        flag: "--bcc"
-        required: false
-    tier: medium
-    enabled: true
-
-  # ── Nextcloud community skill commands (openclaw-nextcloud, keithvassallomt) ──
-  # nextcloud.js is a pre-bundled self-contained file (647KB, no npm deps).
-  # Broker must be on business_net and have NEXTCLOUD_URL, WEBDAV_USER, WEBDAV_PASS.
-
-  nc_calendar_list:
-    description: "List Nextcloud calendar events (default: next 7 days)."
-    binary: /bin/sh
-    fixed_args: ["/scripts/nextcloud_run.sh", "calendar", "list"]
-    params:
-      from:
-        type: string
-        flag: "--from"
-        required: false
-      to:
-        type: string
-        flag: "--to"
-        required: false
-    tier: low
-    enabled: true
-
-  nc_calendar_create:
-    description: "Create a Nextcloud calendar event."
-    binary: /bin/sh
-    fixed_args: ["/scripts/nextcloud_run.sh", "calendar", "create"]
-    params:
-      summary:
-        type: string
-        flag: "--summary"
-        required: true
-      start:
-        type: string
-        flag: "--start"
-        required: true
-      end:
-        type: string
-        flag: "--end"
-        required: true
-      description:
-        type: string
-        flag: "--description"
-        required: false
-      calendar:
-        type: string
-        flag: "--calendar"
-        required: false
-    tier: medium
-    enabled: true
-
-  nc_calendar_delete:
-    description: "Delete a Nextcloud calendar event by UID."
-    binary: /bin/sh
-    fixed_args: ["/scripts/nextcloud_run.sh", "calendar", "delete"]
-    params:
-      uid:
-        type: string
-        flag: "--uid"
-        required: true
-      calendar:
-        type: string
-        flag: "--calendar"
-        required: false
-    tier: medium
-    enabled: true
-
-  nc_tasks_list:
-    description: "List Nextcloud tasks/todos."
-    binary: /bin/sh
-    fixed_args: ["/scripts/nextcloud_run.sh", "tasks", "list"]
-    params:
-      calendar:
-        type: string
-        flag: "--calendar"
-        required: false
-    tier: low
-    enabled: true
-
-  nc_tasks_create:
-    description: "Create a Nextcloud task/todo."
-    binary: /bin/sh
-    fixed_args: ["/scripts/nextcloud_run.sh", "tasks", "create"]
-    params:
-      title:
-        type: string
-        flag: "--title"
-        required: true
-      due:
-        type: string
-        flag: "--due"
-        required: false
-      priority:
-        type: string
-        flag: "--priority"
-        required: false
-      description:
-        type: string
-        flag: "--description"
-        required: false
-      calendar:
-        type: string
-        flag: "--calendar"
-        required: false
-    tier: medium
-    enabled: true
-
-  nc_tasks_complete:
-    description: "Mark a Nextcloud task as complete by UID."
-    binary: /bin/sh
-    fixed_args: ["/scripts/nextcloud_run.sh", "tasks", "complete"]
-    params:
-      uid:
-        type: string
-        flag: "--uid"
-        required: true
-      calendar:
-        type: string
-        flag: "--calendar"
-        required: false
-    tier: medium
-    enabled: true
-
-  nc_files_list:
-    description: "List files/folders in Nextcloud via WebDAV."
-    binary: /bin/sh
-    fixed_args: ["/scripts/nextcloud_run.sh", "files", "list"]
-    params:
-      path:
-        type: string
-        flag: "--path"
-        required: false
-        default: "/"
-    tier: low
-    enabled: true
-
-  nc_files_search:
-    description: "Search files in Nextcloud by name/content."
-    binary: /bin/sh
-    fixed_args: ["/scripts/nextcloud_run.sh", "files", "search"]
-    params:
-      query:
-        type: string
-        flag: "--query"
-        required: true
-    tier: low
     enabled: true
 
   # ── Dev-Harness Phase 1 commands ──────────────────────────────────────────
   # These commands run static analysis tools against the sovereign-core source
   # tree on the host filesystem (/hostfs/home/sovereign/sovereign/core/app).
-  #
-  # Production path: harness.py dispatches dev_analyse (full run) OR the
-  # individual tool commands for targeted re-scans.
-  # Test path: run_local_analysis() in analyser.py (direct subprocess, not
-  # via broker — see production assert guard in that function).
-  #
-  # All dev commands: tier=medium (analysis reads codebase; Director intent
-  # required) and enabled=false until broker is rebuilt with Python toolchain.
 
   dev_analyse:
     description: >
       Dev-Harness Phase 1 full analysis run. Executes pylint, semgrep, and
-      boundary_scanner in sequence against /hostfs/home/sovereign/sovereign/core/app.
-      Returns NDJSON tool-envelope lines (one per tool). Always exits 0.
-      Runs dev_analyse.sh — all three tools run even if one fails.
+      boundary_scanner in sequence. Returns NDJSON tool-envelope lines. Always exits 0.
     binary: /bin/sh
     fixed_args: ["/scripts/dev_analyse.sh"]
     params: {}
@@ -517,8 +187,6 @@ commands:
   dev_pylint:
     description: >
       Run pylint --output-format=json against sovereign-core app directory.
-      Returns raw JSON array (empty if no findings). Non-zero exit is normal
-      when findings exist — treat any output as valid JSON.
       Scan target: /hostfs/home/sovereign/sovereign/core/app
     binary: /usr/bin/python3
     fixed_args:
@@ -532,9 +200,7 @@ commands:
 
   dev_semgrep:
     description: >
-      Run semgrep --json with the local custom ruleset (semgrep-rules.yaml)
-      against sovereign-core app directory. No internet egress required.
-      Returns semgrep JSON object with results[]. Exit 1 if findings.
+      Run semgrep --json with the local custom ruleset (semgrep-rules.yaml).
       Scan target: /hostfs/home/sovereign/sovereign/core/app
     binary: /usr/bin/semgrep
     fixed_args:
@@ -549,9 +215,6 @@ commands:
   dev_boundary_scan:
     description: >
       Run boundary_scanner.py against sovereign-core app directory.
-      Emits NDJSON Finding objects to stdout. Always exits 0.
-      Rules: B1 (LLM in forbidden zones), B2 (LLM in gate/validate),
-      B3 (string literal to translator_pass), B4 (restricted collection write).
       Scan target: /hostfs/home/sovereign/sovereign/core/app
     binary: /usr/bin/python3
     fixed_args:
@@ -564,8 +227,6 @@ commands:
   dev_git_diff:
     description: >
       Get the git diff of uncommitted changes in the sovereign-core source tree.
-      Output used by Dev-Harness Phase 2 (classifier) and Phase 3 (plan) to
-      provide context for LLM classification and CC runsheet generation.
       Repo root: /hostfs/home/sovereign/sovereign
     binary: /usr/bin/git
     fixed_args:
@@ -575,4 +236,37 @@ commands:
       - "--unified=5"
     params: {}
     tier: medium
+    enabled: true
+
+  # ── Docker lifecycle (build/pull) ─────────────────────────────────────────
+
+  docker_build:
+    description: >
+      Build (or rebuild) a named service image via docker compose build --no-cache.
+      Uses nsenter to run docker compose on the host.
+      HIGH tier — requires double confirmation. Timeout 10 minutes.
+    binary: /usr/bin/nsenter
+    fixed_args:
+      - "-t"
+      - "1"
+      - "-m"
+      - "-p"
+      - "--"
+      - "/usr/bin/docker"
+      - "compose"
+      - "-f"
+      - "/docker/sovereign/compose.yml"
+      - "build"
+      - "--no-cache"
+    timeout_ms: 600000
+    params:
+      service:
+        type: string
+        required: true
+        allowlist:
+          - sovereign-core
+          - gateway
+          - nanobot-01
+          - docker-broker
+    tier: high
     enabled: true

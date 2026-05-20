@@ -22,18 +22,17 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - PASS 2 (specialist outbound) → only externally-routable pass via `_routing_decision()`
 - `_routing_decision(prompt, user_input)` scores complexity on `user_input` (NOT full specialist prompt — persona length would inflate every score)
 - DCL hard-block: tier in `{"PRIVATE","SECRET"}` → `force_local=True` regardless of explicit override
-- Explicit external override: `_EXPLICIT_EXTERNAL_RE` matches `use claude|use grok|ask claude|ask grok|via claude|via grok|external llm|external model|external ai` → forces external regardless of score
-- Provider signals (checked on raw user_input): `_CLAUDE_SIGNAL_RE` (architectural/architecture/plan/review/design/strategy/strategic) → claude; `_GROK_SIGNAL_RE` (use grok/ask grok/via grok + current/latest/news/today/recent/market/trending) → grok; default → grok
+- Explicit external override: `_EXPLICIT_EXTERNAL_RE` matches `use grok|ask grok|via grok|external llm|external model|external ai` → forces external regardless of score
+- Provider signals (checked on raw user_input): `_GROK_SIGNAL_RE` (use grok/ask grok/via grok + current/latest/news/today/recent/market/trending) → grok; default → grok
 - Operational penalty: score≥0.50 AND `_OPERATIONAL_RE` (restart/container/service/deploy/port/compose/nginx/redis/mariadb/healthcheck/network/subnet) → -0.20
 - `specialist_plan` always includes `_routing_reason`, `_complexity_score`, `_intended_provider` (even on local fallback)
-- Claude/Grok API unavailable → graceful fallback to Ollama; no error raised
-- **Grok is the preferred external provider** — Grok API key is active; Claude API key is set but Director's plan may not cover API usage. Default external calls go to Grok.
+- Grok API unavailable → graceful fallback to Ollama; no error raised
+- **Grok is the only permitted external LLM provider for PASS 2.** Claude API is not wired for autonomous use and must not be wired. Default external calls go to Grok.
 
 ### Confirmed-continuation bypass
 - When `confirmed=True` and `pending_delegation._pending_load is not None`: skip PASS 2 + PASS 3 (specialist + CEO evaluation)
-- Reasoning already happened before confirmation prompt; re-running is pure overhead (~80s saved)
 - Stash carry-forward state in `pending_delegation._pending_load` to get this bypass
-- Remaining work: PASS 4 dispatch + translate only (~45s)
+- Remaining work: PASS 4 dispatch + translate only
 - **CRITICAL**: `confirmed` must be passed to `_dispatch_inner` via `payload={"confirmed": confirmed}` in the central `_dispatch()` call in `handle_chat`. Without this, `confirmed = payload.get("confirmed", False)` is always False inside `_dispatch_inner` and the short-circuit never fires (confirmed-continuation bypass is silently bypassed)
 
 ### Untrusted nanobot content
@@ -41,7 +40,7 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - Scanner runs on result content between EXEC and PASS 3b
 - Flagged content: `_untrusted_flagged: True` + `_scan_categories` set; ledger entry logged
 - `prompts.specialist_inbound()` surfaces trust warning when `_untrusted_flagged` or `_trust == "untrusted_external"`
-- `result_for_translator` from PASS 4 is the fabrication firewall — translator receives ONLY this
+- See Security Boundaries in root CLAUDE.md for the `result_for_translator` fabrication firewall isolation invariant
 
 ### InternalMessage envelope (`cognition/message.py`)
 - Director input hashed at PASS 1 (SHA-256); raw text never stored in envelope or passed between agents
@@ -114,9 +113,12 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - All results stamped `_trust: "untrusted_external"`
 
 ### Hard boundary (do not violate)
-- Broker handles ONLY: `docker_ps/logs/restart/stats/inspect/exec, uname/df/free/ps/nvidia_smi/systemctl_status/journalctl`
+- Broker handles system operations only; nanobot-01 handles all application skills
+- **Broker commands (LOW — `docker_read` or exec_command):** `docker_ps`, `docker_logs`, `docker_stats`, `docker_inspect`, `uname` (`kernel_info`), `df` (`disk_usage`), `free` (`memory_usage`), `ps`, `nvidia_smi`, `systemctl_status`, `journalctl`, `apt_check`; REST endpoints: `docker_networks`, `docker_volumes`, `docker_images`, `docker_disk` (→ `/system/df`)
+- **Broker commands (MID):** `docker_restart`, `docker_recreate` (`recreate_container`); REST: `POST /containers/*/restart`
+- **Broker commands (HIGH):** `docker_build`, `docker_prune` (→ `POST /images/prune`); REST: `POST /compose/*/rolling-recreate`
 - All other application skills (IMAP/SMTP/feeds/WebDAV/CalDAV) → nanobot-01
-- Do NOT add new system commands to broker without architectural review
+- Do NOT add new system commands to broker without a Director-approved design decision recorded in as-built.md
 
 ---
 

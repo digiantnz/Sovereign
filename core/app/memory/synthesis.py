@@ -20,6 +20,7 @@ Dedup: checks for existing _key before writing — never writes duplicate entrie
        Structural entries update on subsequent runs when insight or relationship_type changes.
 """
 
+import asyncio
 import logging
 import re
 from collections import defaultdict
@@ -29,7 +30,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_LLM_MODEL = "llama3.1:8b-instruct-q4_K_M"
+from config import cfg as _cfg
+_LLM_MODEL = _cfg.models.primary_inference_model
 
 # Structural relationship vocabulary — typed edges in Rex's semantic knowledge graph
 REL_IS_A        = "is_a"         # A is a type/subclass of B
@@ -115,7 +117,8 @@ async def _infer_relationship(cog, payload_a: dict, payload_b: dict) -> dict | N
         f"  {REL_SAME_DOMAIN} — A and B operate in the same context or category"
     )
     try:
-        result = await cog.call_llm_json(prompt)
+        from adapters.inference_queue import InferenceQueue
+        result = await cog.call_llm_json(prompt, priority=InferenceQueue.LOW)
         if not isinstance(result, dict):
             return None
         if result.get("relationship_type") not in _STRUCTURAL_REL_TYPES:
@@ -317,6 +320,9 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
 
     # ── Per-entry: find neighbours → infer relationship → write/update ────────
     for entry in entries:
+        # Yield to event loop between entries — lets HIGH priority user requests
+        # submit their queue jobs before synthesis re-submits its next LOW job.
+        await asyncio.sleep(0)
         entry_key = entry.get("_key", "")
         if not entry_key:
             continue
@@ -655,6 +661,7 @@ async def run_synthesis(qdrant, cog=None) -> dict:
     ]
     # For each pair of mixed intents: write or update a relational entry
     for intent_a, intent_b in combinations(mixed_intents, 2):
+        await asyncio.sleep(0)  # yield between iterations
         slug_a, slug_b = _slug(intent_a), _slug(intent_b)
         key = _rel_key(slug_a, slug_b)
 

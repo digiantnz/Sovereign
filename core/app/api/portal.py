@@ -236,7 +236,7 @@ async def _stream_container_logs(
     queue: "asyncio.Queue[str]",
     tail: int = LOG_TAIL_EACH,
 ) -> None:
-    """Stream Docker container logs into the shared queue.
+    """Stream Docker container logs into the shared queue with auto-reconnect.
 
     Implements the full Docker multiplexed log stream parser (RFC 8-byte header):
       bytes 0:   stream type (1=stdout, 2=stderr; discarded — both shown)
@@ -247,41 +247,46 @@ async def _stream_container_logs(
     Permitted by docker-policy.yaml: GET:/containers/*/logs in trust.levels.low.allow.
     Named policy intent: log_tail_sovereign (see named_commands section).
     """
-    url    = f"{BROKER_URL}/containers/{container}/logs"
-    params = {"follow": "1", "stdout": "1", "stderr": "1", "tail": str(tail)}
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=None, write=5.0, pool=5.0)
-        ) as client:
-            async with client.stream(
-                "GET", url, params=params, headers={"X-Trust-Level": "low"}
-            ) as response:
-                if response.status_code != 200:
-                    await queue.put(f"[{container}] error: HTTP {response.status_code}")
-                    return
-                buf = b""
-                async for chunk in response.aiter_bytes():
-                    buf += chunk
-                    # Parse complete frames from buffer
-                    while len(buf) >= 8:
-                        frame_size = struct.unpack(">I", buf[4:8])[0]
-                        if len(buf) < 8 + frame_size:
-                            break   # incomplete frame — accumulate more data
-                        frame_bytes = buf[8:8 + frame_size]
-                        buf         = buf[8 + frame_size:]
-                        text = frame_bytes.decode("utf-8", errors="replace").rstrip("\n")
-                        if text:
-                            for line in text.splitlines():
-                                if line.strip():
-                                    await queue.put(f"[{container}] {line}")
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.debug("portal /logs/stream: %s stream ended: %s", container, e)
+    url          = f"{BROKER_URL}/containers/{container}/logs"
+    reconnect_s  = 3.0   # delay before reconnect attempt
+    first_connect = True
+    while True:
+        params = {
+            "follow": "1", "stdout": "1", "stderr": "1",
+            "tail": str(tail) if first_connect else "0",
+        }
         try:
-            await queue.put(f"[{container}] stream ended")
-        except Exception:
-            pass
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=5.0, read=None, write=5.0, pool=5.0)
+            ) as client:
+                async with client.stream(
+                    "GET", url, params=params, headers={"X-Trust-Level": "low"}
+                ) as response:
+                    if response.status_code != 200:
+                        await queue.put(f"[{container}] error: HTTP {response.status_code}")
+                        await asyncio.sleep(reconnect_s)
+                        continue
+                    first_connect = False
+                    buf = b""
+                    async for chunk in response.aiter_bytes():
+                        buf += chunk
+                        # Parse complete frames from buffer
+                        while len(buf) >= 8:
+                            frame_size = struct.unpack(">I", buf[4:8])[0]
+                            if len(buf) < 8 + frame_size:
+                                break   # incomplete frame — accumulate more data
+                            frame_bytes = buf[8:8 + frame_size]
+                            buf         = buf[8 + frame_size:]
+                            text = frame_bytes.decode("utf-8", errors="replace").rstrip("\n")
+                            if text:
+                                for line in text.splitlines():
+                                    if line.strip():
+                                        await queue.put(f"[{container}] {line}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("portal /logs/stream: %s reconnecting after error: %s", container, e)
+        await asyncio.sleep(reconnect_s)
 
 
 async def _sse_log_generator(request: Request) -> AsyncGenerator[str, None]:

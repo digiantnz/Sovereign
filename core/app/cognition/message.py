@@ -85,12 +85,13 @@ class Envelope:
 @dataclass
 class MessageContext:
     """Preserved through all passes. Set at PASS 1, never overwritten."""
-    original_intent:      str = ""    # set by orchestrator PASS 1; never changed
-    director_input_hash:  str = ""    # SHA-256 of raw Director input; raw never travels past PASS 1
-    routing_rationale:    str = ""    # set by orchestrator PASS 1
-    security_clearance:   str = ""    # "cleared" | "conditional" | "blocked" — set by PASS 2
-    skill:                str = ""    # null until specialist_outbound sets it
-    operation:            str = ""    # null until specialist_outbound sets it
+    original_intent:      str  = ""    # set by orchestrator PASS 1; never changed
+    director_input_hash:  str  = ""    # SHA-256 of raw Director input; raw never travels past PASS 1
+    routing_rationale:    str  = ""    # set by orchestrator PASS 1
+    security_clearance:   str  = ""    # "cleared" | "conditional" | "blocked" — set by PASS 2
+    skill:                str  = ""    # null until specialist_outbound sets it
+    operation:            str  = ""    # null until specialist_outbound sets it
+    pass0_hits:           list = field(default_factory=list)  # WM point_ids surfaced by PASS 0; used by MRFL
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +101,7 @@ class MessageContext:
             "security_clearance":  self.security_clearance,
             "skill":               self.skill,
             "operation":           self.operation,
+            "pass0_hits":          self.pass0_hits,
         }
 
 
@@ -226,6 +228,7 @@ class InternalMessage:
             security_clearance=clearance,
             skill=self.context.skill,
             operation=self.context.operation,
+            pass0_hits=self.context.pass0_hits,
         )
         return self
 
@@ -238,6 +241,20 @@ class InternalMessage:
             security_clearance=self.context.security_clearance,
             skill=skill,
             operation=operation,
+            pass0_hits=self.context.pass0_hits,
+        )
+        return self
+
+    def set_pass0_hits(self, hits: list) -> "InternalMessage":
+        """Record working_memory point_ids surfaced by PASS 0 for MRFL tracking."""
+        self.context = MessageContext(
+            original_intent=self.context.original_intent,
+            director_input_hash=self.context.director_input_hash,
+            routing_rationale=self.context.routing_rationale,
+            security_clearance=self.context.security_clearance,
+            skill=self.context.skill,
+            operation=self.context.operation,
+            pass0_hits=list(hits),
         )
         return self
 

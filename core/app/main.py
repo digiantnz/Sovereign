@@ -7,6 +7,8 @@ from governance.engine import GovernanceEngine
 from execution.engine import ExecutionEngine
 from cognition.engine import CognitionEngine
 from execution.adapters.qdrant import QdrantAdapter
+from adapters.inference_queue import InferenceQueue
+from adapters.ollama import OllamaAdapter
 from execution.adapters.signing import SigningAdapter
 from security.audit_ledger import AuditLedger
 from security.soul_guardian import SoulGuardian, load_soul_md
@@ -22,9 +24,13 @@ from api.portal import router as portal_router
 from execution.adapters.wallet import WalletAdapter
 from scheduling.task_scheduler import TaskScheduler
 from execution.credential_proxy import CredentialProxy
+from config import cfg as _cfg
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
+
+_GPU_NAME    = "EVGA RTX 3090"
+_GPU_VRAM_GB = 24
 
 
 @asynccontextmanager
@@ -198,8 +204,8 @@ async def lifespan(app: FastAPI):
             "title": "Ollama endpoint and active models",
             "content": (
                 "Ollama endpoint: http://ollama:11434 (ai_net). "
-                "Primary model: llama3.1:8b-instruct-q4_K_M on RTX 3060 Ti (8 GB VRAM). "
-                "Also has mistral:7b installed. Embedding model: nomic-embed-text (768-dim)."
+                f"Primary model: {_cfg.models.primary_inference_model} on {_GPU_NAME} ({_GPU_VRAM_GB} GB VRAM). "
+                "Also has llama3.1:8b and mistral:7b installed. Embedding model: nomic-embed-text (768-dim)."
             ),
             "domain": "infrastructure",
         },
@@ -215,7 +221,7 @@ async def lifespan(app: FastAPI):
                 "Promotions: Rex instruction, PASS 4 decision, or clean shutdown → working_memory → RAID. "
                 "Crash without clean shutdown: un-promoted working_memory entries are lost (known risk). "
                 "Embeddings: nomic-embed-text (768-dim) via CPU-only ollama-embed (http://ollama-embed:11434). "
-                "Inference/key generation: llama3.1:8b via GPU ollama (http://ollama:11434)."
+                f"Inference/key generation: {_cfg.models.primary_inference_model} via GPU ollama (http://ollama:11434)."
             ),
             "domain": "infrastructure",
         },
@@ -562,7 +568,7 @@ async def lifespan(app: FastAPI):
                 f"🧠 Bootstrap complete: {_sl_total} entries loaded (~{_sl_mb} MB)\n"
                 f"   {_sl.get(2,0)} canonical | {_sl.get(3,0)} due today | "
                 f"{_sl.get(6,0)} SI proposals | {_sl.get(7,0)} procedural | "
-                f"{_sl_sim} similarity"
+                f"{_sl.get(8,0)} intent seeds | {_sl_sim} similarity"
             )
             async with _hx.AsyncClient(timeout=10.0) as _cl:
                 await _cl.post(
@@ -573,7 +579,10 @@ async def lifespan(app: FastAPI):
         logger.warning("Bootstrap Telegram notification failed (non-fatal): %s", _boot_notif_err)
 
     app.state.gov      = GovernanceEngine("/app/governance/governance.json")
-    app.state.cog      = CognitionEngine(qdrant, ledger=ledger)
+    inference_queue    = InferenceQueue(OllamaAdapter(), ledger=ledger)
+    await inference_queue.start()
+    app.state.inference_queue = inference_queue
+    app.state.cog      = CognitionEngine(qdrant, ledger=ledger, inference_queue=inference_queue)
     # Inject cog into qdrant AFTER all startup seeds complete — ensures boot-time
     # semantic writes (static facts, intent seeds, component registry) do not each
     # trigger a structural synthesis task. From this point on, every semantic write
@@ -699,6 +708,7 @@ async def lifespan(app: FastAPI):
     _task_scheduler_task.cancel()
     _archive_sync_task.cancel()
     _si_observe_task.cancel()
+    await inference_queue.stop()
     # Promote eligible working_memory entries to RAID sovereign collections before shutdown.
     # Entries not promoted here are lost on container exit (known acceptable risk —
     # see docs/as-built.md; mitigated by 64GB RAM upgrade enabling periodic background flush).
@@ -727,6 +737,44 @@ def health():
 @app.get("/metrics")
 async def metrics():
     return await collect_all(app.state)
+
+
+@app.get("/cognitive/state")
+async def cognitive_state():
+    exec_engine = getattr(app.state, "exec", None)
+    if exec_engine is None:
+        return {"active": False}
+    return getattr(exec_engine, "_loop_state", {"active": False})
+
+
+@app.get("/portal/config")
+async def portal_config():
+    """Structured config values for the dashboard — avoids hardcoding in portal.html."""
+    model = _cfg.models.primary_inference_model
+    # Derive a short display name: last path segment, strip GGUF suffix
+    import re as _re
+    _short = model.split("/")[-1].split(":")[0]
+    _short = _re.sub(r"-abliterated|-Q[0-9].*|_Q[0-9].*|-GGUF.*|\.gguf.*", "", _short, flags=_re.IGNORECASE)
+    return {
+        "primary_model": model,
+        "model_short": _short,
+        # Container mem limits from compose.yml (authoritative source)
+        "container_mem": {
+            "sovereign-core": "2g",
+            "ollama":         "22g",
+            "ollama-embed":   "2g",
+            "qdrant":         "16g",
+            "qdrant-archive": "4g",
+            "docker-broker":  "512m",
+            "gateway":        "256m",
+            "nanobot-01":     "512m",
+            "sov-wallet":     "256m",
+            "nextcloud":      "2g",
+            "nc-db":          "512m",
+            "nc-redis":       "256m",
+            "nginx":          "128m",
+        },
+    }
 
 
 @app.post("/query")
@@ -1151,6 +1199,8 @@ async def attachment(payload: dict):
 
 @app.post("/chat")
 async def chat(payload: dict):
+    import httpx as _httpx
+    import httpcore as _httpcore
     user_input        = payload.get("input", "")
     pending           = payload.get("pending_delegation")
     confirmed         = payload.get("confirmed", False)
@@ -1160,12 +1210,23 @@ async def chat(payload: dict):
     context_window    = payload.get("context_window")
     # _harness_cmd: set by gateway for /slash commands — bypasses NL routing entirely
     harness_cmd       = payload.get("_harness_cmd")
-    return await app.state.exec.handle_chat(
-        user_input,
-        pending_delegation=pending,
-        confirmed=confirmed,
-        confidence_acknowledged=conf_ack,
-        security_confirmed=security_conf,
-        context_window=context_window,
-        harness_cmd=harness_cmd,
-    )
+    portfolio_category = payload.get("portfolio_category", "")
+    try:
+        return await app.state.exec.handle_chat(
+            user_input,
+            pending_delegation=pending,
+            confirmed=confirmed,
+            confidence_acknowledged=conf_ack,
+            security_confirmed=security_conf,
+            context_window=context_window,
+            harness_cmd=harness_cmd,
+            portfolio_category=portfolio_category,
+        )
+    except (_httpx.ReadTimeout, _httpcore.ReadTimeout):
+        import logging as _log
+        _log.getLogger(__name__).warning("/chat ReadTimeout — adapter (nanobot/Ollama) did not respond in time")
+        return {"director_message": "One of my adapters timed out — please try again in a moment.", "status": "timeout"}
+    except Exception as _e:
+        import logging as _log, traceback as _tb
+        _log.getLogger(__name__).error("/chat unhandled exception: %s\n%s", _e, _tb.format_exc())
+        return {"director_message": "An unexpected error occurred — please try again.", "status": "error", "error": str(_e)}

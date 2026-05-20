@@ -77,6 +77,21 @@ async def collect_gpu(broker_url: str = BROKER_URL) -> dict:
         return {"error": str(e)}
 
 
+def collect_temps() -> dict:
+    """Read CPU and NVMe temps from hwmon sysfs. Paths are stable on this host."""
+    result = {}
+    sensors = {
+        "cpu_c":  "/sys/class/hwmon/hwmon1/temp1_input",   # k10temp Tctl (AMD Ryzen)
+        "nvme_c": "/sys/class/hwmon/hwmon0/temp1_input",   # NVMe composite
+    }
+    for key, path in sensors.items():
+        try:
+            result[key] = int(open(path).read().strip()) // 1000
+        except Exception:
+            result[key] = None
+    return result
+
+
 def collect_host_memory() -> dict:
     """Parse /proc/meminfo for RAM stats. Available inside container."""
     try:
@@ -100,27 +115,39 @@ def collect_host_memory() -> dict:
 
 
 async def collect_ollama(ollama_url: str = OLLAMA_URL) -> dict:
-    """Get loaded models and last-inference latency."""
+    """Get loaded models and last-inference latency.
+
+    Generation probe uses a 6s timeout. qwen2.5:32b can take 30s+ when the GPU
+    is already processing a real request; timing out returns status='busy' rather
+    than blocking the entire /metrics endpoint.
+    """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r_tags = await client.get(f"{ollama_url}/api/tags")
             r_tags.raise_for_status()
             models = [m["name"] for m in r_tags.json().get("models", [])]
 
-            # Latency probe — minimal generation
+            # Latency probe — short timeout so busy GPU doesn't block /metrics
             t0 = time.monotonic()
-            r_gen = await client.post(
-                f"{ollama_url}/api/generate",
-                json={"model": models[0] if models else "llama3.1:8b-instruct-q4_K_M",
-                      "prompt": "1", "stream": False},
-                timeout=30.0,
-            )
-            latency_ms = round((time.monotonic() - t0) * 1000, 1)
-            inference_ok = r_gen.status_code == 200
+            try:
+                r_gen = await client.post(
+                    f"{ollama_url}/api/generate",
+                    json={"model": models[0] if models else "qwen2.5:32b-instruct-q4_K_M",
+                          "prompt": "/no_think\n1", "stream": False},
+                    timeout=6.0,
+                )
+                latency_ms = round((time.monotonic() - t0) * 1000, 1)
+                inference_ok = r_gen.status_code == 200
+                inference_status = "ok"
+            except (httpx.TimeoutException, httpx.ReadTimeout):
+                latency_ms = None
+                inference_ok = True   # model is loaded; GPU is just busy
+                inference_status = "busy"
         return {
             "models": models,
             "last_inference_latency_ms": latency_ms,
             "inference_ok": inference_ok,
+            "inference_status": inference_status,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -273,6 +300,7 @@ async def collect_all(app_state=None) -> dict:
     )
 
     ram = collect_host_memory()
+    temps = collect_temps()
     audit = collect_audit_count()
 
     soul_status = {}
@@ -281,6 +309,15 @@ async def collect_all(app_state=None) -> dict:
             "guardian": "active",
             "soul_checksum": getattr(app_state, "soul_checksum", None),
         }
+
+    iq = getattr(app_state, "inference_queue", None) if app_state else None
+    if iq is not None:
+        ollama_info["queue_depth"] = iq.queue_depth()
+        ollama_info["queue_busy"]  = iq.is_busy()
+        ollama_info["current_job"] = iq.current_job()
+
+    exec_engine = getattr(app_state, "exec", None) if app_state else None
+    loop_state = getattr(exec_engine, "_loop_state", {"active": False}) if exec_engine else {"active": False}
 
     return {
         "timestamp":    ts,
@@ -293,4 +330,6 @@ async def collect_all(app_state=None) -> dict:
         "soul_guardian": soul_status,
         "external":     external,
         "wallet":       wallet,
+        "temps":        temps,
+        "loop_state":   loop_state,
     }

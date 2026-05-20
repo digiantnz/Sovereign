@@ -107,14 +107,16 @@ devops_agent:
   skill_audit         — list all installed skills with checksum integrity status (LOW)
   configure_browser_auth — add or update an authenticated host profile for the browser adapter (MID — requires confirmation; target: description of host, auth type, and env var name)
   inspect_container   — docker inspect a specific container (LOW; target: container name)
+  docker_prune        — remove dangling Docker images to free disk space (HIGH — requires double confirmation; no target needed)
   get_compose         — read the current docker-compose.yml (LOW)
   read_host_file      — read a file or list a directory on the host filesystem (LOW; target: absolute path e.g. "/docker/sovereign/core/app/" or "/home/sovereign/docs/as-built.md")
   get_hardware        — combined hardware report: GPU, disk, memory, CPU (LOW)
   list_processes      — system process list / ps aux (LOW)
   schedule_task       — create a recurring or one-time scheduled task from NL description (MID — requires confirmation; e.g. "daily briefing at 7:30", "search weekly for X", "remind me every Monday")
   list_tasks          — list all scheduled/recurring tasks and their status (LOW)
-  pause_task          — pause a running scheduled task (MID; target: task_id)
-  cancel_task         — cancel and remove a scheduled task (MID; target: task_id)
+  pause_task               — pause a running scheduled task (LOW; target: task_id or title)
+  cancel_task              — cancel and remove a scheduled task (LOW; target: task_id or title)
+  complete_scheduled_task  — mark a scheduled task or past reminder as completed (LOW; target: task_id or title)
 
 memory_agent:
   memory_list_keys    — list ALL entries in sovereign memory as a structured directory (key, type, title, collection, last_updated); ALWAYS call this FIRST before any memory retrieval
@@ -125,6 +127,8 @@ research_agent:
   query            — answer, explain, summarise, write up, draft, describe, or discuss using internal knowledge; also greetings, casual conversation, and any meta-instructions about Sovereign itself
   remember_fact    — store a fact, lesson, or instruction the Director wants retained
   github_read      — check GitHub releases or repo status (LOW; shared with devops_agent)
+  research_gather  — multi-source research with synthesis: financial analysis, investment research, company analysis, sector deep-dives, market research, due diligence; uses browser + Grok + Yahoo Finance; offers Nextcloud save; REQUIRES target: the research subject (company name, ticker, topic)
+  news_brief       — current news headlines and morning briefing; short summary only, no save; for "what's in the news" / "morning news" queries only
 
 business_agent:
   list_files       — list files in Nextcloud (target: folder path; use "/" for root, "/Notes/" for Notes folder, "/Notes/Request/" for nested subfolder)
@@ -138,8 +142,15 @@ business_agent:
   delete_email     — delete an email (moves to Trash; requires HIGH tier confirmation)
   send_email       — send an email
   list_folders     — list IMAP mailbox folders/folders for an email account (target: personal or business)
-  list_calendars   — list calendars
-  create_event     — add a calendar event
+  list_calendars   — list available calendars
+  list_events      — list calendar events for a date or range (target: "today", a date, or null for upcoming)
+  create_event     — add a calendar event (any phrasing: "add to my calendar", "put this on my cal", "block that out", "stick it in my diary", etc.)
+  delete_event     — delete a calendar event
+  update_event     — reschedule or edit a calendar event
+  list_nc_tasks    — list Nextcloud tasks and reminders (target: null for all, "today" for due today)
+  tasks_create     — create a new Nextcloud task or reminder
+  tasks_complete   — mark a Nextcloud task as complete (target: task UID)
+  tasks_delete     — delete a Nextcloud task (target: task UID)
 
 ROUTING RULES:
 - CRITICAL: Personal/lifestyle/consumer topics (buying, shopping, food, clothing, fitness, hobbies, entertainment, social plans, opinions, feelings, weather) → research_agent, intent=query. NEVER route personal statements to file, email, or docker operations.
@@ -161,8 +172,20 @@ ROUTING RULES:
 - "create a folder", "make a folder", "new folder", "mkdir" → business_agent, intent=create_folder. Target = full path of folder to create.
 - "show me the contents of", "what does [filename] say", "what is in [filename]", "read [filename]", "open [filename]" → business_agent, intent=read_file. Target = the file path.
 - CRITICAL: "what is in X" where X is a filename or document → business_agent/read_file. NOT devops/get_stats.
-- Calendar, events, schedule, appointments → business_agent, intent=list_calendars or create_event
-- CRITICAL: only use web_search when the Director explicitly mentions internet/web/online. Do NOT default to web_search for general questions.
+- Calendar, events, schedule, appointments → business_agent. Intent rules (apply FIRST match):
+    - "what's on today", "what do I have today", "today's events", "calendar today", "what's scheduled", "show events" → intent=list_events, target="today"
+    - "list calendars", "show calendars", "what calendars" → intent=list_calendars
+    - Viewing/listing events (no action verb, or "show"/"what"/"list") → intent=list_events
+    - ANY request to add, create, schedule, book, put, or save something to a calendar — regardless of phrasing — → intent=create_event. This includes flight details, hotel bookings, meetings, appointments, or any structured event data accompanied by "add to my cal", "put this on", "stick it in", "block it out", or similar. If no explicit calendar verb but the Director has pasted structured flight/hotel data, assume intent=create_event.
+    - Reschedule, move, change time, edit → intent=update_event
+    - Delete, remove, cancel event → intent=delete_event
+- Tasks, reminders, to-do items → business_agent. Intent rules:
+    - "any reminders", "my reminders", "list tasks", "list my tasks", "what tasks", "what's due", "show my tasks" → intent=list_nc_tasks
+    - "create task", "add task", "new reminder", "create reminder", "add reminder" → intent=tasks_create
+    - "complete task", "mark done", "finish task" → intent=tasks_complete
+    - "delete task", "remove task" → intent=tasks_delete
+- Research, analysis, and financial/investment deep-dives → research_agent, intent=research_gather, target=the subject being researched. Triggers: "research [topic]", "analyse/analyze [company/market]", "deep research on/into/about", "financial research on", "investment research on", "should I buy/sell/invest in", "due diligence on", "market research on", "deep dive into", "give me an analysis of", "is [X] worth buying/investing". ALWAYS set target to the company name, ticker, or topic (e.g. "Pacific Edge Limited (NZX: PEB)").
+- news_brief vs research_gather boundary: news_brief = current headlines only, no full report, no save (use for "what's in the news", "morning news", "today's headlines"). research_gather = multi-source analysis with synthesis and full report — investment/company/market/financial analysis ALWAYS routes to research_gather, never news_brief.
 - CRITICAL: "find information", "search for", "look up" relating to internet/web → research_agent, intent=web_search (NOT list_files)
 - GitHub repo / releases / pending updates / "check github" → devops_agent, intent=github_read
 - "push to repo", "commit to github", "update the repo", "push as-built", "push docs" → devops_agent; intent=github_push_soul if target is sovereign-soul.md or governance.json; intent=github_push_security if target is a security pattern file; intent=github_push_doc for all other standard docs
@@ -171,8 +194,9 @@ ROUTING RULES:
 - "search for skills", "find skills", "find a skill", "look for skills", "clawhub", "skill registry", "browse skills" → devops_agent, intent=skill_search, target=the search query
 - "review skill", "check skill", "inspect skill", "security review skill" → devops_agent, intent=skill_review
 - "install skill", "load skill", "add skill" → devops_agent, intent=skill_load (MID — requires confirmation)
-- "list skills", "show skills", "what skills", "skill audit", "check skill integrity", "skills installed" → devops_agent, intent=skill_audit
+- "list skills", "show skills", "what skills", "skill audit", "check skill integrity", "skills installed", "what skills do you have", "what harnesses", "list harnesses", "what can you do" → devops_agent, intent=skill_audit
 - "inspect [container]", "docker inspect" → devops_agent, intent=inspect_container, target=container name
+- "prune images", "prune docker", "clean up docker images", "remove old images", "delete unused images", "free up docker space", "docker cleanup" → devops_agent, intent=docker_prune (HIGH — double confirmation required)
 - "show compose", "read compose", "show docker-compose", "what's in compose.yml" → devops_agent, intent=get_compose
 - "read file [path]", "show file [path]", "list [path]", "what's in [path]", "read host" — when path is a system path (not Nextcloud) → devops_agent, intent=read_host_file, target=the absolute path
 - Sovereign's own files (NOT on Nextcloud — read via read_host_file, devops_agent):
@@ -187,8 +211,9 @@ ROUTING RULES:
 - "processes", "running processes", "ps aux", "what's running on the system", "list processes" → devops_agent, intent=list_processes
 - "schedule a task", "run every", "run daily", "every morning at", "daily briefing", "recurring task", "remind me every", "monitor daily", "search daily", "search weekly", "notify me when", "alert me every" → devops_agent, intent=schedule_task (MID — requires confirmation)
 - "list tasks", "show tasks", "scheduled tasks", "active tasks", "what's scheduled" → devops_agent, intent=list_tasks (LOW)
-- "pause task", "suspend task" → devops_agent, intent=pause_task (MID; target=task_id)
-- "cancel task", "stop task", "delete task", "remove task" → devops_agent, intent=cancel_task (MID; target=task_id)
+- "pause task", "suspend task" → devops_agent, intent=pause_task (LOW; target=task_id or title)
+- "cancel task", "stop task", "delete task", "remove task", "no longer needed", "delete scheduled task" → devops_agent, intent=cancel_task (LOW; target=task title — title lookup is handled automatically)
+- "mark task as complete", "mark reminder as complete", "has passed", "reminder is past", "mark as done", "task is complete", "task no longer needed" → devops_agent, intent=complete_scheduled_task (LOW; target=task title)
 
 MEMORY RETRIEVAL PROTOCOL — MANDATORY:
 When a request requires retrieving a specific known fact from sovereign memory:
@@ -670,15 +695,15 @@ def specialist_outbound(agent_persona: str, delegation: dict, user_input: str,
     context_section = ""
     if context_window:
         _turns = context_window if isinstance(context_window, list) else [context_window]
-        _recent = _turns[-4:]  # last 4 turns is enough
+        _recent = _turns[-8:]  # last 8 turns — qwen2.5:32b 32k context handles full history
         _ctx_lines = []
         for _t in _recent:
             if isinstance(_t, dict):
                 # Gateway format: {"user": "...", "assistant": "..."}
                 if "user" in _t:
-                    _ctx_lines.append(f"USER: {str(_t['user'])[:200]}")
+                    _ctx_lines.append(f"USER: {str(_t['user'])[:500]}")
                 if "assistant" in _t:
-                    _ctx_lines.append(f"ASSISTANT: {str(_t['assistant'])[:400]}")
+                    _ctx_lines.append(f"ASSISTANT: {str(_t['assistant'])[:1000]}")
             elif isinstance(_t, str):
                 _ctx_lines.append(_t[:300])
         if _ctx_lines:
@@ -697,8 +722,16 @@ REQUIRED FIELDS for create_event (today is {_date.today().isoformat()}):
   "description": "<location or details if provided>"
   "uid": ""
 
+MULTIPLE EVENTS: If the request lists 2 or more distinct events, output an "events" array
+AND set the top-level fields to the first event as a fallback:
+  "events": [
+    {{"summary": "NZ6 Auckland → Los Angeles", "start": "2026-06-07T20:15:00", "end": "2026-06-08T13:20:00", "description": "", "calendar": "personal"}},
+    {{"summary": "UA1700 Los Angeles → Newark", "start": "2026-06-07T16:30:00", "end": "2026-06-08T01:04:00", "description": "", "calendar": "personal"}}
+  ]
+
 DATE RULES — read carefully:
 - All-day event (no time given): use T00:00:00 e.g. "2026-06-06T00:00:00"
+- Overnight flight: end date is the NEXT calendar day e.g. departs June 7 20:15 arriving June 8 13:20 → end "2026-06-08T13:20:00"
 - Multi-day range "6–7 June 2026": start = "2026-06-06T00:00:00", end = "2026-06-07T00:00:00"
 - Single date, no time: start = date T00:00:00, end = same day T23:59:59
 - Single date with time: end = start + 1 hour
@@ -759,6 +792,28 @@ Extract 'to' as the email address the Director specified (e.g. "to matt@example.
 Extract 'subject' as the subject line specified. Extract 'body' as the body content specified.
 Do NOT use draft_content — use 'body' directly."""
 
+    elif intent in ("web_search", "research"):
+        _schema_hint = f"""
+REQUIRED OUTPUT FIELDS for deep research (today is {_date.today().isoformat()}):
+  "domain_scope": "<general|securities|commodities — infer from request keywords>"
+  "search_query": "<precise, scoped primary query — not a vague topic>"
+  "research_plan": "<1–2 sentences: primary question + supporting angles>"
+  "synthesis_notes": "<prior hypothesis: expected authoritative sources + time horizon>"
+  "topic": "<clean label for Nextcloud note title — e.g. 'AAPL Q1 2026 earnings'>"
+  "fallback": "<plain English: what to report if execution fails>"
+
+Domain keyword rules:
+  securities  → stock, share, ETF, crypto, ticker, earnings, P/E, IPO, valuation, market cap
+  commodities → gold, silver, oil, gas, futures, XAU, XAG, CL, NG, commodity, barrel, tonne
+  general     → everything else
+
+PASS 3b INBOUND CONTRACT — your inbound result detail MUST include:
+  "full_report": "<complete markdown research report — title, sources, full synthesis>"
+  "telegram_summary": ["<bullet 1>", "<bullet 2>", "<bullet 3 — max 5 total>"]
+  "confidence": "HIGH|MEDIUM|LOW"
+  "topic": "<same label as outbound topic>"
+These four fields are mandatory. The engine extracts full_report before PASS 4 and persists it."""
+
     elif intent in ("list_files", "navigate", "read_file", "delete_file",
                     "create_folder", "write_file", "list_files_recursive", "read_files_recursive"):
         _schema_hint = """REQUIRED OUTPUT FIELD for this file operation:
@@ -816,10 +871,10 @@ def specialist_inbound(agent_persona: str, delegation: dict, outbound: dict,
             # Extract meaningful top-level keys, truncate large lists
             for k, v in inner.items():
                 if isinstance(v, list):
-                    result_summary[k] = v[:5]  # first 5 items
+                    result_summary[k] = v[:15]  # first 15 items — qwen2.5:32b 32k context
                     result_summary[f"{k}_count"] = len(v)
-                elif isinstance(v, str) and len(v) > 500:
-                    result_summary[k] = v[:500] + "…[truncated]"
+                elif isinstance(v, str) and len(v) > 2000:
+                    result_summary[k] = v[:2000] + "…[truncated]"
                 else:
                     result_summary[k] = v
         else:
@@ -839,6 +894,20 @@ def specialist_inbound(agent_persona: str, delegation: dict, outbound: dict,
 
     outbound_summary = {k: v for k, v in (outbound or {}).items()
                         if k not in ("mode", "agent", "fallback", "confidence")}
+
+    # Intent-specific output contract reminder
+    _inbound_hint = ""
+    _inbound_intent = (delegation or {}).get("intent", "")
+    if _inbound_intent in ("web_search", "research"):
+        _inbound_hint = """
+MANDATORY FIELDS in your 'detail' output for this research synthesis:
+  "full_report"       : "<complete markdown research report — topic title, all sources, synthesis, gaps>"
+  "telegram_summary"  : ["<bullet 1>", "<bullet 2>", "<bullet 3 — max 5 total>"]
+  "confidence"        : "HIGH|MEDIUM|LOW"
+  "topic"             : "<clean topic label matching your outbound plan>"
+All four fields are required. The engine reads full_report to persist the report to Nextcloud Notes.
+Never include full_report content inside telegram_summary — summary is bullets only.
+"""
 
     # Surface trust/scan status for the specialist
     trust_warning = ""
@@ -860,7 +929,7 @@ def specialist_inbound(agent_persona: str, delegation: dict, outbound: dict,
 
 ---
 TASK — PASS 3 INBOUND: RESULT INTERPRETATION
-{trust_warning}
+{trust_warning}{_inbound_hint}
 Original intent: {json.dumps(delegation.get("intent", ""))}
 What you planned (outbound): {json.dumps(outbound_summary, indent=2)}
 
@@ -901,6 +970,19 @@ def orchestrator_evaluate(orchestrator_persona: str, delegation: dict,
     specialist_success = specialist_inbound_result.get("success", False)
     specialist_outcome = specialist_inbound_result.get("outcome", "")
 
+    _schedule_task_hint = ""
+    if intent == "schedule_task":
+        _schedule_task_hint = """
+SCHEDULE TASK RULE: When execution result contains 'next_due' (ISO UTC datetime):
+- Include 'next_due' in result_for_translator.detail
+- Include 'title' in result_for_translator.detail
+- Include the task 'status' ('ok' or 'pending_approval') in result_for_translator.detail
+- Director is in New Zealand. NZST = UTC+12 (Apr–Sep winter); NZDT = UTC+13 (Oct–Mar summer)
+- Convert next_due to NZ local time; include as 'next_due_nzst' in result_for_translator.detail
+- For status 'ok': outcome = "Reminder set for {NZ time} — I'll notify you then."
+- For status 'pending_approval': outcome = "Recurring task '{title}' created — awaiting your approval to activate. First run at {NZ time}."
+"""
+
     memory_rules = """
 MEMORY DECISION RULES:
 - "none": routine reads (listing containers/email/files, status checks) — do not store.
@@ -937,7 +1019,7 @@ Specialist inbound result:
 {memory_rules}
 
 {tier_gate}
-
+{_schedule_task_hint}
 Check:
 1. [MID/HIGH only — skip for LOW] Did the specialist attempt the CORRECT TYPE of action for the intent?
    (e.g. send_email → specialist attempted to send an email ✓; send_email → specialist listed files ✗)

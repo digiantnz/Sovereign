@@ -296,6 +296,7 @@ class NanobotAdapter:
         params: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
         node: str = "nanobot-01",
+        http_timeout: float = TASK_TIMEOUT,
     ) -> dict:
         """Dispatch a task to a nanobot node or native adapter (Stage 3 DSL).
 
@@ -384,11 +385,13 @@ class NanobotAdapter:
                     logger.debug("NanobotAdapter: issued credential token for %s", credential_services)
 
             return await self._forward(
-                skill, action, validated, fwd_context, node, t0, path="dsl_remote"
+                skill, action, validated, fwd_context, node, t0, path="dsl_remote",
+                http_timeout=http_timeout,
             )
 
         # ── LLM fallback — no DSL match ─────────────────────────────────────
-        return await self._forward(skill, action, params, context, node, t0, path="llm")
+        return await self._forward(skill, action, params, context, node, t0, path="llm",
+                                   http_timeout=http_timeout)
 
     async def run_upload(self, filename: str, content_bytes: bytes,
                          mime_type: str, size: int,
@@ -475,6 +478,7 @@ class NanobotAdapter:
         node: str,
         t0: float,
         path: str = "llm",
+        http_timeout: float = TASK_TIMEOUT,
     ) -> dict:
         """Forward request to nanobot-01 via A2A JSON-RPC 3.0."""
         try:
@@ -502,7 +506,7 @@ class NanobotAdapter:
         )
 
         try:
-            async with httpx.AsyncClient(timeout=TASK_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=http_timeout) as client:
                 r = await client.post(f"{base_url}/run", json=a2a_request, headers=_auth_headers())
 
             elapsed = round(time.monotonic() - t0, 2)
