@@ -27,7 +27,9 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - Operational penalty: score≥0.50 AND `_OPERATIONAL_RE` (restart/container/service/deploy/port/compose/nginx/redis/mariadb/healthcheck/network/subnet) → -0.20
 - `specialist_plan` always includes `_routing_reason`, `_complexity_score`, `_intended_provider` (even on local fallback)
 - Grok API unavailable → graceful fallback to Ollama; no error raised
-- **Grok is the only permitted external LLM provider for PASS 2.** Claude API is not wired for autonomous use and must not be wired. Default external calls go to Grok.
+- **Approved external LLM providers for PASS 2 (Director-approved 2026-05-21):** Grok, Gemini, Groq Inference, Ollama Cloud, OpenRouter. Guard: DCL gate (PRIVATE/SECRET → force local) + `eligible_classifications` in `provider_registry`. Claude API is not wired for autonomous use and must not be wired. Provider selection is registry-driven via `_routing_decision()` in `cognition/engine.py`.
+- **Provider priority order (free-first):** task_type_preferred (grok for web_aware_query/news_gather) → alpha_vantage (financial data tasks, use_external=False) → complexity≥0.50: groq_inference → gemini → openrouter → ollama_cloud → grok (paid last). Grok is preferred first ONLY for web_aware_query/news_gather (real-time web access). Intent→task_type: `"research"/"web search"` → web_aware_query; `"news"` → news_gather.
+- **OpenRouter routing:** `"route":"fallback"` added to all payloads; meta-llama/llama-3.3-70b-instruct:free is the default but auto-routes to any available free model on rate-limit/unavailability.
 
 ### Confirmed-continuation bypass
 - When `confirmed=True` and `pending_delegation._pending_load is not None`: skip PASS 2 + PASS 3 (specialist + CEO evaluation)

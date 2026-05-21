@@ -5,6 +5,10 @@ import re as _re_fab
 from adapters.ollama import OllamaAdapter
 from adapters.grok import GrokAdapter
 from adapters.claude import ClaudeAdapter
+from adapters.gemini import GeminiAdapter
+from adapters.groq_inference import GroqInferenceAdapter
+from adapters.ollama_cloud import OllamaCloudAdapter
+from adapters.openrouter import OpenRouterAdapter
 from cognition import prompts
 from cognition.dcl import DisclosureControlLayer
 
@@ -141,21 +145,40 @@ def _translator_sanitise(text: str) -> tuple[str, int, int]:
 
 class CognitionEngine:
     def __init__(self, qdrant=None, ledger=None, inference_queue=None):
-        self.ollama  = OllamaAdapter()
-        self.grok    = GrokAdapter()
-        self.claude  = ClaudeAdapter()
-        self.dcl     = DisclosureControlLayer()
-        self.qdrant  = qdrant
-        self.ledger  = ledger   # AuditLedger — injected from main lifespan
-        self._queue  = inference_queue
+        self.ollama       = OllamaAdapter()
+        self.grok         = GrokAdapter()
+        self.claude       = ClaudeAdapter()
+        self.gemini       = GeminiAdapter()
+        self.groq_inf     = GroqInferenceAdapter()
+        self.ollama_cloud = OllamaCloudAdapter()
+        self.openrouter   = OpenRouterAdapter()
+        self.dcl          = DisclosureControlLayer()
+        self.qdrant       = qdrant
+        self.ledger       = ledger   # AuditLedger — injected from main lifespan
+        self._queue       = inference_queue
         self._had_queue_wait = False
         self._security_persona: str = self._load_security_persona()
+        self._provider_registry: dict = self._load_provider_registry()
 
     def _load_security_persona(self) -> str:
         if os.path.exists(SECURITY_AGENT_PATH):
             with open(SECURITY_AGENT_PATH) as f:
                 return f.read()
         return "You are a security evaluator. Return JSON only."
+
+    def _load_provider_registry(self) -> dict:
+        """Load provider_registry.providers from governance.json once at startup.
+        Returns empty dict on any error — callers fall back to complexity scorer silently."""
+        gov_path = "/app/governance/governance.json"
+        try:
+            with open(gov_path) as f:
+                gov = json.load(f)
+            return gov.get("provider_registry", {}).get("providers", {})
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "CognitionEngine: provider_registry load failed (%s) — falling back to complexity scorer", e
+            )
+            return {}
 
     # ── Persona loading ──────────────────────────────────────────────────
     def load_persona(self, name: str) -> str:
@@ -441,7 +464,8 @@ class CognitionEngine:
 
     # ── Pass 1: CEO Classification ────────────────────────────────────────
     async def ceo_classify(self, user_input: str, context_window=None,
-                           cognitive_context: str = "") -> dict:
+                           cognitive_context: str = "",
+                           sovereign_context: str = "") -> dict:
         from execution.adapters.qdrant import classify_query_type
         query_type = classify_query_type(user_input)
         context, confidence, gaps = await self.load_memory_context(
@@ -455,6 +479,7 @@ class CognitionEngine:
             memory_context=context,
             context_window=context_window,
             cognitive_context=cognitive_context,
+            sovereign_context=sovereign_context,
         )
         _raw1 = await self._llm_generate(prompt, model=MODEL, capture_thinking=True)
         result = self._parse_llm_output(
@@ -577,7 +602,8 @@ class CognitionEngine:
             logger.debug("_write_shadow_routing_episodic: failed (non-fatal): %s", exc)
 
     async def orchestrator_classify(self, user_input: str, context_window=None,
-                                     cognitive_context: str = "") -> dict:
+                                     cognitive_context: str = "",
+                                     sovereign_context: str = "") -> dict:
         """PASS 1: Orchestrator classification with routing memory lookup.
         New contract: adds specialist + routing_rationale fields.
         Backward compat: also sets delegate_to = specialist.
@@ -588,7 +614,8 @@ class CognitionEngine:
         is unchanged — LLM result is always used until thresholds are validated.
         """
         result = await self.ceo_classify(
-            user_input, context_window=context_window, cognitive_context=cognitive_context
+            user_input, context_window=context_window,
+            cognitive_context=cognitive_context, sovereign_context=sovereign_context,
         )
         # Normalise: ensure both specialist and delegate_to are present
         agent = result.get("specialist") or result.get("delegate_to", "")
@@ -656,10 +683,15 @@ class CognitionEngine:
                 decision["score"], decision["penalised_score"],
             )
             try:
-                if decision["provider"] == "claude":
-                    raw = await self.ask_claude(prompt, agent=agent_name)
-                else:
-                    raw = await self.ask_grok(prompt, agent=agent_name)
+                _ask_fn = {
+                    "claude":       self.ask_claude,
+                    "grok":         self.ask_grok,
+                    "gemini":       self.ask_gemini,
+                    "groq_inference": self.ask_groq_inf,
+                    "ollama_cloud": self.ask_ollama_cloud,
+                    "openrouter":   self.ask_openrouter,
+                }.get(decision["provider"], self.ask_grok)
+                raw = await _ask_fn(prompt, agent=agent_name)
 
                 response_text = raw.get("response", "")
                 # External providers return freeform text; may wrap JSON in ```json...```
@@ -693,7 +725,7 @@ class CognitionEngine:
 
     # ── Pass 3 outbound: Specialist selects skill and builds payload ──────
     async def specialist_outbound(self, agent_name: str, delegation: dict, user_input: str,
-                                  context_window=None) -> dict:
+                                  context_window=None, sovereign_context: str = "") -> dict:
         """PASS 3 outbound: specialist plans execution — skill, operation, payload.
 
         Externally routable (same routing logic as specialist_reason).
@@ -716,17 +748,23 @@ class CognitionEngine:
             user_input=user_input,
             routing_history=routing_history,
             context_window=context_window,
+            sovereign_context=sovereign_context,
         )
 
-        # External routing applies to outbound (research may use Claude/Grok)
+        # External routing applies to outbound (research may use any eligible provider)
         decision = self._routing_decision(prompt, user_input=user_input)
         if decision["use_external"]:
             _log.info("specialist_outbound[%s]: routing to %s", agent_name, decision["provider"])
             try:
-                if decision["provider"] == "claude":
-                    raw = await self.ask_claude(prompt, agent=agent_name)
-                else:
-                    raw = await self.ask_grok(prompt, agent=agent_name)
+                _ask_fn = {
+                    "claude":       self.ask_claude,
+                    "grok":         self.ask_grok,
+                    "gemini":       self.ask_gemini,
+                    "groq_inference": self.ask_groq_inf,
+                    "ollama_cloud": self.ask_ollama_cloud,
+                    "openrouter":   self.ask_openrouter,
+                }.get(decision["provider"], self.ask_grok)
+                raw = await _ask_fn(prompt, agent=agent_name)
                 response_text = raw.get("response", "")
                 stripped = _re_json.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
                 m = _re_json.search(r"\{.*\}", stripped, _re_json.DOTALL)
@@ -756,7 +794,8 @@ class CognitionEngine:
 
     # ── Pass 3 inbound: Specialist interprets execution result ────────────
     async def specialist_inbound(self, agent_name: str, delegation: dict,
-                                 outbound: dict, execution_result: dict) -> dict:
+                                 outbound: dict, execution_result: dict,
+                                 sovereign_context: str = "") -> dict:
         """PASS 3 inbound: specialist interprets the adapter result.
 
         ALWAYS uses local Ollama — never externally routed.
@@ -768,6 +807,7 @@ class CognitionEngine:
             delegation=delegation,
             outbound=outbound,
             execution_result=execution_result,
+            sovereign_context=sovereign_context,
         )
         _raw3b = await self._llm_generate("/no_think\n" + prompt, model=MODEL)
         result = self._parse_llm_output(
@@ -1216,32 +1256,158 @@ class CognitionEngine:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e)}
 
-    # ── Routed cognition (local-first, external on complexity/explicit request) ──
+    # ── External cognition — Gemini ───────────────────────────────────────
+    async def ask_gemini(
+        self,
+        prompt:  str,
+        agent:   str = "sovereign-core",
+        system:  str = "You are a helpful assistant.",
+        model:   str | None = None,
+    ) -> dict:
+        """DCL-gated Gemini call. Returns {response, _trust} or {error} if blocked."""
+        dcl_result = self.dcl.prepare(prompt, agent=agent, provider="gemini")
+        if dcl_result.blocked:
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger)
+            return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
+                    "message": "Content classified SECRET — not transmitted to external provider."}
+        try:
+            kwargs = {"prompt": dcl_result.content, "system": system}
+            if model:
+                kwargs["model"] = model
+            raw = await self.gemini.generate(**kwargs)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger,
+                                  output_tokens=raw.get("output_tokens", 0))
+            return {"response": raw.get("response", raw.get("error", "")),
+                    "_trust": "untrusted_external"}
+        except Exception as e:
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
+            return {"error": str(e), "_trust": "untrusted_external"}
+
+    # ── External cognition — Groq Inference ──────────────────────────────
+    async def ask_groq_inf(
+        self,
+        prompt:  str,
+        agent:   str = "sovereign-core",
+        system:  str = "You are a helpful assistant.",
+        model:   str | None = None,
+    ) -> dict:
+        """DCL-gated Groq Inference call. Returns {response, _trust} or {error} if blocked."""
+        dcl_result = self.dcl.prepare(prompt, agent=agent, provider="groq_inference")
+        if dcl_result.blocked:
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger)
+            return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
+                    "message": "Content classified SECRET — not transmitted to external provider."}
+        try:
+            kwargs = {"prompt": dcl_result.content, "system": system}
+            if model:
+                kwargs["model"] = model
+            raw = await self.groq_inf.generate(**kwargs)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger,
+                                  output_tokens=raw.get("output_tokens", 0))
+            return {"response": raw.get("response", raw.get("error", "")),
+                    "_trust": "untrusted_external"}
+        except Exception as e:
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
+            return {"error": str(e), "_trust": "untrusted_external"}
+
+    # ── External cognition — Ollama Cloud ────────────────────────────────
+    async def ask_ollama_cloud(
+        self,
+        prompt:  str,
+        agent:   str = "sovereign-core",
+        system:  str = "You are a helpful assistant.",
+        model:   str | None = None,
+    ) -> dict:
+        """DCL-gated Ollama Cloud call. Returns {response, _trust} or {error} if blocked."""
+        dcl_result = self.dcl.prepare(prompt, agent=agent, provider="ollama_cloud")
+        if dcl_result.blocked:
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger)
+            return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
+                    "message": "Content classified SECRET — not transmitted to external provider."}
+        try:
+            kwargs = {"prompt": dcl_result.content, "system": system}
+            if model:
+                kwargs["model"] = model
+            raw = await self.ollama_cloud.generate(**kwargs)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger,
+                                  output_tokens=raw.get("output_tokens", 0))
+            return {"response": raw.get("response", raw.get("error", "")),
+                    "_trust": "untrusted_external"}
+        except Exception as e:
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
+            return {"error": str(e), "_trust": "untrusted_external"}
+
+    # ── External cognition — OpenRouter ──────────────────────────────────
+    async def ask_openrouter(
+        self,
+        prompt:  str,
+        agent:   str = "sovereign-core",
+        system:  str = "You are a helpful assistant.",
+        model:   str | None = None,
+    ) -> dict:
+        """DCL-gated OpenRouter call. Returns {response, _trust} or {error} if blocked."""
+        dcl_result = self.dcl.prepare(prompt, agent=agent, provider="openrouter")
+        if dcl_result.blocked:
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger)
+            return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
+                    "message": "Content classified SECRET — not transmitted to external provider."}
+        try:
+            kwargs = {"prompt": dcl_result.content, "system": system}
+            if model:
+                kwargs["model"] = model
+            raw = await self.openrouter.generate(**kwargs)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger,
+                                  output_tokens=raw.get("output_tokens", 0))
+            return {"response": raw.get("response", raw.get("error", "")),
+                    "_trust": "untrusted_external"}
+        except Exception as e:
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
+            return {"error": str(e), "_trust": "untrusted_external"}
+
+    # ── Routed cognition (registry-aware, local-first) ───────────────────────
     #
     # ROUTING LOGIC (for Rex's self-diagnostic):
     #
-    # Step 1 — Explicit override:
-    #   "use claude" / "ask claude" / "architectural" / "plan" / "review" /
-    #   "design" / "strategy"                            → provider = claude
-    #   "use grok" / "ask grok" / "current" / "latest" /
-    #   "news" / "today" / "recent" / "market"          → provider = grok
-    #   (both trigger external regardless of score)
+    # Step 1 — DCL sensitivity gate (hard block, checked first):
+    #   PRIVATE or SECRET content → local always, no external call ever
     #
-    # Step 2 — DCL sensitivity gate:
-    #   PRIVATE or SECRET content → hard local, no external call ever
+    # Step 2 — Explicit provider override in user input:
+    #   "use grok/ask grok/via grok"             → grok (if eligible)
+    #   "use gemini/ask gemini/via gemini"        → gemini (if eligible)
+    #   "use groq/ask groq/via groq"              → groq_inference (if eligible)
+    #   "use openrouter/ask openrouter"           → openrouter (if eligible)
+    #   "use claude/ask claude/via claude"        → claude (if eligible)
     #
-    # Step 3 — Complexity scoring (five factors, score in [0,1]):
-    #   • Length       (>300 words)                     weight 0.40
-    #   • Conjunctions (and/also/furthermore/moreover)   weight 0.20
-    #   • Depth kw     (analyse/compare/evaluate/etc.)   weight 0.25
-    #   • Question cnt (multiple ?)                      weight 0.15
-    #   • Operational penalty: if score ≥ 0.50 AND prompt contains
-    #     restart/container/service/deploy/mount/volume/port → -0.20
-    #     (biases operational/infra queries back to local Ollama)
+    # Step 3 — task_type specialist match:
+    #   alpha_vantage task_types → returns use_external=False, provider="alpha_vantage"
+    #   (actual alpha_vantage call happens via execution engine research harness;
+    #    the provider tag is for audit logging only — do NOT add alpha_vantage to
+    #    the LLM dispatch dict in specialist_reason/specialist_outbound/route_cognition)
     #
-    # Step 4 — score ≥ 0.50 (after penalty) → external, default provider = grok
+    # Step 4 — Default preference by task_type:
+    #   web_aware_query / news_gather → grok (web-grounded)
+    #   llm_generate / llm_chat       → grok (default) when complexity ≥ 0.50
+    #   else → local
     #
-    # Step 5 — Default → Ollama local
+    # Step 5 — Complexity fallback (score ≥ 0.50, after operational penalty) → grok
+    #
+    # Step 6 — Default → Ollama local
+    #
+    # Provider eligibility gate: enabled=True AND task_type in task_types
+    # AND DCL tier in eligible_classifications.  Falls back to complexity scorer
+    # silently if provider_registry is empty or lookup fails.
     #
     # ALL external calls are DCL-gated and audit-logged regardless of trigger.
     # PASS 1 (classify), PASS 3 (evaluate), PASS 4 (memory) are NEVER routed
@@ -1251,11 +1417,13 @@ class CognitionEngine:
     _PREFER_LOCAL_TIERS   = {"PRIVATE", "SECRET"}
 
     _EXPLICIT_EXTERNAL_RE = __import__("re").compile(
-        r"\b(use claude|use grok|ask claude|ask grok|via claude|via grok"
+        r"\b(use claude|use grok|use gemini|use groq|use openrouter|use ollama.?cloud"
+        r"|ask claude|ask grok|ask gemini|ask groq|ask openrouter"
+        r"|via claude|via grok|via gemini|via groq|via openrouter"
         r"|external llm|external model|external ai)\b",
         __import__("re").IGNORECASE,
     )
-    # Provider-selection signals (checked against raw user input, not full prompt)
+    # Named-provider explicit signals (checked against raw user input)
     _CLAUDE_SIGNAL_RE = __import__("re").compile(
         r"\b(use claude|ask claude|via claude"
         r"|architectural|architecture|plan|review|design|strategy|strategic)\b",
@@ -1266,12 +1434,55 @@ class CognitionEngine:
         r"|current|latest|news|today|recent|market|trending)\b",
         __import__("re").IGNORECASE,
     )
+    _GEMINI_SIGNAL_RE = __import__("re").compile(
+        r"\b(use gemini|ask gemini|via gemini)\b",
+        __import__("re").IGNORECASE,
+    )
+    _GROQ_SIGNAL_RE = __import__("re").compile(
+        r"\b(use groq|ask groq|via groq)\b",
+        __import__("re").IGNORECASE,
+    )
+    _OPENROUTER_SIGNAL_RE = __import__("re").compile(
+        r"\b(use openrouter|ask openrouter|via openrouter)\b",
+        __import__("re").IGNORECASE,
+    )
     # Operational/infra keywords that trigger the complexity penalty
     _OPERATIONAL_RE = __import__("re").compile(
         r"\b(restart|container|service|deploy|mount|volume|port|compose|dockerfile"
         r"|nginx|redis|mariadb|healthcheck|network|subnet)\b",
         __import__("re").IGNORECASE,
     )
+
+    # Maps intent-derived signals in user_input to provider_registry task_type names.
+    # Default: "llm_generate" for anything not in this map.
+    _INTENT_TO_TASK_TYPE = {
+        "web search":              "web_aware_query",  # natural language "web search X"
+        "research":                "web_aware_query",
+        "news":                    "news_gather",    # matches "latest news", "news today", "news brief"
+        "securities_price":        "securities_price",
+        "securities_fundamentals": "securities_fundamentals",
+        "securities_technicals":   "securities_technicals",
+        "commodities_price":       "commodities_price",
+        "economic_indicators":     "economic_indicators",
+    }
+
+    # Default LLM provider preferences by task_type (used when no explicit override)
+    _TASK_TYPE_PREFERRED = {
+        "web_aware_query": "grok",
+        "news_gather":     "grok",
+    }
+
+    # Adapter module paths for the `adapter` return field (audit logging)
+    _PROVIDER_ADAPTERS = {
+        "grok":         "core.app.adapters.grok",
+        "claude":       "core.app.adapters.claude",
+        "gemini":       "core.app.adapters.gemini",
+        "groq_inference": "core.app.adapters.groq_inference",
+        "ollama_cloud": "core.app.adapters.ollama_cloud",
+        "openrouter":   "core.app.adapters.openrouter",
+        "alpha_vantage": "core.app.adapters.alpha_vantage",
+        "local":        "local",
+    }
 
     @staticmethod
     def _complexity_score(prompt: str) -> float:
@@ -1298,49 +1509,174 @@ class CognitionEngine:
         q_count    = min(prompt.count("?") / 3, 1.0)
         return min(length_s * 0.4 + multi_conj * 0.2 + depth_kw * 0.25 + q_count * 0.15, 1.0)
 
-    def _routing_decision(self, prompt: str, user_input: str = "") -> dict:
-        """Compute routing decision for a prompt. Returns a dict:
-          {use_external, provider, score, penalised_score, explicit, force_local, reason}
-        Centralises all routing logic so specialist_reason and route_cognition share it.
-        user_input is the raw Director message (for provider-signal matching).
+    def _routing_decision(self, prompt: str, user_input: str = "", task_type: str | None = None) -> dict:
+        """Registry-aware routing decision. Returns:
+          {use_external, provider, adapter, score, penalised_score, explicit, force_local, reason}
+
+        Consults provider_registry from governance.json (loaded once at startup).
+        Falls back silently to complexity scorer if registry is empty or lookup fails.
+        user_input is the raw Director message (for explicit-override and signal matching).
+        task_type is the execution-layer task type; inferred from user_input if not passed.
         """
+        _log = logging.getLogger(__name__)
         signal_text = user_input or prompt
-        explicit    = bool(self._EXPLICIT_EXTERNAL_RE.search(signal_text))
-        # Score complexity on user_input (Director's message) only, not the full
-        # specialist prompt — personas are inherently long and would inflate every score.
-        score       = self._complexity_score(user_input or prompt)
+
+        # ── Step 1: DCL gate (hard block) ─────────────────────────────────
         tier        = self.dcl.classify(prompt)
         force_local = tier in self._PREFER_LOCAL_TIERS
+        if force_local:
+            return {
+                "use_external": False, "provider": "local",
+                "adapter": "local",
+                "score": 0.0, "penalised_score": 0.0,
+                "explicit": False, "force_local": True,
+                "reason": "force_local(dcl)",
+            }
 
-        # Operational penalty: score ≥ threshold but strongly infra-flavoured → bias local
+        # ── Complexity scoring (used in fallback and for audit logging) ────
+        score     = self._complexity_score(user_input or prompt)
         penalised = score
         if score >= self._COMPLEXITY_THRESHOLD and self._OPERATIONAL_RE.search(prompt):
             penalised = max(0.0, score - 0.20)
 
-        use_external = (explicit or penalised >= self._COMPLEXITY_THRESHOLD) and not force_local
+        # ── Step 2: Explicit named-provider override ───────────────────────
+        explicit = bool(self._EXPLICIT_EXTERNAL_RE.search(signal_text))
+        explicit_provider: str | None = None
+        if explicit:
+            if self._CLAUDE_SIGNAL_RE.search(signal_text):
+                explicit_provider = "claude"
+            elif self._GEMINI_SIGNAL_RE.search(signal_text):
+                explicit_provider = "gemini"
+            elif self._GROQ_SIGNAL_RE.search(signal_text):
+                explicit_provider = "groq_inference"
+            elif self._OPENROUTER_SIGNAL_RE.search(signal_text):
+                explicit_provider = "openrouter"
+            else:
+                explicit_provider = "grok"  # "use grok" or generic "external"
 
-        # Provider selection from signal keywords; default grok
-        if self._CLAUDE_SIGNAL_RE.search(signal_text):
+        # ── Registry-aware selection ───────────────────────────────────────
+        # Infer task_type from user_input if not provided by caller.
+        if task_type is None:
+            task_type = "llm_generate"  # default
+            u_lower = signal_text.lower()
+            for intent_kw, tt in self._INTENT_TO_TASK_TYPE.items():
+                if intent_kw in u_lower:
+                    task_type = tt
+                    break
+
+        registry = self._provider_registry  # dict loaded once at startup
+        if registry:
+            try:
+                # Build eligible provider list: enabled AND task_type supported AND DCL tier allowed
+                eligible = {
+                    name: cfg for name, cfg in registry.items()
+                    if cfg.get("enabled")
+                    and task_type in cfg.get("task_types", [])
+                    and tier in cfg.get("eligible_classifications", [])
+                }
+
+                # Explicit override: honour if eligible, else fall through to default selection
+                if explicit_provider and explicit_provider in eligible:
+                    chosen = explicit_provider
+                    reason = "explicit_override"
+                    # alpha_vantage is a data API, not an LLM — tag for audit but keep local
+                    if chosen == "alpha_vantage":
+                        return {
+                            "use_external": False, "provider": "alpha_vantage",
+                            "adapter": self._PROVIDER_ADAPTERS.get("alpha_vantage", ""),
+                            "score": round(score, 3), "penalised_score": round(penalised, 3),
+                            "explicit": True, "force_local": False,
+                            "reason": "alpha_vantage_data_api",
+                        }
+                    return {
+                        "use_external": True, "provider": chosen,
+                        "adapter": self._PROVIDER_ADAPTERS.get(chosen, ""),
+                        "score": round(score, 3), "penalised_score": round(penalised, 3),
+                        "explicit": True, "force_local": False,
+                        "reason": reason,
+                    }
+
+                # Task-type preferred LLM provider (e.g. grok for news_gather/web_aware_query).
+                # Checked BEFORE alpha_vantage so grok wins for "news" queries even if
+                # alpha_vantage also supports news_gather.
+                preferred = self._TASK_TYPE_PREFERRED.get(task_type)
+                if preferred and preferred in eligible:
+                    chosen = preferred
+                    reason = f"task_type_preference({task_type})"
+                    return {
+                        "use_external": True, "provider": chosen,
+                        "adapter": self._PROVIDER_ADAPTERS.get(chosen, ""),
+                        "score": round(score, 3), "penalised_score": round(penalised, 3),
+                        "explicit": False, "force_local": False,
+                        "reason": reason,
+                    }
+
+                # Specialist data provider: alpha_vantage matches financial task_types
+                # (securities_price, fundamentals, technicals, commodities, economic_indicators).
+                # Returns use_external=False — execution engine research harness handles it.
+                if "alpha_vantage" in eligible:
+                    return {
+                        "use_external": False, "provider": "alpha_vantage",
+                        "adapter": self._PROVIDER_ADAPTERS.get("alpha_vantage", ""),
+                        "score": round(score, 3), "penalised_score": round(penalised, 3),
+                        "explicit": False, "force_local": False,
+                        "reason": "alpha_vantage_data_api",
+                    }
+
+                # Complexity-triggered selection among remaining eligible LLM providers
+                if penalised >= self._COMPLEXITY_THRESHOLD:
+                    # Remove alpha_vantage (data API) from LLM candidates
+                    llm_eligible = {k: v for k, v in eligible.items() if k != "alpha_vantage"}
+                    if llm_eligible:
+                        # Free-first: groq_inference → gemini → openrouter → ollama_cloud → grok (paid last)
+                        for pref in ("groq_inference", "gemini", "openrouter", "ollama_cloud", "grok"):
+                            if pref in llm_eligible:
+                                return {
+                                    "use_external": True, "provider": pref,
+                                    "adapter": self._PROVIDER_ADAPTERS.get(pref, ""),
+                                    "score": round(score, 3), "penalised_score": round(penalised, 3),
+                                    "explicit": False, "force_local": False,
+                                    "reason": "complexity",
+                                }
+
+                # No eligible external provider — go local
+                return {
+                    "use_external": False, "provider": "local",
+                    "adapter": "local",
+                    "score": round(score, 3), "penalised_score": round(penalised, 3),
+                    "explicit": False, "force_local": False,
+                    "reason": "local_default",
+                }
+
+            except Exception as e:
+                _log.warning("_routing_decision: registry lookup failed (%s) — complexity fallback", e)
+                # Fall through to complexity scorer below
+
+        # ── Complexity scorer fallback (registry empty or lookup failed) ───
+        if explicit:
+            provider = explicit_provider or "grok"
+        elif self._CLAUDE_SIGNAL_RE.search(signal_text):
             provider = "claude"
         elif self._GROK_SIGNAL_RE.search(signal_text):
             provider = "grok"
         else:
-            provider = "grok"  # default for complexity-triggered external calls
+            provider = "grok"
 
+        use_external = (explicit or penalised >= self._COMPLEXITY_THRESHOLD) and not force_local
         reason = (
-            "force_local(dcl)"   if force_local else
-            "explicit_external"  if explicit else
-            "complexity"         if penalised >= self._COMPLEXITY_THRESHOLD else
+            "explicit_external" if explicit else
+            "complexity"        if penalised >= self._COMPLEXITY_THRESHOLD else
             "local_default"
         )
         return {
-            "use_external":   use_external,
-            "provider":       provider,
-            "score":          round(score, 3),
+            "use_external":    use_external,
+            "provider":        provider if use_external else "local",
+            "adapter":         self._PROVIDER_ADAPTERS.get(provider if use_external else "local", "local"),
+            "score":           round(score, 3),
             "penalised_score": round(penalised, 3),
-            "explicit":       explicit,
-            "force_local":    force_local,
-            "reason":         reason,
+            "explicit":        explicit,
+            "force_local":     False,
+            "reason":          reason,
         }
 
     async def route_cognition(
@@ -1362,10 +1698,15 @@ class CognitionEngine:
         use_external = decision["use_external"] or (provider is not None)
 
         if use_external:
-            if chosen == "claude":
-                result = await self.ask_claude(prompt, agent=agent, system=system)
-            else:
-                result = await self.ask_grok(prompt, agent=agent, system=system)
+            _ask_fn = {
+                "claude":         self.ask_claude,
+                "grok":           self.ask_grok,
+                "gemini":         self.ask_gemini,
+                "groq_inference": self.ask_groq_inf,
+                "ollama_cloud":   self.ask_ollama_cloud,
+                "openrouter":     self.ask_openrouter,
+            }.get(chosen, self.ask_grok)
+            result = await _ask_fn(prompt, agent=agent, system=system)
             result["provider_used"]      = chosen
             result["complexity_score"]   = decision["score"]
             result["penalised_score"]    = decision["penalised_score"]

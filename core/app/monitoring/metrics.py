@@ -20,8 +20,12 @@ QDRANT_URL         = os.environ.get("QDRANT_URL", "http://qdrant-archive:6333")
 # QDRANT_WM_URL points to the working_memory qdrant container (tmpfs).
 QDRANT_WM_URL      = os.environ.get("QDRANT_WM_URL", "http://qdrant:6333")
 WEBDAV_URL         = os.environ.get("WEBDAV_URL", "http://nextcloud:80/remote.php/dav/")
-TELEGRAM_URL  = "https://api.telegram.org"
-GROK_URL      = "https://api.x.ai/v1"
+TELEGRAM_URL       = "https://api.telegram.org"
+GROK_URL           = "https://api.x.ai/v1"
+GEMINI_URL         = "https://generativelanguage.googleapis.com"
+GROQ_URL           = "https://api.groq.com"
+OPENROUTER_URL     = "https://openrouter.ai/api/v1"
+OLLAMA_CLOUD_URL   = "https://api.ollama.com"
 
 AUDIT_PATH    = "/home/sovereign/audit/security-ledger.jsonl"
 SOVEREIGN_CONTAINERS = [
@@ -260,20 +264,92 @@ async def collect_wallet(wallet_url: str = SOV_WALLET_URL) -> dict:
         return {"reachable": False, "error": str(e), "chains_failing": 0}
 
 
+async def _probe_gemini() -> tuple[str, dict]:
+    key = os.environ.get("GEMINI_API_KEY", "")
+    try:
+        t0 = time.monotonic()
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            r = await client.get(
+                f"{GEMINI_URL}/v1beta/models",
+                params={"key": key} if key else {},
+            )
+        ok = r.status_code < 500
+        return "gemini_api", {"reachable": ok, "status_code": r.status_code,
+                               "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+                               "key_set": bool(key)}
+    except Exception as e:
+        return "gemini_api", {"reachable": False, "error": str(e), "key_set": bool(key)}
+
+
+async def _probe_groq() -> tuple[str, dict]:
+    key = os.environ.get("GROQ_API_KEY", "")
+    try:
+        t0 = time.monotonic()
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            r = await client.get(
+                f"{GROQ_URL}/openai/v1/models",
+                headers={"Authorization": f"Bearer {key}"} if key else {},
+            )
+        ok = r.status_code < 500
+        return "groq_api", {"reachable": ok, "status_code": r.status_code,
+                             "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+                             "key_set": bool(key)}
+    except Exception as e:
+        return "groq_api", {"reachable": False, "error": str(e), "key_set": bool(key)}
+
+
+async def _probe_openrouter() -> tuple[str, dict]:
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    try:
+        t0 = time.monotonic()
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            r = await client.get(
+                f"{OPENROUTER_URL}/models",
+                headers={"Authorization": f"Bearer {key}"} if key else {},
+            )
+        ok = r.status_code < 500
+        return "openrouter_api", {"reachable": ok, "status_code": r.status_code,
+                                   "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+                                   "key_set": bool(key)}
+    except Exception as e:
+        return "openrouter_api", {"reachable": False, "error": str(e), "key_set": bool(key)}
+
+
+async def _probe_ollama_cloud() -> tuple[str, dict]:
+    key = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
+    try:
+        t0 = time.monotonic()
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            r = await client.get(
+                f"{OLLAMA_CLOUD_URL}/v1/models",
+                headers={"Authorization": f"Bearer {key}"} if key else {},
+            )
+        ok = r.status_code < 500
+        return "ollama_cloud_api", {"reachable": ok, "status_code": r.status_code,
+                                     "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+                                     "key_set": bool(key)}
+    except Exception as e:
+        return "ollama_cloud_api", {"reachable": False, "error": str(e), "key_set": bool(key)}
+
+
 async def collect_external_reachability() -> dict:
     """Probe external services concurrently. Total time = slowest single probe."""
     results = await asyncio.gather(
         _probe_grok(),
         _probe_webdav(),
         _probe_telegram(),
+        _probe_gemini(),
+        _probe_groq(),
+        _probe_openrouter(),
+        _probe_ollama_cloud(),
         _reachable("https://api.anthropic.com", timeout=6.0),
         _reachable("http://172.16.201.4:8001/health", timeout=5.0),
         _reachable("http://172.16.201.4:8003/health", timeout=5.0),
         return_exceptions=True,
     )
-    grok, webdav, telegram, claude_res, browser_res, whisper_res = results
+    grok, webdav, telegram, gemini, groq, openrouter, ollama_cloud, claude_res, browser_res, whisper_res = results
     checks = {}
-    for r in (grok, webdav, telegram):
+    for r in (grok, webdav, telegram, gemini, groq, openrouter, ollama_cloud):
         if isinstance(r, tuple):
             checks[r[0]] = r[1]
     def _ok_lat(r, key):

@@ -84,6 +84,17 @@ async def lifespan(app: FastAPI):
     if not os.environ.get("GROK_API_KEY"):
         logger.warning("GROK_API_KEY is not set — Grok API calls will fail with 401. "
                        "Set it in secrets/grok.env and rebuild.")
+    for _prov_key, _prov_file in [
+        ("GEMINI_API_KEY",        "secrets/providers.env"),
+        ("GROQ_API_KEY",          "secrets/providers.env"),
+        ("OLLAMA_CLOUD_API_KEY",  "secrets/providers.env"),
+        ("OPENROUTER_API_KEY",    "secrets/providers.env"),
+    ]:
+        if not os.environ.get(_prov_key):
+            logger.warning(
+                "%s not set — provider disabled at startup. Set it in %s and rebuild.",
+                _prov_key, _prov_file,
+            )
 
     guardrail = GuardrailEngine(scanner, ledger)
 

@@ -2767,6 +2767,77 @@ class ExecutionEngine:
     _ITEM_INDEX_FLAG = "_item_index"
     _ZERO_VECTOR = [0.0] * 768
 
+    # SOVEREIGN_CONTEXT static cache — assembled once per boot from SKILL.md files + governance.json
+    _sovereign_static_cache: str = ""
+
+    def _build_sovereign_static(self) -> str:
+        """Deterministically build the SOVEREIGN CONTEXT block (no LLM).
+
+        A1: installed skill names, descriptions, and assigned agents.
+        A2: enabled external providers with their DCL classifications.
+        Result cached at class level for the lifetime of this boot.
+        """
+        if ExecutionEngine._sovereign_static_cache:
+            return ExecutionEngine._sovereign_static_cache
+
+        import os as _os
+        import json as _json
+        import re as _re
+
+        lines = ["SOVEREIGN CONTEXT (installed capabilities and external providers):"]
+
+        # A2 first: Enabled external providers (from governance.json provider_registry)
+        # Placed before skills so providers survive the 2000-char cap — skills appear in PASS 1 separately
+        try:
+            gov_path = "/app/governance/governance.json"
+            with open(gov_path) as _f:
+                gov = _json.load(_f)
+            providers = gov.get("provider_registry", {}).get("providers", {})
+            prov_lines = []
+            for name, p in providers.items():
+                if p.get("enabled"):
+                    dcl = p.get("eligible_classifications", [])
+                    prov_lines.append(f"  {name}: enabled, DCL={dcl}")
+            if prov_lines:
+                lines.append("Enabled external providers:")
+                lines.extend(prov_lines)
+        except Exception:
+            pass
+
+        # A1: Skills (name + short description + assigned agents)
+        try:
+            skills_dir = str(_cfg.paths.skills_dir)
+            skill_lines = []
+            for skill in sorted(_os.listdir(skills_dir)):
+                path = _os.path.join(skills_dir, skill, "SKILL.md")
+                if not _os.path.isfile(path):
+                    continue
+                try:
+                    content = open(path).read()
+                    m = _re.match(r'^---\n(.*?)\n---', content, _re.DOTALL)
+                    if not m:
+                        continue
+                    fm = m.group(1)
+                    desc_m = _re.search(r'^description:\s*(.+?)(?=\n\w|\Z)', fm, _re.DOTALL | _re.MULTILINE)
+                    if not desc_m:
+                        continue
+                    desc = _re.sub(r'\n\s+', ' ', desc_m.group(1).strip()).strip('"')[:80]
+                    spc_m = _re.search(r'specialists:\s*\[(.*?)\]', fm)
+                    spc = spc_m.group(1).strip() if spc_m else ""
+                    suffix = f" [for: {spc}]" if spc else ""
+                    skill_lines.append(f"  {skill}: {desc}{suffix}")
+                except Exception:
+                    continue
+            if skill_lines:
+                lines.append("Installed skills:")
+                lines.extend(skill_lines)
+        except Exception:
+            pass
+
+        result = "\n".join(lines)[:2000]
+        ExecutionEngine._sovereign_static_cache = result
+        return result
+
     async def _index_items(self, items: list, item_type: str) -> None:
         """Write a batch of retrieved items into the working_memory item index.
 
@@ -2860,7 +2931,7 @@ class ExecutionEngine:
 
     # ── Memory consultation pass (PASS 0) ────────────────────────────────────
 
-    async def _memory_consultation_pass(self, user_input: str) -> tuple[str, list, float]:
+    async def _memory_consultation_pass(self, user_input: str) -> tuple[str, str, list, float]:
         """Deterministic working_memory context scan injected into PASS 1 prompt.
 
         Scrolls working_memory (RAM-resident qdrant container) and returns the top-25
@@ -2872,7 +2943,8 @@ class ExecutionEngine:
           norm_slot     = (slot_priority − 1) / 7      (slot_priority = 8 − _bootstrap_slot, range 1–8)
           norm_weight   = (_weight − 1.0) / 4.0        (_weight range 1.0–5.0)
 
-        Returns (context_str, pass0_hit_ids, elapsed_ms).
+        Returns (cognitive_ctx, sovereign_ctx, pass0_hit_ids, elapsed_ms).
+        sovereign_ctx = A1 (skills) + A2 (providers) + A3 (live config WM entries), 2000-char cap.
         """
         import time as _t_mod
         import logging as _log_mod
@@ -2880,7 +2952,7 @@ class ExecutionEngine:
         _t0 = _t_mod.monotonic()
 
         if not self.qdrant:
-            return "", [], 0.0
+            return "", "", [], 0.0
 
         try:
             from qdrant_client.models import Filter as _F0, FieldCondition as _FC0, MatchValue as _MV0
@@ -2906,7 +2978,7 @@ class ExecutionEngine:
 
             if not entries:
                 elapsed = (_t_mod.monotonic() - _t0) * 1000
-                return "", [], elapsed
+                return "", self._build_sovereign_static(), [], elapsed
 
             input_terms = set(user_input.lower().split())
 
@@ -2933,10 +3005,26 @@ class ExecutionEngine:
 
             hit_ids = [e["_wm_id"] for e in ranked if e.get("_wm_id")]
 
+            # Build SOVEREIGN_CONTEXT: A1+A2 (static) + A3 (live config WM entries)
+            sov_parts = [self._build_sovereign_static()]
+            config_entries = [
+                e for e in entries
+                if (e.get("_key") or "").startswith(
+                    ("semantic:governance:", "semantic:provider:", "semantic:infrastructure:")
+                )
+            ]
+            if config_entries:
+                sov_parts.append("Live config entries:")
+                for e in config_entries[:5]:
+                    key = e.get("_key", "")
+                    content = e.get("content", "")[:200]
+                    sov_parts.append(f"  [{key}] {content}")
+            sovereign_ctx = "\n".join(sov_parts)[:2000]
+
             elapsed = (_t_mod.monotonic() - _t0) * 1000
             _log_p0.info(
-                "PASS 0 consultation: %d WM entries scanned, %d ranked, %.1fms",
-                len(entries), len(ranked), elapsed,
+                "PASS 0 consultation: %d WM entries scanned, %d ranked, %.1fms; SOVEREIGN_CONTEXT %d chars",
+                len(entries), len(ranked), elapsed, len(sovereign_ctx),
             )
             if elapsed > 200:
                 _log_p0.warning(
@@ -2944,11 +3032,83 @@ class ExecutionEngine:
                     " — working_memory may be oversized (%d entries)",
                     elapsed, len(entries),
                 )
-            return "\n".join(lines), hit_ids, elapsed
+            return "\n".join(lines), sovereign_ctx, hit_ids, elapsed
 
         except Exception as exc:
             _log_p0.warning("_memory_consultation_pass failed (non-fatal): %s", exc)
-            return "", [], 0.0
+            return "", "", [], 0.0
+
+    # ── PASS 4a — Contrarian gate ─────────────────────────────────────────
+
+    async def _contrarian_gate(self, sp_in: dict, intent: str,
+                               delegation: dict, sovereign_ctx: str = "") -> dict:
+        """PASS 4a — contrarian consensus check.
+
+        Fires between PASS 3b and PASS 4 for research-type results that contain
+        a full_report and domain_scope. Verifies that anti-consensus fields are
+        present; if absent, issues one local-only Ollama retry with an explicit
+        anti-consensus prompt. Never routes externally.
+
+        Returns the (possibly amended) sp_in dict with _contrarian_gate stamp.
+        """
+        detail = sp_in.get("detail", {})
+
+        # Gate conditions — only fires on substantive research with domain scope
+        if intent not in ("research", "web_search"):
+            return sp_in
+        if not detail.get("full_report"):
+            return sp_in
+        if not detail.get("domain_scope"):
+            return sp_in
+
+        # Check for anti-consensus fields
+        has_consensus_narrative = bool(detail.get("consensus_narrative"))
+        has_sovereign_assessment = bool(detail.get("sovereign_assessment"))
+        has_divergence = bool(detail.get("consensus_divergence"))
+
+        if has_consensus_narrative and has_sovereign_assessment and has_divergence:
+            sp_in["_contrarian_gate"] = "passed"
+            return sp_in
+
+        # Fields missing — re-invoke specialist with explicit anti-consensus prompt
+        retry_prompt = (
+            "Your previous synthesis did not demonstrate independent analysis. "
+            "Apply the five-step anti-consensus obligation from your persona (Section 3a). "
+            "Your response MUST include these fields in detail:\n"
+            "- consensus_narrative: what is the prevailing view?\n"
+            "- sovereign_assessment: Sovereign's independent view after interrogating consensus\n"
+            "- consensus_divergence: low / moderate / high / contrary\n"
+            "These are mandatory. Resubmit your full_report with all three fields populated."
+        )
+
+        try:
+            retry_result = await self.cog.specialist_inbound(
+                agent_name=sp_in.get("agent", "research_agent"),
+                delegation=delegation,
+                outbound={"retry_reason": "contrarian_gate_fail", "original_detail": detail},
+                execution_result={"_contrarian_retry": True, "retry_prompt": retry_prompt},
+                sovereign_context=sovereign_ctx,
+            )
+            retry_detail = retry_result.get("detail", {})
+            if (retry_detail.get("consensus_narrative")
+                    and retry_detail.get("sovereign_assessment")
+                    and retry_detail.get("consensus_divergence")):
+                retry_result["_contrarian_gate"] = "passed_on_retry"
+                return retry_result
+        except Exception:
+            pass
+
+        # Retry exhausted — proceed with original sp_in, stamp and log
+        sp_in["_contrarian_gate"] = "retry_exhausted"
+        if self.ledger:
+            try:
+                self.ledger.append("contrarian_gate_exhausted", "cognition", {
+                    "intent": intent,
+                    "domain": detail.get("domain_scope"),
+                })
+            except Exception:
+                pass
+        return sp_in
 
     # ── Notes index helpers (built on universal item index) ───────────────
 
@@ -3295,9 +3455,10 @@ class ExecutionEngine:
         # PASS 0 — deterministic working_memory context scan (no LLM, < 100ms target)
         self._set_pass("P0")
         _cognitive_ctx = ""
+        _sovereign_ctx = ""
         _p0_hits: list = []
         if not pending_delegation:
-            _cognitive_ctx, _p0_hits, _p0_ms = await self._memory_consultation_pass(user_input)
+            _cognitive_ctx, _sovereign_ctx, _p0_hits, _p0_ms = await self._memory_consultation_pass(user_input)
             self._log_pass(0, "memory_consultation", user_input, {"elapsed_ms": round(_p0_ms, 1), "hits": len(_p0_hits)}, _p0_ms / 1000)
             if _p0_hits:
                 _msg.set_pass0_hits(_p0_hits)
@@ -3324,6 +3485,7 @@ class ExecutionEngine:
                             user_input,
                             context_window=context_window,
                             cognitive_context=_cognitive_ctx,
+                            sovereign_context=_sovereign_ctx,
                         ),
                         timeout=_PASS_TIMEOUT,
                     )
@@ -3535,12 +3697,18 @@ class ExecutionEngine:
         if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
-                _SC_GROK_RE   = _re_sc.compile(r'\b(use grok|ask grok|via grok)\b',     _re_sc.IGNORECASE)
-                _SC_CLAUDE_RE = _re_sc.compile(r'\b(use claude|ask claude|via claude)\b', _re_sc.IGNORECASE)
+                _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok)\b',           _re_sc.IGNORECASE)
+                _SC_CLAUDE_RE      = _re_sc.compile(r'\b(use claude|ask claude|via claude)\b',      _re_sc.IGNORECASE)
+                _SC_GEMINI_RE      = _re_sc.compile(r'\b(use gemini|ask gemini|via gemini)\b',      _re_sc.IGNORECASE)
+                _SC_GROQ_RE        = _re_sc.compile(r'\b(use groq|ask groq|via groq)\b',            _re_sc.IGNORECASE)
+                _SC_OPENROUTER_RE  = _re_sc.compile(r'\b(use openrouter|ask openrouter)\b',         _re_sc.IGNORECASE)
+                _SC_OLLAMACLOUD_RE = _re_sc.compile(r'\b(use ollama.?cloud|ask ollama.?cloud)\b',   _re_sc.IGNORECASE)
                 # Strip the routing directive before sending to the provider so
                 # "ask grok about X" doesn't make Grok defensive about its identity.
                 _sc_clean = _re_sc.sub(
-                    r'\b(use grok|ask grok|via grok|use claude|ask claude|via claude)\b\s*',
+                    r'\b(use grok|ask grok|via grok|use claude|ask claude|via claude'
+                    r'|use gemini|ask gemini|via gemini|use groq|ask groq|via groq'
+                    r'|use openrouter|ask openrouter|use ollama.?cloud|ask ollama.?cloud)\b\s*',
                     '', user_input, flags=_re_sc.IGNORECASE,
                 ).strip(" ,;:—-")
                 _sc_prompt = _sc_clean or user_input  # fallback if strip empties the string
@@ -3551,6 +3719,22 @@ class ExecutionEngine:
                 elif _SC_CLAUDE_RE.search(user_input):
                     _sc_routed = await self.cog.route_cognition(
                         _sc_prompt, agent="research_agent", provider="claude", user_input=_sc_prompt)
+                    conv_text = _sc_routed.get("response", "")
+                elif _SC_GEMINI_RE.search(user_input):
+                    _sc_routed = await self.cog.route_cognition(
+                        _sc_prompt, agent="research_agent", provider="gemini", user_input=_sc_prompt)
+                    conv_text = _sc_routed.get("response", "")
+                elif _SC_GROQ_RE.search(user_input):
+                    _sc_routed = await self.cog.route_cognition(
+                        _sc_prompt, agent="research_agent", provider="groq_inference", user_input=_sc_prompt)
+                    conv_text = _sc_routed.get("response", "")
+                elif _SC_OPENROUTER_RE.search(user_input):
+                    _sc_routed = await self.cog.route_cognition(
+                        _sc_prompt, agent="research_agent", provider="openrouter", user_input=_sc_prompt)
+                    conv_text = _sc_routed.get("response", "")
+                elif _SC_OLLAMACLOUD_RE.search(user_input):
+                    _sc_routed = await self.cog.route_cognition(
+                        _sc_prompt, agent="research_agent", provider="ollama_cloud", user_input=_sc_prompt)
                     conv_text = _sc_routed.get("response", "")
                 else:
                     conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
@@ -3648,7 +3832,8 @@ class ExecutionEngine:
             try:
                 sp_out = await _asyncio.wait_for(
                     self.cog.specialist_outbound(agent, delegation, _sp_user_input,
-                                                 context_window=context_window),
+                                                 context_window=context_window,
+                                                 sovereign_context=_sovereign_ctx),
                     timeout=_PASS_TIMEOUT,
                 )
             except _asyncio.TimeoutError:
@@ -3822,7 +4007,8 @@ class ExecutionEngine:
         _t3in_start = _time_mod.monotonic()
         try:
             sp_in = await _asyncio.wait_for(
-                self.cog.specialist_inbound(agent, delegation, sp_out, execution_result),
+                self.cog.specialist_inbound(agent, delegation, sp_out, execution_result,
+                                            sovereign_context=_sovereign_ctx),
                 timeout=_PASS_TIMEOUT,
             )
         except (_asyncio.TimeoutError, Exception) as _e3in:
@@ -3854,11 +4040,15 @@ class ExecutionEngine:
                     execution_result = _retry_result
                     execution_result.setdefault("execution_confirmed", _execution_confirmed)
                     sp_in = await _asyncio.wait_for(
-                        self.cog.specialist_inbound(agent, delegation, sp_out, execution_result),
+                        self.cog.specialist_inbound(agent, delegation, sp_out, execution_result,
+                                                    sovereign_context=_sovereign_ctx),
                         timeout=_PASS_TIMEOUT,
                     )
             except Exception:
                 pass  # keep original sp_in if retry fails
+
+        # ── PASS 4a — Contrarian gate (research/web_search with full_report only) ──
+        sp_in = await self._contrarian_gate(sp_in, intent, delegation, _sovereign_ctx)
 
         # ── PASS 4 — Orchestrator evaluates result + makes memory decision ────
         self._set_pass("P4", intent=intent, tier=tier, agent=agent)
@@ -4343,6 +4533,13 @@ class ExecutionEngine:
             _msg.append_pass(5, "translator", _p5_dur, bool(director_msg))
         except Exception:
             pass
+
+        # Contrarian gate postscript — deterministic append, never touches _rft
+        _gate = sp_in.get("_contrarian_gate")
+        if _gate == "passed_on_retry":
+            director_msg += "\n[Independent analysis confirmed on review.]"
+        elif _gate == "retry_exhausted":
+            director_msg += "\n[Note: consensus validation incomplete.]"
 
         result_dict = {
             "status": "ok",

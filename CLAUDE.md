@@ -189,14 +189,18 @@ PASS 5  Translator              → plain English director_message (always local
 
 Two separate routing layers. Do not conflate them.
 
-**External LLM invariant: Grok is the only permitted external LLM provider for PASS 2.** Claude API is not wired for autonomous use and must not be wired.
+**External LLM providers for PASS 2:** Grok, Gemini, Groq Inference, Ollama Cloud, and OpenRouter are all approved for PASS 2 routing (Director-approved 2026-05-21). The guard is the DCL gate (PRIVATE/SECRET → force local) plus `eligible_classifications` in `provider_registry`. Claude API is not wired for autonomous use and must not be wired. Provider selection is registry-driven via `_routing_decision()` — see `cognition/engine.py` for the full priority chain.
 
-#### PASS 2/3a — LLM selection for planning (auto-routing applies)
-`_routing_decision` in `cognition/engine.py` selects which LLM writes the specialist's action plan:
-1. **Explicit override**: `use grok|ask grok|via grok|external llm/model/ai` → forces external
-2. **Provider signals** on raw user message: `current/latest/news/today/recent/market/trending` → Grok; default → Grok
-3. **Complexity ≥ 0.50** → external Grok. Operational penalty (`restart/container/service/deploy/compose/nginx/redis/mariadb/subnet`) subtracts 0.20.
-4. **DCL gate** — PRIVATE/SECRET → force local
+#### PASS 2/3a — LLM selection for planning (registry-aware routing)
+`_routing_decision` in `cognition/engine.py` selects which provider writes the specialist's action plan:
+1. **DCL gate** — PRIVATE/SECRET → force local (checked first, always)
+2. **Explicit override**: `use grok/gemini/groq/openrouter|ask grok/...` → that provider if eligible in registry
+3. **task_type preference**: `web_aware_query`/`news_gather` → Grok first (real-time web access). Checked before alpha_vantage so news queries go to grok not the financial data API.
+4. **task_type specialist**: financial task_types (securities_price/fundamentals/technicals/commodities/economic_indicators) → alpha_vantage tag (use_external=False; actual call via research harness)
+5. **Complexity ≥ 0.50** → free-first order: groq_inference → gemini → openrouter → ollama_cloud → grok (paid last). Operational penalty subtracts 0.20.
+6. **Default** → local Ollama
+Provider eligibility: `enabled=True AND task_type in task_types AND DCL_tier in eligible_classifications` (governance.json `provider_registry`). Director-approved 2026-05-21.
+Intent → task_type inference: `"research"/"web search"` → `web_aware_query`; `"news"` → `news_gather`; financial keywords → financial task_types.
 
 #### `domain: ollama` execution — explicit-only external routing
 When `_dispatch_inner` reaches `domain: ollama`, Grok is only called on **explicit** triggers. Auto-signals are intentionally excluded to avoid firing Grok alongside RSS/browser paths PASS 1 may have already chosen.
