@@ -314,7 +314,7 @@ _COMPONENTS: list[dict] = [
         "content": (
             "memory_synthesise short-circuit domain: nightly episodic memory synthesis "
             "runs bypass the full 5-pass loop. Calls memory.synthesis.run_synthesis() "
-            "directly. Triggered by nightly cron (15:00 UTC = 03:00 NZST) or manual request."
+            "directly. Triggered by nightly cron (13:00 UTC = 01:00 NZST) or manual request."
         ),
         "location": "execution/engine.py:_dispatch_inner (domain=='memory_synthesise')",
         "short_circuit_domain": "memory_synthesise",
@@ -869,7 +869,7 @@ _COMPONENTS: list[dict] = [
             "Pass 1: same-intent variant grouping → associative:intent:{slug}:variants. "
             "Pass 2: mixed-outcome relational → relational:intent:{a}:{b}. "
             "Pass 3: co-occurrence links → associative:intent:{a}:{b}. "
-            "Runs nightly (15:00 UTC) and on demand via memory_synthesise intent."
+            "Runs nightly (13:00 UTC = 01:00 NZST) and on demand via memory_synthesise intent."
         ),
         "location": "memory/synthesis.py",
     },
@@ -905,7 +905,7 @@ _COMPONENTS: list[dict] = [
             "task_scheduler.py: NL task parser → TaskDefinition → Qdrant-backed store. "
             "PROSPECTIVE + PROCEDURAL + EPISODIC triple per task_id. "
             "60-second executor loop. Seeded tasks: Dev-Harness (14:00 UTC), "
-            "Memory Synthesis (15:00 UTC), Weekday Briefing (20:30 UTC Mon-Fri)."
+            "Memory Synthesis (13:00 UTC), Weekday Briefing (20:30 UTC Mon-Fri)."
         ),
         "location": "scheduling/task_scheduler.py",
     },

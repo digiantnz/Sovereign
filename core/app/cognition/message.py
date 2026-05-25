@@ -205,6 +205,7 @@ class InternalMessage:
             success=success,
         )
         self.history.append(record)
+        self.envelope.pass_num = pass_num
         return self
 
     def set_payload(self, new_payload: dict) -> "InternalMessage":

@@ -79,7 +79,7 @@ async def _fetch_rss(nanobot) -> tuple[list[dict], str | None]:
 
 
 async def _fetch_grok(cog, topics: list[str]) -> tuple[list[dict], str | None]:
-    """Ask Grok for current news on Matt's preferred topics."""
+    """Ask best-available external provider for current news on Matt's preferred topics."""
     try:
         topic_str = ", ".join(topics)
         prompt = (
@@ -88,7 +88,19 @@ async def _fetch_grok(cog, topics: list[str]) -> tuple[list[dict], str | None]:
             "Format your response as a JSON array of objects with keys 'title' and 'summary'. "
             "Each summary should be 1–2 sentences. Return ONLY the JSON array — no other text."
         )
-        result = await cog.ask_grok(prompt, agent="research_agent")
+        _decision = cog._routing_decision(prompt, user_input=topic_str, task_type="news_gather")
+        if _decision["use_external"]:
+            _dispatch_map = {
+                "grok":           cog.ask_grok,
+                "gemini":         cog.ask_gemini,
+                "groq_inference": cog.ask_groq_inf,
+                "openrouter":     cog.ask_openrouter,
+                "ollama_cloud":   cog.ask_ollama_cloud,
+            }
+            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
+            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
+        else:
+            result = await cog.ask_local(prompt)
         raw = result.get("response", "") if isinstance(result, dict) else str(result)
         # Extract JSON array from response
         match = re.search(r'\[.*\]', raw, re.DOTALL)
@@ -162,7 +174,7 @@ def _deduplicate(all_items: list[dict]) -> tuple[list[dict], int]:
 
 # ── Synthesis ─────────────────────────────────────────────────────────────
 
-async def _synthesise(cog, items: list[dict], prefs_text: str, use_grok: bool = False) -> str:
+async def _synthesise(cog, items: list[dict], prefs_text: str, user_input: str = "") -> str:
     """One LLM call to synthesise all items into a 5–8 bullet brief."""
     numbered = "\n".join(
         f"{i+1}. {item['title']} — {item['summary']}"
@@ -179,8 +191,17 @@ async def _synthesise(cog, items: list[dict], prefs_text: str, use_grok: bool = 
         "Do NOT include source names, URLs, or metadata — only the synthesised content. "
         "Start each bullet with •"
     )
-    if use_grok:
-        result = await cog.ask_grok(body, agent="research_agent")
+    _decision = cog._routing_decision(body, user_input=user_input, task_type="llm_generate")
+    if _decision["use_external"]:
+        _dispatch_map = {
+            "grok":           cog.ask_grok,
+            "gemini":         cog.ask_gemini,
+            "groq_inference": cog.ask_groq_inf,
+            "openrouter":     cog.ask_openrouter,
+            "ollama_cloud":   cog.ask_ollama_cloud,
+        }
+        _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
+        result = await _fn(body, agent="research_agent", routing_decision=_decision)
         return result.get("response", "") if isinstance(result, dict) else str(result)
     # /no_think suppresses qwen3 extended reasoning for this extraction-only step
     from adapters.inference_queue import InferenceQueue
@@ -301,8 +322,7 @@ async def run_news_brief(cog, nanobot, qdrant, user_input: str = "") -> dict:
     deduped, dedup_removed = _deduplicate(all_items)
 
     # ── 4. Synthesise via single LLM call ──────────────────────────────────
-    _use_grok = any(kw in user_input.lower() for kw in ("use grok", "ask grok", "via grok"))
-    brief = await _synthesise(cog, deduped, prefs_text, use_grok=_use_grok)
+    brief = await _synthesise(cog, deduped, prefs_text, user_input=user_input)
 
     if not brief.strip():
         brief = "Could not synthesise news brief — synthesis returned an empty response."

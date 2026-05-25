@@ -165,6 +165,7 @@ services:
       - ./secrets/github.env
       - ./secrets/wallet.env
       - ./secrets/nanobot.env
+      - ./secrets/providers.env
     environment:
       - SOVEREIGN_KEY_PATH=/run/secrets/sovereign_key
       - OLLAMA_EMBED_URL=http://ollama-embed:11434  # CPU-only nomic-embed-text instance

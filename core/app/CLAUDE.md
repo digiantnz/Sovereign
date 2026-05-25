@@ -27,8 +27,10 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - Operational penalty: score≥0.50 AND `_OPERATIONAL_RE` (restart/container/service/deploy/port/compose/nginx/redis/mariadb/healthcheck/network/subnet) → -0.20
 - `specialist_plan` always includes `_routing_reason`, `_complexity_score`, `_intended_provider` (even on local fallback)
 - Grok API unavailable → graceful fallback to Ollama; no error raised
-- **Approved external LLM providers for PASS 2 (Director-approved 2026-05-21):** Grok, Gemini, Groq Inference, Ollama Cloud, OpenRouter. Guard: DCL gate (PRIVATE/SECRET → force local) + `eligible_classifications` in `provider_registry`. Claude API is not wired for autonomous use and must not be wired. Provider selection is registry-driven via `_routing_decision()` in `cognition/engine.py`.
-- **Provider priority order (free-first):** task_type_preferred (grok for web_aware_query/news_gather) → alpha_vantage (financial data tasks, use_external=False) → complexity≥0.50: groq_inference → gemini → openrouter → ollama_cloud → grok (paid last). Grok is preferred first ONLY for web_aware_query/news_gather (real-time web access). Intent→task_type: `"research"/"web search"` → web_aware_query; `"news"` → news_gather.
+- **Approved external LLM providers for PASS 2 (Director-approved 2026-05-21):** Grok, Gemini, Groq Inference, Ollama Cloud, OpenRouter. Guard: DCL gate (PRIVATE/SECRET → force local; CONFIDENTIAL → force local unless `confidential_external_approved` session flag set) + `eligible_classifications` in `provider_registry`. Claude API is not wired for autonomous use and must not be wired. Provider selection is registry-driven via `_routing_decision()` in `cognition/engine.py`.
+- **Provider priority order (free-first):** task_type_preferred (grok for web_aware_query/news_gather) → alpha_vantage (financial data tasks, use_external=False) → complexity≥0.50: groq_inference → gemini → openrouter → ollama_cloud → grok (paid last). Rate-limited providers (429 within 3600s TTL) are skipped. Grok is preferred first ONLY for web_aware_query/news_gather (real-time web access). Intent→task_type: `"research"/"web search"` → web_aware_query; `"news"` → news_gather.
+- **CONFIDENTIAL gate:** Director sets `confidential_external_approved` flag via phrase "approve external providers" or similar → `set_session_flag("confidential_external_approved", True)` on CognitionEngine instance → CONFIDENTIAL treated as WORKSPACE_INTERNAL for eligibility checks only; PRIVATE/SECRET hard-block remains unchanged.
+- **Dev-Harness exemption:** Dev-Harness security analysis (`cog.security_evaluate()`) always runs locally — never routes through `_routing_decision()`. Code review must not leave the local trust boundary.
 - **OpenRouter routing:** `"route":"fallback"` added to all payloads; meta-llama/llama-3.3-70b-instruct:free is the default but auto-routes to any available free model on rate-limit/unavailability.
 
 ### Confirmed-continuation bypass
@@ -87,6 +89,15 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - `"eth address"`, `"wallet address"`, `"safe address"`, `"tailscale"` added to both `_system_signals` (passes conversational guard) and `_mem_list_kw` (short-circuits to `memory_list_keys`); "what is my ETH address" now routes correctly
 - `memory_index` domain added to short-circuit tuple at line 1333; full 5-pass loop caused PASS 4 rejection (same pattern as `browser_config`)
 - Short-circuit `else:` branch passes `delegation` to `_dispatch` so `retrieve_key` key extraction works (target field carries the extracted key from `_quick_classify`)
+
+### Structural synthesis background task
+- `run_structural_loop(qdrant, cog)` in `memory/synthesis.py` — started as named asyncio task `structural_synthesis_loop` in `main.py` lifespan (after `qdrant.set_cog()`), cancelled on shutdown
+- Loop: load cursor from `meta:memory-synthesis:structural-cursor` (META, RAID-durable) → call `synthesise_structural(max_entries=20, start_offset=cursor)` → upsert cursor point → `asyncio.sleep(30 if active else 3600)`
+- Cursor point ID: UUID5(`7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d`, `"meta:memory-synthesis:structural-cursor"`) — deterministic, idempotent upsert
+- Skips entries already stamped `_structural_synthesised_ts` — backfill-only; never re-processes
+- Scoped synthesis (`synthesise_structural(key=<new_key>)`) still fires on every new SEMANTIC write via `asyncio.create_task()` and stamps those entries too — background loop only attacks un-stamped entries
+- Parameters: similarity threshold 0.65, top-K neighbours 5 (InferenceQueue.LOW priority)
+- Idle condition: `wrapped=True` AND `semantic_processed==0` (all entries stamped) → sleep 3600s
 
 ### Memory dispatch
 - Async memory write via `asyncio.create_task()` — never blocks return path

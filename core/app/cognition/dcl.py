@@ -40,6 +40,11 @@ _COST_RATES = {
     "grok":        {"input": 2.00,  "output": 10.00},
 }
 _COMPRESS_MAX_CHARS = 1500
+_COMPRESS_MAX_CHARS_SYNTHESIS = 6000
+_SYNTHESIS_TASK_TYPES = frozenset({
+    "llm_generate", "web_aware_query", "news_gather",
+    "research_synthesis", "long_document_analysis", "large_context_synthesis",
+})
 
 # ── Detection patterns ────────────────────────────────────────────────────────
 
@@ -101,6 +106,50 @@ _ABSTRACT_SUBS = [
     (re.compile(r"\bsearxng\b",       re.IGNORECASE),     "internal-service"),
     (re.compile(r"\bqdrant\b",        re.IGNORECASE),     "internal-service"),
 ]
+
+# ── PII strip patterns (for strip_private_fields()) ──────────────────────────
+# Wallet addresses intentionally excluded — pseudonymous; stripping breaks the
+# provider request context (e.g. "what is the balance of 0x...?").
+_PII_STRIP_PATTERNS: list[tuple[re.Pattern, str, str]] = [
+    (
+        re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
+        "<EMAIL>",
+        "email",
+    ),
+    (
+        re.compile(r"\+?[\d][\d\s\-\(\)\.]{7,}\d"),
+        "<PHONE>",
+        "phone",
+    ),
+    # Payment card numbers: groups of 4 separated by space or dash
+    (
+        re.compile(r"\b\d{4}[\s\-]\d{4}[\s\-]\d{4}[\s\-]\d{1,4}\b"),
+        "<CARD_NUMBER>",
+        "card_number",
+    ),
+    # NZ IRD numbers: XX-XXX-XXX or XXX-XXX-XXX (formatted only — bare 9-digit
+    # sequences are too likely to false-positive on financial figures)
+    (
+        re.compile(r"\b\d{2,3}[- ]\d{3}[- ]\d{3}\b"),
+        "<IRD_NUMBER>",
+        "ird_number",
+    ),
+]
+
+
+def strip_private_fields(prompt: str) -> tuple[str, bool, list[str]]:
+    """Remove PII from prompt before external dispatch.
+
+    Returns (cleaned_prompt, was_stripped, field_types_stripped).
+    """
+    stripped_types: list[str] = []
+    text = prompt
+    for pattern, replacement, label in _PII_STRIP_PATTERNS:
+        if pattern.search(text):
+            text = pattern.sub(replacement, text)
+            stripped_types.append(label)
+    return text, bool(stripped_types), stripped_types
+
 
 # ── Result type ───────────────────────────────────────────────────────────────
 
@@ -165,48 +214,50 @@ class DisclosureControlLayer:
 
     # ── Transformations ───────────────────────────────────────────────────────
 
-    def _compress(self, content: str) -> str:
-        """Remove blank lines and trim to COMPRESS_MAX_CHARS."""
+    def _compress(self, content: str, task_type: str = "") -> str:
+        """Remove blank lines and trim to cap (6000 for synthesis, 1500 otherwise)."""
+        cap = (
+            _COMPRESS_MAX_CHARS_SYNTHESIS
+            if task_type in _SYNTHESIS_TASK_TYPES
+            else _COMPRESS_MAX_CHARS
+        )
         lines = [l for l in content.splitlines() if l.strip()]
         text = "\n".join(lines)
-        if len(text) > _COMPRESS_MAX_CHARS:
-            text = text[:_COMPRESS_MAX_CHARS] + "\n[...compressed]"
+        if len(text) > cap:
+            text = text[:cap] + "\n[...compressed]"
         return text
 
-    def _abstract(self, content: str) -> str:
+    def _abstract(self, content: str, task_type: str = "") -> str:
         """Replace internal identifiers with generics, then compress."""
         text = content
         for pattern, replacement in _ABSTRACT_SUBS:
             text = pattern.sub(replacement, text)
-        # Strip inline markers
         text = re.sub(r"\[SENS:[A-Z_]+\]", "", text).strip()
-        return self._compress(text)
+        return self._compress(text, task_type)
 
-    def _mask(self, content: str) -> str:
+    def _mask(self, content: str, task_type: str = "") -> str:
         """Replace PII with stable placeholders, then abstract."""
         text = content
-        # Email → <EMAIL>
         text = re.sub(
             r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
             "<EMAIL>", text,
         )
-        # Phone → <PHONE> (10+ digit sequences with separators)
         text = re.sub(
             r"\+?[\d][\d\s\-\(\)\.]{8,}\d",
             "<PHONE>", text,
         )
-        return self._abstract(text)
+        return self._abstract(text, task_type)
 
-    def _apply_transform(self, tier: str, content: str) -> tuple[str, str]:
+    def _apply_transform(self, tier: str, content: str, task_type: str = "") -> tuple[str, str]:
         """Return (transformation_name, transformed_content)."""
         if tier == SECRET:
             return TRANSFORM_BLOCK, ""
         if tier == PRIVATE:
-            return TRANSFORM_MASK, self._mask(content)
+            return TRANSFORM_MASK, self._mask(content, task_type)
         if tier == CONFIDENTIAL:
-            return TRANSFORM_ABSTRACT, self._abstract(content)
+            return TRANSFORM_ABSTRACT, self._abstract(content, task_type)
         if tier == WORKSPACE_INTERNAL:
-            return TRANSFORM_COMPRESS, self._compress(content)
+            return TRANSFORM_COMPRESS, self._compress(content, task_type)
         # PUBLIC
         return TRANSFORM_PASSTHROUGH, content
 
@@ -226,13 +277,15 @@ class DisclosureControlLayer:
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
-    def prepare(self, content: str, agent: str, provider: str) -> DCLResult:
+    def prepare(self, content: str, agent: str, provider: str,
+                task_type: str = "") -> DCLResult:
         """Classify and transform content for an external provider call.
 
         Returns a DCLResult. If blocked=True, caller must NOT transmit.
+        task_type controls the compress cap (6000 for synthesis, 1500 otherwise).
         """
         tier = self.classify(content)
-        transformation, transformed = self._apply_transform(tier, content)
+        transformation, transformed = self._apply_transform(tier, content, task_type)
         input_tokens = self.estimate_tokens(transformed) if not (transformation == TRANSFORM_BLOCK) else 0
         return DCLResult(
             tier=tier,

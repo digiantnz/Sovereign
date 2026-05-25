@@ -4,6 +4,7 @@ import httpx
 from config import cfg as _cfg
 
 _TIMEOUT  = 200.0  # qwen2.5:32b: 30-50s typical, headroom for complex passes
+_NUM_CTX  = 16384
 _THINK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 _log      = logging.getLogger(__name__)
 
@@ -35,7 +36,8 @@ def _strip_think(text: str) -> str:
 class OllamaAdapter:
     async def generate(self, prompt: str, model: str = None, fmt: str = None,
                        capture_thinking: bool = False) -> dict:
-        payload = {"model": model or _cfg.models.primary_inference_model, "prompt": prompt, "stream": False}
+        payload = {"model": model or _cfg.models.primary_inference_model, "prompt": prompt, "stream": False,
+                   "options": {"num_ctx": _NUM_CTX}}
         if fmt:
             payload["format"] = fmt
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -79,7 +81,8 @@ class OllamaAdapter:
         """Call /api/chat with a messages array (system/user/assistant roles).
         Returns a dict with a 'response' key containing the assistant's reply text,
         matching the shape of generate() for a consistent interface."""
-        payload = {"model": model or _cfg.models.primary_inference_model, "messages": messages, "stream": False}
+        payload = {"model": model or _cfg.models.primary_inference_model, "messages": messages, "stream": False,
+                   "options": {"num_ctx": _NUM_CTX}}
         if fmt:
             payload["format"] = fmt
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:

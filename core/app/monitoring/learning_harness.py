@@ -19,7 +19,7 @@ Collections written:
   relational — structural links between concepts
 
 Collections NOT written by this harness:
-  associative — populated ONLY by run_synthesis() nightly cron (15:00 UTC)
+  associative — populated ONLY by run_synthesis() nightly cron (13:00 UTC = 01:00 NZST)
                 (associative entries ARE read for context in doc_array)
 
 Sentinel: episodic:learning:processed:{slug} (MIP format)
@@ -577,11 +577,13 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
                                source_note_id: int | None = None) -> dict:
     """Run semantic→relational round-robin until plateau or safety cap.
 
-    Returns: {cycles, created, updated, gaps}
+    Returns: {cycles, created, updated, gaps, timeout_skips}
+    GPU timeouts skip the affected chunk rather than aborting the loop.
     """
     total_created    = 0
     total_updated    = 0
     all_gaps: list   = []
+    timeout_skips    = 0
     supplemental_ctx: dict = {}
     if source_note_id is not None:
         _extra_meta = {"source_note_id": source_note_id}
@@ -600,6 +602,7 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
 
                 try:
                     from adapters.inference_queue import InferenceQueue
+                    import asyncio as _aq
                     result = await cog.ask_local(
                         prompt, priority=InferenceQueue.LOW, timeout=90.0
                     )
@@ -608,15 +611,18 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
                             "LearningHarness: GPU timeout on cycle %d %s — retrying once",
                             cycle, pass_type,
                         )
-                        import asyncio as _aq
                         _aq.create_task(_log_learning_timeout(cog, result, cycle, pass_type))
                         result = await cog.ask_local(
                             prompt, priority=InferenceQueue.LOW, timeout=90.0
                         )
                         if result.get("status") == "llm_timeout":
-                            raise Exception(
-                                f"Ollama timed out on cycle {cycle} ({pass_type}) — GPU busy"
+                            timeout_skips += 1
+                            logger.warning(
+                                "LearningHarness: GPU still busy on cycle %d (%s) — "
+                                "skipping chunk (%d skipped total)",
+                                cycle, pass_type, timeout_skips,
                             )
+                            continue
                     raw = result.get("response", "") if isinstance(result, dict) else str(result)
                 except Exception as e:
                     logger.error("LearningHarness: Ollama call failed (cycle %d %s): %s",
@@ -670,10 +676,11 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
             break
 
     return {
-        "cycles":  cycle,
-        "created": total_created,
-        "updated": total_updated,
-        "gaps":    all_gaps,
+        "cycles":        cycle,
+        "created":       total_created,
+        "updated":       total_updated,
+        "gaps":          all_gaps,
+        "timeout_skips": timeout_skips,
     }
 
 
@@ -921,17 +928,30 @@ async def _process_file(app_state, file_info: dict,
     entries_created = loop_result["created"]
     entries_updated = loop_result["updated"]
     gaps            = loop_result["gaps"]
+    timeout_skips   = loop_result.get("timeout_skips", 0)
+
+    # If the GPU was busy for every chunk and nothing was learned, skip the
+    # sentinel so the file is retried on the next poll cycle.
+    if timeout_skips > 0 and entries_created == 0 and entries_updated == 0:
+        logger.warning(
+            "LearningHarness: GPU busy throughout — no sentinel written for %s; "
+            "will retry next cycle (%d chunk(s) skipped)",
+            filename, timeout_skips,
+        )
+        return
 
     # ── Step 6: Write sentinel ────────────────────────────────────────────
     file_hash = hashlib.sha256(document_text.encode()).hexdigest()[:16]
+    outcome   = "partial" if timeout_skips > 0 else "positive"
     await _write_sentinel(qdrant, sentinel, {
-        "outcome":          "positive",
+        "outcome":          outcome,
         "file_path":        file_path,
         "file_hash":        file_hash,
         "cycles_completed": cycles,
         "entries_created":  entries_created,
         "entries_updated":  entries_updated,
         "gaps_flagged":     len(gaps),
+        "timeout_skips":    timeout_skips,
         "completed_at":     datetime.now(timezone.utc).isoformat(),
         **_source_meta,
     })

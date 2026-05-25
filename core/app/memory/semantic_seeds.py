@@ -695,3 +695,186 @@ def make_skill_semantic_seed(
             "failure_count":  0,
         },
     }
+
+
+def build_provider_seeds() -> list[dict]:
+    """Semantic seeds for all provider_registry entries in governance.json.
+
+    One entry per provider at semantic:provider:{name}. Keeps Rex's semantic
+    memory aligned with governance.json v1.33 strengths/preferred_for fields.
+    Idempotent via seed_id — safe to re-seed on every startup.
+    """
+    return [
+        {
+            "seed_id": "provider_seed_v1_grok",
+            "key":     "semantic:provider:grok",
+            "title":   "Grok — external LLM provider (real-time web, news, market data)",
+            "content": (
+                "Grok is an external LLM provider with real-time web access. "
+                "Preferred for: news_gather, web_aware_query, market_sentiment, cve_monitor. "
+                "Strengths: real_time_web, current_events, market_data. "
+                "Weaknesses: paid API (token cost); not suitable for CONFIDENTIAL content without Director approval. "
+                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
+                "Trigger phrases: 'use grok', 'ask grok', 'via grok', 'current events', 'latest news', 'market today'. "
+                "Priority: first choice for web_aware_query and news_gather task types."
+            ),
+            "domain": "provider",
+            "extra_meta": {
+                "provider_name":       "grok",
+                "preferred_for":       ["news_gather", "web_aware_query", "market_sentiment", "cve_monitor"],
+                "strengths":           ["real_time_web", "current_events", "market_data"],
+                "free_tier":           False,
+                "queue_position":      5,
+            },
+        },
+        {
+            "seed_id": "provider_seed_v1_gemini",
+            "key":     "semantic:provider:gemini",
+            "title":   "Gemini — external LLM provider (long context, document analysis)",
+            "content": (
+                "Gemini is an external LLM provider by Google with strong long-context and multimodal reasoning. "
+                "Preferred for: long_document_analysis, large_context_synthesis, document_extraction. "
+                "Strengths: long_context (up to 1M tokens), document_analysis, multimodal. "
+                "Weaknesses: occasional verbosity; quota limits on free tier. "
+                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
+                "Queue position: 2 (second in free-first complexity queue, after groq_inference). "
+                "Best for: large document synthesis, multi-source consolidation, extracting structured data from text."
+            ),
+            "domain": "provider",
+            "extra_meta": {
+                "provider_name":       "gemini",
+                "preferred_for":       ["long_document_analysis", "large_context_synthesis", "document_extraction"],
+                "strengths":           ["long_context", "document_analysis", "multimodal"],
+                "free_tier":           True,
+                "queue_position":      2,
+            },
+        },
+        {
+            "seed_id": "provider_seed_v1_groq_inference",
+            "key":     "semantic:provider:groq_inference",
+            "title":   "Groq Inference — external LLM provider (fastest free inference)",
+            "content": (
+                "Groq Inference is an external LLM provider running on Groq LPU hardware. "
+                "Preferred for: fast_classify, fast_synthesis, parallel_research, time_sensitive_reasoning. "
+                "Strengths: speed (lowest latency of all providers), low_latency, free tier available. "
+                "Weaknesses: context window smaller than Gemini; rate limits on free tier. "
+                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
+                "Queue position: 1 (first choice in free-first complexity queue). "
+                "Best for: structured JSON output, short synthesis tasks, time-sensitive requests."
+            ),
+            "domain": "provider",
+            "extra_meta": {
+                "provider_name":       "groq_inference",
+                "preferred_for":       ["fast_classify", "fast_synthesis", "parallel_research", "time_sensitive_reasoning"],
+                "strengths":           ["speed", "low_latency", "free_tier"],
+                "free_tier":           True,
+                "queue_position":      1,
+            },
+        },
+        {
+            "seed_id": "provider_seed_v1_openrouter",
+            "key":     "semantic:provider:openrouter",
+            "title":   "OpenRouter — external LLM provider (free-tier fallback, model diversity)",
+            "content": (
+                "OpenRouter is an external LLM routing layer providing access to multiple free models. "
+                "Preferred for: general_reasoning, research_synthesis, cross_validation, llm_generate. "
+                "Strengths: model_diversity, auto_fallback (route=fallback selects any available free model). "
+                "Weaknesses: latency varies by model availability; free models change over time. "
+                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
+                "Queue position: 3 (third in free-first complexity queue). "
+                "Uses meta-llama/llama-3.3-70b-instruct:free as default; auto-routes on rate-limit."
+            ),
+            "domain": "provider",
+            "extra_meta": {
+                "provider_name":       "openrouter",
+                "preferred_for":       ["general_reasoning", "research_synthesis", "cross_validation", "llm_generate"],
+                "strengths":           ["model_diversity", "auto_fallback"],
+                "free_tier":           True,
+                "queue_position":      3,
+                "default_model":       "meta-llama/llama-3.3-70b-instruct:free",
+            },
+        },
+        {
+            "seed_id": "provider_seed_v1_ollama_cloud",
+            "key":     "semantic:provider:ollama_cloud",
+            "title":   "Ollama Cloud — external LLM provider (hosted Ollama, overflow inference)",
+            "content": (
+                "Ollama Cloud is an external hosted Ollama service mirroring local model capability. "
+                "Preferred for: overflow_inference, parallel_synthesis, llm_generate. "
+                "Strengths: familiar_models (same weights as local), sovereign_compatible output format. "
+                "Weaknesses: network latency vs local GPU; paid after free quota. "
+                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
+                "Queue position: 4 (fourth in free-first complexity queue). "
+                "Best for: parallel synthesis when local GPU is saturated, consistent output format."
+            ),
+            "domain": "provider",
+            "extra_meta": {
+                "provider_name":       "ollama_cloud",
+                "preferred_for":       ["overflow_inference", "parallel_synthesis", "llm_generate"],
+                "strengths":           ["familiar_models", "sovereign_compatible"],
+                "free_tier":           True,
+                "queue_position":      4,
+            },
+        },
+        {
+            "seed_id": "provider_seed_v1_alpha_vantage",
+            "key":     "semantic:provider:alpha_vantage",
+            "title":   "Alpha Vantage — financial data API (not an LLM)",
+            "content": (
+                "Alpha Vantage is a financial data API providing structured market data. "
+                "This is NOT an LLM — it returns deterministic structured financial data. "
+                "Preferred for: securities_price, securities_fundamentals, securities_technicals, "
+                "commodities_price, economic_indicators. "
+                "Strengths: deterministic, structured_financial_data, real-time quotes. "
+                "Returns use_external=False — the research harness handles the actual API call. "
+                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
+                "Used by research_harness.py for financial data gathering tasks."
+            ),
+            "domain": "provider",
+            "extra_meta": {
+                "provider_name":       "alpha_vantage",
+                "preferred_for":       ["securities_price", "securities_fundamentals", "securities_technicals", "commodities_price", "economic_indicators"],
+                "strengths":           ["deterministic", "structured_financial_data"],
+                "is_llm":              False,
+                "free_tier":           True,
+            },
+        },
+        {
+            "seed_id": "provider_seed_v1_mistral_api",
+            "key":     "semantic:provider:mistral_api",
+            "title":   "Mistral API — external LLM provider (code analysis, structured extraction)",
+            "content": (
+                "Mistral API is an external LLM provider by Mistral AI. "
+                "Preferred for: code_analysis, structured_extraction. "
+                "Strengths: code_analysis, structured_output, efficient inference. "
+                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
+                "Not yet in the primary routing queue — available for future integration."
+            ),
+            "domain": "provider",
+            "extra_meta": {
+                "provider_name":       "mistral_api",
+                "preferred_for":       ["code_analysis", "structured_extraction"],
+                "strengths":           ["code_analysis", "structured_output"],
+                "free_tier":           False,
+            },
+        },
+        {
+            "seed_id": "provider_seed_v1_perplexity",
+            "key":     "semantic:provider:perplexity",
+            "title":   "Perplexity — external LLM provider (cited research, academic search)",
+            "content": (
+                "Perplexity is an external LLM provider specialising in cited research and academic search. "
+                "Preferred for: cited_research, academic_search, technical_research. "
+                "Strengths: cited_sources, academic_research, inline citations. "
+                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
+                "Not yet in the primary routing queue — available for future integration."
+            ),
+            "domain": "provider",
+            "extra_meta": {
+                "provider_name":       "perplexity",
+                "preferred_for":       ["cited_research", "academic_search", "technical_research"],
+                "strengths":           ["cited_sources", "academic_research"],
+                "free_tier":           False,
+            },
+        },
+    ]

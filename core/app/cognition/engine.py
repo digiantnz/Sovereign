@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re as _re_fab
+import time as _time
 from adapters.ollama import OllamaAdapter
 from adapters.grok import GrokAdapter
 from adapters.claude import ClaudeAdapter
@@ -159,6 +160,8 @@ class CognitionEngine:
         self._had_queue_wait = False
         self._security_persona: str = self._load_security_persona()
         self._provider_registry: dict = self._load_provider_registry()
+        self._session_flags: dict = {}
+        self._provider_rate_limited: dict[str, float] = {}
 
     def _load_security_persona(self) -> str:
         if os.path.exists(SECURITY_AGENT_PATH):
@@ -179,6 +182,19 @@ class CognitionEngine:
                 "CognitionEngine: provider_registry load failed (%s) — falling back to complexity scorer", e
             )
             return {}
+
+    # ── Session flags ────────────────────────────────────────────────────
+    def set_session_flag(self, key: str, value) -> None:
+        self._session_flags[key] = value
+
+    def get_session_flag(self, key: str, default=None):
+        return self._session_flags.get(key, default)
+
+    def mark_provider_rate_limited(self, provider: str) -> None:
+        self._provider_rate_limited[provider] = _time.monotonic()
+        logging.getLogger(__name__).warning(
+            "provider_rate_limited: %s — skipping for %.0fs", provider, self._PROVIDER_RATE_LIMIT_TTL_S
+        )
 
     # ── Persona loading ──────────────────────────────────────────────────
     def load_persona(self, name: str) -> str:
@@ -485,7 +501,10 @@ class CognitionEngine:
         result = self._parse_llm_output(
             _raw1.get("response", ""),
             required=["intent", "delegate_to", "tier"],
-            defaults={"intent": "query", "delegate_to": "research_agent", "tier": "LOW"},
+            defaults={
+                "intent": "query", "delegate_to": "research_agent", "tier": "LOW",
+                "preferred_provider": "local", "delegation_reason": "", "expected_output_format": "",
+            },
         )
         result["_memory_confidence"] = confidence
         result["_memory_gaps"] = gaps
@@ -752,7 +771,13 @@ class CognitionEngine:
         )
 
         # External routing applies to outbound (research may use any eligible provider)
-        decision = self._routing_decision(prompt, user_input=user_input)
+        _deleg_reason = delegation.get("delegation_reason", "")
+        _deleg_fmt    = delegation.get("expected_output_format", "")
+        decision = self._routing_decision(
+            prompt, user_input=user_input,
+            delegation_reason=_deleg_reason,
+            expected_output_format=_deleg_fmt,
+        )
         if decision["use_external"]:
             _log.info("specialist_outbound[%s]: routing to %s", agent_name, decision["provider"])
             try:
@@ -764,7 +789,7 @@ class CognitionEngine:
                     "ollama_cloud": self.ask_ollama_cloud,
                     "openrouter":   self.ask_openrouter,
                 }.get(decision["provider"], self.ask_grok)
-                raw = await _ask_fn(prompt, agent=agent_name)
+                raw = await _ask_fn(prompt, agent=agent_name, routing_decision=decision)
                 response_text = raw.get("response", "")
                 stripped = _re_json.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
                 m = _re_json.search(r"\{.*\}", stripped, _re_json.DOTALL)
@@ -1170,8 +1195,13 @@ class CognitionEngine:
     # ── Conversational query ───────────────────────────────────────────────
     async def ask_conversational(self, user_input: str, context_window: dict = None) -> dict:
         context, confidence, _gaps = await self.load_memory_context(user_input)
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        _now_utc = _dt.now(_tz.utc)
+        _now_nz = _now_utc + _td(hours=12)  # NZST (UTC+12); NZDT is +13 Oct–Apr
+        _time_str = _now_nz.strftime("%H:%M NZST on %A %-d %B %Y") + f" ({_now_utc.strftime('%H:%M UTC')})"
         system = (
-            "You are Sovereign, a helpful personal AI assistant. Answer directly and helpfully in plain English.\n"
+            f"You are Sovereign, a helpful personal AI assistant. Answer directly and helpfully in plain English.\n"
+            f"Current time: {_time_str}\n"
             "CRITICAL: Only reference events, requests, or context that appear explicitly in the conversation history "
             "below. Do NOT invent, assume, or hallucinate prior requests or context that are not shown. "
             "If you are uncertain about prior context, say so honestly rather than guessing."
@@ -1203,9 +1233,18 @@ class CognitionEngine:
         agent:   str = "sovereign-core",
         system:  str = "You are a helpful assistant.",
         model:   str | None = None,
+        routing_decision: dict | None = None,
     ) -> dict:
         """DCL-gated Grok call. Returns {response} or {error} if blocked.
         Every call — including blocks — is logged to audit."""
+        if routing_decision and (routing_decision.get("delegation_reason") or routing_decision.get("expected_output_format")):
+            prompt = (
+                f"[SOVEREIGN DELEGATION]\n"
+                f"Reason: {routing_decision.get('delegation_reason', '')}\n"
+                f"Expected output format: {routing_decision.get('expected_output_format', 'prose')}\n"
+                f"---\n{prompt}"
+            )
+            logger.info("provider_delegation: grok reason=%s", routing_decision.get("delegation_reason", ""))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="grok")
         if dcl_result.blocked:
             if self.ledger:
@@ -1222,6 +1261,8 @@ class CognitionEngine:
                                   output_tokens=raw.get("output_tokens", 0))
             return {"response": raw["response"]}
         except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                self.mark_provider_rate_limited("grok")
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e)}
@@ -1263,8 +1304,17 @@ class CognitionEngine:
         agent:   str = "sovereign-core",
         system:  str = "You are a helpful assistant.",
         model:   str | None = None,
+        routing_decision: dict | None = None,
     ) -> dict:
         """DCL-gated Gemini call. Returns {response, _trust} or {error} if blocked."""
+        if routing_decision and (routing_decision.get("delegation_reason") or routing_decision.get("expected_output_format")):
+            prompt = (
+                f"[SOVEREIGN DELEGATION]\n"
+                f"Reason: {routing_decision.get('delegation_reason', '')}\n"
+                f"Expected output format: {routing_decision.get('expected_output_format', 'prose')}\n"
+                f"---\n{prompt}"
+            )
+            logger.info("provider_delegation: gemini reason=%s", routing_decision.get("delegation_reason", ""))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="gemini")
         if dcl_result.blocked:
             if self.ledger:
@@ -1279,9 +1329,12 @@ class CognitionEngine:
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger,
                                   output_tokens=raw.get("output_tokens", 0))
-            return {"response": raw.get("response", raw.get("error", "")),
-                    "_trust": "untrusted_external"}
+            if raw.get("status") == "error" or not raw.get("response"):
+                raise ValueError(raw.get("error", "empty response from Gemini"))
+            return {"response": raw["response"], "_trust": "untrusted_external"}
         except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                self.mark_provider_rate_limited("gemini")
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
@@ -1293,8 +1346,17 @@ class CognitionEngine:
         agent:   str = "sovereign-core",
         system:  str = "You are a helpful assistant.",
         model:   str | None = None,
+        routing_decision: dict | None = None,
     ) -> dict:
         """DCL-gated Groq Inference call. Returns {response, _trust} or {error} if blocked."""
+        if routing_decision and (routing_decision.get("delegation_reason") or routing_decision.get("expected_output_format")):
+            prompt = (
+                f"[SOVEREIGN DELEGATION]\n"
+                f"Reason: {routing_decision.get('delegation_reason', '')}\n"
+                f"Expected output format: {routing_decision.get('expected_output_format', 'prose')}\n"
+                f"---\n{prompt}"
+            )
+            logger.info("provider_delegation: groq_inference reason=%s", routing_decision.get("delegation_reason", ""))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="groq_inference")
         if dcl_result.blocked:
             if self.ledger:
@@ -1309,9 +1371,12 @@ class CognitionEngine:
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger,
                                   output_tokens=raw.get("output_tokens", 0))
-            return {"response": raw.get("response", raw.get("error", "")),
-                    "_trust": "untrusted_external"}
+            if raw.get("status") == "error" or not raw.get("response"):
+                raise ValueError(raw.get("error", "empty response from Groq"))
+            return {"response": raw["response"], "_trust": "untrusted_external"}
         except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                self.mark_provider_rate_limited("groq_inference")
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
@@ -1323,8 +1388,17 @@ class CognitionEngine:
         agent:   str = "sovereign-core",
         system:  str = "You are a helpful assistant.",
         model:   str | None = None,
+        routing_decision: dict | None = None,
     ) -> dict:
         """DCL-gated Ollama Cloud call. Returns {response, _trust} or {error} if blocked."""
+        if routing_decision and (routing_decision.get("delegation_reason") or routing_decision.get("expected_output_format")):
+            prompt = (
+                f"[SOVEREIGN DELEGATION]\n"
+                f"Reason: {routing_decision.get('delegation_reason', '')}\n"
+                f"Expected output format: {routing_decision.get('expected_output_format', 'prose')}\n"
+                f"---\n{prompt}"
+            )
+            logger.info("provider_delegation: ollama_cloud reason=%s", routing_decision.get("delegation_reason", ""))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="ollama_cloud")
         if dcl_result.blocked:
             if self.ledger:
@@ -1339,9 +1413,12 @@ class CognitionEngine:
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger,
                                   output_tokens=raw.get("output_tokens", 0))
-            return {"response": raw.get("response", raw.get("error", "")),
-                    "_trust": "untrusted_external"}
+            if raw.get("status") == "error" or not raw.get("response"):
+                raise ValueError(raw.get("error", "empty response from Ollama Cloud"))
+            return {"response": raw["response"], "_trust": "untrusted_external"}
         except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                self.mark_provider_rate_limited("ollama_cloud")
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
@@ -1353,8 +1430,17 @@ class CognitionEngine:
         agent:   str = "sovereign-core",
         system:  str = "You are a helpful assistant.",
         model:   str | None = None,
+        routing_decision: dict | None = None,
     ) -> dict:
         """DCL-gated OpenRouter call. Returns {response, _trust} or {error} if blocked."""
+        if routing_decision and (routing_decision.get("delegation_reason") or routing_decision.get("expected_output_format")):
+            prompt = (
+                f"[SOVEREIGN DELEGATION]\n"
+                f"Reason: {routing_decision.get('delegation_reason', '')}\n"
+                f"Expected output format: {routing_decision.get('expected_output_format', 'prose')}\n"
+                f"---\n{prompt}"
+            )
+            logger.info("provider_delegation: openrouter reason=%s", routing_decision.get("delegation_reason", ""))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="openrouter")
         if dcl_result.blocked:
             if self.ledger:
@@ -1369,9 +1455,12 @@ class CognitionEngine:
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger,
                                   output_tokens=raw.get("output_tokens", 0))
-            return {"response": raw.get("response", raw.get("error", "")),
-                    "_trust": "untrusted_external"}
+            if raw.get("status") == "error" or not raw.get("response"):
+                raise ValueError(raw.get("error", "empty response from OpenRouter"))
+            return {"response": raw["response"], "_trust": "untrusted_external"}
         except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                self.mark_provider_rate_limited("openrouter")
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
@@ -1412,6 +1501,10 @@ class CognitionEngine:
     # ALL external calls are DCL-gated and audit-logged regardless of trigger.
     # PASS 1 (classify), PASS 3 (evaluate), PASS 4 (memory) are NEVER routed
     # externally — governance must remain deterministic and local.
+
+    _GROK_PRIORITY_TASKS       = frozenset({"news_gather", "web_aware_query", "market_sentiment", "cve_monitor"})
+    _PROVIDER_QUEUE            = ["groq_inference", "gemini", "openrouter", "ollama_cloud", "grok"]
+    _PROVIDER_RATE_LIMIT_TTL_S = 3600.0
 
     _COMPLEXITY_THRESHOLD = 0.50
     _PREFER_LOCAL_TIERS   = {"PRIVATE", "SECRET"}
@@ -1509,14 +1602,24 @@ class CognitionEngine:
         q_count    = min(prompt.count("?") / 3, 1.0)
         return min(length_s * 0.4 + multi_conj * 0.2 + depth_kw * 0.25 + q_count * 0.15, 1.0)
 
-    def _routing_decision(self, prompt: str, user_input: str = "", task_type: str | None = None) -> dict:
+    def _routing_decision(
+        self,
+        prompt: str,
+        user_input: str = "",
+        task_type: str | None = None,
+        delegation_reason: str = "",
+        expected_output_format: str = "",
+    ) -> dict:
         """Registry-aware routing decision. Returns:
-          {use_external, provider, adapter, score, penalised_score, explicit, force_local, reason}
+          {use_external, provider, adapter, score, penalised_score, explicit, force_local,
+           reason, delegation_reason, expected_output_format}
 
         Consults provider_registry from governance.json (loaded once at startup).
         Falls back silently to complexity scorer if registry is empty or lookup fails.
         user_input is the raw Director message (for explicit-override and signal matching).
         task_type is the execution-layer task type; inferred from user_input if not passed.
+        delegation_reason / expected_output_format are threaded into the return dict and
+        prepended as a [SOVEREIGN DELEGATION] block by each ask_* wrapper.
         """
         _log = logging.getLogger(__name__)
         signal_text = user_input or prompt
@@ -1531,7 +1634,17 @@ class CognitionEngine:
                 "score": 0.0, "penalised_score": 0.0,
                 "explicit": False, "force_local": True,
                 "reason": "force_local(dcl)",
+                "delegation_reason": delegation_reason,
+                "expected_output_format": expected_output_format,
             }
+
+        # CONFIDENTIAL gate: if Director has explicitly approved external use for this
+        # session, treat CONFIDENTIAL as WORKSPACE_INTERNAL for eligibility checks.
+        effective_tier = (
+            "WORKSPACE_INTERNAL"
+            if tier == "CONFIDENTIAL" and self.get_session_flag("confidential_external_approved")
+            else tier
+        )
 
         # ── Complexity scoring (used in fallback and for audit logging) ────
         score     = self._complexity_score(user_input or prompt)
@@ -1565,14 +1678,28 @@ class CognitionEngine:
                     break
 
         registry = self._provider_registry  # dict loaded once at startup
+        _now     = _time.monotonic()
+
+        def _d(extra: dict) -> dict:
+            """Attach delegation context to every return dict."""
+            extra["delegation_reason"]       = delegation_reason
+            extra["expected_output_format"]  = expected_output_format
+            return extra
+
         if registry:
             try:
-                # Build eligible provider list: enabled AND task_type supported AND DCL tier allowed
+                # Build eligible provider list:
+                #   enabled AND task_type supported AND effective DCL tier allowed
+                #   AND not currently rate-limited
                 eligible = {
                     name: cfg for name, cfg in registry.items()
                     if cfg.get("enabled")
                     and task_type in cfg.get("task_types", [])
-                    and tier in cfg.get("eligible_classifications", [])
+                    and effective_tier in cfg.get("eligible_classifications", [])
+                    and not (
+                        name in self._provider_rate_limited
+                        and _now - self._provider_rate_limited[name] < self._PROVIDER_RATE_LIMIT_TTL_S
+                    )
                 }
 
                 # Explicit override: honour if eligible, else fall through to default selection
@@ -1581,20 +1708,20 @@ class CognitionEngine:
                     reason = "explicit_override"
                     # alpha_vantage is a data API, not an LLM — tag for audit but keep local
                     if chosen == "alpha_vantage":
-                        return {
+                        return _d({
                             "use_external": False, "provider": "alpha_vantage",
                             "adapter": self._PROVIDER_ADAPTERS.get("alpha_vantage", ""),
                             "score": round(score, 3), "penalised_score": round(penalised, 3),
                             "explicit": True, "force_local": False,
                             "reason": "alpha_vantage_data_api",
-                        }
-                    return {
+                        })
+                    return _d({
                         "use_external": True, "provider": chosen,
                         "adapter": self._PROVIDER_ADAPTERS.get(chosen, ""),
                         "score": round(score, 3), "penalised_score": round(penalised, 3),
                         "explicit": True, "force_local": False,
                         "reason": reason,
-                    }
+                    })
 
                 # Task-type preferred LLM provider (e.g. grok for news_gather/web_aware_query).
                 # Checked BEFORE alpha_vantage so grok wins for "news" queries even if
@@ -1603,25 +1730,25 @@ class CognitionEngine:
                 if preferred and preferred in eligible:
                     chosen = preferred
                     reason = f"task_type_preference({task_type})"
-                    return {
+                    return _d({
                         "use_external": True, "provider": chosen,
                         "adapter": self._PROVIDER_ADAPTERS.get(chosen, ""),
                         "score": round(score, 3), "penalised_score": round(penalised, 3),
                         "explicit": False, "force_local": False,
                         "reason": reason,
-                    }
+                    })
 
                 # Specialist data provider: alpha_vantage matches financial task_types
                 # (securities_price, fundamentals, technicals, commodities, economic_indicators).
                 # Returns use_external=False — execution engine research harness handles it.
                 if "alpha_vantage" in eligible:
-                    return {
+                    return _d({
                         "use_external": False, "provider": "alpha_vantage",
                         "adapter": self._PROVIDER_ADAPTERS.get("alpha_vantage", ""),
                         "score": round(score, 3), "penalised_score": round(penalised, 3),
                         "explicit": False, "force_local": False,
                         "reason": "alpha_vantage_data_api",
-                    }
+                    })
 
                 # Complexity-triggered selection among remaining eligible LLM providers
                 if penalised >= self._COMPLEXITY_THRESHOLD:
@@ -1629,24 +1756,24 @@ class CognitionEngine:
                     llm_eligible = {k: v for k, v in eligible.items() if k != "alpha_vantage"}
                     if llm_eligible:
                         # Free-first: groq_inference → gemini → openrouter → ollama_cloud → grok (paid last)
-                        for pref in ("groq_inference", "gemini", "openrouter", "ollama_cloud", "grok"):
+                        for pref in self._PROVIDER_QUEUE:
                             if pref in llm_eligible:
-                                return {
+                                return _d({
                                     "use_external": True, "provider": pref,
                                     "adapter": self._PROVIDER_ADAPTERS.get(pref, ""),
                                     "score": round(score, 3), "penalised_score": round(penalised, 3),
                                     "explicit": False, "force_local": False,
                                     "reason": "complexity",
-                                }
+                                })
 
                 # No eligible external provider — go local
-                return {
+                return _d({
                     "use_external": False, "provider": "local",
                     "adapter": "local",
                     "score": round(score, 3), "penalised_score": round(penalised, 3),
                     "explicit": False, "force_local": False,
                     "reason": "local_default",
-                }
+                })
 
             except Exception as e:
                 _log.warning("_routing_decision: registry lookup failed (%s) — complexity fallback", e)
@@ -1668,7 +1795,7 @@ class CognitionEngine:
             "complexity"        if penalised >= self._COMPLEXITY_THRESHOLD else
             "local_default"
         )
-        return {
+        return _d({
             "use_external":    use_external,
             "provider":        provider if use_external else "local",
             "adapter":         self._PROVIDER_ADAPTERS.get(provider if use_external else "local", "local"),
@@ -1677,7 +1804,7 @@ class CognitionEngine:
             "explicit":        explicit,
             "force_local":     False,
             "reason":          reason,
-        }
+        })
 
     async def route_cognition(
         self,

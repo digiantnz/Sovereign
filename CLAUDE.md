@@ -193,14 +193,16 @@ Two separate routing layers. Do not conflate them.
 
 #### PASS 2/3a — LLM selection for planning (registry-aware routing)
 `_routing_decision` in `cognition/engine.py` selects which provider writes the specialist's action plan:
-1. **DCL gate** — PRIVATE/SECRET → force local (checked first, always)
+1. **DCL gate** — PRIVATE/SECRET → force local (checked first, always); CONFIDENTIAL → force local unless `confidential_external_approved` session flag is set (treated as WORKSPACE_INTERNAL for eligibility checks only)
 2. **Explicit override**: `use grok/gemini/groq/openrouter|ask grok/...` → that provider if eligible in registry
 3. **task_type preference**: `web_aware_query`/`news_gather` → Grok first (real-time web access). Checked before alpha_vantage so news queries go to grok not the financial data API.
 4. **task_type specialist**: financial task_types (securities_price/fundamentals/technicals/commodities/economic_indicators) → alpha_vantage tag (use_external=False; actual call via research harness)
 5. **Complexity ≥ 0.50** → free-first order: groq_inference → gemini → openrouter → ollama_cloud → grok (paid last). Operational penalty subtracts 0.20.
-6. **Default** → local Ollama
+6. **Rate-limit check** — provider marked rate-limited (429) within TTL 3600s → skipped; next eligible provider tried
+7. **Default** → local Ollama
 Provider eligibility: `enabled=True AND task_type in task_types AND DCL_tier in eligible_classifications` (governance.json `provider_registry`). Director-approved 2026-05-21.
 Intent → task_type inference: `"research"/"web search"` → `web_aware_query`; `"news"` → `news_gather`; financial keywords → financial task_types.
+Dev-Harness exemption: Dev-Harness security analysis (`cog.security_evaluate()`) always runs locally — never routes through `_routing_decision()`. Code review must not leave the local trust boundary.
 
 #### `domain: ollama` execution — explicit-only external routing
 When `_dispatch_inner` reaches `domain: ollama`, Grok is only called on **explicit** triggers. Auto-signals are intentionally excluded to avoid firing Grok alongside RSS/browser paths PASS 1 may have already chosen.
@@ -307,7 +309,7 @@ Two distinct search contexts — do not conflate:
 
 ### Semantic memory seeding — principle
 - **Seed only for critical blind spots**: only seed domain knowledge when Rex has a complete vocabulary gap that prevents basic function (e.g. address format recognition, zero knowledge of a domain the harness depends on)
-- **Never seed conceptual relationships**: relationships between concepts (ETH ↔ staking_reward ↔ income) should emerge organically via the associative synthesis pass (`run_synthesis()` Passes 1–3, nightly 15:00 UTC), not hand-crafted entries
+- **Never seed conceptual relationships**: relationships between concepts (ETH ↔ staking_reward ↔ income) should emerge organically via the associative synthesis pass (`run_synthesis()` Passes 1–3, nightly 13:00 UTC = 01:00 NZST), not hand-crafted entries
 - **Before adding a seed**: check semantic memory first — Rex may already have the knowledge from prior conversations; hand-stitching what he already knows is expensive and bypasses the learning process
 - **Minimal footprint**: seed vocabulary and format recognition; leave reasoning and relationship-building to synthesis
 
@@ -315,8 +317,9 @@ Two distinct search contexts — do not conflate:
 - `find_active_by_title()` uses ALL-word matching (≥5 chars) — not ANY — to avoid false dedup positives where unrelated tasks share a single common word (e.g. "nightly")
 - If no words in the title meet the ≥5-char threshold, the match returns no results — do not fall back to ANY-word matching. The caller must handle an empty result as 'not found'.
 - `seed_nightly_synthesis_task()` idempotency: checks PROCEDURAL for `intent=memory_synthesise` step; falls through to `store_task` if not found; `store_task` ALL-match dedup is the second gate
-- Synthesis cron: `0 15 * * *` (15:00 UTC = 03:00 NZST) — runs Passes 1–3 of `run_synthesis()` (episodic scan → associative/relational); structural Pass 4 fires inline on every semantic write (no schedule needed)
-- Associative memory (`associative` collection) is populated ONLY by `run_synthesis()` Passes 1–3 — not by structural Pass 4, not by curate, not by seeding
+- Synthesis cron: `0 13 * * *` (13:00 UTC = 01:00 NZST) — runs Passes 1–3 of `run_synthesis()` (episodic scan → associative/relational) only; Pass 4 structural synthesis is a **separate continuous background task** (see below)
+- Associative memory (`associative` collection) is populated ONLY by `run_synthesis()` Passes 1–3 — not by structural synthesis, not by curate, not by seeding
+- **Structural synthesis background task** (`run_structural_loop()` in `memory/synthesis.py`): started as a named asyncio task (`structural_synthesis_loop`) in `main.py` lifespan, cancelled on shutdown. Processes 20 un-stamped semantic entries per chunk → saves cursor to `meta:memory-synthesis:structural-cursor` in META (RAID-durable, survives reboots) → sleeps 30s → repeats. Skips entries already stamped `_structural_synthesised_ts`. Idles at 3600s when all entries are stamped. Similarity threshold 0.65 (was 0.5), top-K neighbours 5 (was 8). Scoped synthesis (`synthesise_structural(key=<new_key>)`) still fires on every new semantic write via `asyncio.create_task()` and also stamps processed entries — the background loop only attacks un-stamped (unvisited) entries.
 
 ## Pending Director Decisions
 
@@ -416,6 +419,8 @@ The following items require Director input before CC can implement them. Do not 
 | Memory-Consultation-Pass | **COMPLETE** | PASS 0 in `execution/engine.py` `handle_chat()`. `_memory_consultation_pass()`: deterministic working_memory scroll (no LLM), keyword relevance scoring, top-15 ranked (slot priority + term overlap), formatted as COGNITIVE CONTEXT block injected into PASS 1 prompt via `prompts.classify(cognitive_context=...)`. Timing: 7-14ms typical (target <100ms, WARNING >200ms). Wired: `handle_chat` → `orchestrator_classify(cognitive_context=)` → `ceo_classify(cognitive_context=)` → `prompts.classify(cognitive_context=)`. 2026-04-17. |
 | Director-Fact-Capture | **COMPLETE** | Auto-detection of Director-provided structured facts in `_quick_classify`. Five detection conditions: (1) 2+ airline codes, (2) 1 flight + hotel keyword, (3) hotel block >200 chars + multiline, (4) 1 flight + city-to-city route OR HH:MM time range + multiline, (5) Air NZ app share header "Here are my flight details" + multiline, (6) Booking.com share "I just booked...PIN code" pattern. Flight regex allows single-digit codes (`\d{1,4}` — covers NZ1, NZ6, QF1 etc). Topic extraction: `_booking_share` extracts hotel name + `bn=` ref from URL; else city extraction from curated list; fallback in `_dispatch_inner` derives topic from `Hotel:` line or city names in fact content. `_dispatch_inner` forces `human_confirmed=True` + `extra_metadata={"source": "director_provided"}`. Confirmation: "Stored your Doubletree By Hilton New York Times Square West." 2026-05-14. |
 | Travel-Fact-Fixes | **COMPLETE** | (1) `governance/engine.py`: added `elif domain == 'memory_synthesise':` handler — "run nightly memory synthesis" was governance-blocked. (2) `monitoring/learning_harness.py`: `asyncio.TimeoutError` now caught explicitly with message "Ollama timed out on cycle N (pass_type) — GPU busy" instead of empty string. Notes quality gate: skip notes < 80 chars (writes `skipped_too_short` sentinel). (3) `main.py`: `/chat` endpoint wrapped in try/except catching `httpx.ReadTimeout`, `httpcore.ReadTimeout`, generic Exception — returns graceful JSON instead of HTTP 500. (4) `_quick_classify`: skill install false-positive fix — `"skill" in u` guard prevents "add a note to NextCloud" misrouting to skill install when `prior_domain=="skills"`. 2026-05-14. |
+| Provider-Routing | **COMPLETE** | Full 8-task provider routing overhaul. 5 external LLM providers active (Groq Inference, Gemini, OpenRouter, Ollama Cloud, Grok — free-first, paid last). `_routing_decision()` rewritten with registry-aware queue, task_type preference (Grok for news_gather/web_aware_query), CONFIDENTIAL session-flag gate (`confidential_external_approved`), rate-limit TTL (3600s). `session_flag_set` intent (LOW tier, Director-activatable). All 3 harnesses (news, research, portfolio) converted from direct `ask_grok()` to routed dispatch. 8 MIP provider seeds added. CLAUDE.md routing invariants updated. `EXTERNAL_COGNITION.md` added to soul guardian RESTORABLE. 2026-05-22/23. |
+| Memory-Synthesis-Redesign | **COMPLETE** | Extracted Pass 4 structural synthesis from the nightly `run_synthesis()` job into `run_structural_loop()` — a continuous asyncio background task started at boot, never scheduled. Processes 20 un-stamped SEMANTIC entries per chunk; saves cursor to `meta:memory-synthesis:structural-cursor` (META collection, RAID-durable) after each chunk so progress survives reboots. Stamps each processed entry `_structural_synthesised_ts` to avoid re-doing. Sleeps 30s between active chunks, 3600s when idle (all entries stamped). Similarity threshold raised 0.5→0.65, top-K neighbours reduced 8→5 (~74% fewer LLM pairs per entry). Scoped synthesis on every `qdrant.store()` also stamps entries, so new writes are never re-processed by the background loop. Nightly job now runs Passes 1–3 only. Eliminates the prior pattern where a full 7,000+ entry scan blocked the cognitive loop for 80+ hours per cycle. 2026-05-25. |
 
 Full phase history: `docs/CLAUDE-archive.md`
 

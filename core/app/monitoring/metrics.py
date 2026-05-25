@@ -25,7 +25,7 @@ GROK_URL           = "https://api.x.ai/v1"
 GEMINI_URL         = "https://generativelanguage.googleapis.com"
 GROQ_URL           = "https://api.groq.com"
 OPENROUTER_URL     = "https://openrouter.ai/api/v1"
-OLLAMA_CLOUD_URL   = "https://api.ollama.com"
+OLLAMA_CLOUD_URL   = "https://ollama.com"
 
 AUDIT_PATH    = "/home/sovereign/audit/security-ledger.jsonl"
 SOVEREIGN_CONTAINERS = [
@@ -321,7 +321,7 @@ async def _probe_ollama_cloud() -> tuple[str, dict]:
         t0 = time.monotonic()
         async with httpx.AsyncClient(timeout=6.0) as client:
             r = await client.get(
-                f"{OLLAMA_CLOUD_URL}/v1/models",
+                f"{OLLAMA_CLOUD_URL}/api/tags",
                 headers={"Authorization": f"Bearer {key}"} if key else {},
             )
         ok = r.status_code < 500

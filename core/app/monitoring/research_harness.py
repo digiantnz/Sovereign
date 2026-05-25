@@ -285,6 +285,60 @@ async def _gather_finance(nanobot, finance_url: str) -> tuple[str, str | None]:
         return "", str(exc)
 
 
+async def _gather_alpha_vantage(ticker: str) -> tuple[str, str | None]:
+    """Fetch company fundamentals from Alpha Vantage OVERVIEW endpoint.
+    Returns formatted string with P/E, EPS, market cap, margins, growth rates."""
+    import os
+    import httpx as _httpx
+    api_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+    if not api_key:
+        return "", "ALPHA_VANTAGE_API_KEY not configured"
+    try:
+        async with _httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                "https://www.alphavantage.co/query",
+                params={"function": "OVERVIEW", "symbol": ticker, "apikey": api_key},
+            )
+            r.raise_for_status()
+            ov = r.json()
+        # Rate limit / no data guards
+        if ov.get("Note") or ov.get("Information"):
+            return "", ov.get("Note") or ov.get("Information")
+        if not ov.get("Symbol"):
+            return "", f"no data for {ticker}"
+        parts = []
+        desc = ov.get("Description", "")
+        if desc and desc != "None":
+            parts.append(f"**Overview:** {desc[:300]}")
+        metrics = [
+            ("MarketCapitalization", "Mkt Cap"),
+            ("PERatio",              "P/E"),
+            ("ForwardPE",            "Fwd P/E"),
+            ("EPS",                  "EPS"),
+            ("PriceToBookRatio",     "P/B"),
+            ("DividendYield",        "Div Yield"),
+            ("ProfitMargin",         "Net Margin"),
+            ("OperatingMarginTTM",   "Op Margin"),
+            ("RevenueTTM",           "Revenue TTM"),
+            ("52WeekHigh",           "52W High"),
+            ("52WeekLow",            "52W Low"),
+            ("AnalystTargetPrice",   "Analyst Target"),
+            ("QuarterlyEarningsGrowthYOY",  "EPS Growth YoY"),
+            ("QuarterlyRevenueGrowthYOY",   "Rev Growth YoY"),
+        ]
+        lines = [
+            f"{label}: {ov[key]}"
+            for key, label in metrics
+            if ov.get(key) and ov[key] not in ("None", "-", "")
+        ]
+        if lines:
+            parts.append("**Alpha Vantage Fundamentals:**\n" + " | ".join(lines))
+        return "\n\n".join(parts)[:2000], None
+    except Exception as exc:
+        logger.warning("research_harness: alpha_vantage failed: %s", exc)
+        return "", str(exc)
+
+
 async def _gather_grok(cog, topic: str) -> tuple[str, str | None]:
     try:
         prompt = (
@@ -292,12 +346,24 @@ async def _gather_grok(cog, topic: str) -> tuple[str, str | None]:
             "Include: recent price action narrative, key bull/bear factors, notable news this week. "
             "Factual and concise — 3–5 sentences."
         )
-        result = await cog.ask_grok(prompt, agent="research_agent")
+        _decision = cog._routing_decision(prompt, user_input=topic, task_type="web_aware_query")
+        if _decision["use_external"]:
+            _dispatch_map = {
+                "grok":           cog.ask_grok,
+                "gemini":         cog.ask_gemini,
+                "groq_inference": cog.ask_groq_inf,
+                "openrouter":     cog.ask_openrouter,
+                "ollama_cloud":   cog.ask_ollama_cloud,
+            }
+            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
+            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
+        else:
+            result = await cog.ask_local(prompt)
         if result.get("error"):
             return "", result["error"]
         return result.get("response", ""), None
     except Exception as exc:
-        logger.warning("research_harness: Grok enrichment failed: %s", exc)
+        logger.warning("research_harness: web enrichment failed: %s", exc)
         return "", str(exc)
 
 
@@ -348,9 +414,21 @@ Write the full report first, then the JSON. Be factual — never fabricate data 
 
     try:
         from adapters.inference_queue import InferenceQueue
-        result = await cog.ask_local(
-            prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT
-        )
+        _decision = cog._routing_decision(prompt, user_input=topic, task_type="llm_generate")
+        if _decision["use_external"]:
+            _dispatch_map = {
+                "grok":           cog.ask_grok,
+                "gemini":         cog.ask_gemini,
+                "groq_inference": cog.ask_groq_inf,
+                "openrouter":     cog.ask_openrouter,
+                "ollama_cloud":   cog.ask_ollama_cloud,
+            }
+            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
+            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
+        else:
+            result = await cog.ask_local(
+                prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT
+            )
         if result.get("status") == "llm_timeout":
             logger.error("research_harness: synthesis timed out after %.0fs", _SYNTHESIS_TIMEOUT)
             return {
@@ -420,6 +498,33 @@ async def _write_episodic(qdrant, topic: str, domain_scope: str,
         )
     except Exception as exc:
         logger.warning("research_harness: episodic write failed: %s", exc)
+
+
+async def _write_research_semantic(
+    qdrant, topic: str, domain_scope: str,
+    note_id: str | None, note_title: str,
+    full_report: str, confidence: str, report_date: str,
+) -> None:
+    try:
+        slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:48]
+        await qdrant.store(
+            collection="semantic",
+            content=full_report,
+            metadata={
+                "type":         "semantic",
+                "domain":       "research",
+                "_key":         f"semantic:research:{slug}",
+                "topic":        topic,
+                "domain_scope": domain_scope,
+                "note_id":      note_id,
+                "note_title":   note_title,
+                "confidence":   confidence,
+                "report_date":  report_date,
+                "event_type":   "research_note_saved",
+            },
+        )
+    except Exception as exc:
+        logger.warning("research_harness: semantic write failed: %s", exc)
 
 
 # ── Intent classifier ────────────────────────────────────────────────────────
@@ -801,9 +906,21 @@ Provide:
 Output a structured research report."""
 
     try:
-        result = await cog.ask_local(
-            prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT,
-        )
+        _decision = cog._routing_decision(prompt, user_input=topic, task_type="llm_generate")
+        if _decision["use_external"]:
+            _dispatch_map = {
+                "grok":           cog.ask_grok,
+                "gemini":         cog.ask_gemini,
+                "groq_inference": cog.ask_groq_inf,
+                "openrouter":     cog.ask_openrouter,
+                "ollama_cloud":   cog.ask_ollama_cloud,
+            }
+            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
+            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
+        else:
+            result = await cog.ask_local(
+                prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT,
+            )
         if result.get("status") == "llm_timeout":
             return {
                 "full_report":      f"# {topic}\n\nSynthesis timed out.",
@@ -888,15 +1005,18 @@ async def run_research_gather(cog, nanobot, qdrant,
         nzx_url     = _build_nzx_url(ticker, topic)
         grok_query  = f"{security_name} market sentiment and recent analyst commentary"
 
-        # Parallel: two browser queries + Yahoo Finance + Grok + optional NZX.com
+        # Parallel: two browser queries + Yahoo Finance + Grok + NZX.com + Alpha Vantage
         finance_coro = _gather_finance(nanobot, finance_url) if finance_url else _no_data()
         nzx_coro     = _gather_browser(nanobot, nzx_url) if nzx_url else _no_data()
-        res_a, res_b, res_f, res_g, res_nzx = await asyncio.gather(
+        av_ticker    = _resolve_yahoo_ticker(ticker, topic)  # use US/ASX ticker for AV
+        av_coro      = _gather_alpha_vantage(av_ticker) if av_ticker else _no_data()
+        res_a, res_b, res_f, res_g, res_nzx, res_av = await asyncio.gather(
             _gather_browser(nanobot, query_a),
             _gather_browser(nanobot, query_b),
             finance_coro,
             _gather_grok(cog, grok_query),
             nzx_coro,
+            av_coro,
             return_exceptions=True,
         )
         def _safe(r, label: str) -> tuple[str, str | None]:
@@ -904,20 +1024,24 @@ async def run_research_gather(cog, nanobot, qdrant,
                 return "", str(r)
             return r  # already (text, err)
 
-        res_a, res_b, res_f, res_g, res_nzx = (
+        res_a, res_b, res_f, res_g, res_nzx, res_av = (
             _safe(res_a, "browser_a"), _safe(res_b, "browser_b"),
             _safe(res_f, "yahoo_finance"), _safe(res_g, "grok"),
-            _safe(res_nzx, "nzx"),
+            _safe(res_nzx, "nzx"), _safe(res_av, "alpha_vantage"),
         )
         browser_content = "\n\n".join(t for t in [res_a[0], res_b[0]] if t)
         browser_err     = res_a[1] or res_b[1]
-        # Merge Yahoo Finance + NZX.com data into a single finance block
-        finance_parts   = [p for p in [res_f[0], res_nzx[0]] if p]
+        # Merge Yahoo Finance + NZX.com + Alpha Vantage into a single finance block
+        finance_parts   = [p for p in [res_f[0], res_nzx[0], res_av[0]] if p]
         finance_data    = "\n\n---\n\n".join(finance_parts)
         finance_err     = res_f[1] if not res_f[0] else None
         grok_context    = res_g[0]
         if res_nzx[0]:
             sources_ok.append("nzx")
+        if res_av[0]:
+            sources_ok.append("alpha_vantage")
+        elif res_av[1]:
+            sources_failed.append(f"alpha_vantage: {res_av[1]}")
 
     else:
         # financial_topic or general — single browser query
@@ -1060,13 +1184,19 @@ async def run_research_save(cog, nanobot, qdrant) -> dict:
     if isinstance(result, dict):
         note_id = result.get("id") or result.get("note_id")
 
-    gather_info = cp.get("step_results", {}).get("gather", {})
+    gather_info  = cp.get("step_results", {}).get("gather", {})
+    _domain      = gather_info.get("domain_scope", "general")
+    _confidence  = synth.get("confidence", "")
+    _note_id_str = str(note_id) if note_id else None
     asyncio.create_task(_write_episodic(
-        qdrant, topic,
-        gather_info.get("domain_scope", "general"),
-        synth.get("confidence", ""),
+        qdrant, topic, _domain, _confidence,
         gather_info.get("sources_ok", []),
-        str(note_id) if note_id else None,
+        _note_id_str,
+    ))
+    asyncio.create_task(_write_research_semantic(
+        qdrant, topic, _domain,
+        _note_id_str, note_title,
+        synth["full_report"], _confidence, report_date,
     ))
     await _clear_checkpoint(qdrant)
 

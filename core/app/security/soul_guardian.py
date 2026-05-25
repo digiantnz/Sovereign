@@ -36,9 +36,13 @@ CHECKSUM_PATH = "/home/sovereign/security/.checksums.json"
 
 # Files that support auto-restore from a known backup.
 # Backup is written in record_baseline() — guaranteed to exist after first startup.
+EXTERNAL_COGNITION_PATH        = "/home/sovereign/governance/EXTERNAL_COGNITION.md"
+EXTERNAL_COGNITION_BACKUP_PATH = "/home/sovereign/governance/soul-backup/EXTERNAL_COGNITION.md"
+
 RESTORABLE: dict[str, str] = {
-    SOUL_MD_PATH:     SOUL_BACKUP_PATH,
-    GOVERNANCE_PATH:  GOVERNANCE_BACKUP_PATH,
+    SOUL_MD_PATH:              SOUL_BACKUP_PATH,
+    GOVERNANCE_PATH:           GOVERNANCE_BACKUP_PATH,
+    EXTERNAL_COGNITION_PATH:   EXTERNAL_COGNITION_BACKUP_PATH,
 }
 
 

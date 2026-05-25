@@ -80,6 +80,7 @@ _CANONICAL_KEY_PREFIXES = (
     "semantic:networking:",
     "semantic:infrastructure:",
     "semantic:governance:",
+    "semantic:provider:",
 )
 
 # ── Query type classification ─────────────────────────────────────────────

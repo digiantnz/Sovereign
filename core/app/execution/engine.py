@@ -85,8 +85,9 @@ INTENT_ACTION_MAP = {
     "ingest_folder":  {"domain": "ncingest", "operation": "ingest",  "name": "ingest_folder"},
     "ingest_status":  {"domain": "ncingest", "operation": "status",  "name": "ingest_status"},
     # cognitive skills — specialist synthesis, no external dispatch
-    "session_wrap_up": {"domain": "session",       "operation": "wrap_up", "name": "session_wrap_up"},
-    "memory_curate":   {"domain": "memory_curate", "operation": "curate",  "name": "memory_curate"},
+    "session_wrap_up":  {"domain": "session",       "operation": "wrap_up",    "name": "session_wrap_up"},
+    "session_flag_set": {"domain": "session",       "operation": "set_flag"},
+    "memory_curate":    {"domain": "memory_curate", "operation": "curate",     "name": "memory_curate"},
     "fetch_email":        {"domain": "mail",   "operation": "read",    "name": "nc_list_unread"},
     "search_email":       {"domain": "mail",   "operation": "search",  "name": "nc_search"},
     "move_email":         {"domain": "mail",   "operation": "move",    "name": "nc_move"},
@@ -254,7 +255,7 @@ INTENT_TIER_MAP = {
     "ncfs_tag": "LOW", "ncfs_untag": "LOW",
     # sovereign-nextcloud-ingest tiers — MID because memory write follows confirmation
     "ingest_file": "MID", "ingest_folder": "MID", "ingest_status": "LOW",
-    "session_wrap_up": "LOW", "memory_curate": "LOW",
+    "session_wrap_up": "LOW", "session_flag_set": "LOW", "memory_curate": "LOW",
     "fetch_email": "LOW", "search_email": "LOW", "fetch_message": "LOW",
     "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
     "read_feed": "LOW",
@@ -1310,18 +1311,20 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Explicit web search phrase — deterministic direct-to-browser",
         }
 
-    # Explicit Grok/Claude provider request — must be checked BEFORE _time_signals so that
+    # Explicit provider request — must be checked BEFORE _time_signals so that
     # "ask grok about the latest X" doesn't get sidetracked to web_search by "latest".
     import re as _re_xprov
     _XPROV_RE = _re_xprov.compile(
-        r'\b(use grok|ask grok|via grok|use claude|ask claude|via claude)\b',
+        r'\b(use grok|ask grok|via grok|use claude|ask claude|via claude'
+        r'|use gemini|ask gemini|via gemini|use groq|ask groq|via groq'
+        r'|use openrouter|ask openrouter|use ollama.?cloud|ask ollama.?cloud)\b',
         _re_xprov.IGNORECASE,
     )
     if _XPROV_RE.search(u):
         return {
             "intent": "query", "delegate_to": "research_agent",
             "tier": "LOW", "confidence": 0.95,
-            "reasoning_summary": "Explicit external provider request — routes to domain:ollama for Grok/Claude dispatch",
+            "reasoning_summary": "Explicit external provider request — routes to domain:ollama for provider dispatch",
         }
 
     # ── News brief — before _time_signals so "what's the latest news" etc. aren't
@@ -1426,6 +1429,15 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Explicit research phrase — research harness",
         }
 
+    # Bare "research <topic>" prefix — covers NL queries and the /research gateway command
+    # (which sends "research {topic}" to /chat). Exclude "research that" (pronoun reference).
+    if u.startswith("research ") and not u.startswith("research that"):
+        return {
+            "delegate_to": "research_agent", "intent": "research_gather",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Research prefix — deterministic research_gather pre-classifier",
+        }
+
     import re as _re_fp
     _has_file_path = bool(_re_fp.search(r"(?:^|\s)/[A-Za-z0-9_./-]+", user_input))
     _has_calendar_signal = any(w in u for w in ("calendar", "event", "schedule", "appointment"))
@@ -1495,6 +1507,21 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Nanobot/Nextcloud skill query — deterministic skill_audit pre-classifier",
         }
 
+    # ── Financial quote / commodity price — before conversational guard ──────
+    # Routes to research_gather so the financial_topic path (Yahoo Finance / AV) handles it.
+    _fin_quote_kw = (
+        "quote for", "stock quote", "share price", "stock price", "price of shares",
+        "gold price", "silver price", "price of gold", "price of silver",
+        "commodity price", "oil price", "price of oil", "gas price",
+        "get me a quote", "get a quote",
+    )
+    if any(w in u for w in _fin_quote_kw):
+        return {
+            "delegate_to": "research_agent", "intent": "research_gather",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Financial quote/commodity price — deterministic research_gather routing",
+        }
+
     # ── Portfolio analysis save/clear shortcuts — before conversational guard ─
     _portfolio_save_kw = any(p in u for p in ("save portfolio", "save the portfolio", "portfolio save"))
     _portfolio_clear_kw = any(p in u for p in ("clear portfolio", "clear portfolio analysis", "discard portfolio"))
@@ -1506,6 +1533,19 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         return {"intent": "portfolio_analysis_clear", "domain": "portfolio_analysis", "operation": "clear",
                 "delegate_to": "business_agent", "tier": "LOW", "confidence": 0.99,
                 "reasoning_summary": "Portfolio clear shortcut — deterministic pre-classifier"}
+
+    # ── Session flag approval — before conversational guard ──────────────────
+    _session_flag_kw = (
+        "approve external", "allow external providers", "confidential external approved",
+        "approve external llm", "allow external llm", "enable external providers",
+        "external providers approved", "approve external access",
+    )
+    if any(p in u for p in _session_flag_kw):
+        return {
+            "intent": "session_flag_set", "domain": "session", "operation": "set_flag",
+            "delegate_to": "devops_agent", "tier": "LOW", "confidence": 0.99,
+            "reasoning_summary": "Director approving external LLM access for CONFIDENTIAL content",
+        }
 
     if not prior_has_system and not any(sig in u for sig in _system_signals) and not _note_suffix and not _please_prefix:
         return {
@@ -3694,7 +3734,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis"):
+        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
                 _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok)\b',           _re_sc.IGNORECASE)
@@ -3712,30 +3752,40 @@ class ExecutionEngine:
                     '', user_input, flags=_re_sc.IGNORECASE,
                 ).strip(" ,;:—-")
                 _sc_prompt = _sc_clean or user_input  # fallback if strip empties the string
+                _sc_provider_labels = {
+                    "grok": "Grok", "claude": "Claude", "gemini": "Gemini",
+                    "groq_inference": "Groq", "openrouter": "OpenRouter", "ollama_cloud": "Ollama Cloud",
+                }
+                def _sc_extract(routed: dict, label: str) -> str:
+                    err = routed.get("error")
+                    resp = routed.get("response", "")
+                    if err or not resp:
+                        return f"{label} is temporarily unavailable — it may be rate-limited or offline."
+                    return resp
                 if _SC_GROK_RE.search(user_input):
                     _sc_routed = await self.cog.route_cognition(
                         _sc_prompt, agent="research_agent", provider="grok", user_input=_sc_prompt)
-                    conv_text = _sc_routed.get("response", "")
+                    conv_text = _sc_extract(_sc_routed, "Grok")
                 elif _SC_CLAUDE_RE.search(user_input):
                     _sc_routed = await self.cog.route_cognition(
                         _sc_prompt, agent="research_agent", provider="claude", user_input=_sc_prompt)
-                    conv_text = _sc_routed.get("response", "")
+                    conv_text = _sc_extract(_sc_routed, "Claude")
                 elif _SC_GEMINI_RE.search(user_input):
                     _sc_routed = await self.cog.route_cognition(
                         _sc_prompt, agent="research_agent", provider="gemini", user_input=_sc_prompt)
-                    conv_text = _sc_routed.get("response", "")
+                    conv_text = _sc_extract(_sc_routed, "Gemini")
                 elif _SC_GROQ_RE.search(user_input):
                     _sc_routed = await self.cog.route_cognition(
                         _sc_prompt, agent="research_agent", provider="groq_inference", user_input=_sc_prompt)
-                    conv_text = _sc_routed.get("response", "")
+                    conv_text = _sc_extract(_sc_routed, "Groq")
                 elif _SC_OPENROUTER_RE.search(user_input):
                     _sc_routed = await self.cog.route_cognition(
                         _sc_prompt, agent="research_agent", provider="openrouter", user_input=_sc_prompt)
-                    conv_text = _sc_routed.get("response", "")
+                    conv_text = _sc_extract(_sc_routed, "OpenRouter")
                 elif _SC_OLLAMACLOUD_RE.search(user_input):
                     _sc_routed = await self.cog.route_cognition(
                         _sc_prompt, agent="research_agent", provider="ollama_cloud", user_input=_sc_prompt)
-                    conv_text = _sc_routed.get("response", "")
+                    conv_text = _sc_extract(_sc_routed, "Ollama Cloud")
                 else:
                     conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
                     conv_text = conv_result.get("response", "")
@@ -3794,6 +3844,21 @@ class ExecutionEngine:
                         },
                         "director_message": exec_result.get("director_message", "Research complete. Save to Nextcloud Notes?"),
                     }
+                if exec_result.get("status") == "stale_checkpoint":
+                    # Stale checkpoint: surface the director_message directly, no confirmation gate
+                    return {
+                        "status": "ok", "intent": intent, "tier": tier, "agent": agent,
+                        "confidence": round(confidence, 3), "gaps": gaps,
+                        "director_message": exec_result.get("director_message", "There is a pending research result. Say 'save research' to save or 'clear research' to discard."),
+                    }
+                _rft = self._build_result_for_translator(intent, exec_result)
+            elif intent == "session_flag_set":
+                exec_result = await self._dispatch(
+                    action, None,
+                    delegation={**delegation, "intent": intent},
+                    specialist={},
+                    payload={"confirmed": confirmed},
+                )
                 _rft = self._build_result_for_translator(intent, exec_result)
             else:
                 exec_result = await self._dispatch(action, user_input,
@@ -4154,7 +4219,7 @@ class ExecutionEngine:
             "wallet_add_address", "wallet_remove_address", "wallet_update_address",
             "wallet_sign_btc_psbt", "wallet_create_btc_psbt",
             # cognitive skills — specialist synthesis passes directly to translator
-            "session_wrap_up", "memory_curate",
+            "session_wrap_up", "session_flag_set", "memory_curate",
             # Memory synthesis — structured result passes directly to translator
             "memory_synthesise",
         })
@@ -5063,11 +5128,22 @@ class ExecutionEngine:
         tax_year = delegation.get("tax_year") or ""
         harness  = TaxReportHarness(self.cog, self.nanobot, self.qdrant, tax_year or None)
         result   = await harness.run(user_input=user_input, confirmed=confirmed)
-        return {
-            "status":           result.get("status", "ok"),
-            "director_message": result.get("response", ""),
+        status   = result.get("status", "ok")
+        # Steps awaiting user input must set requires_confirmation so the gateway
+        # routes the next free-text message back to this harness instead of NL.
+        needs_reply = status in ("awaiting_csv_names", "awaiting_confirm")
+        pending_del = {**delegation, "_harness_cmd": "tax_report"}
+        response_text = result.get("response", "")
+        out = {
+            "status":           status,
+            "director_message": response_text,
+            "summary":          response_text,
             "_translator_bypass": True,
         }
+        if needs_reply:
+            out["requires_confirmation"] = True
+            out["pending_delegation"]    = pending_del
+        return out
 
     # ── Cognitive loop helpers ───────────────────────────────────────────────
 
@@ -6197,6 +6273,26 @@ class ExecutionEngine:
 
         # ── Cognitive skills — specialist synthesis, no external dispatch ──────
         if domain == "session":
+            if operation == "set_flag":
+                self.cog.set_session_flag("confidential_external_approved", True)
+                import asyncio as _asyncio_sf
+                if self.qdrant:
+                    _asyncio_sf.create_task(self.qdrant.store(
+                        content="Director approved external LLM provider access for CONFIDENTIAL content this session.",
+                        metadata={
+                            "type": "episodic", "intent": "session_flag_set",
+                            "flag": "confidential_external_approved", "value": True,
+                        },
+                        collection="episodic",
+                        writer="sovereign-core",
+                    ))
+                return {
+                    "status": "ok",
+                    "flag":    "confidential_external_approved",
+                    "value":   True,
+                    "message": "External provider access approved for CONFIDENTIAL content this session.",
+                }
+            # session_wrap_up (operation == "wrap_up")
             sp = specialist or {}
             return {
                 "status":               "ok",

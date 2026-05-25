@@ -17,6 +17,7 @@ from security.guardrail import GuardrailEngine
 from monitoring.metrics import collect_all
 from monitoring.scheduler import start_scheduler, start_archive_sync, start_observe_loop
 from monitoring.learning_harness import start_learning_loop, check_downloads
+from memory.synthesis import run_structural_loop as _run_structural_loop
 from monitoring.eth_watcher import start_eth_watcher
 from skills.loader import scan_all_skills
 from skills.lifecycle import load_skill_watchlist
@@ -495,7 +496,7 @@ async def lifespan(app: FastAPI):
     try:
         from memory.semantic_seeds import (
             build_intent_seeds, build_skill_seeds, build_harness_seeds,
-            build_tax_address_seeds, build_crypto_domain_seeds,
+            build_tax_address_seeds, build_crypto_domain_seeds, build_provider_seeds,
         )
         from execution.engine import INTENT_ACTION_MAP as _IAM
         _sem_seeds = (
@@ -504,6 +505,7 @@ async def lifespan(app: FastAPI):
             + build_harness_seeds()
             + build_tax_address_seeds()
             + build_crypto_domain_seeds()
+            + build_provider_seeds()
         )
         _sem_audit = await qdrant.seed_intent_semantic_entries(_sem_seeds)
         logger.info(
@@ -599,6 +601,14 @@ async def lifespan(app: FastAPI):
     # trigger a structural synthesis task. From this point on, every semantic write
     # fires synthesise_structural(key=<new_key>) as a background asyncio task.
     qdrant.set_cog(app.state.cog)
+    # Start continuous background structural synthesis loop. Runs indefinitely:
+    # load cursor (META, RAID-durable) → process N=20 un-stamped semantic entries
+    # → save cursor → sleep 30s. Resumes from cursor across reboots. Idles at
+    # 3600s when all entries are stamped; wakes to process new arrivals.
+    _structural_loop_task = asyncio.create_task(
+        _run_structural_loop(qdrant, app.state.cog),
+        name="structural_synthesis_loop",
+    )
     app.state.exec     = ExecutionEngine(
         app.state.gov, app.state.cog, qdrant,
         scanner=scanner, guardrail=guardrail, ledger=ledger,
@@ -719,6 +729,7 @@ async def lifespan(app: FastAPI):
     _task_scheduler_task.cancel()
     _archive_sync_task.cancel()
     _si_observe_task.cancel()
+    _structural_loop_task.cancel()
     await inference_queue.stop()
     # Promote eligible working_memory entries to RAID sovereign collections before shutdown.
     # Entries not promoted here are lost on container exit (known acceptable risk —

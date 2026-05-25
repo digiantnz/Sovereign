@@ -366,10 +366,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _dispatch_and_reply(payload, saved or text, chat_id, context.bot, session)
             return
         elif text.lower() in ("no", "n", "cancel"):
+            _cancelled_delegation = session.pending_delegation or {}
             session.awaiting_confirmation = False
             session.pending_delegation = None
             session.pending_input = None
+            # Clear stateful harness checkpoint so next invocation starts fresh
+            if _cancelled_delegation.get("_harness_cmd") == "tax_report":
+                try:
+                    import httpx as _hx
+                    async with _hx.AsyncClient(timeout=5.0) as _cl:
+                        await _cl.post(
+                            "http://sovereign-core:8000/chat",
+                            json={
+                                "input": "cancel",
+                                "_harness_cmd": "tax_report",
+                                "pending_delegation": _cancelled_delegation,
+                            },
+                        )
+                except Exception:
+                    pass
             await update.message.reply_text("Cancelled.")
+            return
+        elif (session.pending_delegation or {}).get("_harness_cmd") == "tax_report":
+            # Tax report harness: free-text at awaiting_csv_names step — route directly to harness
+            _del = session.pending_delegation or {}
+            payload = {
+                "input":              text,
+                "_harness_cmd":       "tax_report",
+                "pending_delegation": _del,
+                "confirmed":          False,
+                "context_window":     session.history,
+            }
+            # Don't clear awaiting_confirmation — harness will re-set it if another reply is needed
+            session.awaiting_confirmation = False
+            session.pending_delegation = None
+            session.pending_input = None
+            await _dispatch_and_reply(payload, text, chat_id, context.bot, session)
             return
         else:
             # New substantive message — cancel the stale pending confirmation and process fresh

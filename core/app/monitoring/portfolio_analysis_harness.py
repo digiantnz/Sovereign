@@ -755,7 +755,22 @@ async def _synthesise_security(cog, spec: AssetSpec, gather_result: dict) -> dic
     #    are designed for non-securities. Until then, existing single-call path.
     prompt = _build_synthesis_prompt(spec, gather_result.get("gathered", ""))
     try:
-        result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT)
+        _decision = cog._routing_decision(
+            prompt, user_input=spec.display_name, task_type="llm_generate",
+            delegation_reason="Portfolio asset synthesis — non-sensitive after DCL gate",
+        )
+        if _decision["use_external"]:
+            _dispatch_map = {
+                "grok":           cog.ask_grok,
+                "gemini":         cog.ask_gemini,
+                "groq_inference": cog.ask_groq_inf,
+                "openrouter":     cog.ask_openrouter,
+                "ollama_cloud":   cog.ask_ollama_cloud,
+            }
+            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
+            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
+        else:
+            result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT)
     except Exception as exc:
         logger.error("portfolio_harness: synthesis error for %s: %s", spec.slug, exc)
         return {
@@ -840,7 +855,19 @@ End with this JSON block on its own line:
 {{"health_score": 7, "executive_summary": "...", "ranked_actions": ["...", "...", "..."]}}"""
 
     try:
-        result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT)
+        _decision = cog._routing_decision(prompt, user_input=category, task_type="llm_generate")
+        if _decision["use_external"]:
+            _dispatch_map = {
+                "grok":           cog.ask_grok,
+                "gemini":         cog.ask_gemini,
+                "groq_inference": cog.ask_groq_inf,
+                "openrouter":     cog.ask_openrouter,
+                "ollama_cloud":   cog.ask_ollama_cloud,
+            }
+            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
+            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
+        else:
+            result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT)
     except Exception as exc:
         logger.error("portfolio_harness: overall synthesis error: %s", exc)
         return {"health_score": 0, "executive_summary": "Overall synthesis failed.", "ranked_actions": []}

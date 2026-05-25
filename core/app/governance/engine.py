@@ -202,5 +202,9 @@ class GovernanceEngine:
                 return rules
             elif operation == 'save' and rules.get('webdav_write', False):
                 return rules
+        elif domain == 'session':
+            # Session flag operations (e.g. confidential_external_approved) — always LOW tier
+            if operation == 'set_flag':
+                return rules
 
         raise ValueError(f"Action {action} not allowed under tier {tier}")

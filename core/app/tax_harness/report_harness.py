@@ -74,8 +74,13 @@ def _in_range(timestamp: str, start: str, end: str) -> bool:
 
 
 def _resolve_tax_year_from_now() -> str:
-    """Return the current NZ financial year string."""
-    return resolve_tax_year(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    """Return the most recently *completed* NZ financial year.
+
+    FY ends 31 March each year. From 1 April onwards the previous FY is complete.
+    E.g. in May 2026: current active FY = 2027, most recently completed = 2026.
+    """
+    active = int(resolve_tax_year(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
+    return str(active - 1)
 
 
 def _nzd_decimal(nzd_str: str | None) -> Decimal | None:
@@ -106,7 +111,30 @@ class TaxReportHarness:
         Reads current checkpoint to determine which step to execute next.
         """
         checkpoint = await self._load_checkpoint()
+
+        # Discard stale checkpoint if it belongs to a different tax year
+        if checkpoint and self.tax_year:
+            ck_year = checkpoint.get("tax_year", "")
+            if ck_year and ck_year != self.tax_year:
+                logger.info(
+                    "report_harness: year changed %s→%s, clearing stale checkpoint",
+                    ck_year, self.tax_year,
+                )
+                await self._step_clear()
+                checkpoint = None
+
         current_step = (checkpoint or {}).get("current_step", "start")
+
+        # Explicit cancellation from any step
+        if (user_input or "").strip().lower() in ("cancel", "no", "n", "abort"):
+            if checkpoint:
+                await self._step_clear()
+            year = (checkpoint or {}).get("tax_year", self.tax_year)
+            return {
+                "status": "cancelled",
+                "response": f"FY{year} tax report cancelled. Run /do_tax {year} to start again.",
+                "_translator_bypass": True,
+            }
 
         if current_step == "start":
             return await self._step_query()
@@ -164,8 +192,9 @@ class TaxReportHarness:
                 "response": (
                     f"No tax events found in semantic memory for FY{year} "
                     f"(01 Apr {int(year)-1} – 31 Mar {year}). "
-                    f"Provide expense CSV filename(s) from {_TAX_YEAR_ROOT}/FY{year}/ "
-                    f"to include, or reply 'none' to proceed."
+                    f"Provide CSV filename(s) to include (comma-separated), or reply 'none' to proceed. "
+                    f"Bare filenames resolve from {_TAX_YEAR_ROOT}/FY{year}/; "
+                    f"absolute Nextcloud paths (e.g. /Digiant/Tax/25-26/file.csv) are used as-is."
                 ),
                 "_translator_bypass": True,
             }
@@ -194,8 +223,10 @@ class TaxReportHarness:
                 f"FY{year} (01 Apr {int(year)-1} – 31 Mar {year}): "
                 f"found {len(income_rows)} crypto/income record(s) and "
                 f"{len(expense_rows)} expense record(s) in memory. "
-                f"Provide expense CSV filename(s) from {_TAX_YEAR_ROOT}/FY{year}/ "
-                f"to include in the report (comma-separated), or reply 'none' to proceed."
+                f"Provide CSV filename(s) to include in the report (comma-separated), "
+                f"or reply 'none' to proceed. "
+                f"Bare filenames are resolved from {_TAX_YEAR_ROOT}/FY{year}/; "
+                f"absolute paths (e.g. /Digiant/Tax/25-26/receipts.csv) are used as-is."
             ),
             "_translator_bypass": True,
         }
@@ -228,7 +259,8 @@ class TaxReportHarness:
             filenames = [n.strip() for n in raw_names if n.strip()]
 
             for fname in filenames:
-                path = f"{folder}/{fname}"
+                # Accept absolute Nextcloud paths (starting with /) or bare filenames
+                path = fname if fname.startswith("/") else f"{folder}/{fname}"
                 try:
                     from .ingest import ingest_csv_file
                     parsed_events = await ingest_csv_file(self.nanobot, path, fname)
@@ -301,6 +333,15 @@ class TaxReportHarness:
 
         income_csv  = _build_income_csv(income_rows)
         expense_csv = _build_expense_csv(expense_rows)
+
+        # Ensure output folder exists
+        try:
+            await self.nanobot.run(
+                "sovereign-nextcloud-fs", "fs_mkdir",
+                {"path": folder},
+            )
+        except Exception as exc:
+            logger.info("report_harness: mkdir %s: %s", folder, exc)
 
         saved: list[str] = []
         errors: list[str] = []

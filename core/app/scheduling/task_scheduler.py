@@ -531,7 +531,7 @@ class TaskScheduler:
     async def seed_nightly_synthesis_task(self) -> bool:
         """Seed the nightly memory synthesis task at startup. Idempotent.
 
-        Registers a cron task (0 15 * * * — 15:00 UTC = 03:00 NZST) that runs
+        Registers a cron task (0 13 * * * — 13:00 UTC = 01:00 NZST) that runs
         memory_synthesise with no additional params.
 
         Idempotency: checks PROCEDURAL for an existing entry with
@@ -583,7 +583,7 @@ class TaskScheduler:
             "title": _TASK_TITLE,
             "schedule": {
                 "type": "cron",
-                "cron": "0 15 * * *",  # 15:00 UTC = 03:00 NZST (fixed offset, no tz lib)
+                "cron": "0 13 * * *",  # 13:00 UTC = 01:00 NZST (fixed offset, no tz lib)
             },
             "steps": [
                 {
@@ -645,17 +645,19 @@ class TaskScheduler:
                     continue
                 for _step in _pp.get("steps", []):
                     if _step.get("intent") == "tax_ingest_run":
-                        # Found — check any status (pending or active both count as seeded)
+                        # Found — pending_approval or active count as seeded; cancelled does not
                         prosp_items, _ = await self.qdrant.archive_client.scroll(
                             collection_name=PROSPECTIVE,
                             scroll_filter=Filter(must=[
                                 FieldCondition(key="task_id", match=MatchValue(value=_existing_tid)),
                             ]),
                             limit=2,
-                            with_payload=False,
+                            with_payload=True,
                             with_vectors=False,
                         )
-                        if prosp_items:
+                        live = [p for p in prosp_items
+                                if (p.payload or {}).get("status") != "cancelled"]
+                        if live:
                             logger.info(
                                 "TaskScheduler: tax ingest task already seeded (task_id=%s) — skipping",
                                 _existing_tid[:8],

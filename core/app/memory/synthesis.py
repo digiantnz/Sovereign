@@ -129,7 +129,7 @@ async def _infer_relationship(cog, payload_a: dict, payload_b: dict) -> dict | N
         return None
 
 
-async def _load_semantic_neighbours(qdrant, entry: dict, top_k: int = 8) -> list[dict]:
+async def _load_semantic_neighbours(qdrant, entry: dict, top_k: int = 5) -> list[dict]:
     """Vector-search SEMANTIC for entries similar to entry.
 
     Uses the entry's stored vector directly (fetch via scroll with_vectors=True on _key
@@ -176,7 +176,7 @@ async def _load_semantic_neighbours(qdrant, entry: dict, top_k: int = 8) -> list
             collection_name=SEMANTIC,
             query=query_vector,
             limit=top_k + 1,   # +1 in case self appears in results
-            score_threshold=0.5,
+            score_threshold=0.65,
             with_payload=True,
         )
         return [
@@ -215,29 +215,37 @@ async def _upsert_raw(qdrant, collection: str, key: str, payload: dict) -> str:
     return point_id
 
 
-async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
-    """Pass 4 — structural synthesis over semantic memory.
+async def synthesise_structural(
+    key: str = None,
+    qdrant=None,
+    cog=None,
+    max_entries: int = None,
+    start_offset: str = None,
+) -> dict:
+    """Structural synthesis over semantic memory.
 
     Discovers typed relationships between semantic knowledge entries via vector
-    similarity search (first use of vectors in synthesis.py) and LLM inference.
-    Writes relational entries with LLM-derived insight — never boilerplate.
+    similarity search and LLM inference. Writes relational/associative entries.
 
     Two modes:
         key provided — scoped: process only the named semantic entry.
-                       Called by QdrantAdapter.store() via asyncio.create_task()
-                       on every semantic write. Non-blocking invariant: store()
-                       has already succeeded before this task is scheduled.
-        key=None     — full scan: process entire SEMANTIC collection.
-                       Called by run_synthesis() as Pass 4 after Passes 1–3.
+                       Called by QdrantAdapter.store() on every semantic write.
+                       max_entries and start_offset are ignored in this mode.
+        key=None     — full scan with cursor support.
+                       Called by run_structural_loop() in N-entry chunks.
+                       start_offset: Qdrant point ID to resume from (None = beginning).
+                       max_entries:  stop after this many valid entries (None = unlimited).
+                       Returns next_offset (cursor for next call) and wrapped (True when
+                       collection is fully exhausted and cursor resets to beginning).
 
-    Failures are logged at WARNING level and to episodic memory (scan-level failures
-    only). Per-entry failures log and continue — never surface to Director.
+    Per-entry failures log and continue — never surface to Director.
 
     Args:
-        key:    _key of a semantic entry to process (None for full scan)
-        qdrant: QdrantAdapter instance (required)
-        cog:    CognitionEngine instance (required for LLM inference;
-                None → skips all inference, no relational entries written)
+        key:          _key of a semantic entry to process (None for full scan)
+        qdrant:       QdrantAdapter instance (required)
+        cog:          CognitionEngine instance (required for LLM inference)
+        max_entries:  full-scan only — max valid entries to process per call
+        start_offset: full-scan only — Qdrant point ID to resume scrolling from
     """
     from execution.adapters.qdrant import SEMANTIC, RELATIONAL, EPISODIC, ASSOCIATIVE
 
@@ -250,40 +258,57 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
         "skipped_no_cog": 0,
         "errors": 0,
     }
+    # Cursor state — returned to caller for chunked full-scan resumption
+    _next_return_offset: str | None = None
+    _wrapped: bool = False
 
     if qdrant is None:
         logger.error("synthesise_structural: qdrant required — aborting")
-        return {"status": "error", "error": "qdrant required", **stats}
+        return {"status": "error", "error": "qdrant required", "next_offset": None, "wrapped": False, **stats}
 
     # ── Load entries to process ───────────────────────────────────────────────
     entries: list[dict] = []
 
     if key:
-        # Scoped mode — single entry by key
+        # Scoped mode — single entry by key (max_entries/start_offset ignored)
         entry = await qdrant.retrieve_by_key(key)
         if entry is None or entry.get("collection") != SEMANTIC:
             logger.debug("synthesise_structural: key %r not found in SEMANTIC — skipping", key)
-            return {"status": "ok", **stats}
+            return {"status": "ok", "next_offset": None, "wrapped": False, **stats}
         entries.append(entry)
     else:
-        # Full scan mode — entire SEMANTIC collection (keyed entries only)
+        # Full scan with cursor support — keyed entries only.
+        # start_offset (None = from beginning) is the Qdrant point ID to resume after.
+        # max_entries caps entries processed this call; None = unlimited (legacy full scan).
         try:
-            offset = None
+            _scan_offset = start_offset
             while True:
-                result, next_offset = await qdrant.archive_client.scroll(
+                _batch, _scan_next = await qdrant.archive_client.scroll(
                     collection_name=SEMANTIC,
                     limit=100,
-                    offset=offset,
+                    offset=_scan_offset,
                     with_payload=True,
                     with_vectors=False,
                 )
-                for r in result:
+                if not _batch:
+                    _wrapped = True
+                    _next_return_offset = None
+                    break
+                for r in _batch:
                     p = dict(r.payload or {})
+                    # Track last point seen as cursor (even _no_key entries advance it)
+                    _next_return_offset = str(r.id)
                     if p.get("_key") and not p.get("_no_key"):
                         entries.append({"point_id": str(r.id), **p})
-                if next_offset is None:
+                    if max_entries is not None and len(entries) >= max_entries:
+                        break  # chunk limit reached mid-batch
+                if max_entries is not None and len(entries) >= max_entries:
+                    break  # exit scroll loop; cursor sits at _next_return_offset
+                if _scan_next is None:
+                    _wrapped = True
+                    _next_return_offset = None
                     break
-                offset = next_offset
+                _scan_offset = _scan_next
         except Exception as e:
             logger.error("synthesise_structural: SEMANTIC scroll failed: %s", e)
             # Write scan-level failure to episodic so Rex can recall it
@@ -309,12 +334,13 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
                 )
             except Exception:
                 pass  # episodic write failure is not surfaced
-            return {"status": "error", "error": str(e), **stats}
+            return {"status": "error", "error": str(e), "next_offset": None, "wrapped": False, **stats}
 
-    stats["semantic_processed"] = len(entries)
+    # semantic_processed counts only un-stamped entries actually processed.
+    # (len(entries) includes already-stamped ones that will be skipped.)
     if entries:
         logger.info(
-            "synthesise_structural: processing %d semantic entries (scoped=%s)",
+            "synthesise_structural: loaded %d candidates (scoped=%s)",
             len(entries), bool(key),
         )
 
@@ -326,6 +352,11 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
         entry_key = entry.get("_key", "")
         if not entry_key:
             continue
+        # Skip entries already stamped as structurally synthesised — backfill only,
+        # never re-process an entry that was completed in a previous cycle.
+        if entry.get("_structural_synthesised_ts"):
+            continue
+        stats["semantic_processed"] += 1
 
         # ── cog=None fallback: derive structural links from payload fields ──
         # Writes part_of / depends_on relationships directly from parent_sov_id and
@@ -363,7 +394,7 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
             continue
 
         try:
-            neighbours = await _load_semantic_neighbours(qdrant, entry, top_k=8)
+            neighbours = await _load_semantic_neighbours(qdrant, entry, top_k=5)
         except Exception as e:
             logger.warning(
                 "synthesise_structural: neighbour search failed for %r: %s", entry_key, e
@@ -510,14 +541,125 @@ async def synthesise_structural(key: str = None, qdrant=None, cog=None) -> dict:
                             "synthesise_structural: assoc write failed %s: %s", assoc_key, e,
                         )
 
+        # ── Stamp entry as structurally synthesised ───────────────────────────
+        # Prevents re-processing on the next cycle. Scoped-mode entries are stamped
+        # the same way so the background loop never redundantly re-infers them.
+        # Stamp is on the SEMANTIC entry itself (point_id from scroll or retrieve_by_key).
+        # Failure is non-fatal — the entry will simply be retried next cycle.
+        _spoint_id = entry.get("point_id")
+        if _spoint_id:
+            try:
+                await qdrant.archive_client.set_payload(
+                    collection_name=SEMANTIC,
+                    payload={"_structural_synthesised_ts": datetime.now(timezone.utc).isoformat()},
+                    points=[_spoint_id],
+                )
+            except Exception:
+                pass
+
     logger.info(
         "synthesise_structural: complete — processed=%d rel_created=%d rel_updated=%d "
-        "assoc_created=%d unrelated=%d no_cog=%d errors=%d",
+        "assoc_created=%d unrelated=%d no_cog=%d errors=%d wrapped=%s",
         stats["semantic_processed"], stats["relational_created"], stats["relational_updated"],
         stats["associative_created"], stats["skipped_unrelated"],
-        stats["skipped_no_cog"], stats["errors"],
+        stats["skipped_no_cog"], stats["errors"], _wrapped,
     )
-    return {"status": "ok", **stats}
+    return {"status": "ok", "next_offset": _next_return_offset, "wrapped": _wrapped, **stats}
+
+
+_STRUCTURAL_CURSOR_KEY = "meta:memory-synthesis:structural-cursor"
+_STRUCTURAL_CHUNK_SIZE = 20
+
+
+async def run_structural_loop(qdrant, cog) -> None:
+    """Continuous background structural synthesis — runs indefinitely at LOW priority.
+
+    Each cycle: loads cursor from META → processes _STRUCTURAL_CHUNK_SIZE semantic
+    entries → writes relational/associative links → saves cursor → sleeps 30s → repeats.
+    When the full SEMANTIC collection is exhausted, wraps to the beginning for a new
+    observation cycle (increments observation_count on existing links).
+
+    Preemption: asyncio.sleep(30) yields between chunks so all higher-priority tasks
+    (user requests, harnesses) run unimpeded. Each chunk completes before yielding —
+    chunks take seconds, not minutes.
+
+    Started from main.py lifespan after qdrant.set_cog() so boot-time semantic seeds
+    do not each trigger a background synthesis task on first start.
+    """
+    import uuid as _uuid
+    from qdrant_client.models import PointStruct as _PS
+
+    _META = "meta"
+    _ZERO = [0.0] * 768
+    _cursor_point_id = str(_uuid.uuid5(
+        _uuid.UUID("7d3f1c2a-4b5e-6f7a-8c9d-0e1f2a3b4c5d"),
+        _STRUCTURAL_CURSOR_KEY,
+    ))
+
+    logger.info("structural_loop: started — chunk=%d yield=30s", _STRUCTURAL_CHUNK_SIZE)
+
+    while True:
+        result: dict = {}
+        try:
+            # ── Load cursor ───────────────────────────────────────────────────
+            cursor_entry = await qdrant.retrieve_by_key(_STRUCTURAL_CURSOR_KEY)
+            start_offset = (cursor_entry.get("offset") if cursor_entry else None)
+            total_processed = int(cursor_entry.get("processed_total", 0) if cursor_entry else 0)
+
+            # ── Process chunk ─────────────────────────────────────────────────
+            result = await synthesise_structural(
+                key=None,
+                qdrant=qdrant,
+                cog=cog,
+                max_entries=_STRUCTURAL_CHUNK_SIZE,
+                start_offset=start_offset,
+            )
+
+            next_offset  = result.get("next_offset")
+            wrapped      = result.get("wrapped", False)
+            chunk_done   = result.get("semantic_processed", 0)
+            new_total    = total_processed + chunk_done
+
+            # ── Save cursor ───────────────────────────────────────────────────
+            _now = datetime.now(timezone.utc).isoformat()
+            await qdrant.archive_client.upsert(
+                collection_name=_META,
+                points=[_PS(
+                    id=_cursor_point_id,
+                    vector=_ZERO,
+                    payload={
+                        "_key":               _STRUCTURAL_CURSOR_KEY,
+                        "offset":             next_offset,
+                        "processed_total":    new_total,
+                        "last_run_ts":        _now,
+                        "entries_this_chunk": chunk_done,
+                        "last_updated":       _now,
+                    },
+                )],
+            )
+
+            if wrapped:
+                logger.info(
+                    "structural_loop: full cycle complete — total_processed=%d; restarting",
+                    new_total,
+                )
+            elif chunk_done > 0:
+                logger.debug(
+                    "structural_loop: chunk — entries=%d total=%d rel_created=%d",
+                    chunk_done, new_total, result.get("relational_created", 0),
+                )
+
+        except asyncio.CancelledError:
+            logger.info("structural_loop: cancelled — shutting down")
+            return
+        except Exception as e:
+            logger.warning("structural_loop: error in chunk (will retry next cycle): %s", e)
+
+        # Sleep duration: short when actively backfilling; long when idle (all entries stamped).
+        # wrapped=True and chunk_done=0 means nothing left to process — new entries will
+        # arrive via scoped synthesis (stamped inline) so check back hourly.
+        _idle = result.get("wrapped", False) and result.get("semantic_processed", 0) == 0
+        await asyncio.sleep(3600 if _idle else 30)
 
 
 async def run_synthesis(qdrant, cog=None) -> dict:
@@ -790,14 +932,9 @@ async def run_synthesis(qdrant, cog=None) -> dict:
             except Exception as e:
                 logger.warning("synthesis: co-occur write failed %s: %s", key, e)
 
-    # ── Pass 4: Structural synthesis over semantic collection ─────────────────
-    # Full scan — cog required for inference; if None, structural stats are all zero.
-    _structural = await synthesise_structural(key=None, qdrant=qdrant, cog=cog)
-    if _structural.get("status") == "ok":
-        stats["structural_processed"]   = _structural.get("semantic_processed", 0)
-        stats["structural_created"]     = _structural.get("relational_created", 0)
-        stats["structural_updated"]     = _structural.get("relational_updated", 0)
-        stats["structural_assoc"]       = _structural.get("associative_created", 0)
+    # ── Pass 4: Structural synthesis (moved to run_structural_loop) ──────────
+    # The structural pass now runs as a continuous background task with cursor-based
+    # chunking (N=20 entries per 30s cycle). This function handles Passes 1-3 only.
 
     # ── Pass 5: Cull low-confidence structural entries ────────────────────────
     # Delete structural relational/associative entries that remain at observation_count=1
@@ -858,12 +995,10 @@ async def run_synthesis(qdrant, cog=None) -> dict:
     logger.info(
         "synthesis: complete — assoc_created=%d assoc_updated=%d "
         "rel_created=%d rel_updated=%d skipped=%d "
-        "structural_created=%d structural_updated=%d "
         "culled_relational=%d culled_associative=%d",
         stats["associative_created"], stats["associative_updated"],
         stats["relational_created"], stats["relational_updated"],
         stats["skipped_existing"],
-        stats.get("structural_created", 0), stats.get("structural_updated", 0),
         stats.get("culled_relational", 0), stats.get("culled_associative", 0),
     )
     return {"status": "ok", **stats}
