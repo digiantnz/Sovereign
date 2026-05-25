@@ -28,8 +28,8 @@ Human-in-the-loop flow (3 turns):
     clear step: deletes checkpoint from working_memory.
 
 Output files (saved to /Digiant/Tax/FY{year}/):
-  income{year}.csv  — all tax:crypto events with classifier labels
-  expenses{year}.csv — all tax:expense events (memory + supplementary CSVs)
+  income{year}.csv           — all tax:crypto events with classifier labels
+  expenses_master_{year}.csv — all tax:expense events (memory + supplementary CSVs)
 
 NZ tax year YYYY = 01 Apr YYYY-1 → 31 Mar YYYY
   e.g. /do_tax 2026 → 2025-04-01 to 2026-03-31
@@ -155,7 +155,7 @@ class TaxReportHarness:
                 "response": (
                     f"Ready to generate FY{year} report: {n_income} income records, "
                     f"{n_expense} expense records. Confirm to create "
-                    f"income{year}.csv and expenses{year}.csv in "
+                    f"income{year}.csv and expenses_master_{year}.csv in "
                     f"{_TAX_YEAR_ROOT}/FY{year}/?"
                 ),
                 "_translator_bypass": True,
@@ -310,6 +310,19 @@ class TaxReportHarness:
             "expense_count": len(expense_rows),
         })
 
+        # Per-source expense breakdown for confirmation
+        source_counts: dict[str, int] = {}
+        for r in expense_rows:
+            src = r.get("Source", "Unknown")
+            source_counts[src] = source_counts.get(src, 0) + 1
+        source_breakdown = ", ".join(
+            f"{cnt} {src}" for src, cnt in sorted(source_counts.items())
+        )
+        expense_detail = (
+            f"{len(expense_rows)} record(s) ({source_breakdown})"
+            if source_breakdown else f"{len(expense_rows)} record(s)"
+        )
+
         if skip_files:
             summary = "No supplementary files added."
         else:
@@ -321,7 +334,7 @@ class TaxReportHarness:
                 f"{summary}\n\n"
                 f"Ready to generate FY{year} report:\n"
                 f"  income{year}.csv — {len(income_rows)} record(s)\n"
-                f"  expenses{year}.csv — {len(expense_rows)} record(s)\n\n"
+                f"  expenses_master_{year}.csv — {expense_detail}\n\n"
                 f"Confirm to create files in {folder}/?"
             ),
             "_translator_bypass": True,
@@ -352,8 +365,8 @@ class TaxReportHarness:
         errors: list[str] = []
 
         for filename, content in [
-            (f"income{year}.csv",   income_csv),
-            (f"expenses{year}.csv", expense_csv),
+            (f"income{year}.csv",            income_csv),
+            (f"expenses_master_{year}.csv",  expense_csv),
         ]:
             path = f"{folder}/{filename}"
             try:
@@ -394,7 +407,7 @@ class TaxReportHarness:
             "response": (
                 f"FY{year} tax report complete.\n"
                 f"  income{year}.csv — {len(income_rows)} record(s)\n"
-                f"  expenses{year}.csv — {len(expense_rows)} record(s)\n"
+                f"  expenses_master_{year}.csv — {len(expense_rows)} record(s)\n"
                 f"Saved to {folder}/."
             ),
             "_translator_bypass": True,
@@ -424,6 +437,7 @@ class TaxReportHarness:
         if unpriced:
             lines.append(f"  Unpriced income records (NZD value missing): {unpriced}")
 
+        lines.append(f"  Expense file: expenses_master_{year}.csv")
         lines.append(f"  Files saved: {', '.join(saved) or 'none'}")
         if errors:
             lines.append(f"  Save errors: {'; '.join(errors)}")
@@ -557,6 +571,34 @@ def _clean_vendor(raw: str) -> str:
     return clean or raw
 
 
+def _date_to_dmy(iso_date: str) -> str:
+    """Convert YYYY-MM-DD to DD/MM/YYYY (NZ accountant format)."""
+    if not iso_date or len(iso_date) < 10:
+        return iso_date
+    try:
+        dt = datetime.strptime(iso_date[:10], "%Y-%m-%d")
+        return dt.strftime("%d/%m/%Y")
+    except ValueError:
+        return iso_date
+
+
+def _nzd_plain(nzd_str: str) -> str:
+    """Convert '$X.XX NZD' to plain decimal string (no currency symbols)."""
+    if not nzd_str:
+        return ""
+    return nzd_str.replace("$", "").replace("NZD", "").replace(",", "").strip()
+
+
+def _source_label(source: str) -> str:
+    """Map a file source string to a human-readable Source column label."""
+    s = (source or "").lower()
+    if "aliexpress" in s:
+        return "AliExpress"
+    if "wirex" in s:
+        return "Wirex"
+    return "Receipt"
+
+
 def _income_row(ev) -> dict:
     """Convert a classified TaxEvent to an income CSV row dict."""
     return {
@@ -573,23 +615,25 @@ def _income_row(ev) -> dict:
 
 
 def _expense_row(ev) -> dict:
-    """Convert a TaxEvent (tax:expense) to an expense CSV row dict.
+    """Convert a TaxEvent (tax:expense) to an expenses_master CSV row dict.
 
-    Vendor: cleaned merchant name (Card prefix and location suffix stripped).
-    Description: raw original string (for Wirex) or metadata description (for receipts).
+    Columns: Date (DD/MM/YYYY), Source (Wirex/AliExpress/Receipt), Vendor (cleaned),
+             Description (blank for Wirex; item/description for others),
+             Amount NZD (plain decimal), Reference, Notes (blank).
     """
-    raw_vendor = ev.vendor or ev.source or ""
-    meta_desc  = (ev.metadata or {}).get("description", "")
-    # For receipts: metadata.description holds the description column;
-    # for Wirex card payments: vendor IS the raw description string.
-    description = meta_desc or raw_vendor
+    raw_vendor   = ev.vendor or ev.source or ""
+    src_label    = _source_label(ev.source or "")
+    meta_desc    = (ev.metadata or {}).get("description", "")
+    description  = "" if src_label == "Wirex" else meta_desc
+    date_raw     = ev.timestamp[:10] if ev.timestamp else ""
     return {
-        "Date":        ev.timestamp[:10] if ev.timestamp else "",
+        "Date":        _date_to_dmy(date_raw),
+        "Source":      src_label,
         "Vendor":      _clean_vendor(raw_vendor),
         "Description": description,
-        "Amount NZD":  ev.amount_nzd or ev.nzd_value or "",
-        "Source":      ev.source or "",
+        "Amount NZD":  _nzd_plain(ev.amount_nzd or ev.nzd_value or ""),
         "Reference":   ev.reference or "",
+        "Notes":       "",
     }
 
 
@@ -608,10 +652,10 @@ def _build_income_csv(rows: list[dict]) -> str:
 
 
 def _build_expense_csv(rows: list[dict]) -> str:
-    """Serialise expense rows to CSV string."""
+    """Serialise expense rows to expenses_master CSV string."""
     if not rows:
         rows = [{}]
-    headers = ["Date", "Vendor", "Description", "Amount NZD", "Source", "Reference"]
+    headers = ["Date", "Source", "Vendor", "Description", "Amount NZD", "Reference", "Notes"]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore",
                             lineterminator="\n")

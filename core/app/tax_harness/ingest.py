@@ -130,7 +130,15 @@ async def ingest_csv_file(
 
 
 def _is_receipts_format(headers: list[str]) -> bool:
-    return {"date", "merchant", "description", "amount nzd", "reference"}.issubset(set(headers))
+    header_set = set(headers)
+    has_date   = "date" in header_set
+    has_amount = (
+        "amount nzd" in header_set
+        or "total cost (incl gst)" in header_set
+        or "total cost (incl. gst)" in header_set
+    )
+    has_desc   = "description" in header_set or "item" in header_set
+    return has_date and has_amount and has_desc
 
 
 def _is_wirex_format(headers: list[str]) -> bool:
@@ -503,10 +511,19 @@ def _parse_receipts_csv(reader: csv.DictReader, source: str) -> list[TaxEvent]:
     for row in reader:
         try:
             raw_date    = (row.get("Date") or "").strip()
-            merchant    = (row.get("Merchant") or "").strip()
-            description = (row.get("Description") or "").strip()
-            raw_amount  = (row.get("Amount NZD") or "").strip()
-            reference   = (row.get("Reference") or "").strip()
+            merchant    = (
+                row.get("Merchant") or row.get("Vendor") or row.get("Store") or ""
+            ).strip()
+            description = (row.get("Description") or row.get("Item") or "").strip()
+            raw_amount  = (
+                row.get("Amount NZD")
+                or row.get("Total Cost (incl GST)")
+                or row.get("Total Cost (incl. GST)")
+                or ""
+            ).strip()
+            reference   = (
+                row.get("Reference") or row.get("Order ID") or row.get("Order No.") or ""
+            ).strip()
 
             if not raw_date or not raw_amount:
                 continue
