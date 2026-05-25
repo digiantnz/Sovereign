@@ -95,8 +95,8 @@ async def classify_events(
 ) -> ClassifiedEventSet:
     """Classify a list of TaxEvents for report generation.
 
-    Loads taxable_wallets, mining_wallets, and staking_contracts from semantic
-    memory once. Sets ev.subtype on each event in-memory.
+    Loads taxable_wallets, mining_wallets, staking_contracts, and excluded_references
+    from semantic memory once. Sets ev.subtype on each event in-memory.
     Returns a ClassifiedEventSet with income and expenses lists.
 
     Parameters
@@ -107,6 +107,9 @@ async def classify_events(
     taxable_wallets   = await _load_address_set(qdrant, "semantic:tax:taxable_wallets")
     staking_contracts = await _load_address_set(qdrant, "semantic:tax:staking_contracts")
     mining_wallets    = await _load_address_set(qdrant, "semantic:tax:mining_wallets")
+    # excluded_references: references of non-taxable events (loan disbursements etc.)
+    # stored as lowercased strings in the "addresses" list of this semantic entry
+    excluded_refs     = await _load_address_set(qdrant, "semantic:tax:excluded_references")
 
     # All addresses the Director controls — used for own-wallet-to-own-wallet detection
     all_own_wallets = taxable_wallets | mining_wallets
@@ -121,6 +124,13 @@ async def classify_events(
             continue
 
         # tax:crypto — apply rules in order, first match wins
+
+        # Excluded references — loan disbursements, non-taxable events
+        # Stored in semantic:tax:excluded_references (lowercased reference strings)
+        if excluded_refs and ev.reference and ev.reference.lower() in excluded_refs:
+            ev.subtype = "loan_disbursement"
+            income.append(ev)
+            continue
 
         # Lightning — checked first because Lightning events have non-standard addresses
         if ev.source == "lightning_channel":

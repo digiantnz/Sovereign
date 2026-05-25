@@ -207,6 +207,11 @@ async def _parse_etherscan_csv(
                 continue
             asset = parts[1].upper() if len(parts) == 2 else "ETH"
 
+            # Normalize WEI to ETH — Etherscan labels some 1-WEI transactions as "WEI"
+            if asset == "WEI":
+                amount_d = amount_d / Decimal("1000000000000000000")
+                asset = "ETH"
+
             # Skip zero-value and dust rows (contract probes, 1-WEI spam, RP interactions)
             if amount_d == 0:
                 continue
@@ -298,9 +303,17 @@ def _parse_wirex_nzd_statement(reader: csv.DictReader, source: str) -> list[TaxE
                     foreign_d = None
 
                 nzd_value = format_amount(abs(amount_d), "NZD") if amount_d else None
-                # amount_d > 0 = received NZD (sold crypto = disposal)
-                # amount_d < 0 = spent NZD (bought crypto = acquisition)
-                direction = "sell" if amount_d > 0 else "buy"
+                # Direction: primary check from Description (reliable Wirex phrases);
+                # fallback to NZD amount sign.
+                # "Bought NZD with ETH/X" → sold crypto → disposal (sell)
+                # Negative NZD / "Bought ETH/X with NZD" → acquired crypto → acquisition (buy)
+                desc_lower = description.lower()
+                if "bought nzd" in desc_lower:
+                    direction = "sell"
+                elif amount_d > 0:
+                    direction = "sell"
+                else:
+                    direction = "buy"
                 events.append(TaxEvent(
                     id=make_tax_id(reference),
                     event_tag="tax:crypto",

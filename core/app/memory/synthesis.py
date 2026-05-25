@@ -571,7 +571,10 @@ _STRUCTURAL_CURSOR_KEY = "meta:memory-synthesis:structural-cursor"
 _STRUCTURAL_CHUNK_SIZE = 20
 
 
-async def run_structural_loop(qdrant, cog) -> None:
+_SYNTHESIS_PAUSE_SECS = 1800  # pause synthesis for 30 min after any Director interaction
+
+
+async def run_structural_loop(qdrant, cog, get_last_interaction=None) -> None:
     """Continuous background structural synthesis — runs indefinitely at LOW priority.
 
     Each cycle: loads cursor from META → processes _STRUCTURAL_CHUNK_SIZE semantic
@@ -583,9 +586,14 @@ async def run_structural_loop(qdrant, cog) -> None:
     (user requests, harnesses) run unimpeded. Each chunk completes before yielding —
     chunks take seconds, not minutes.
 
+    get_last_interaction: optional callable → float (monotonic time of last /chat call).
+    When provided, synthesis is suppressed for _SYNTHESIS_PAUSE_SECS after each
+    Director interaction so GPU stays free for conversational use.
+
     Started from main.py lifespan after qdrant.set_cog() so boot-time semantic seeds
     do not each trigger a background synthesis task on first start.
     """
+    import time as _time
     import uuid as _uuid
     from qdrant_client.models import PointStruct as _PS
 
@@ -596,9 +604,22 @@ async def run_structural_loop(qdrant, cog) -> None:
         _STRUCTURAL_CURSOR_KEY,
     ))
 
-    logger.info("structural_loop: started — chunk=%d yield=30s", _STRUCTURAL_CHUNK_SIZE)
+    logger.info("structural_loop: started — chunk=%d yield=30s pause_on_interaction=%ds",
+                _STRUCTURAL_CHUNK_SIZE, _SYNTHESIS_PAUSE_SECS)
 
     while True:
+        # Pause synthesis when Director is actively chatting — keeps GPU free for Rex.
+        if get_last_interaction is not None:
+            idle_secs = _time.monotonic() - get_last_interaction()
+            if idle_secs < _SYNTHESIS_PAUSE_SECS:
+                wait = min(60, int(_SYNTHESIS_PAUSE_SECS - idle_secs))
+                logger.debug(
+                    "structural_loop: Director active %ds ago — pausing %ds",
+                    int(idle_secs), wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+
         result: dict = {}
         try:
             # ── Load cursor ───────────────────────────────────────────────────

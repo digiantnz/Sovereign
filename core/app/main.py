@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 _GPU_NAME    = "EVGA RTX 3090"
 _GPU_VRAM_GB = 24
 
+# Tracks monotonic time of last Director message via /chat.
+# Structural synthesis loop checks this and pauses for 30 min after any interaction.
+import time as _time
+_last_gateway_interaction: float = 0.0
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -605,8 +610,12 @@ async def lifespan(app: FastAPI):
     # load cursor (META, RAID-durable) → process N=20 un-stamped semantic entries
     # → save cursor → sleep 30s. Resumes from cursor across reboots. Idles at
     # 3600s when all entries are stamped; wakes to process new arrivals.
+    # Pauses for 30 min after any Director /chat interaction to free GPU.
     _structural_loop_task = asyncio.create_task(
-        _run_structural_loop(qdrant, app.state.cog),
+        _run_structural_loop(
+            qdrant, app.state.cog,
+            get_last_interaction=lambda: _last_gateway_interaction,
+        ),
         name="structural_synthesis_loop",
     )
     app.state.exec     = ExecutionEngine(
@@ -1221,6 +1230,8 @@ async def attachment(payload: dict):
 
 @app.post("/chat")
 async def chat(payload: dict):
+    global _last_gateway_interaction
+    _last_gateway_interaction = _time.monotonic()
     import httpx as _httpx
     import httpcore as _httpcore
     user_input        = payload.get("input", "")

@@ -40,6 +40,7 @@ import csv
 import io
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -203,7 +204,9 @@ class TaxReportHarness:
         from .classifier import classify_events
         classified = await classify_events(events, self.qdrant)
 
-        income_rows  = [_income_row(ev)  for ev in classified.income]
+        income_rows  = [_income_row(ev)  for ev in classified.income
+                        if ev.subtype != "loan_disbursement"]
+        excluded_count = sum(1 for ev in classified.income if ev.subtype == "loan_disbursement")
         expense_rows = [_expense_row(ev) for ev in classified.expenses]
 
         await self._write_checkpoint({
@@ -217,11 +220,12 @@ class TaxReportHarness:
             "expense_count": len(expense_rows),
         })
 
+        excl_note = f" ({excluded_count} loan_disbursement excluded)" if excluded_count else ""
         return {
             "status": "awaiting_csv_names",
             "response": (
                 f"FY{year} (01 Apr {int(year)-1} – 31 Mar {year}): "
-                f"found {len(income_rows)} crypto/income record(s) and "
+                f"found {len(income_rows)} crypto/income record(s){excl_note} and "
                 f"{len(expense_rows)} expense record(s) in memory. "
                 f"Provide CSV filename(s) to include in the report (comma-separated), "
                 f"or reply 'none' to proceed. "
@@ -276,7 +280,8 @@ class TaxReportHarness:
                         from .classifier import classify_events
                         crypto_evs = [ev for ev in in_scope if ev.event_tag == "tax:crypto"]
                         cls = await classify_events(crypto_evs, self.qdrant)
-                        new_income = [_income_row(ev) for ev in cls.income]
+                        new_income = [_income_row(ev) for ev in cls.income
+                                      if ev.subtype != "loan_disbursement"]
 
                     expense_rows.extend(new_expense)
                     income_rows.extend(new_income)
@@ -535,29 +540,56 @@ class TaxReportHarness:
 
 # ── CSV helpers ────────────────────────────────────────────────────────────────
 
+_CARD_PREFIX_RE    = re.compile(r'^Card\s+\d+\s*:\s*', re.IGNORECASE)
+_COUNTRY_CODE_RE   = re.compile(r'\s+[A-Z]{2,3}$')
+_CITY_SUFFIX_RE    = re.compile(r'\s+[A-Z]{4,}$')
+
+
+def _clean_vendor(raw: str) -> str:
+    """Strip Wirex card prefix and trailing location from vendor string.
+
+    "Card 8820 : www.aliexpress.com SHENZHEN CHN" → "www.aliexpress.com"
+    Non-Wirex strings are returned unchanged.
+    """
+    clean = _CARD_PREFIX_RE.sub('', raw).strip()
+    clean = _COUNTRY_CODE_RE.sub('', clean).strip()   # strip country code (CHN, NZL, IE…)
+    clean = _CITY_SUFFIX_RE.sub('', clean).strip()    # strip city (SHENZHEN, AUCKLAND…)
+    return clean or raw
+
+
 def _income_row(ev) -> dict:
     """Convert a classified TaxEvent to an income CSV row dict."""
     return {
-        "Date":          ev.timestamp[:10] if ev.timestamp else "",
+        "Date":           ev.timestamp[:10] if ev.timestamp else "",
         "Classification": ev.subtype or "unknown",
-        "From Address":  ev.from_address or "",
-        "To Address":    ev.to_address   or "",
-        "Asset":         ev.asset         or "",
-        "Amount":        ev.amount        or "",
-        "NZD Value":     ev.nzd_value     or "",
-        "Source":        ev.source        or "",
-        "Reference":     ev.reference     or "",
+        "From Address":   ev.from_address or "",
+        "To Address":     ev.to_address   or "",
+        "Asset":          ev.asset         or "",
+        "Amount":         ev.amount        or "",
+        "NZD Value":      ev.nzd_value     or "",
+        "Source":         ev.source        or "",
+        "Reference":      ev.reference     or "",
     }
 
 
 def _expense_row(ev) -> dict:
-    """Convert a TaxEvent (tax:expense) to an expense CSV row dict."""
+    """Convert a TaxEvent (tax:expense) to an expense CSV row dict.
+
+    Vendor: cleaned merchant name (Card prefix and location suffix stripped).
+    Description: raw original string (for Wirex) or metadata description (for receipts).
+    """
+    raw_vendor = ev.vendor or ev.source or ""
+    meta_desc  = (ev.metadata or {}).get("description", "")
+    # For receipts: metadata.description holds the description column;
+    # for Wirex card payments: vendor IS the raw description string.
+    description = meta_desc or raw_vendor
     return {
-        "Date":       ev.timestamp  [:10] if ev.timestamp else "",
-        "Vendor":     ev.vendor         or ev.source or "",
-        "Amount NZD": ev.amount_nzd     or ev.nzd_value or "",
-        "Source":     ev.source         or "",
-        "Reference":  ev.reference      or "",
+        "Date":        ev.timestamp[:10] if ev.timestamp else "",
+        "Vendor":      _clean_vendor(raw_vendor),
+        "Description": description,
+        "Amount NZD":  ev.amount_nzd or ev.nzd_value or "",
+        "Source":      ev.source or "",
+        "Reference":   ev.reference or "",
     }
 
 
@@ -579,7 +611,7 @@ def _build_expense_csv(rows: list[dict]) -> str:
     """Serialise expense rows to CSV string."""
     if not rows:
         rows = [{}]
-    headers = ["Date", "Vendor", "Amount NZD", "Source", "Reference"]
+    headers = ["Date", "Vendor", "Description", "Amount NZD", "Source", "Reference"]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore",
                             lineterminator="\n")
