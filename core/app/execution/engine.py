@@ -106,6 +106,8 @@ INTENT_ACTION_MAP = {
     "research_gather":    {"domain": "research", "operation": "gather"},
     "research_save":      {"domain": "research", "operation": "save"},
     "research_clear":     {"domain": "research", "operation": "clear"},
+    # Validator queue monitor
+    "validator_queue_check":    {"domain": "validator_queue", "operation": "check"},
     # Portfolio analysis harness intents
     "portfolio_analysis":       {"domain": "portfolio_analysis", "operation": "gather"},
     "portfolio_analysis_save":  {"domain": "portfolio_analysis", "operation": "save"},
@@ -232,6 +234,8 @@ INTENT_ACTION_MAP = {
     # Portal introspection
     "skill_status":   {"domain": "portal", "operation": "read", "name": "skill_status"},
     "harness_status": {"domain": "portal", "operation": "read", "name": "harness_status"},
+    # ClawSec pattern refresh — fetches live feed, writes clawsec_dynamic.yaml, updates checksum
+    "clawsec_update": {"domain": "security", "operation": "update_patterns"},
 }
 
 # Tier required for each operation — deterministic, never from LLM
@@ -248,11 +252,10 @@ INTENT_TIER_MAP = {
     "list_notes": "LOW", "read_note": "LOW",
     "create_note": "MID", "update_note": "MID", "delete_note": "MID",
     # sovereign-nextcloud-fs tiers
-    # All ncfs ops are LOW — Nextcloud is Director-trusted; no confirmation required for FS ops.
-    # New files arriving in /downloads/ are still scanned before ingest (inline_scan gate).
+    # Read ops are LOW; mutating ops are MID (irreversible without explicit delete/undo).
     "ncfs_list": "LOW", "ncfs_list_recursive": "LOW", "ncfs_read": "LOW", "ncfs_search": "LOW",
-    "ncfs_move": "LOW", "ncfs_copy": "LOW", "ncfs_mkdir": "LOW", "ncfs_delete": "LOW",
-    "ncfs_tag": "LOW", "ncfs_untag": "LOW",
+    "ncfs_move": "MID", "ncfs_copy": "MID", "ncfs_mkdir": "MID", "ncfs_delete": "MID",
+    "ncfs_tag": "MID", "ncfs_untag": "MID",
     # sovereign-nextcloud-ingest tiers — MID because memory write follows confirmation
     "ingest_file": "MID", "ingest_folder": "MID", "ingest_status": "LOW",
     "session_wrap_up": "LOW", "session_flag_set": "LOW", "memory_curate": "LOW",
@@ -270,15 +273,16 @@ INTENT_TIER_MAP = {
     "delete_event": "MID", "update_event": "MID",
     "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
     "research_gather": "LOW", "research_save": "MID", "research_clear": "LOW",
+    "validator_queue_check": "NORMAL",
     "portfolio_analysis": "LOW", "portfolio_analysis_save": "MID", "portfolio_analysis_clear": "LOW",
     "restart_container": "MID", "recreate_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
     "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
     "delete_file": "HIGH", "delete_email": "HIGH", "delete_task": "HIGH",
-    "remember_fact": "LOW",
+    "remember_fact": "NORMAL",
     "memory_recall": "LOW",
     "memory_list_keys": "LOW",
     "memory_retrieve_key": "LOW",
-    "memory_synthesise": "LOW",
+    "memory_synthesise": "NORMAL",
     # Skill harness tiers — explicit steps with validation gates + WM checkpoints
     "skill_search":           "LOW",   # search + write checkpoint
     "skill_list_candidates":  "LOW",   # read checkpoint
@@ -316,6 +320,7 @@ INTENT_TIER_MAP = {
     "nanobot_run":    "MID",
     "nanobot_health": "LOW",
     # Self-improvement harness tiers — all LOW (observe/report only; proposals require Director approval)
+    "clawsec_update":          "MID",
     "self_improve_observe":    "LOW",
     "self_improve_proposals":  "LOW",
     "self_improve_baseline":   "LOW",
@@ -1618,10 +1623,12 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                     _cw_text = (_cw_turn.get("user", "") + " " + _cw_turn.get("assistant", "")).lower()
                 elif isinstance(_cw_turn, str):
                     _cw_text = _cw_turn.lower()
-                if any(s in _cw_text for s in ("business email", "business inbox", "check my business", "my business")):
+                if any(s in _cw_text for s in ("business email", "business inbox", "check my business", "my business",
+                                                "account: business", "[business inbox]")):
                     account = "business"
                     break
-                if any(s in _cw_text for s in ("personal email", "personal inbox", "check my personal", "my personal")):
+                if any(s in _cw_text for s in ("personal email", "personal inbox", "check my personal", "my personal",
+                                                "account: personal", "[personal inbox]")):
                     account = "personal"
                     break
         if any(w in u for w in _folder_kw):
@@ -1664,7 +1671,13 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                          "read message", "open message", "show message", "view message", "fetch message",
                          "read the email", "open the email", "show me email", "email number",
                          "message number", "email id", "message id", "email #", "message #",
-                         "read id", "open id", "show id", "fetch id", "read #")
+                         "read id", "open id", "show id", "fetch id", "read #",
+                         "summarise email", "summarize email", "summarise message", "summarize message",
+                         "summary of email", "summary of message", "tell me about email",
+                         "what does the email", "what does email", "summarise id", "summarize id",
+                         # Pronoun references to a previously listed email
+                         "read it", "open it", "show it", "what does it say", "what's in it",
+                         "can you read it", "summarise it", "summarize it", "review it", "tell me about it")
         _has_id_ref = bool(_re_id.search(r'\[id:\d+\]', u)) or any(w in u for w in _fetch_msg_kw)
         if _has_id_ref:
             # Extract databaseId from [id:XXXX] tag or bare 4-5 digit number
@@ -1674,6 +1687,15 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "target": account, "tier": "LOW",
                 "database_id": _db_m.group(1) if _db_m else "",
                 "reasoning_summary": "Email fetch by ID — deterministic pre-classifier",
+            }
+        # Bare 4–5 digit number in email context with no other keyword match → fetch that message
+        _bare_id_m = _re_id.search(r'\b(\d{4,6})\b', u)
+        if _bare_id_m and not any(w in u for w in _search_kw):
+            return {
+                "delegate_to": "business_agent", "intent": "fetch_message",
+                "target": account, "tier": "LOW",
+                "database_id": _bare_id_m.group(1),
+                "reasoning_summary": "Email fetch by bare ID — deterministic pre-classifier",
             }
         if any(w in u for w in _search_kw):
             return {
@@ -3734,7 +3756,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis"):
+        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "validator_queue"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
                 _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok)\b',           _re_sc.IGNORECASE)
@@ -4468,12 +4490,16 @@ class ExecutionEngine:
                         _id_index[str(_i)] = _mid
                 _rft = dict(_rft)
                 _rft["detail"] = dict(_rft["detail"])
-                _rft["detail"]["messages"] = "\n".join(_lines)
+                _acct = action.get("account") or (delegation or {}).get("target") or "personal"
+                # Prepend [personal inbox] / [business inbox] so context_window account
+                # tracking in _quick_classify can identify the account on follow-up turns.
+                _acct_label = "personal" if str(_acct) in ("personal", "2") else "business"
+                _rft["detail"]["messages"] = f"[{_acct_label} inbox]\n" + "\n".join(_lines)
                 _rft["detail"]["count"] = len(_lines)
+                _rft["detail"]["account"] = _acct_label
                 if _id_index:
                     _rft["detail"]["id_index"] = _id_index
                 # Index emails in working_memory for cross-turn lookup
-                _acct = action.get("account") or (delegation or {}).get("target") or "personal"
                 _asyncio.create_task(self._index_items([
                     {"title": _em.get("subject", "(no subject)"),
                      "id": str(_em.get("databaseId", _em.get("uid", ""))),
@@ -6813,6 +6839,9 @@ class ExecutionEngine:
             if op == "read":
                 pending = await self.github.get_pending_updates()
                 return {"status": "ok", "pending": pending}
+            if op == "update_patterns":
+                from security.clawsec_harness import fetch_and_apply as _clawsec_apply
+                return await _clawsec_apply(self.qdrant, self.ledger)
             return {"error": f"Unknown security operation: {op}"}
 
         if domain == "github":
@@ -7499,8 +7528,9 @@ class ExecutionEngine:
                     return {"status": "error", "message": "Nothing to remember — fact was empty."}
                 # Default to SEMANTIC for explicit remember_fact writes — facts and URLs
                 # committed by the Director should be durable RAID entries, not ephemeral
-                # working_memory.  Action dict may override (e.g. prospective for commitments).
-                _raw_coll = action.get("collection", SEMANTIC)
+                # working_memory.  Action dict may override; delegation may also supply
+                # collection (e.g. episodic for structured facts detected in PASS 1).
+                _raw_coll = action.get("collection") or (delegation or {}).get("collection") or SEMANTIC
                 coll = _raw_coll if _raw_coll in SOVEREIGN_COLLECTIONS else SEMANTIC
                 mem_type = action.get("type", SEMANTIC)
                 writer = action.get("writer", "sovereign-core")
@@ -7656,6 +7686,10 @@ class ExecutionEngine:
                 return {"status": "ok", "entry": entry}
 
             return {"error": f"Unknown memory_index operation: {op}"}
+
+        if domain == "validator_queue":
+            from monitoring.validator_queue_harness import run_validator_queue_check
+            return await run_validator_queue_check()
 
         if domain == "memory_synthesise":
             from memory.synthesis import run_synthesis

@@ -5,10 +5,18 @@ Prevents GPU contention between the cognitive loop and background harnesses.
 
 Priority model (lower number = higher priority):
   HIGH   = 1  — gateway/Telegram interactive messages (cognitive loop passes)
-  NORMAL = 2  — user-initiated harnesses (/portfolio, /install, research)
-  LOW    = 3  — background/scheduled jobs (learning, dev harness, news)
+  NORMAL = 2  — all other LLM work (harnesses, research, portfolio, learning, SI)
+  LOW    = 3  — perpetual memory synthesis ONLY
 
-LOW jobs are capped at 90 seconds. HIGH/NORMAL jobs default to 200s.
+Grace period: after any HIGH job completes, non-HIGH jobs are held for
+_HIGH_GRACE_S seconds (240). This keeps the GPU free for Director follow-up
+messages. If another HIGH job arrives during the grace window it runs
+immediately; once the window expires non-HIGH jobs proceed normally.
+
+Pre-emption check: before a NORMAL/LOW job starts executing, the worker
+peeks at the queue. If a HIGH job is already waiting, the NORMAL/LOW job
+re-queues itself so the HIGH job can run first. This prevents an in-flight
+NORMAL job from blocking a Director message that arrives mid-generation.
 
 On timeout, the worker resolves the future with a structured dict rather than
 raising — callers check result.get("status") == "llm_timeout" and may resubmit
@@ -28,6 +36,14 @@ logger = logging.getLogger(__name__)
 # Brief pause after cancelling a timed-out job. Gives Ollama time to notice
 # the aborted HTTP connection before the next job starts.
 _OLLAMA_RESET_DELAY_S = 1.0
+
+# After a HIGH job completes, non-HIGH jobs wait this many seconds so the
+# Director can send follow-up messages without hitting GPU contention.
+_HIGH_GRACE_S = 240.0
+# Poll interval while waiting out the grace period.
+_HIGH_GRACE_POLL_S = 10.0
+# Actual-wait threshold: only show "GPU was busy" banner when wait > this.
+_QUEUE_WAIT_BANNER_THRESHOLD_S = 3.0
 
 
 @dataclass(order=True)
@@ -59,6 +75,7 @@ class InferenceQueue:
         self._busy          = False
         self._current_job: dict | None = None
         self._worker_task: asyncio.Task | None = None
+        self._last_high_ts: float = 0.0  # monotonic time of last HIGH job completion
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -197,6 +214,37 @@ class InferenceQueue:
 
     async def _run_one(self) -> None:
         job: _InferenceJob = await self._queue.get()
+
+        # Grace period: hold non-HIGH jobs for up to _HIGH_GRACE_S after a HIGH job
+        # so the Director can send follow-up messages without GPU contention.
+        if job.priority > self.HIGH and self._last_high_ts > 0:
+            elapsed = time.monotonic() - self._last_high_ts
+            remaining = _HIGH_GRACE_S - elapsed
+            if remaining > 0:
+                logger.debug(
+                    "InferenceQueue: grace hold — job=%s priority=%s remaining=%.0fs",
+                    job.job_id, self._LABELS.get(job.priority, str(job.priority)), remaining,
+                )
+                # Re-queue the job and yield so arriving HIGH jobs can jump ahead.
+                await self._queue.put(job)
+                self._queue.task_done()
+                await asyncio.sleep(min(_HIGH_GRACE_POLL_S, remaining))
+                return
+
+        # Pre-emption check: if a HIGH job is already queued, re-queue this NORMAL/LOW
+        # job and yield — HIGH jobs must never wait behind an in-flight lower-priority job.
+        if job.priority > self.HIGH and self._queue.qsize() > 0:
+            queued = list(self._queue._queue)  # snapshot of heapq internals
+            if any(j.priority == self.HIGH for j in queued):
+                logger.debug(
+                    "InferenceQueue: HIGH job queued — deferring %s job=%s",
+                    self._LABELS.get(job.priority, str(job.priority)), job.job_id,
+                )
+                await self._queue.put(job)
+                self._queue.task_done()
+                await asyncio.sleep(0.1)
+                return
+
         self._busy = True
         self._current_job = {
             "priority":       job.priority,
@@ -214,6 +262,8 @@ class InferenceQueue:
             result = await asyncio.wait_for(
                 self._dispatch(job), timeout=job.timeout,
             )
+            if isinstance(result, dict):
+                result["_queue_wait_seconds"] = wait_s
             if not job.future.done():
                 job.future.set_result(result)
         except asyncio.TimeoutError:
@@ -242,6 +292,8 @@ class InferenceQueue:
                 job.future.set_exception(exc)
         finally:
             self._busy = False
+            if job.priority == self.HIGH:
+                self._last_high_ts = time.monotonic()
             self._current_job = None
             self._queue.task_done()
 

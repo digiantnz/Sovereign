@@ -369,7 +369,7 @@ class CognitionEngine:
                 prompt, model=model, fmt=fmt, priority=p, timeout=timeout,
                 capture_thinking=capture_thinking,
             )
-            if result.get("_queue_waited"):
+            if result.get("_queue_waited") and result.get("_queue_wait_seconds", 0) > 3.0:
                 self._had_queue_wait = True
             return result
         return await self.ollama.generate(prompt, model=model, fmt=fmt,
@@ -385,7 +385,7 @@ class CognitionEngine:
             result = await self._queue.chat(
                 messages, model=model, fmt=fmt, priority=p, timeout=timeout
             )
-            if result.get("_queue_waited"):
+            if result.get("_queue_waited") and result.get("_queue_wait_seconds", 0) > 3.0:
                 self._had_queue_wait = True
             return result
         return await self.ollama.chat(messages, model=model, fmt=fmt)

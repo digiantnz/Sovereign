@@ -4,7 +4,7 @@
 Commands:
   list_unread      -- GET /api/messages?mailboxId={id}&limit={n}  (filters to unread)
   fetch_message    -- GET /api/messages/{id}/body, or search by from_addr/subject
-  delete_message   -- DELETE /api/thread/{id}
+  delete_message   -- DELETE /api/messages/{id}  (was /thread/{id} — databaseId is message not thread)
   move_message     -- POST /api/messages/{id}/move {destFolderId}
   mark_read        -- PUT /api/messages/{id}/flags {"flags":{"seen":true}}
   mark_unread      -- PUT /api/messages/{id}/flags {"flags":{"seen":false}}
@@ -164,11 +164,37 @@ def _strip_html(html):
 # Commands
 # ---------------------------------------------------------------------------
 
+def _sync_account(account_id):
+    """Fire a background IMAP sync for the account's INBOX before listing.
+    Uses POST /api/mailboxes/{id}/sync (NC Mail v5). Runs in a daemon thread
+    so it doesn't block the subsequent messages fetch, but the sync completes
+    during or shortly after the fetch (which itself takes 10-40s)."""
+    import threading
+    inbox_id = _INBOX_CACHE.get(account_id)
+    if not inbox_id:
+        return
+
+    def _do_sync():
+        try:
+            requests.post(
+                f"{_MAIL_API}/mailboxes/{inbox_id}/sync",
+                auth=_auth(), headers=_hdr(), timeout=60,
+            )
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_do_sync, daemon=True)
+    t.start()
+
+
 def cmd_list_unread(args):
     account_id = _account_id(args.account)
     inbox_id = _get_inbox_id(account_id)
     if not inbox_id:
         _err(f"Could not find INBOX for account {args.account!r}")
+
+    # Trigger IMAP sync so latest messages are visible before we read the cache.
+    _sync_account(account_id)
 
     # Nextcloud Mail API is slow (~10-40s per request due to IMAP sync).
     # When filtering, fetch more to increase match probability. Cap personal at 10 to avoid timeout.
@@ -264,11 +290,15 @@ def cmd_fetch_message(args):
             _err("Message not found matching search criteria")
         database_id = found["databaseId"]
 
-    # Fetch full body via /body sub-endpoint
-    r = requests.get(
-        f"{_MAIL_API}/messages/{database_id}/body",
-        auth=_auth(), headers=_hdr(), timeout=20,
-    )
+    # Fetch full body via /body sub-endpoint.
+    # Personal account (Murena/eCloud) can take 20-55s; business is usually <5s.
+    try:
+        r = requests.get(
+            f"{_MAIL_API}/messages/{database_id}/body",
+            auth=_auth(), headers=_hdr(), timeout=55,
+        )
+    except requests.exceptions.Timeout:
+        _err(f"fetch_message body timed out for id {database_id} — inbox sync in progress, try again in a moment")
     if r.status_code != 200:
         _err(f"fetch_message body HTTP {r.status_code}: {r.text[:200]}")
 
@@ -326,7 +356,7 @@ def cmd_delete_message(args):
             _err("No message found matching delete criteria")
 
     r = requests.delete(
-        f"{_MAIL_API}/thread/{database_id}",
+        f"{_MAIL_API}/messages/{database_id}",
         auth=_auth(), headers=_hdr(), timeout=15,
     )
     if r.status_code not in (200, 202, 204):

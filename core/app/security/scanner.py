@@ -67,6 +67,45 @@ class SecurityScanner:
                         except re.error:
                             pass
 
+        self._load_clawsec_dynamic()
+
+    def _load_clawsec_dynamic(self) -> None:
+        """Load dynamic patterns from clawsec_dynamic.yaml (written by clawsec_harness).
+
+        File is optional — silently skipped if absent (before first clawsec_update run).
+        Format: {version, updated, categories: {name: [{pattern, action, source_id, severity}]}}
+        """
+        path = os.path.join(self._dir, "clawsec_dynamic.yaml")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
+            categories = data.get("categories", {})
+            added = 0
+            for cat_name, entries in categories.items():
+                for entry in (entries or []):
+                    pattern = entry.get("pattern", "")
+                    if not pattern:
+                        continue
+                    try:
+                        self._regex_patterns.append(
+                            (cat_name, re.compile(pattern, re.IGNORECASE))
+                        )
+                        added += 1
+                    except re.error:
+                        pass
+            if added:
+                import logging as _log
+                _log.getLogger(__name__).info(
+                    "SecurityScanner: loaded %d dynamic patterns from clawsec_dynamic.yaml", added
+                )
+        except Exception as exc:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "SecurityScanner: failed to load clawsec_dynamic.yaml: %s", exc
+            )
+
     def _load_yaml(self, filename: str) -> dict:
         path = os.path.join(self._dir, filename)
         if not os.path.exists(path):

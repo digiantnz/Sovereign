@@ -100,7 +100,8 @@ async def _fetch_grok(cog, topics: list[str]) -> tuple[list[dict], str | None]:
             _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
             result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
         else:
-            result = await cog.ask_local(prompt)
+            from adapters.inference_queue import InferenceQueue
+            result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL)
         raw = result.get("response", "") if isinstance(result, dict) else str(result)
         # Extract JSON array from response
         match = re.search(r'\[.*\]', raw, re.DOTALL)

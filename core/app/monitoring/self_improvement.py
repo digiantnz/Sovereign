@@ -4,14 +4,14 @@ Two modes:
   OBSERVE — runs daily. Aggregates inputs from all monitoring sources:
     skill success/failure rates (episodic), prospective task execution rates,
     container/GPU/RAM health, soul guardian events, audit log anomalies,
-    ClawSec pattern update checks, monitored repository releases.
+    ClawSec pending-log staleness (security/pending/ age > 7 days).
     Stores aggregated observation as episodic entry with pattern analysis.
     Compares against baseline using statistical anomaly detection.
 
   PROPOSE — triggered by observe when patterns warrant corrective action:
     - same skill/intent failing >3 times in rolling 7-day window
     - prospective task with status=active that has never executed
-    - monitored repo with unreviewed updates
+    - ClawSec fetch log stale (security/pending/ oldest entry > 7 days)
     - memory collection anomalies
     - resource thresholds exceeded (persistent soft anomaly)
     - hard failure events (immediate trigger)
@@ -446,6 +446,39 @@ async def _collect_scheduler_health(qdrant) -> dict:
     return {"stuck": stuck, "collisions": collisions}
 
 
+def _check_security_pending(pending_dir: str = "/home/sovereign/security/pending") -> dict:
+    """Inspect security/pending/ for ClawSec fetch logs.
+
+    Returns {count, oldest_age_days, newest_fetch_at} based on fetch-*.json log files.
+    Falls back to file mtime when fetched_at field is absent.
+    """
+    import glob
+    result = {"count": 0, "oldest_age_days": 0.0, "newest_fetch_at": None}
+    if not os.path.exists(pending_dir):
+        return result
+    now = datetime.now(timezone.utc)
+    ages: list[float] = []
+    newest_ts: str | None = None
+    for fpath in glob.glob(os.path.join(pending_dir, "*.json")):
+        try:
+            with open(fpath) as f:
+                data = json.load(f)
+            fetched_at = data.get("fetched_at", "")
+            if fetched_at:
+                age_days = (now - datetime.fromisoformat(fetched_at)).days
+                if newest_ts is None or fetched_at > newest_ts:
+                    newest_ts = fetched_at
+            else:
+                age_days = (now.timestamp() - os.path.getmtime(fpath)) / 86400
+        except Exception:
+            age_days = (now.timestamp() - os.path.getmtime(fpath)) / 86400
+        ages.append(age_days)
+    result["count"] = len(ages)
+    result["oldest_age_days"] = max(ages) if ages else 0.0
+    result["newest_fetch_at"] = newest_ts
+    return result
+
+
 async def _collect_audit_hard_failures(ledger) -> list[dict]:
     """Scan the security ledger for hard failure events in the last 24 hours.
     Returns list of {event_type, detail, ts} dicts.
@@ -831,6 +864,13 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
     except Exception as e:
         logger.warning("SIHarness: memory ceiling check failed (non-fatal): %s", e)
 
+    # 2.6. ClawSec pending check — count + oldest age in security/pending/
+    security_pending: dict = {}
+    try:
+        security_pending = _check_security_pending()
+    except Exception as e:
+        logger.warning("SIHarness: security pending check failed: %s", e)
+
     # Build normalised metrics snapshot (scalar values only — for baseline comparison)
     ram  = sys_metrics.get("ram",  {})
     gpu  = sys_metrics.get("gpu",  {})
@@ -932,6 +972,12 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
         f"external unreachable: {', '.join(unreachable_names)}" if unreachable_names
         else "external services: ok"
     )
+    _sp_count = security_pending.get("count", 0)
+    _sp_oldest = security_pending.get("oldest_age_days", 0.0)
+    sp_str = (
+        f"security pending: {_sp_count} items (oldest {_sp_oldest:.0f}d)"
+        if _sp_count > 0 else "security pending: none"
+    )
     obs_content = (
         f"Self-improvement observe cycle {session['cycle_count']} at {ts_now[:16]} UTC. "
         f"System: RAM {ram.get('percent','?')}% {gpu_str}, "
@@ -946,6 +992,7 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
         f"Hard failures last 24h: {len(hard_failures)}. "
         f"External service failures: {len(external_failures)}. "
         f"Soft anomalies: {len(soft_anomalies)}. "
+        f"{sp_str}. "
         f"Proposal triggers: {trigger_count}."
     )
 
@@ -1066,6 +1113,15 @@ async def observe(qdrant, cog, ledger, app_state=None) -> dict:
             "conflicting_types": tc["conflicting_types"],
         })
 
+    # ClawSec staleness trigger — count > 0 and oldest > 7 days
+    _CLAWSEC_STALE_DAYS = 7
+    if _sp_count > 0 and _sp_oldest > _CLAWSEC_STALE_DAYS:
+        proposal_triggers.append({
+            "type":            "clawsec_stale",
+            "pending_count":   _sp_count,
+            "oldest_age_days": _sp_oldest,
+        })
+
     # Soft anomaly triggers (only if ready after SOFT_ANOMALY_CYCLES consecutive cycles)
     for anomaly in soft_anomalies:
         if anomaly["ready_to_propose"]:
@@ -1178,6 +1234,7 @@ async def _existing_pending_proposal(qdrant, trigger_type: str, dedup_key: str |
                 "hard_failure":               "event_type",
                 "soft_anomaly":               "metric",
                 "external_service_down":      "service",
+                "clawsec_stale":              "clawsec_key",
             }.get(trigger_type)
             if _key_field:
                 must.append(FieldCondition(key=_key_field, match=MatchValue(value=dedup_key)))
@@ -1262,6 +1319,25 @@ async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
             tier = "LOW"
             outcome = f"Task '{title}' executes successfully on its next scheduled due date."
 
+        elif ttype == "clawsec_stale":
+            count    = trigger.get("pending_count", 0)
+            oldest   = trigger.get("oldest_age_days", 0.0)
+            obs = (
+                f"ClawSec security/pending/ has {count} item(s), "
+                f"oldest is {oldest:.0f} days old (threshold: 7 days). "
+                "Live dynamic injection patterns may be stale."
+            )
+            hypothesis = (
+                "clawsec_update has not been run recently, or the feed was not reachable. "
+                "Dynamic scanner patterns loaded from clawsec_dynamic.yaml may be outdated."
+            )
+            action = (
+                "Run clawsec_update to fetch the live ClawSec feed and refresh "
+                "clawsec_dynamic.yaml. This is a MID-tier operation."
+            )
+            tier = "MID"
+            outcome = "clawsec_dynamic.yaml is refreshed; security/pending/ has a recent fetch log."
+
         elif ttype == "soft_anomaly":
             metric = trigger.get("metric", "unknown")
             value = trigger.get("value", 0.0)
@@ -1285,6 +1361,7 @@ async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
             "hard_failure":               trigger.get("event_type"),
             "soft_anomaly":               trigger.get("metric"),
             "external_service_down":      trigger.get("service"),
+            "clawsec_stale":              "clawsec",
         }.get(ttype)
         if await _existing_pending_proposal(qdrant, ttype, _dedup_key):
             logger.info("SIHarness: skipping duplicate proposal for %s / %s", ttype, _dedup_key)
@@ -1304,6 +1381,7 @@ async def propose(qdrant, cog, ledger, triggers: list[dict]) -> list[str]:
                 "hard_failure":               "event_type",
                 "soft_anomaly":               "metric",
                 "external_service_down":      "service",
+                "clawsec_stale":              "clawsec_key",
             }.get(ttype)) and _dedup_key else None,
         )
         proposal_ids.append(pid)

@@ -184,6 +184,7 @@ ROUTING RULES:
 - Any instruction about Sovereign's behaviour, tone, or communication style (e.g. "speak more clearly", "stop doing X", "you need to Y", "your response was wrong") → research_agent, intent=query
 - If the input contains no clear domain (docker/files/email/calendar/web) → research_agent, intent=query
 - "Remember", "store", "note", "memorise", "don't forget", "add to my list", "add to shopping list", "save to my list", "put on my list" → research_agent, intent=remember_fact
+- Director states a personal future-schedule fact WITHOUT an explicit "remember" trigger — flight itinerary, hotel booking, meeting, appointment, or personal commitment that includes specific dates/times/places — → research_agent, intent=remember_fact, _structured_fact: true, collection: episodic. Signals: first-person future/present tense ("I'm flying", "I'll be", "I have a meeting", "I'm staying at", "I start", "I arrive", "I depart"), with a specific date, time, or location. Exclude: past events already completed, opinions, questions, and casual acknowledgements like "we're back" or "I'm home".
 - Container/service/infrastructure operations → devops_agent
 - CRITICAL SELF-DIAGNOSTIC RULE: ANY question about Sovereign's own health, performance, resource usage, internal state, GPU/VRAM/RAM, system status, or self-monitoring → devops_agent, intent=get_stats, target=null. NEVER route these to research_agent.
 - CRITICAL EMAIL RULE: ANY mention of "email", "emails", "inbox", "messages", "mail" → business_agent. Intent rules (apply the FIRST match):
@@ -260,7 +261,9 @@ Respond with ONLY this JSON and nothing else:
   "reasoning_summary": "<one sentence>",
   "preferred_provider": "local",
   "delegation_reason": "",
-  "expected_output_format": ""
+  "expected_output_format": "",
+  "_structured_fact": false,
+  "collection": null
 }}"""
 
 
@@ -395,7 +398,7 @@ RULES:
         _schema_hint = """
 REQUIRED OUTPUT FIELDS for this email operation:
   "operation": "<choose: fetch_email to list inbox, fetch_message to read a specific email>"
-  "account": "<personal or business — match the Director's request; default to business if unclear>"
+  "account": "<personal or business — match the Director's request; check conversation context for [personal inbox] or [business inbox] label; default to personal if unclear>"
   "risk": "LOW"
   "confidence": 0.9
 
@@ -405,7 +408,7 @@ OPERATION SELECTION RULES:
   When using fetch_message, also include:
     "from_addr": "<the SENDER name or email — e.g. 'UptimeRobot', 'support@example.com'. Use this for service names like UptimeRobot, GitHub, Stripe etc.>"
     "subject": "<a keyword from the subject line — only if the Director names a specific subject>"
-    "database_id": "<numeric databaseId if the Director gives a number (e.g. 'email 3474' → '3474'); also shown as [id:XXXX] in prior lists. Else empty string>"
+    "database_id": "<extract from: (1) [id:XXXX] tag in a prior email list in this conversation, (2) a number the Director gives ('email 3474' → '3474'). If the Director says 'it'/'that'/pronoun referring to a recently listed email, look in the conversation context for the [id:XXXX] tag of that email. Else empty string>"
   IMPORTANT: Service/tool names (UptimeRobot, GitHub, Stripe, Trade Me) go in from_addr, NOT subject.
   At least one of database_id, from_addr, or subject must be non-empty for fetch_message.
 
@@ -782,7 +785,8 @@ REQUIRED OUTPUT FIELDS for this email operation:
   (e.g. "read the X email", "what does Y say", "show me the email from Z").
 - Use "fetch_unread_personal" only when Director wants to list/check the inbox with no specific email in mind.
 - For fetch_message: include "from_addr" (sender display name only — e.g. "Metalheadz", "AliExpress")
-  and/or "subject" keyword. Also extract "database_id" from [id:XXXX] tag in context if present, or from a number the Director gives (e.g. "email 3474" → "3474").
+  and/or "subject" keyword. Extract "database_id" from: (1) [id:XXXX] tag in a prior email list in this conversation, (2) a number the Director gives (e.g. "email 3474" → "3474"). If the Director uses a pronoun ("it", "that") referring to a previously listed email, look in the conversation context for the matching [id:XXXX] and use that as database_id.
+- For account: check if the conversation context shows "[personal inbox]" or "[business inbox]" — use that account. Default to "personal" if unclear.
 - Never output a file/Nextcloud operation for email intents."""
 
     elif intent == "delete_email":

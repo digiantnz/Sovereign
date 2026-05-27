@@ -110,6 +110,8 @@ class GovernanceEngine:
         elif domain == 'security':
             if operation in ('check_updates', 'read') and rules.get('security_read', False):
                 return rules
+            elif operation == 'update_patterns' and rules.get('file_write', False):
+                return rules
         elif domain == 'browser':
             if operation == 'search' and rules.get('browser_search', False):
                 return rules

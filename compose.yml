@@ -373,6 +373,8 @@ services:
       - /home/sovereign/skills:/skills:ro          # Read-only skill definitions
       - /home/sovereign/sovereign/nanobot-01/workspace:/workspace  # Task workspace (RAID)
       - /home/sovereign/nanobot-01/memory:/memory  # Durable nanobot memory (RAID)
+      - /home/sovereign/a2a-nanobot/nanobot-security:/nanobot-security:ro  # nanobot_security package (via PYTHONPATH)
+      - /home/sovereign/security:/home/sovereign/security:ro  # clawsec_dynamic.yaml live patterns
     # No docker.sock, no privileged, no extra capabilities, no host ports
     # Phase 1 credential delegation: static env var mounts (ai_net only, contained risk)
     # Phase 2 will replace these with session-scoped token proxy via sovereign-core
@@ -388,6 +390,7 @@ services:
       - SKILLS_DIR=/skills
       - MEMORY_DIR=/memory
       - NANOBOT_TASK_TIMEOUT=25
+      - PYTHONPATH=/nanobot-security
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

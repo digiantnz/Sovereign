@@ -160,7 +160,7 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 - `_move_sync()`: checks for spaces in `archive_folder` → wraps in double-quotes before IMAP UID COPY command. imaplib does NOT auto-quote mailbox names. Error dict includes `imap_folder_arg` showing exact string sent
 
 ### Community skill routing (execution/engine.py)
-- Mail domain calls `self.nanobot.run("imap-smtp-email", action, params)` — NOT IMAPAdapter/SMTPAdapter
+- Mail domain calls `self.nanobot.run("nc-mail", action, params)` — NOT IMAPAdapter/SMTPAdapter
 - Account suffix: `_suf = "" if account == "business" else "_personal"` selects personal vs business command
 - Account resolution order: `sp.get("account")` → `delegation.get("target")` → `action.get("account")` → `"personal"` (never default to business)
 - CalDAV/WebDAV now route through nanobot-01 skills (openclaw-nextcloud / sovereign-nextcloud-fs) — Python adapters removed 2026-04-03

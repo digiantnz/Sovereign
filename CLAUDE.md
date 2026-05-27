@@ -216,7 +216,7 @@ When `_dispatch_inner` reaches `domain: ollama`, Grok is only called on **explic
 
 | Skill | Executor | Specialists | Operations |
 |-------|----------|-------------|------------|
-| `imap-smtp-email` | python3_exec → nanobot-01 | business_agent | |
+| `nc-mail` | python3_exec → nanobot-01 | business_agent | list_unread, fetch_message, delete_message, move_message, mark_read, mark_unread, send, list_mailboxes, list_accounts (9 ops) |
 | `openclaw-nextcloud` | python3_exec → nanobot-01 | business_agent | calendar_list/list_events/create/delete/update, tasks_list/create/complete/delete, files_list/search/read/write/delete/mkdir, notes_list/read/create/update/delete (22 ops) |
 | `sovereign-browser` | python3_exec → nanobot-01 | research_agent | search, fetch (2 ops) |
 | `sovereign-nextcloud-fs` | python3_exec → nanobot-01 | business_agent | telegram_upload, fs_list/list_recursive/read/move/copy/mkdir/delete/tag/untag/search (11 ops) |
@@ -371,7 +371,7 @@ The following items require Director input before CC can implement them. Do not 
 | 7 | **COMPLETE** | Generalised task scheduler: NL→TaskDefinition, Qdrant PROSPECTIVE+PROCEDURAL+EPISODIC, 60s executor |
 | W1+W2 | **COMPLETE** | sov-wallet, BIP-39 keygen, HKDF+AES-256-GCM, EIP-712 SafeTx, get_btc_xpub. First boot confirmed 2026-03-31. |
 | OC-S1–S3.1 | **COMPLETE** | Python adapters, nanobot-01 sidecar, Model B DSL, broker CLI exec |
-| OC-S4 | **COMPLETE** | Community skills (imap-smtp-email, openclaw-nextcloud), skill_install flow, confirmed-continuation bypass |
+| OC-S4 | **COMPLETE** | Community skills (nc-mail, openclaw-nextcloud), skill_install flow, confirmed-continuation bypass |
 | OC-S5 | **COMPLETE** | nanobot-01 as primary executor, CredentialProxy single-use token delegation |
 | OC-S6 | **COMPLETE** | python3_exec cutover, imap/smtp/nextcloud/feeds.py scripts, rss-digest skill, route_cognition PASS 2 wiring |
 | CL-Rework | **COMPLETE** | 5-pass cognitive loop, InternalMessage envelope, nanobot protocol contract, untrusted tagging |

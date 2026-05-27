@@ -27,41 +27,61 @@ import csv
 import io
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date as _date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from .models import TaxEvent, format_amount, make_tax_id, resolve_tax_year
 
 logger = logging.getLogger(__name__)
 
-_TAX_FOLDER   = "/Digiant/Tax"
+_TAX_BASE     = "/Digiant/Tax"
 _INGESTED_TAG = "tax_file_ingested"
 
 # Currency codes that indicate a crypto asset (not fiat)
 _FIAT_CURRENCIES = {"NZD", "AUD", "USD", "EUR", "GBP", "JPY", "CAD", "CHF", "SGD"}
 
 
+def _active_fy_folders() -> list[str]:
+    """Return FY folder paths for the current and immediately prior NZ fiscal year.
+
+    NZ FY YYYY: 1 Apr (YYYY-1) → 31 Mar YYYY.
+    Example: today = May 2026 → current_fy = 2027; scan FY2027 and FY2026.
+    Archived years (renamed to FYxxxx by Director but not in this range) are skipped.
+    """
+    today = _date.today()
+    current_fy = today.year + 1 if today.month >= 4 else today.year
+    return [
+        f"{_TAX_BASE}/FY{current_fy}",
+        f"{_TAX_BASE}/FY{current_fy - 1}",
+    ]
+
+
 # ── File listing ───────────────────────────────────────────────────────────────
 
 async def list_unprocessed_files(nanobot) -> list[dict]:
-    """Return files in /Tax (recursively) that do NOT have the tax_file_ingested tag."""
-    try:
-        nb = await nanobot.run(
-            "sovereign-nextcloud-fs", "fs_list_recursive", {"path": _TAX_FOLDER}
-        )
-        result = nb.get("result") if nb.get("result") is not None else nb
-        files = result if isinstance(result, list) else (
-            result.get("files") or result.get("items") or []
-            if isinstance(result, dict) else []
-        )
-        return [
-            f for f in files
-            if _INGESTED_TAG not in (f.get("tags") or [])
-            and f.get("type", "file") in ("file", None)
-        ]
-    except Exception as exc:
-        logger.warning("ingest: list_unprocessed_files failed: %s", exc)
-        return []
+    """Return files in active FY folders that do NOT have the tax_file_ingested tag.
+
+    Only scans FY{current_fy} and FY{current_fy-1} — archived prior years are ignored.
+    """
+    all_files: list[dict] = []
+    for folder in _active_fy_folders():
+        try:
+            nb = await nanobot.run(
+                "sovereign-nextcloud-fs", "fs_list_recursive", {"path": folder}
+            )
+            result = nb.get("result") if nb.get("result") is not None else nb
+            files = result if isinstance(result, list) else (
+                result.get("files") or result.get("items") or []
+                if isinstance(result, dict) else []
+            )
+            all_files.extend(files)
+        except Exception as exc:
+            logger.warning("ingest: list_unprocessed_files %s failed: %s", folder, exc)
+    return [
+        f for f in all_files
+        if _INGESTED_TAG not in (f.get("tags") or [])
+        and f.get("type", "file") in ("file", None)
+    ]
 
 
 # ── CSV ingestion ──────────────────────────────────────────────────────────────

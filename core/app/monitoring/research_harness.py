@@ -358,7 +358,8 @@ async def _gather_grok(cog, topic: str) -> tuple[str, str | None]:
             _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
             result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
         else:
-            result = await cog.ask_local(prompt)
+            from adapters.inference_queue import InferenceQueue
+            result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL)
         if result.get("error"):
             return "", result["error"]
         return result.get("response", ""), None

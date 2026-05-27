@@ -87,14 +87,6 @@ class TaxIngestHarness:
             session["status"] = "partial"
             logger.warning("tax_harness: store step failed: %s", exc)
 
-        # ── Step 5: notify ─────────────────────────────────────────────────
-        if stored > 0:
-            try:
-                await self._step_notify(session, events)
-            except Exception as exc:
-                session["errors"].append(f"notify: {exc}")
-                logger.warning("tax_harness: notify step failed: %s", exc)
-
         # ── Step 6: clear ──────────────────────────────────────────────────
         try:
             await self._step_clear()

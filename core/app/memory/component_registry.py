@@ -495,17 +495,6 @@ _COMPONENTS: list[dict] = [
         "location": "/home/sovereign/skills/email-harness/SKILL.md",
     },
     {
-        "name": "skill-imap-smtp-email",
-        "component_type": "skill",
-        "title": "Skill: imap-smtp-email",
-        "content": (
-            "imap-smtp-email skill: IMAP fetch + SMTP send for personal and business accounts. "
-            "Executor: python3_exec → nanobot-01 (imap_check.py, smtp_send.py). "
-            "Specialist: business_agent. Credentials via CredentialProxy."
-        ),
-        "location": "/home/sovereign/skills/imap-smtp-email/SKILL.md",
-    },
-    {
         "name": "skill-memory-curate",
         "component_type": "skill",
         "title": "Skill: memory-curate",

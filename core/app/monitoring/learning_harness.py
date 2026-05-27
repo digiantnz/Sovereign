@@ -604,7 +604,7 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
                     from adapters.inference_queue import InferenceQueue
                     import asyncio as _aq
                     result = await cog.ask_local(
-                        prompt, priority=InferenceQueue.LOW, timeout=90.0
+                        prompt, priority=InferenceQueue.NORMAL, timeout=90.0
                     )
                     if result.get("status") == "llm_timeout":
                         logger.warning(
@@ -613,7 +613,7 @@ async def _run_confidence_loop(chunks: list, doc_array: list,
                         )
                         _aq.create_task(_log_learning_timeout(cog, result, cycle, pass_type))
                         result = await cog.ask_local(
-                            prompt, priority=InferenceQueue.LOW, timeout=90.0
+                            prompt, priority=InferenceQueue.NORMAL, timeout=90.0
                         )
                         if result.get("status") == "llm_timeout":
                             timeout_skips += 1

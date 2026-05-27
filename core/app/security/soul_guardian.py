@@ -16,6 +16,8 @@ SOUL_BACKUP_PATH = "/home/sovereign/governance/soul-backup/Sovereign-soul.md"
 GOVERNANCE_PATH = "/app/governance/governance.json"  # container path (mounted from RAID)
 GOVERNANCE_BACKUP_PATH = "/home/sovereign/governance/soul-backup/governance.json"
 
+CLAWSEC_DYNAMIC_PATH = "/home/sovereign/security/clawsec_dynamic.yaml"
+
 PROTECTED_FILES = [
     SOUL_MD_PATH,
     GOVERNANCE_PATH,
@@ -28,10 +30,15 @@ PROTECTED_FILES = [
     "/home/sovereign/security/destructive_commands.yaml",
     "/home/sovereign/security/exfiltration_patterns.yaml",
     "/home/sovereign/keys/sovereign.key",   # CRITICAL — Ed25519 signing key
+    CLAWSEC_DYNAMIC_PATH,
 ]
 
 # Files that escalate to CRITICAL alert (not just warning) on any modification
 CRITICAL_FILES = {"/home/sovereign/keys/sovereign.key"}
+
+# Optional protected files: protected once created, but no alert if missing.
+# Used for files that are absent until a first-run harness creates them.
+OPTIONAL_PROTECTED_FILES = frozenset({CLAWSEC_DYNAMIC_PATH})
 CHECKSUM_PATH = "/home/sovereign/security/.checksums.json"
 
 # Files that support auto-restore from a known backup.
@@ -133,7 +140,7 @@ class SoulGuardian:
                         logger.info("SoulGuardian: backup written %s → %s", path, backup_path)
                     except Exception as e:
                         logger.warning("SoulGuardian: backup write failed for %s: %s", path, e)
-            else:
+            elif path not in OPTIONAL_PROTECTED_FILES:
                 logger.warning(
                     "SoulGuardian: protected file missing at baseline: %s", path
                 )
@@ -156,6 +163,8 @@ class SoulGuardian:
         restore_results: dict[str, bool] = {}
         for path in self._files:
             if not os.path.exists(path):
+                if path in OPTIONAL_PROTECTED_FILES:
+                    continue  # not yet created — silently skip until first run
                 logger.warning("SoulGuardian: protected file missing: %s", path)
                 drifted.append(path)
                 restore_results[path] = self._attempt_restore(path, auto_reason="file_missing")
