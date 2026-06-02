@@ -112,6 +112,7 @@ INTENT_ACTION_MAP = {
     "portfolio_analysis":       {"domain": "portfolio_analysis", "operation": "gather"},
     "portfolio_analysis_save":  {"domain": "portfolio_analysis", "operation": "save"},
     "portfolio_analysis_clear": {"domain": "portfolio_analysis", "operation": "clear"},
+    "portfolio_watcher_scan":   {"domain": "portfolio_watcher",  "operation": "scan"},
     "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
     "news_brief":         {"domain": "news",    "operation": "brief"},
     # Tax ingest harness intents (Phase 1 — continuous hourly ingest)
@@ -135,8 +136,11 @@ INTENT_ACTION_MAP = {
     "memory_recall":      {"domain": "memory",  "operation": "recall"},   # exact content search
     "memory_synthesise":  {"domain": "memory_synthesise", "operation": "synthesise"},
     # Memory Index Protocol — deterministic directory + exact-key retrieval (MIP v1.2)
-    "memory_list_keys":    {"domain": "memory_index", "operation": "list_keys"},
-    "memory_retrieve_key": {"domain": "memory_index", "operation": "retrieve_key"},
+    "memory_list_keys":         {"domain": "memory_index", "operation": "list_keys"},
+    "memory_retrieve_key":      {"domain": "memory_index", "operation": "retrieve_key"},
+    "memory_list_gaps":         {"domain": "memory_index", "operation": "list_gaps"},
+    "memory_list_collections":  {"domain": "memory_index", "operation": "list_collections"},
+    "governance_describe":      {"domain": "governance_read", "operation": "describe"},
     # GitHub intents — devops_agent scope (read also available to research_agent)
     # Protected operations (PAT modification, repo creation, visibility change) NOT exposed.
     "github_read":          {"domain": "github", "operation": "read",      "name": "github_read"},
@@ -275,6 +279,7 @@ INTENT_TIER_MAP = {
     "research_gather": "LOW", "research_save": "MID", "research_clear": "LOW",
     "validator_queue_check": "NORMAL",
     "portfolio_analysis": "LOW", "portfolio_analysis_save": "MID", "portfolio_analysis_clear": "LOW",
+    "portfolio_watcher_scan": "LOW",
     "restart_container": "MID", "recreate_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
     "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
     "delete_file": "HIGH", "delete_email": "HIGH", "delete_task": "HIGH",
@@ -282,6 +287,9 @@ INTENT_TIER_MAP = {
     "memory_recall": "LOW",
     "memory_list_keys": "LOW",
     "memory_retrieve_key": "LOW",
+    "memory_list_gaps":        "LOW",
+    "memory_list_collections": "LOW",
+    "governance_describe":     "LOW",
     "memory_synthesise": "NORMAL",
     # Skill harness tiers — explicit steps with validation gates + WM checkpoints
     "skill_search":           "LOW",   # search + write checkpoint
@@ -1221,6 +1229,8 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "list all memories", "show my memories", "show memory",
         "retrieve memory", "fetch memory key", "get memory key",
         "what do you remember", "what's in memory", "what is in memory",
+        "knowledge gap", "knowledge gaps", "what gaps", "your gaps",
+        "what don't you know", "what do you not know", "memory gaps",
         "eth address", "wallet address", "safe address", "tailscale",
         "recall", "look up in memory", "retrieve from memory",
         # Wallet watchlist
@@ -1264,6 +1274,20 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "lightning channel", "create bitcoin", "btc transaction", "btc send",
         # Research requests — pass guard so CEO LLM classifies correctly
         "research ", "look into ", "investigate ",
+        # Self-identity / architecture queries (Fix 1 — memory_recall)
+        "who are you", "what are you", "describe yourself", "your architecture",
+        "your design", "your components", "how are you built", "how were you built",
+        "your cognitive", "sovereign architecture", "rex architecture",
+        "how do you work", "how do you think", "explain yourself",
+        "your agents", "your specialists", "your passes", "your cognitive loop",
+        "what makes you up", "what are your parts", "what is rex",
+        "who is rex", "describe rex", "rex cognitive",
+        # Memory collection queries (Fix 2 — memory_list_collections)
+        "memory collections", "your collections", "what collections", "qdrant collections",
+        "list collections", "show collections", "memory stores", "memory databases",
+        # Governance describe queries (Fix 3 — governance_describe; "governance" already present above)
+        "governance tiers", "what are your governance", "governance structure",
+        "what are the tiers", "your governance tiers", "list governance",
     )
     prior_has_system = prior_domain is not None
 
@@ -1727,6 +1751,62 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Capability diagnostic — research_agent query fast-path",
         }
 
+    # Memory collection registry query — "what collections do you have", "list your collections"
+    # Must be before _gap_kw to avoid "your gaps" vs "your collections" ambiguity.
+    _coll_kw = (
+        "what collections", "list collections", "your collections", "memory collections",
+        "qdrant collections", "what memory collections", "list memory collections",
+        "show your collections", "show collections", "what are your collections",
+        "memory stores", "what stores do you", "memory databases",
+    )
+    if any(w in u for w in _coll_kw):
+        return {
+            "delegate_to": "memory_agent", "intent": "memory_list_collections",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Memory collection registry query — static handler",
+        }
+
+    # Knowledge gap query — must be before _self_diag_kw (shares "your" prefix words)
+    _gap_kw = (
+        "knowledge gap", "knowledge gaps", "what gaps", "your gaps",
+        "what don't you know", "what do you not know", "memory gaps",
+        "gaps in your", "gaps in memory", "what are your gaps",
+    )
+    if any(w in u for w in _gap_kw):
+        return {
+            "delegate_to": "memory_agent", "intent": "memory_list_gaps",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Knowledge gap query — deterministic pre-classifier",
+        }
+
+    # Self-identity / architecture queries — "who are you", "describe yourself", "your architecture"
+    # Routes to memory_recall so Rex reads from sovereign-self-architecture.md in semantic memory.
+    # Must be BEFORE _self_diag_kw which also contains "your capabilities", "your toolset" etc.
+    # Exclusion guard prevents "what are you" from matching "what are your governance tiers" etc.
+    _self_arch_kw = (
+        "who are you", "what are you", "describe yourself", "tell me about yourself",
+        "your architecture", "your design", "your components", "how are you built",
+        "how were you built", "how do you work", "what is your architecture",
+        "what's your architecture", "what is your design", "explain your architecture",
+        "explain yourself", "your cognitive", "your cognitive loop", "your cognitive architecture",
+        "how you think", "how do you think", "what makes you", "what makes you up",
+        "what are your parts", "your agents", "your specialists", "your passes",
+        "sovereign architecture", "rex architecture", "explain rex", "what is rex",
+        "who is rex", "describe rex", "rex cognitive",
+    )
+    # Guard: exclude queries about specific system domains (governance, skills, memory ops, etc.)
+    # e.g. "what are your governance tiers" contains "what are you" but is not a self-arch query.
+    _self_arch_exclude = (
+        "governance", "tier", "skill", "harness", "collection", "permission",
+        "memory collection", "qdrant", "knowledge gap",
+    )
+    if any(w in u for w in _self_arch_kw) and not any(x in u for x in _self_arch_exclude):
+        return {
+            "delegate_to": "memory_agent", "intent": "memory_recall",
+            "target": "sovereign architecture", "tier": "LOW",
+            "reasoning_summary": "Self-identity/architecture query — memory_recall from semantic memory",
+        }
+
     # Self-diagnostic — requests about Sovereign's own health, performance, or internal state
     _self_diag_kw = (
         "how are you running", "how are you performing", "how are you doing",
@@ -1765,6 +1845,23 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "skill_audit",
             "target": None, "tier": "LOW",
             "reasoning_summary": "Skill/harness introspection — deterministic to bypass LLM generic response",
+        }
+
+    # Governance describe — "what are your governance tiers", "describe your governance"
+    # Deterministic read of governance.json — never sent to LLM.
+    _gov_desc_kw = (
+        "governance tiers", "your governance tiers", "what are your governance tiers",
+        "describe your governance", "governance structure", "what is your governance",
+        "what's your governance", "how does governance work", "what are the tiers",
+        "what tiers do you have", "your tiers", "what are the governance", "your governance",
+        "governance policy", "your governance policy", "what governance tiers",
+        "list governance tiers", "show governance tiers",
+    )
+    if any(w in u for w in _gov_desc_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "governance_describe",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Governance description — deterministic read of governance.json",
         }
 
     # Docker / containers — only for list/status queries, not action verbs
@@ -3756,7 +3853,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "validator_queue"):
+        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
                 _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok)\b',           _re_sc.IGNORECASE)
@@ -4224,8 +4321,11 @@ class ExecutionEngine:
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "research_gather", "research_save", "research_clear",
             "portfolio_analysis", "portfolio_analysis_save", "portfolio_analysis_clear",
-            "memory_list_keys", "memory_retrieve_key",  # MIP — pass structured index directly
+            "portfolio_watcher_scan",   # watcher result passes directly; harness sends its own Telegram
+            "memory_list_keys", "memory_retrieve_key", "memory_list_gaps",  # MIP — pass structured index directly
+            "memory_list_collections",  # static collection registry — passes directly
             "memory_recall",   # exact content search — found/not-found result passes directly
+            "governance_describe",  # deterministic governance.json read — passes directly
             # remember_fact intentionally excluded — raw execution_result leaks point_id/collection
             # to the translator; let PASS 4 → translator produce plain-English confirmation instead
             # Dev-Harness — all phases return structured dicts; bypass LLM summarisation
@@ -6574,12 +6674,33 @@ class ExecutionEngine:
             if operation == "gather":
                 _pa_cat = (delegation or {}).get("category") or (delegation or {}).get("target") or prompt or ""
                 _pa_url = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
+                # Last-day-of-month guard — set by the monthly task scheduler step.
+                # Fires on days 28-31 (cron 0 20 28-31 * *); guard skips if not the actual last day.
+                if (delegation or {}).get("last_day_guard"):
+                    import calendar as _cal
+                    from datetime import date as _date_cls
+                    _today = _date_cls.today()
+                    _last = _cal.monthrange(_today.year, _today.month)[1]
+                    if _today.day != _last:
+                        logger.info(
+                            "portfolio_analysis: last_day_guard — today is %d/%d, last day is %d — skipping",
+                            _today.month, _today.day, _last,
+                        )
+                        return {
+                            "status": "skipped",
+                            "director_message": f"Portfolio analysis skipped — today ({_today.isoformat()}) is not the last day of the month.",
+                        }
                 return await run_portfolio_analysis(self.cog, self.nanobot, self.qdrant, _pa_cat, _pa_url)
             if operation == "save":
                 return await run_portfolio_analysis_save(self.cog, self.nanobot, self.qdrant)
             if operation == "clear":
                 return await run_portfolio_analysis_clear(self.qdrant)
             return {"status": "error", "error": f"unknown portfolio_analysis operation: {operation}"}
+
+        if domain == "portfolio_watcher":
+            from monitoring.portfolio_analysis_harness import run_portfolio_watcher_scan
+            _pw_url = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
+            return await run_portfolio_watcher_scan(self.cog, self.nanobot, self.qdrant, _pw_url)
 
         if domain == "tax":
             from tax_harness.harness import TaxIngestHarness
@@ -7685,7 +7806,115 @@ class ExecutionEngine:
                     }
                 return {"status": "ok", "entry": entry}
 
+            if op == "list_gaps":
+                from qdrant_client.models import FieldCondition, MatchValue, Filter
+                _META = "meta"
+                gaps_result = await self.qdrant.archive_client.scroll(
+                    collection_name=_META,
+                    scroll_filter=Filter(
+                        must=[FieldCondition(key="type", match=MatchValue(value="gap"))]
+                    ),
+                    limit=100,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                gap_points = gaps_result[0] if gaps_result else []
+                gaps = []
+                for pt in gap_points:
+                    payload = pt.payload or {}
+                    gaps.append({
+                        "domain": payload.get("domain", ""),
+                        "query":  payload.get("query", payload.get("content", "")),
+                    })
+                return {
+                    "status": "ok",
+                    "count":  len(gaps),
+                    "gaps":   gaps,
+                }
+
+            if op == "list_collections":
+                return {
+                    "status": "ok",
+                    "description": "Sovereign has 8 Qdrant collections: 7 durable (RAID) + 1 ephemeral (RAM).",
+                    "collections": [
+                        {
+                            "name": "semantic",
+                            "tier": "RAID (durable)",
+                            "description": "Long-term learned knowledge — ingested documents, learned facts, skill entries, MIP keys, semantic seeds. Primary knowledge base.",
+                        },
+                        {
+                            "name": "episodic",
+                            "tier": "RAID (durable)",
+                            "description": "Event history and audit trail — learning sentinels, MRFL weight increments, security ledger entries, session events.",
+                        },
+                        {
+                            "name": "prospective",
+                            "tier": "RAID (durable)",
+                            "description": "Future-oriented tasks — scheduled tasks (active/pending/cancelled), SI proposals awaiting Director approval.",
+                        },
+                        {
+                            "name": "procedural",
+                            "tier": "RAID (durable)",
+                            "description": "Step-by-step task definitions — human-confirmed PROCEDURAL tasks with step arrays, harness session records.",
+                        },
+                        {
+                            "name": "associative",
+                            "tier": "RAID (durable)",
+                            "description": "Relationship graph — populated exclusively by nightly synthesis (Passes 1–3). Encodes connections between concepts in semantic memory.",
+                        },
+                        {
+                            "name": "relational",
+                            "tier": "RAID (durable)",
+                            "description": "Structured relational facts — explicit named relationships written during learning and synthesis.",
+                        },
+                        {
+                            "name": "meta",
+                            "tier": "RAID (durable)",
+                            "description": "System metadata — synthesis cursors, knowledge gaps (type=gap), config-change records, MIP session state.",
+                        },
+                        {
+                            "name": "working_memory",
+                            "tier": "Ephemeral (tmpfs RAM)",
+                            "description": "Session scratch space — PASS 0 context, item index (notes/events/emails), harness checkpoints. Lost on container restart by design.",
+                        },
+                    ],
+                }
+
             return {"error": f"Unknown memory_index operation: {op}"}
+
+        if domain == "governance_read":
+            import json as _gj
+            _gov_path = "/home/sovereign/governance/governance.json"
+            try:
+                _gov = _gj.loads(open(_gov_path).read())
+            except Exception as _ge:
+                return {"status": "error", "error": f"Cannot read governance.json: {_ge}"}
+            _tiers = _gov.get("tiers", {})
+            _intent_tiers = _gov.get("intent_tiers", {})
+            _version = _gov.get("meta", {}).get("version", _gov.get("version", "unknown"))
+            _tier_lines = []
+            for _tn, _tc in _tiers.items():
+                _conf = "no confirmation" if not _tc.get("requires_confirmation") and not _tc.get("requires_double_confirmation") else (
+                    "double-confirmation required" if _tc.get("requires_double_confirmation") else "confirmation required"
+                )
+                _perms = [k for k, v in _tc.items()
+                          if isinstance(v, bool) and v and k not in ("requires_confirmation", "requires_double_confirmation")]
+                _tier_lines.append(
+                    f"**{_tn}** — {_conf}. Permissions: {', '.join(_perms[:6])}{'...' if len(_perms) > 6 else ''}."
+                )
+            _summary = (
+                f"Governance v{_version} — {len(_tiers)} tiers:\n\n"
+                + "\n".join(_tier_lines)
+                + f"\n\nIntent tiers: {len(_intent_tiers)} intents mapped. "
+                  "All tiers are deterministic — GovernanceEngine never calls an LLM."
+            )
+            return {
+                "status": "ok",
+                "description": _summary,
+                "version": _version,
+                "tier_names": list(_tiers.keys()),
+                "intent_tier_count": len(_intent_tiers),
+            }
 
         if domain == "validator_queue":
             from monitoring.validator_queue_harness import run_validator_queue_check

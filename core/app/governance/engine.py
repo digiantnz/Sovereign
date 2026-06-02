@@ -79,13 +79,13 @@ class GovernanceEngine:
             elif operation == 'model_status' and rules.get('ollama_query', False):
                 return rules
         elif domain == 'memory':
-            if operation in ('read', 'write', 'search', 'store') and rules.get('memory_write', False):
+            if operation in ('read', 'write', 'search', 'store', 'recall') and rules.get('memory_write', False):
                 return rules
             elif operation == 'promote' and rules.get('memory_promote', False):
                 return rules
         elif domain == 'memory_index':
             # MIP — directory listing and exact-key retrieval are read-only at LOW tier
-            if operation in ('list_keys', 'retrieve_key') and rules.get('memory_search', False):
+            if operation in ('list_keys', 'retrieve_key', 'list_gaps', 'list_collections') and rules.get('memory_search', False):
                 return rules
         elif domain == 'scheduler':
             # list + recall are read-only (memory_write suffices at LOW tier)
@@ -204,9 +204,17 @@ class GovernanceEngine:
                 return rules
             elif operation == 'save' and rules.get('webdav_write', False):
                 return rules
+        elif domain == 'portfolio_watcher':
+            # Weekly watcher — deterministic scan; no LLM unless signal fires
+            if operation == 'scan' and rules.get('browser_search', False):
+                return rules
         elif domain == 'session':
             # Session flag operations (e.g. confidential_external_approved) — always LOW tier
             if operation == 'set_flag':
+                return rules
+        elif domain == 'governance_read':
+            # Deterministic read of governance.json — always read-only, LOW tier
+            if operation == 'describe' and rules.get('memory_search', False):
                 return rules
 
         raise ValueError(f"Action {action} not allowed under tier {tier}")
