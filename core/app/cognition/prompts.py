@@ -55,10 +55,13 @@ def classify(ceo_persona: str, user_input: str, memory_context: str,
     if context_window:
         # Normalise: list of {user,assistant} dicts or legacy single dict
         turns = context_window if isinstance(context_window, list) else [context_window]
+        # Trim to last 6 turns with per-turn char caps — routing only needs recent context;
+        # full history risks overflowing the 32k KV window under long sessions.
+        recent = turns[-6:]
         lines = ["---", "CONVERSATION HISTORY (most recent last — use to resolve pronouns and follow-ups):"]
-        for t in turns:
-            lines.append(f"Director: {t.get('user', '')}")
-            lines.append(f"Sovereign: {t.get('assistant', '')}")
+        for t in recent:
+            lines.append(f"Director: {str(t.get('user', ''))[:500]}")
+            lines.append(f"Sovereign: {str(t.get('assistant', ''))[:1000]}")
         lines += [
             "",
             "PRONOUN RESOLUTION RULE: If the current input uses 'they/them/those/these/it/that' or",

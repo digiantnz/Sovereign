@@ -497,7 +497,7 @@ class CognitionEngine:
             cognitive_context=cognitive_context,
             sovereign_context=sovereign_context,
         )
-        _raw1 = await self._llm_generate(prompt, model=MODEL, capture_thinking=True)
+        _raw1 = await self._llm_generate("/no_think\n" + prompt, model=MODEL, capture_thinking=False)
         result = self._parse_llm_output(
             _raw1.get("response", ""),
             required=["intent", "delegate_to", "tier"],

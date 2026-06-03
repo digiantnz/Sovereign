@@ -3,8 +3,8 @@ import re
 import httpx
 from config import cfg as _cfg
 
-_TIMEOUT  = 200.0  # qwen2.5:32b: 30-50s typical, headroom for complex passes
-_NUM_CTX  = 16384
+_TIMEOUT  = 200.0  # qwen3-32b: 30-50s typical without thinking; headroom for complex passes
+_NUM_CTX  = 32768  # raised from 16384; qwen3-32b-abliterated native max is 40960; 32k → ~4GB KV → ~23GB total VRAM (safe on RTX 3090)
 _THINK_RE = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 _log      = logging.getLogger(__name__)
 

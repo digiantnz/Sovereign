@@ -17,8 +17,14 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 
 ## Cognitive Loop Invariants
 
+### Inference model
+- **Running model:** `hf.co/RoadToNowhere/Qwen3-32B-abliterated-Q4_K_M-GGUF:latest` — set via `SOVEREIGN_INFERENCE_MODEL` env var in `compose.yml:172`. The `qwen2.5:32b-instruct-q4_K_M` string in `config/loader.py` defaults is stale; the env override takes precedence at startup.
+- **Native context:** 40,960 tokens (GQA: 64 attn heads, 8 KV heads, 64 layers). Safe `_NUM_CTX` ceiling for RTX 3090 (24GB) is **32,768** — at 32k the KV cache is ~4GB (q8_0), total VRAM ~23GB, ~1.5GB headroom. Do not set 40,960 — no headroom.
+- `_NUM_CTX` is set per-request in `adapters/ollama.py`; this overrides the server-level `OLLAMA_CONTEXT_LENGTH` default in `secrets/ollama.env` regardless of that file's value.
+
 ### Pass routing
-- PASS 1 (orchestrator classify), PASS 3b (specialist inbound), PASS 4 (orchestrator evaluate), PASS 5 (translator) → always local Ollama
+- PASS 1 (orchestrator classify), PASS 3b (specialist inbound), PASS 4 (orchestrator evaluate), PASS 5 (translator) → always local Ollama; all prepend `/no_think` to suppress Qwen3 thinking tokens
+- PASS 1 history: trimmed to last 6 turns, user capped 500 chars, assistant capped 1000 chars (mirrors PASS 3 pattern); full history not needed for routing and risks KV overflow under long sessions
 - PASS 2 (specialist outbound) → only externally-routable pass via `_routing_decision()`
 - `_routing_decision(prompt, user_input)` scores complexity on `user_input` (NOT full specialist prompt — persona length would inflate every score)
 - DCL hard-block: tier in `{"PRIVATE","SECRET"}` → `force_local=True` regardless of explicit override
