@@ -1152,7 +1152,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     # Directory-specific size queries — vector DB, docker data, source tree, etc.
     _dir_usage_kw = (
         "vector db size", "vector database size", "vector store size",
-        "how big is the vector", "how much space.*vector", "qdrant size", "qdrant disk",
+        "how big is the vector", "qdrant size", "qdrant disk",
         "how much space is the vector", "size of the vector",
     )
     _dir_path_map = {
@@ -1646,7 +1646,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     # Use word-boundary regex to avoid substring matches (e.g. "it" inside "with", "that" inside "that's")
     import re as _re_pr
     _is_pronoun_ref = bool(_re_pr.search(
-        r'\b(they|them|those|these|it|that|all of them|all of those)\b', u
+        r'\b(they|them|those|these|all of them|all of those)\b', u
     )) and len(u.split()) <= 12
 
     # Email — explicit keyword or pronoun ref when prior domain was email
