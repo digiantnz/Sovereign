@@ -2304,32 +2304,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "File delete — deterministic pre-classifier",
         }
 
-    # Document follow-up — when last turn involved a file read, route content questions
-    # to Ollama so the LLM answers from context_window rather than misrouting to web search.
-    # Only fires when no new system/file-operation signal is present in the current message.
-    # Deliberately narrow: only clear document-analysis phrases. Single-word verbs like
-    # "what", "list", "explain", "review", "describe" removed — too broad, grabbed
-    # unrelated queries (file listings, task queries) that shared prior_domain=file.
-    _doc_followup_kw = (
-        "summarise", "summarize",
-        "key points", "main points", "key takeaways", "key findings",
-        "what does it say", "what does this say", "what does it contain",
-        "duties", "responsibilities", "obligations",
-        "conclusions", "recommendations",
-    )
-    _new_op_signal = any(w in u for w in (
-        "read", "open", "fetch", "download", "upload", "write", "create", "delete",
-        "move", "copy", "rename", "search nextcloud", "list nextcloud",
-    ))
-    if (prior_domain == "file"
-            and not _new_op_signal
-            and any(w in u for w in _doc_followup_kw)):
-        return {
-            "delegate_to": "business_agent", "intent": "query",
-            "target": user_input,
-            "reasoning_summary": "Document follow-up — answer from context_window",
-        }
-
     # ── Dev-Harness fast-paths ─────────────────────────────────────────────
     # All dev_* intents are deterministic — bypass CEO LLM + PASS 3.
     # "approve/reject/verify dev fix {id}" carry an 8-char hex session_id_short
@@ -2406,30 +2380,16 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Dev-Harness clear — deterministic pre-classifier",
         }
 
-    # Safety net: prior context active but no domain keywords matched the current query.
-    # Don't fall through to CEO LLM — the small 8b model re-uses prior context and misroutes.
-    # Exceptions:
-    #   - RSS queries: must reach CEO LLM + PASS 3 so specialist selects rss-digest via nanobot
-    #   - Time signals: route to web_search (browser/Grok) not Ollama
-    if prior_has_system:
-        if _is_rss:
-            pass  # fall through to CEO LLM — PASS 3 needed for rss-digest skill selection
-        elif any(sig in u for sig in _time_signals):
-            return {
-                "delegate_to": "research_agent", "intent": "web_search",
-                "target": user_input, "tier": "LOW",
-                "reasoning_summary": "Time-sensitive query after system context — direct to browser/Grok, bypass CEO LLM",
-            }
-        elif prior_domain == "calendar" or _has_calendar_signal:
-            pass  # fall through to CEO LLM — calendar intents classified by qwen2.5:32b
-        else:
-            return {
-                "delegate_to": "research_agent", "intent": "query",
-                "target": None, "tier": "LOW",
-                "reasoning_summary": "Prior context active but no domain keywords — safe fallback to conversational query",
-            }
+    # Time-sensitive query with prior system context — route direct to browser/Grok.
+    # All other unmatched queries fall through to PASS 1 regardless of session state.
+    if prior_has_system and any(sig in u for sig in _time_signals):
+        return {
+            "delegate_to": "research_agent", "intent": "web_search",
+            "target": user_input, "tier": "LOW",
+            "reasoning_summary": "Time-sensitive query after system context — direct to browser/Grok, bypass CEO LLM",
+        }
 
-    return None   # fall through to CEO LLM
+    return None   # fall through to PASS 1 (Qwen3-32B owns unmatched queries)
 
 
 # Safe fallback intent when CEO returns an unrecognised intent label.
