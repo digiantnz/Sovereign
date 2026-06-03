@@ -121,8 +121,8 @@ VALID INTENTS BY AGENT:
 
 devops_agent:
   list_containers     — list / show running containers
-  get_logs            — fetch container logs
-  get_stats           — fetch container resource stats; also use for any question about Sovereign's own health, performance, resource usage, internal state, GPU/VRAM/RAM, or self-diagnostic requests
+  get_logs            — fetch recent log output from a specific named container; use when Director asks to "check" a container, diagnose a service issue, see what a container is doing, or troubleshoot an error (target: container name e.g. "nginx", "sovereign-core", "gateway")
+  get_stats           — fetch resource metrics (CPU, RAM, VRAM, GPU) across all containers; use ONLY for questions about Sovereign's overall resource usage, performance, or hardware health — NOT for diagnosing a specific named service
   restart_container   — restart a container (requires target container name)
   github_read         — check GitHub releases, pending security updates, or Sovereign repo status (LOW — no confirmation)
   github_push_doc     — push standard docs or as-built updates to Sovereign GitHub repo (MID — requires confirmation; target: repo-relative path e.g. "docs/as-built.md")
@@ -218,7 +218,7 @@ ROUTING RULES:
 - "Remember", "store", "note", "memorise", "don't forget", "add to my list", "add to shopping list", "save to my list", "put on my list" → research_agent, intent=remember_fact
 - Director states a personal future-schedule fact WITHOUT an explicit "remember" trigger — flight itinerary, hotel booking, meeting, appointment, or personal commitment that includes specific dates/times/places — → research_agent, intent=remember_fact, _structured_fact: true, collection: episodic. Signals: first-person future/present tense ("I'm flying", "I'll be", "I have a meeting", "I'm staying at", "I start", "I arrive", "I depart"), with a specific date, time, or location. Exclude: past events already completed, opinions, questions, and casual acknowledgements like "we're back" or "I'm home".
 - Container/service/infrastructure operations → devops_agent
-- CRITICAL SELF-DIAGNOSTIC RULE: ANY question about Sovereign's own health, performance, resource usage, internal state, GPU/VRAM/RAM, system status, or self-monitoring → devops_agent, intent=get_stats, target=null. NEVER route these to research_agent.
+- CRITICAL SELF-DIAGNOSTIC RULE: Questions about Sovereign's OVERALL health, resource usage, GPU/VRAM/RAM, or performance across the whole system → devops_agent, intent=get_stats, target=null. NEVER route these to research_agent. Exception: if a specific container is named (e.g. "check nginx", "is gateway ok", "what's wrong with sovereign-core") → intent=get_logs with target=that container name.
 - CRITICAL EMAIL RULE: ANY mention of "email", "emails", "inbox", "messages", "mail" → business_agent. Intent rules (apply the FIRST match):
     - "mailboxes", "mail folders", "IMAP folders", "what folders", "list folders" → intent=list_folders
     - "send", "write", "reply", "compose", "draft" + email → intent=send_email
