@@ -1087,6 +1087,8 @@ async def check_notes(app_state) -> None:
         return
 
     # ── Find unprocessed notes ────────────────────────────────────────────
+    _SKIP_CATEGORIES = {"Research"}
+
     pending = []
     for n in notes_raw:
         if not isinstance(n, dict):
@@ -1094,7 +1096,11 @@ async def check_notes(app_state) -> None:
         note_id  = n.get("id")
         modified = n.get("modified")
         title    = n.get("title") or f"note-{note_id}"
+        category = n.get("category") or ""
         if note_id is None or modified is None:
+            continue
+        if category in _SKIP_CATEGORIES:
+            logger.debug("LearningHarness: skipping note '%s' (category=%r)", title, category)
             continue
         sentinel = _notes_api_sentinel_key(note_id, modified)
         if await _has_sentinel(qdrant, sentinel):

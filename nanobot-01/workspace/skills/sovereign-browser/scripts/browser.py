@@ -51,6 +51,8 @@ def cmd_search(args):
     }
     if str(args.test_mode).lower() in ("true", "1", "yes"):
         body["test_mode"] = True
+    if args.time_range and args.time_range != "none":
+        body["time_range"] = args.time_range
 
     try:
         r = requests.post(f"{_BASE_URL}/search", json=body, headers=_headers(), timeout=_TIMEOUT)
@@ -111,6 +113,7 @@ def main():
     p_search.add_argument("--locale",        default="en-NZ")
     p_search.add_argument("--return_format", default="full")
     p_search.add_argument("--test_mode",     default="false")
+    p_search.add_argument("--time_range",    default="none")
 
     p_fetch = sub.add_parser("fetch")
     p_fetch.add_argument("--url",     required=True)

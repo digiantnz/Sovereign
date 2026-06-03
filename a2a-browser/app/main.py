@@ -147,7 +147,7 @@ async def search(req: SearchRequest, _: None = Depends(security.verify_secret)):
         # ── Stage 1: Search ───────────────────────────────────────────────
         t_search = monotonic()
         router: SearchRouter = app.state.search_router
-        raw_results, backend_used = await router.search(req.query, req.locale)
+        raw_results, backend_used = await router.search(req.query, req.locale, time_range=req.time_range)
         search_ms = (monotonic() - t_search) * 1000
 
         # Sanitise raw results before anything touches them

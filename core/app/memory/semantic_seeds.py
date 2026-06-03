@@ -439,6 +439,26 @@ def build_harness_seeds() -> list[dict]:
         },
     })
 
+    # NZ crypto and investment tax treatment — injected into risk manager verdict context
+    seeds.append({
+        "seed_id": "nz_tax_research_v1",
+        "key":     "semantic:research:nz-tax-crypto",
+        "title":   "NZ Crypto and Investment Tax Treatment",
+        "content": (
+            "NZ crypto tax: property treatment, disposal events taxable as ordinary income, no CGT. "
+            "Staking and LP rewards taxable on receipt at NZD fair market value. "
+            "WETH unwrap is not a disposal. psETH redemption may be — confirm with advisor. "
+            "CARF reporting active April 2026. Fund switches are not disposal events. "
+            "Bright-line test applies to property. Frequent rebalancing creates tax drag. "
+            "Always include NZ tax cost estimate in any SELL or rebalancing recommendation."
+        ),
+        "domain": "research",
+        "extra_meta": {
+            "intent_signals": ["nz tax", "crypto tax", "disposal", "staking tax", "carf"],
+            "owner":          "research_agent",
+        },
+    })
+
     # Portfolio harness pointer seed — fixed key for MIP retrieval
     seeds.append({
         "seed_id": "portfolio_harness_pointer_v1",

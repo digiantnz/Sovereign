@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import httpx
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
 
 from execution.adapters.qdrant import PROSPECTIVE, PROCEDURAL, EPISODIC, WORKING
 from config import cfg as _cfg
@@ -1333,3 +1333,183 @@ class TaskScheduler:
         logger.info("TaskScheduler: background loop started (interval: %ds)",
                     self.SCHEDULER_INTERVAL)
         return task
+
+    # ── Portfolio harness seeds ───────────────────────────────────────────────
+
+    async def _notify_director(self, message: str) -> None:
+        """Send a Telegram notification to the Director. Best-effort — never raises."""
+        try:
+            token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            chat_id = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
+            if not token or not chat_id:
+                return
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+                )
+        except Exception as exc:
+            logger.debug("TaskScheduler._notify_director failed: %s", exc)
+
+    async def seed_monthly_portfolio_task(self) -> bool:
+        """Seed the monthly crypto portfolio analysis task at startup. Idempotent.
+
+        Creates a pending_approval task for Director activation. Notifies via Telegram
+        only on first creation. Checks for any existing entry (active or pending_approval)
+        with a portfolio_analysis step targeting crypto to avoid duplicates.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Monthly Portfolio Analysis — Crypto"
+        _TASK_CRONS = {"0 20 28 * *", "0 20 28-31 * *"}
+
+        # Idempotency: scan PROSPECTIVE for any active/pending_approval entry matching
+        # by title keywords OR by cron string (handles LLM title overwrite in qdrant.store()).
+        try:
+            _words = [w for w in _TASK_TITLE.lower().split() if len(w) >= 5]
+            prosp_all, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="status", match=MatchAny(any=["active", "pending_approval"])),
+                ]),
+                limit=300,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in prosp_all:
+                pp = pt.payload or {}
+                pt_title = pp.get("title", "").lower()
+                pt_cron  = (pp.get("schedule") or {}).get("cron", "")
+                if all(w in pt_title for w in _words) or pt_cron in _TASK_CRONS:
+                    logger.info(
+                        "TaskScheduler: monthly portfolio task already exists "
+                        "(task_id=%s status=%s) — skipping seed",
+                        str(pp.get("task_id", ""))[:8], pp.get("status", ""),
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("seed_monthly_portfolio_task: idempotency check failed: %s", exc)
+
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                # Fires on days 28-31 to catch every month; last_day_guard in params
+                # filters to actual last day at dispatch time.
+                "cron": "0 20 28-31 * *",
+            },
+            "steps": [
+                {
+                    "intent": "portfolio_analysis",
+                    "params": {"category": "crypto", "last_day_guard": True},
+                    "description": (
+                        "Full 6-agent crypto analysis + Correlation Analyst + 3 stress test "
+                        "scenarios + ranked rebalancing actions. Runtime ~90 min on current GPU. "
+                        "Delivers full verdict table + stress summary to Telegram. "
+                        "last_day_guard=True: skips silently if today is not the last day of the month."
+                    ),
+                }
+            ],
+            "notify_when": "always",
+            "stop_condition": "Director cancels",
+            "status": "pending_approval",
+        }
+
+        result = await self.store_task(task_def, human_confirmed=False)
+        if result.get("status") in ("ok", "partial", "pending_approval"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s — pending Director approval",
+                _TASK_TITLE, result.get("task_id", "?"),
+            )
+            await self._notify_director(
+                f"📅 <b>Monthly Portfolio Analysis — Crypto</b> task created.\n"
+                f"Schedule: last day of each month at 8:00 AM NZST.\n"
+                f"Runs full 6-agent analysis + correlation + stress tests (~90 min).\n"
+                f"Reply <b>approve monthly portfolio</b> to activate."
+            )
+            return True
+        else:
+            logger.warning("TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result)
+            return False
+
+    async def seed_weekly_watcher_task(self) -> bool:
+        """Seed the weekly portfolio technical scan task at startup. Idempotent.
+
+        Creates a pending_approval task for Director activation. Notifies via Telegram
+        only on first creation. Checks for any existing entry with portfolio_watcher_scan
+        step to avoid duplicates.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Weekly Portfolio Technical Scan"
+        _TASK_CRON  = "0 20 * * 6"
+
+        # Idempotency: scan PROSPECTIVE for any active/pending_approval entry matching
+        # by title keywords OR by cron string (handles LLM title overwrite in qdrant.store()).
+        try:
+            _words = [w for w in _TASK_TITLE.lower().split() if len(w) >= 5]
+            prosp_all, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="status", match=MatchAny(any=["active", "pending_approval"])),
+                ]),
+                limit=300,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in prosp_all:
+                pp = pt.payload or {}
+                pt_title = pp.get("title", "").lower()
+                pt_cron  = (pp.get("schedule") or {}).get("cron", "")
+                if all(w in pt_title for w in _words) or pt_cron == _TASK_CRON:
+                    logger.info(
+                        "TaskScheduler: weekly watcher task already exists "
+                        "(task_id=%s status=%s) — skipping seed",
+                        str(pp.get("task_id", ""))[:8], pp.get("status", ""),
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("seed_weekly_watcher_task: idempotency check failed: %s", exc)
+
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                "cron": "0 20 * * 6",   # Saturday 20:00 UTC = Sunday 8:00 NZST
+            },
+            "steps": [
+                {
+                    "intent": "portfolio_watcher_scan",
+                    "params": {},
+                    "description": (
+                        "Deterministic RSI/MACD signal scan across all active crypto assets. "
+                        "No LLM unless a signal fires. Signals: STRONG_BUY (monthly RSI<30), "
+                        "BUY (weekly RSI<35 + bullish MACD), SELL_ALERT (RSI>75 + overweight), "
+                        "CAUTION (bearish MACD + >10% weight), DRIFT_ALERT (>5% outside band). "
+                        "On signal: Telegram alert + full single-asset 6-agent analysis + Notes save. "
+                        "Clean week: episodic log only, no Director notification."
+                    ),
+                }
+            ],
+            "notify_when": "never",   # watcher sends its own Telegram on signal; clean week = silence
+            "stop_condition": "Director cancels",
+            "status": "pending_approval",
+        }
+
+        result = await self.store_task(task_def, human_confirmed=False)
+        if result.get("status") in ("ok", "partial", "pending_approval"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s — pending Director approval",
+                _TASK_TITLE, result.get("task_id", "?"),
+            )
+            await self._notify_director(
+                f"📡 <b>Weekly Portfolio Technical Scan</b> task created.\n"
+                f"Schedule: Saturday 8:00 AM NZST.\n"
+                f"Deterministic RSI/MACD scan — no LLM unless a signal fires.\n"
+                f"Reply <b>approve weekly scan</b> to activate."
+            )
+            return True
+        else:
+            logger.warning("TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result)
+            return False

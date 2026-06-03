@@ -25,7 +25,8 @@
         "cancel_task",
         "recall_last_briefing",
         "systemctl_status",
-        "journalctl"
+        "journalctl",
+        "portfolio_watcher_scan"
       ]
     },
     "MID": {
@@ -82,8 +83,8 @@
     }
   },
   "meta": {
-    "version": "1.15",
-    "description": "Sovereign governance policy — Phase 0/1/2 schedule_task/pause_task/cancel_task moved to LOW allowed_actions + recall_last_briefing/systemctl_status/journalctl",
+    "version": "1.16",
+    "description": "Sovereign governance policy — v1.16 adds portfolio_watcher_scan to LOW allowed_actions (weekly portfolio technical scan)",
     "raid_path": "/home/sovereign/governance/governance.json",
     "specialists_can_override_tier": false,
     "specialists_can_write_memory": false,

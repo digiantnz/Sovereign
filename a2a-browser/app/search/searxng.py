@@ -11,7 +11,8 @@ _TIMEOUT = 20.0
 _ENGINES = "google,bing,duckduckgo,startpage,wikipedia"
 
 
-async def search(query: str, locale: str, max_results: int) -> list[dict]:
+async def search(query: str, locale: str, max_results: int,
+                 time_range: str | None = None) -> list[dict]:
     if not config.SEARXNG_URL:
         return []
     lang = locale[:2].lower() if locale else "en"
@@ -23,6 +24,8 @@ async def search(query: str, locale: str, max_results: int) -> list[dict]:
         "engines": _ENGINES,
         "pageno": 1,
     }
+    if time_range in ("day", "week", "month", "year"):
+        params["time_range"] = time_range
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             r = await client.get(f"{config.SEARXNG_URL}/search", params=params)

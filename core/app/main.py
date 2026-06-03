@@ -706,6 +706,8 @@ async def lifespan(app: FastAPI):
     await task_scheduler.seed_nightly_dev_task()
     await task_scheduler.seed_nightly_synthesis_task()
     await task_scheduler.seed_tax_ingest_task()
+    await task_scheduler.seed_monthly_portfolio_task()
+    await task_scheduler.seed_weekly_watcher_task()
 
     # ── Step 3c: Credential proxy — session-scoped token delegation for nanobot-01
     credential_proxy = CredentialProxy(default_ttl=60, ledger=ledger)

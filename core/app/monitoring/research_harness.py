@@ -14,6 +14,7 @@ Checkpoint (_research_harness_checkpoint=True) lives in working_memory between g
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -32,6 +33,98 @@ class GatheredSources:
     news:    str = ""   # browser search results (web research)
     finance: str = ""   # Yahoo Finance / CoinGecko market data
     grok:    str = ""   # Grok sentiment commentary
+
+
+@dataclass
+class TechnicalData:
+    """Technical indicator data for a single asset, derived from weekly/monthly OHLCV bars."""
+    symbol:              str
+    weekly_rsi:          float | None
+    monthly_rsi:         float | None
+    macd_line:           float | None
+    macd_signal:         float | None
+    macd_histogram:      float | None
+    macd_signal_type:    str | None    # "bullish_crossover" | "bearish_crossover" | "neutral"
+    price_vs_50w_ma_pct: float | None
+    price_vs_200w_ma_pct: float | None
+    volume_trend:        str | None    # "increasing" | "decreasing" | "neutral"
+    data_available:      bool
+
+    def as_prompt_block(self) -> str:
+        if not self.data_available:
+            return "Technical indicators: unavailable (API error or symbol not mapped)"
+        rsi_w = f"{self.weekly_rsi:.1f}" if self.weekly_rsi is not None else "N/A"
+        rsi_m = f"{self.monthly_rsi:.1f}" if self.monthly_rsi is not None else "N/A"
+        rsi_w_label = (
+            ("overbought" if self.weekly_rsi > 70 else ("oversold" if self.weekly_rsi < 30 else "neutral"))
+            if self.weekly_rsi is not None else "unknown"
+        )
+        rsi_m_label = (
+            ("overbought" if self.monthly_rsi > 70 else ("oversold" if self.monthly_rsi < 30 else "neutral"))
+            if self.monthly_rsi is not None else "unknown"
+        )
+        macd_l = f"{self.macd_line:.4f}" if self.macd_line is not None else "N/A"
+        macd_s = f"{self.macd_signal:.4f}" if self.macd_signal is not None else "N/A"
+        p50  = f"{self.price_vs_50w_ma_pct:+.1f}%" if self.price_vs_50w_ma_pct is not None else "N/A"
+        p200 = f"{self.price_vs_200w_ma_pct:+.1f}%" if self.price_vs_200w_ma_pct is not None else "N/A"
+        return (
+            f"TECHNICAL INDICATORS (weekly/monthly bars — calibrated for quarterly rebalancing):\n"
+            f"RSI (14, weekly): {rsi_w} — {rsi_w_label}\n"
+            f"RSI (14, monthly): {rsi_m} — {rsi_m_label}\n"
+            f"MACD (weekly, 12/26/9): Line {macd_l} | Signal {macd_s} | {self.macd_signal_type or 'N/A'}\n"
+            f"Price vs 50-week MA: {p50}\n"
+            f"Price vs 200-week MA: {p200}\n"
+            f"Volume trend (vs 4-week avg): {self.volume_trend or 'N/A'}\n\n"
+            f"Note: Monthly RSI < 30 is historically rare and a strong buy signal. "
+            f"Weekly MACD crossovers are meaningful momentum shifts, not noise."
+        )
+
+
+# Yahoo Finance symbol map — slug → Yahoo ticker or None (graceful degradation)
+# None = disposal candidate or no reliable proxy; _gather_technicals returns data_available=False
+YAHOO_SYMBOLS: dict[str, str | None] = {
+    "eth":   "ETH-USD",
+    "btc":   "BTC-USD",
+    "sol":   "SOL-USD",
+    "link":  "LINK-USD",
+    "dot":   "DOT-USD",
+    "aave":  "AAVE-USD",
+    "uni":   "UNI-USD",
+    "yfi":   "YFI-USD",
+    "weth":  "ETH-USD",   # same underlying as ETH
+    "rkl":   "RKLB",      # Rocket Lab — NASDAQ primary listing (crypto portfolio slug)
+    # Retirement fund — NZX equities
+    "fph":   "FPH.NZ",    # Fisher & Paykel Healthcare
+    "fsf":   "FSF.NZ",    # Fonterra Shareholders Fund
+    "gne":   "GNE.NZ",    # Genesis Energy
+    "ift":   "IFT.NZ",    # Infratil
+    "chi":   "CHI.NZ",    # Channel Infrastructure
+    "smi":   "SMI.NZ",    # Santana Minerals (exploration — speculative)
+    # Retirement fund — NZX ETFs
+    "npf":   "NPF.NZ",    # Smart NZ Property
+    "asr":   "ASR.NZ",    # Smart Australian Resources
+    "aiq":   "AIQ.AX",    # Global X AI ETF — NZX-listed but only ASX ticker in Yahoo Finance
+    # Disposal candidates / stablecoins / no reliable technicals
+    "matic": None,
+    "pseth": None,
+    "wxt":   None,
+    "dai":   None,
+    "enj":   None,
+    "mkr":   None,
+    "usdt":  None,
+    "musd":  None,
+    "ucap":  None,
+}
+
+
+def _no_td(slug: str) -> "TechnicalData":
+    return TechnicalData(
+        symbol=slug, data_available=False,
+        weekly_rsi=None, monthly_rsi=None,
+        macd_line=None, macd_signal=None, macd_histogram=None,
+        macd_signal_type=None, price_vs_50w_ma_pct=None,
+        price_vs_200w_ma_pct=None, volume_trend=None,
+    )
 
 
 async def _no_data() -> tuple[str, None]:
@@ -368,6 +461,258 @@ async def _gather_grok(cog, topic: str) -> tuple[str, str | None]:
         return "", str(exc)
 
 
+# ── Technical indicator helpers (deterministic — no async, no LLM) ────────────
+
+def _ema(values: list[float], period: int) -> list[float]:
+    if len(values) < period:
+        return []
+    k = 2.0 / (period + 1)
+    result = [sum(values[:period]) / period]
+    for v in values[period:]:
+        result.append(v * k + result[-1] * (1 - k))
+    return result
+
+
+def _calculate_rsi(closes: list[float], period: int = 14) -> float | None:
+    """Wilder RSI. Returns None if insufficient data."""
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains  = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100.0 - (100.0 / (1.0 + rs)), 2)
+
+
+def _calculate_macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9,
+                    ) -> tuple[float | None, float | None, float | None, float | None]:
+    """Returns (macd_line, signal_line, histogram, prev_histogram). Nones if insufficient data."""
+    if len(closes) < slow + signal:
+        return None, None, None, None
+    fast_ema = _ema(closes, fast)
+    slow_ema = _ema(closes, slow)
+    offset = len(fast_ema) - len(slow_ema)
+    macd_series = [f - s for f, s in zip(fast_ema[offset:], slow_ema)]
+    if len(macd_series) < signal:
+        return None, None, None, None
+    signal_series = _ema(macd_series, signal)
+    histogram_series = [m - s for m, s in zip(macd_series[-len(signal_series):], signal_series)]
+    if len(histogram_series) < 2:
+        return round(macd_series[-1], 6), round(signal_series[-1], 6), round(histogram_series[-1], 6), None
+    return (
+        round(macd_series[-1], 6),
+        round(signal_series[-1], 6),
+        round(histogram_series[-1], 6),
+        round(histogram_series[-2], 6),
+    )
+
+
+def _classify_macd_crossover(prev_histogram: float | None, curr_histogram: float | None) -> str:
+    """Detects sign change in MACD histogram across the last two bars."""
+    if prev_histogram is None or curr_histogram is None:
+        return "neutral"
+    if prev_histogram < 0 and curr_histogram > 0:
+        return "bullish_crossover"
+    if prev_histogram > 0 and curr_histogram < 0:
+        return "bearish_crossover"
+    return "neutral"
+
+
+def _price_vs_ma(closes: list[float], period: int) -> float | None:
+    """% current price is above/below the simple moving average. None if insufficient data."""
+    if len(closes) < period:
+        return None
+    ma = sum(closes[-period:]) / period
+    if ma == 0:
+        return None
+    return round((closes[-1] - ma) / ma * 100, 2)
+
+
+def _classify_volume_trend(bars: list[dict]) -> str:
+    """Current week volume vs 4-week average."""
+    if len(bars) < 5:
+        return "neutral"
+    volumes = [b.get("volume", 0) for b in bars]
+    if not any(volumes):
+        return "neutral"
+    avg_4w = sum(volumes[-5:-1]) / 4
+    if avg_4w == 0:
+        return "neutral"
+    ratio = volumes[-1] / avg_4w
+    if ratio > 1.20:
+        return "increasing"
+    if ratio < 0.80:
+        return "decreasing"
+    return "neutral"
+
+
+async def _store_technical_snapshot(qdrant, td: "TechnicalData", slug: str) -> None:
+    """Persist a TechnicalData snapshot to episodic memory (qdrant-archive, RAID).
+
+    Non-blocking — called via asyncio.create_task(). Never raises.
+    """
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        content = (
+            f"Technical snapshot for {slug} ({td.symbol}) on {now[:10]}: "
+            f"weekly RSI {td.weekly_rsi}, monthly RSI {td.monthly_rsi}, "
+            f"MACD {td.macd_signal_type}, "
+            f"price vs 50w MA {td.price_vs_50w_ma_pct}%, "
+            f"price vs 200w MA {td.price_vs_200w_ma_pct}%, "
+            f"volume {td.volume_trend}."
+        )
+        await qdrant.store(
+            content=content,
+            collection="episodic",
+            metadata={
+                "event_type":           "technical_snapshot",
+                "slug":                 slug,
+                "symbol":               td.symbol,
+                "source":               "yahoo_finance",
+                "snapshot_date":        now[:10],
+                "weekly_rsi":           td.weekly_rsi,
+                "monthly_rsi":          td.monthly_rsi,
+                "macd_line":            td.macd_line,
+                "macd_signal":          td.macd_signal,
+                "macd_histogram":       td.macd_histogram,
+                "macd_signal_type":     td.macd_signal_type,
+                "price_vs_50w_ma_pct":  td.price_vs_50w_ma_pct,
+                "price_vs_200w_ma_pct": td.price_vs_200w_ma_pct,
+                "volume_trend":         td.volume_trend,
+                "timestamp":            now,
+                "_key":                 f"technical_snapshot:{slug}:{now[:10]}",
+            },
+        )
+        logger.info("_store_technical_snapshot: stored %s (%s)", slug, now[:10])
+    except Exception as exc:
+        logger.warning("_store_technical_snapshot: failed for %s — %s", slug, exc)
+
+
+async def _query_technical_trend(qdrant, slug: str, limit: int = 4) -> str:
+    """Query last N episodic technical_snapshot records for slug.
+
+    Returns a formatted trend block, or "" if no history exists.
+    """
+    try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        points, _ = await qdrant.archive_client.scroll(
+            collection_name="episodic",
+            scroll_filter=Filter(must=[
+                FieldCondition(key="event_type", match=MatchValue(value="technical_snapshot")),
+                FieldCondition(key="slug",       match=MatchValue(value=slug)),
+            ]),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        if not points:
+            return ""
+        # Sort chronologically ascending so the trend reads oldest → newest
+        points.sort(key=lambda p: p.payload.get("snapshot_date", ""))
+        lines = []
+        for pt in points:
+            p = pt.payload
+            d     = p.get("snapshot_date", "?")
+            rsi_w = f"{p['weekly_rsi']:.1f}" if p.get("weekly_rsi") is not None else "N/A"
+            rsi_m = f"{p['monthly_rsi']:.1f}" if p.get("monthly_rsi") is not None else "N/A"
+            macd  = p.get("macd_signal_type") or "N/A"
+            p50   = f"{p['price_vs_50w_ma_pct']:+.1f}%" if p.get("price_vs_50w_ma_pct") is not None else "N/A"
+            vol   = p.get("volume_trend") or "N/A"
+            lines.append(f"  {d}: RSI(w) {rsi_w} | RSI(m) {rsi_m} | MACD {macd} | vs 50w {p50} | vol {vol}")
+        return "TECHNICAL TREND (last {} readings — oldest→newest):\n{}".format(len(lines), "\n".join(lines))
+    except Exception as exc:
+        logger.warning("_query_technical_trend: failed for %s — %s", slug, exc)
+        return ""
+
+
+async def _gather_technicals(slug: str) -> "TechnicalData":
+    """Fetch weekly + monthly OHLCV from Yahoo Finance; calculate RSI/MACD/MAs.
+
+    No API key required. Returns TechnicalData with data_available=False on any
+    failure — never raises.
+    """
+    import httpx as _httpx
+
+    symbol = YAHOO_SYMBOLS.get(slug.lower())
+    if symbol is None:
+        return _no_td(slug)
+
+    base = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    def _parse_bars(data: dict) -> tuple[list[float], list[dict]]:
+        """Extract (closes, bar_dicts) from Yahoo v8 chart response."""
+        result = (data.get("chart") or {}).get("result") or []
+        if not result:
+            return [], []
+        r = result[0]
+        timestamps = r.get("timestamp", [])
+        quote = (r.get("indicators") or {}).get("quote") or [{}]
+        q = quote[0]
+        closes  = q.get("close",  []) or []
+        volumes = q.get("volume", []) or []
+        closes  = [c for c in closes  if c is not None]
+        bars = [
+            {"close": c, "volume": v or 0}
+            for c, v in zip(closes, volumes)
+            if c is not None
+        ]
+        return closes, bars
+
+    try:
+        async with _httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+            weekly_r, monthly_r = await asyncio.gather(
+                client.get(base, params={"interval": "1wk", "range": "52wk",  "includePrePost": "false"}),
+                client.get(base, params={"interval": "1mo", "range": "48mo",  "includePrePost": "false"}),
+            )
+        weekly_r.raise_for_status()
+        monthly_r.raise_for_status()
+
+        weekly_closes,  weekly_bars  = _parse_bars(weekly_r.json())
+        monthly_closes, _            = _parse_bars(monthly_r.json())
+
+        weekly_rsi  = _calculate_rsi(weekly_closes,  period=14)
+        monthly_rsi = _calculate_rsi(monthly_closes, period=14)
+        macd_line, macd_sig, macd_hist, macd_prev = _calculate_macd(weekly_closes)
+        macd_signal_type = _classify_macd_crossover(macd_prev, macd_hist)
+        price_vs_50w  = _price_vs_ma(weekly_closes, period=50)
+        price_vs_200w = _price_vs_ma(weekly_closes, period=200)
+        volume_trend  = _classify_volume_trend(weekly_bars)
+
+        logger.info(
+            "_gather_technicals: %s weekly_rsi=%s monthly_rsi=%s macd=%s vol=%s bars_w=%d bars_m=%d",
+            symbol,
+            f"{weekly_rsi:.1f}" if weekly_rsi is not None else "N/A",
+            f"{monthly_rsi:.1f}" if monthly_rsi is not None else "N/A",
+            macd_signal_type, volume_trend,
+            len(weekly_closes), len(monthly_closes),
+        )
+
+        return TechnicalData(
+            symbol=symbol,
+            weekly_rsi=weekly_rsi,
+            monthly_rsi=monthly_rsi,
+            macd_line=macd_line,
+            macd_signal=macd_sig,
+            macd_histogram=macd_hist,
+            macd_signal_type=macd_signal_type,
+            price_vs_50w_ma_pct=price_vs_50w,
+            price_vs_200w_ma_pct=price_vs_200w,
+            volume_trend=volume_trend,
+            data_available=True,
+        )
+    except Exception as exc:
+        logger.warning("_gather_technicals: failed for %s (%s) — %s", slug, symbol, exc)
+        return _no_td(slug)
+
+
 # ── Synthesis ─────────────────────────────────────────────────────────────────
 
 async def _synthesise(cog, topic: str, domain_scope: str,
@@ -556,7 +901,7 @@ Respond with JSON only — no preamble:
 Use null for fields that do not apply."""
 
     try:
-        result = await cog.ask_local(prompt, priority=InferenceQueue.HIGH, timeout=30.0)
+        result = await cog.ask_local(prompt, priority=InferenceQueue.HIGH, timeout=90.0)
         if result.get("status") == "llm_timeout":
             logger.warning("research_harness: classifier timed out — falling back to general")
             return {"intent": "general", "security_name": None, "ticker": None, "slug": None}
@@ -584,6 +929,9 @@ async def security_analysis_engine(
     ticker: str | None,
     gathered: GatheredSources,
     asset_spec=None,
+    td: "TechnicalData | None" = None,
+    technical_trend: str = "",
+    concentration_flags: list | None = None,
 ) -> dict:
     """6-agent adversarial analysis pipeline for a named security.
 
@@ -649,6 +997,26 @@ async def security_analysis_engine(
 
     verdict_options = "BUY | HOLD | SELL" if asset_spec else "BULLISH | NEUTRAL | BEARISH"
 
+    technical_block = (
+        td.as_prompt_block() if (td is not None and td.data_available)
+        else "Technical indicators: unavailable (symbol not mapped or API error)"
+    )
+
+    # ── Concentration flag for this asset (Agent 6 context) ───────────────────
+    _asset_slug = (asset_spec.slug if asset_spec else "").lower()
+    _matching_flags = [
+        f for f in (concentration_flags or [])
+        if _asset_slug in f.get("slugs_in_group", [])
+        or _asset_slug == f.get("group", "")
+    ]
+    if _matching_flags:
+        _flag_lines = "\n".join(
+            f"  [{fl['direction'].upper()}] {fl['rationale']}" for fl in _matching_flags
+        )
+        concentration_block = f"CONCENTRATION FLAGS FOR THIS ASSET:\n{_flag_lines}"
+    else:
+        concentration_block = "CONCENTRATION FLAGS FOR THIS ASSET:\n  Position within target band."
+
     # ── Shared helper: one queued LLM call ───────────────────────────────────
     async def _agent_call(prompt_text: str, agent_name: str) -> str:
         try:
@@ -668,6 +1036,8 @@ async def security_analysis_engine(
     # ── Agent 1 — News Analyst ────────────────────────────────────────────────
     news_report = await _agent_call(f"""You are a News Analyst at a trading firm. Today is {today}.
 Security: {sec_label}
+
+Any catalyst, upgrade, or event described as upcoming or anticipated in your sources must be verified against today's date. If it has already occurred, classify it as a past event and assess its actual outcome, not its anticipated impact. Do not present historical events as future catalysts.
 
 GATHERED NEWS AND RECENT DEVELOPMENTS:
 {gathered.news or "No news data available."}
@@ -696,6 +1066,8 @@ Security: {sec_label}
 GATHERED FUNDAMENTAL DATA:
 {gathered.finance or "No fundamental data available."}
 
+{(technical_trend + chr(10) + chr(10)) if technical_trend else ""}{technical_block}
+
 Write a brief fundamentals analysis using these markdown headings. Use plain prose and bullet points — do NOT output JSON or code blocks.
 
 ### Valuation
@@ -703,6 +1075,9 @@ Current valuation vs historical range. If no data is available, state that clear
 
 ### Key Metrics
 Bullet list of the most important metrics (for crypto: on-chain health, TVL, staking yield; for stocks: P/E, revenue growth, margins, cash position). If no data, say so.
+
+### Technical Picture
+Interpret the RSI, MACD, and MA signals above. Are technicals aligned with or diverging from fundamentals? Weekly MACD crossovers and monthly RSI extremes carry the most weight.
 
 ### Fundamental Trend
 One sentence: strengthening, weakening, or stable — and why.
@@ -781,6 +1156,10 @@ BEAR CASE:
 
 {position_context_block}
 
+{concentration_block}
+
+{technical_block}
+
 NZ TAX CONTEXT: {tax_note_from_spec}
 
 Your role: resolve the debate between the Bull and Bear researchers.
@@ -820,6 +1199,12 @@ After the prose above, end with ONLY this JSON block — do not include any othe
     json_m = re.search(r'```json\s*(\{.*?\})\s*```', risk_report, re.DOTALL)
     if not json_m:
         json_m = re.search(r'\{[^{}]*"verdict"[^{}]*\}', risk_report, re.DOTALL)
+    if not json_m:
+        logger.warning(
+            "security_analysis_engine: risk_manager produced no JSON block for %s — "
+            "falling back to defaults (verdict=%s, confidence=LOW)",
+            security_name or ticker, verdict,
+        )
     if json_m:
         try:
             block_str = json_m.group(1) if '```' in json_m.group(0) else json_m.group(0)
@@ -963,6 +1348,10 @@ async def run_research_gather(cog, nanobot, qdrant,
     """
     import uuid
 
+    # Strip leading "research " prefix — /research gateway sends "research {topic}"
+    if topic.lower().startswith("research "):
+        topic = topic[len("research "):].strip()
+
     # ── Stale checkpoint guard ────────────────────────────────────────────────
     existing_cp = await _read_checkpoint(qdrant)
     if existing_cp:
@@ -1000,24 +1389,27 @@ async def run_research_gather(cog, nanobot, qdrant,
     year = date.today().year
 
     if intent == "security":
-        query_a     = f"{security_name}{' ' + ticker if ticker else ''} analysis outlook {year}"
-        query_b     = f"{security_name} news {year}"
+        # Use security_name only for browser queries — tickers confuse SearXNG
+        query_a = f"{security_name} {year}"
+        query_b = f"{security_name} stock analysis {year}"
         finance_url = _build_finance_url(domain_scope, ticker, topic)
         nzx_url     = _build_nzx_url(ticker, topic)
         grok_query  = f"{security_name} market sentiment and recent analyst commentary"
 
-        # Parallel: two browser queries + Yahoo Finance + Grok + NZX.com + Alpha Vantage
+        # Parallel: two browser queries + Yahoo Finance + Grok + NZX.com + Alpha Vantage + technicals
+        slug         = classify_result.get("slug") or ""
         finance_coro = _gather_finance(nanobot, finance_url) if finance_url else _no_data()
         nzx_coro     = _gather_browser(nanobot, nzx_url) if nzx_url else _no_data()
         av_ticker    = _resolve_yahoo_ticker(ticker, topic)  # use US/ASX ticker for AV
         av_coro      = _gather_alpha_vantage(av_ticker) if av_ticker else _no_data()
-        res_a, res_b, res_f, res_g, res_nzx, res_av = await asyncio.gather(
+        res_a, res_b, res_f, res_g, res_nzx, res_av, td = await asyncio.gather(
             _gather_browser(nanobot, query_a),
             _gather_browser(nanobot, query_b),
             finance_coro,
             _gather_grok(cog, grok_query),
             nzx_coro,
             av_coro,
+            _gather_technicals(slug),
             return_exceptions=True,
         )
         def _safe(r, label: str) -> tuple[str, str | None]:
@@ -1030,6 +1422,8 @@ async def run_research_gather(cog, nanobot, qdrant,
             _safe(res_f, "yahoo_finance"), _safe(res_g, "grok"),
             _safe(res_nzx, "nzx"), _safe(res_av, "alpha_vantage"),
         )
+        if isinstance(td, Exception):
+            td = _no_td(slug)
         browser_content = "\n\n".join(t for t in [res_a[0], res_b[0]] if t)
         browser_err     = res_a[1] or res_b[1]
         # Merge Yahoo Finance + NZX.com + Alpha Vantage into a single finance block
@@ -1043,6 +1437,8 @@ async def run_research_gather(cog, nanobot, qdrant,
             sources_ok.append("alpha_vantage")
         elif res_av[1]:
             sources_failed.append(f"alpha_vantage: {res_av[1]}")
+        if td.data_available:
+            sources_ok.append("technicals")
 
     else:
         # financial_topic or general — single browser query
@@ -1059,7 +1455,7 @@ async def run_research_gather(cog, nanobot, qdrant,
             finance_data, finance_err = await _gather_finance(nanobot, finance_url)
 
         grok_context = ""
-        if domain_scope in ("securities", "commodities"):
+        if domain_scope in ("securities", "commodities") or intent == "financial_topic":
             grok_context, _ = await _gather_grok(cog, topic)
 
     # Source accounting
@@ -1075,10 +1471,24 @@ async def run_research_gather(cog, nanobot, qdrant,
         sources_ok.append("grok")
 
     gathered = GatheredSources(news=browser_content, finance=finance_data, grok=grok_context)
+    logger.info(
+        "research_harness: gathered chars — news=%d finance=%d grok=%d (topic=%r intent=%s)",
+        len(gathered.news), len(gathered.finance), len(gathered.grok), topic, intent,
+    )
+
+    # ── Technical snapshot store + trend query (security only) ────────────────
+    technical_trend = ""
+    if intent == "security" and td.data_available:
+        # Fire-and-forget snapshot — persists to episodic (qdrant-archive, RAID)
+        asyncio.create_task(_store_technical_snapshot(qdrant, td, slug))
+        # Query historical trend (snapshots already in qdrant — excludes the task just fired)
+        technical_trend = await _query_technical_trend(qdrant, slug)
 
     # ── Synthesis — routes by intent ──────────────────────────────────────────
     if intent == "security":
-        eng = await security_analysis_engine(cog, security_name, ticker, gathered)
+        eng = await security_analysis_engine(
+            cog, security_name, ticker, gathered, td=td, technical_trend=technical_trend,
+        )
         synthesis_data = {
             "full_report":      eng["full_report"],
             "telegram_summary": eng["summary"] or [f"Analysis of {security_name} complete."],

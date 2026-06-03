@@ -42,25 +42,28 @@ class SearchRouter:
     def set_browser(self, browser):
         self._browser = browser
 
-    async def search(self, query: str, locale: str = "en-US") -> tuple[list[dict], str]:
+    async def search(self, query: str, locale: str = "en-US",
+                     time_range: str | None = None) -> tuple[list[dict], str]:
         """
         Try backends in priority order until one succeeds.
         SearXNG (if configured) → DDG → Brave → Bing.
         Returns (results, backend_name). Raises RuntimeError if all fail/rate-limited.
+        time_range: "day" | "week" | "month" | "year" | None — passed to SearXNG only.
         """
         for backend in self._enabled:
             limiter = self._limiters[backend]
             if not await limiter.acquire():
                 continue   # rate limited — try next
-            results = await self._call(backend, query, locale)
+            results = await self._call(backend, query, locale, time_range=time_range)
             if results:
                 return results, backend
         raise RuntimeError("All search backends exhausted (rate-limited or failed)")
 
-    async def _call(self, backend: str, query: str, locale: str) -> list[dict]:
+    async def _call(self, backend: str, query: str, locale: str,
+                    time_range: str | None = None) -> list[dict]:
         max_r = config.MAX_RESULTS
         if backend == "searxng":
-            return await searxng.search(query, locale, max_r)
+            return await searxng.search(query, locale, max_r, time_range=time_range)
         if backend == "ddg":
             return await ddg.search(query, max_r, browser=self._browser)
         if backend == "brave":

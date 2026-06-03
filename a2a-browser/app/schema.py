@@ -7,6 +7,7 @@ class SearchRequest(BaseModel):
     locale: str = "en-US"
     return_format: str = "full"   # "full" | "summary" | "raw"
     test_mode: bool = False
+    time_range: Optional[str] = None   # "day" | "week" | "month" | "year" | None (no filter)
 
 
 class SearchResult(BaseModel):

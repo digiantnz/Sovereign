@@ -920,12 +920,26 @@ def _dispatch_python3_exec(skill: str, op_spec: dict, params: dict, run_id: str,
                 "error": f"python3_exec: script not found at {script_path} — "
                          "deploy scripts/ to workspace/skills/<name>/ at install time"}
 
-    # Build command as a list (shell=False) so param values with spaces are safe
+    # Build command as a list (shell=False) so param values with spaces are safe.
+    # Large string params (> 50 KB) are offloaded to temp files to avoid ARG_MAX.
+    _LARGE_PARAM_THRESHOLD = 50_000  # bytes
     fixed_args   = [str(a) for a in op_spec.get("args", [])]
     dynamic_args = []
+    tmp_files: list[str] = []  # cleaned up after subprocess completes
     for k, v in params.items():
-        if k not in ("command", "timeout", "script"):
-            dynamic_args.extend([f"--{k}", str(v)])
+        if k in ("command", "timeout", "script"):
+            continue
+        sv = str(v)
+        if len(sv.encode("utf-8")) > _LARGE_PARAM_THRESHOLD:
+            tmp_path = os.path.join(WORKSPACE, "tmp", f"{run_id}_{k}.txt")
+            os.makedirs(os.path.dirname(tmp_path), exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as _f:
+                _f.write(sv)
+            dynamic_args.extend([f"--{k}-file", tmp_path])
+            tmp_files.append(tmp_path)
+            logger.info("[%s] python3_exec: param %r offloaded to tempfile (%d bytes)", run_id, k, len(sv.encode("utf-8")))
+        else:
+            dynamic_args.extend([f"--{k}", sv])
 
     cmd_list = ["python3", script_path] + fixed_args + dynamic_args
     timeout  = int(params.get("timeout", 30))
@@ -991,6 +1005,12 @@ def _dispatch_python3_exec(skill: str, op_spec: dict, params: dict, run_id: str,
     except Exception as e:
         return {"status": "error", "path": "dsl_python3",
                 "error": f"python3_exec failed: {e}"}
+    finally:
+        for _tmp in tmp_files:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
 
 
 def _dispatch_dsl(op_spec: dict, params: dict, run_id: str, skill: str = "",

@@ -1029,11 +1029,21 @@ def main():
     parser.add_argument("--path", default="/")
     parser.add_argument("--query", default="")
     parser.add_argument("--content", default="")
+    parser.add_argument("--content-file", default="", dest="content_file")
     # Notes params
     parser.add_argument("--note-id", default="")
     parser.add_argument("--category", default="")
     parser.add_argument("--favorite", type=str, default="false")
     args = parser.parse_args()
+
+    # Large-param offload: if --content-file is set, read content from that file.
+    if args.content_file:
+        try:
+            with open(args.content_file, "r", encoding="utf-8") as _cf:
+                args.content = _cf.read()
+        except Exception as _e:
+            print(json.dumps({"status": "error", "error": f"content-file read failed: {_e}"}))
+            sys.exit(1)
 
     if not _NC_PASS:
         print(json.dumps({"status": "error",
