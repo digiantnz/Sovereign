@@ -19,7 +19,7 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 
 ### Inference model
 - **Running model:** `hf.co/RoadToNowhere/Qwen3-32B-abliterated-Q4_K_M-GGUF:latest` — set via `SOVEREIGN_INFERENCE_MODEL` env var in `compose.yml:172`. The `qwen2.5:32b-instruct-q4_K_M` string in `config/loader.py` defaults is stale; the env override takes precedence at startup.
-- **Native context:** 40,960 tokens (GQA: 64 attn heads, 8 KV heads, 64 layers). Safe `_NUM_CTX` ceiling for RTX 3090 (24GB) is **32,768** — at 32k the KV cache is ~4GB (q8_0), total VRAM ~23GB, ~1.5GB headroom. Do not set 40,960 — no headroom.
+- **Native context:** 40,960 tokens (GQA: 64 attn heads, 8 KV heads, 64 layers). Model weights ~21GB actual (Q4_K_M is heavier than theoretical; measured). Each 4k of context adds ~600MB KV (q8_0). At 16k: 2.6GB free; at 32k: only 266MB free (OOM risk). Safe `_NUM_CTX` ceiling is **20,480** — leaves ~1.6GB headroom. Do not set above 24576 without confirming free VRAM first.
 - `_NUM_CTX` is set per-request in `adapters/ollama.py`; this overrides the server-level `OLLAMA_CONTEXT_LENGTH` default in `secrets/ollama.env` regardless of that file's value.
 
 ### Pass routing
