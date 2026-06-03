@@ -5269,6 +5269,11 @@ class ExecutionEngine:
                     return {"status": "ok", "_trust": nb.get("_trust", "untrusted_external"), **flat}
                 return nb
 
+            # Strip leading /digiant/ account-name prefix — _WEBDAV_BASE already includes it.
+            # Case-sensitive: /digiant/ (account name) is stripped; /Digiant/ (real folder) is kept.
+            if path.startswith("/digiant/"):
+                path = "/" + path[len("/digiant/"):]
+
             if name == "file_navigate":
                 return _nb_unwrap(await self.nanobot.run(
                     "sovereign-nextcloud-fs", "fs_list", {"path": path}

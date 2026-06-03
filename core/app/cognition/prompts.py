@@ -907,13 +907,15 @@ These four fields are mandatory. The engine extracts full_report before PASS 4 a
     elif intent in ("list_files", "navigate", "read_file", "delete_file",
                     "create_folder", "write_file", "list_files_recursive", "read_files_recursive"):
         _schema_hint = """REQUIRED OUTPUT FIELD for this file operation:
-  "path": "<EXACT path as stated by the user>"
+  "path": "<Nextcloud folder/file path>"
 RULES:
-- Use EXACTLY the path the user mentioned (e.g. user said "/Templates/" → path = "/Templates/")
-- Do NOT prepend company names, account names, or any other prefix
-- Do NOT assume "/Digiant/", "/home/", "/Projects/", or any other base directory
+- path MUST start with "/"
 - If no specific path was stated, use "/"
-- path MUST start with "/" """
+- Do NOT include the Nextcloud account name ("digiant") in the path — it is NOT a folder.
+  The top-level Nextcloud folders are: /Digiant/, /Documents/, /Notes/, /Photos/, /Private/, /Sovereign/, /Templates/
+- If the user says "/digiant/tax/" they mean /Digiant/Tax/ — strip the account prefix and fix case.
+  Correct examples: "/Digiant/Tax/FY2026/", "/Documents/", "/Notes/todo.md"
+  Wrong examples:   "/digiant/Tax/", "/home/digiant/", "/Digiant/Digiant/" """
 
     sovereign_section = f"\n{sovereign_context}\n" if sovereign_context else ""
     return f"""{agent_persona}
