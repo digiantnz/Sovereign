@@ -165,6 +165,28 @@ class TaxReportHarness:
 
     # ── Step 1: query ──────────────────────────────────────────────────────────
 
+    async def _list_fy_csvs(self, year: str) -> str:
+        """Return a one-line summary of CSV files found in the FY Nextcloud folder."""
+        folder = f"{_TAX_YEAR_ROOT}/FY{year}"
+        try:
+            nb = await self.nanobot.run(
+                "sovereign-nextcloud-fs", "fs_list", {"path": folder}
+            )
+            result = nb.get("result") if isinstance(nb, dict) and nb.get("result") is not None else nb
+            files = result if isinstance(result, list) else (
+                result.get("files") or result.get("items") or []
+                if isinstance(result, dict) else []
+            )
+            csvs = [
+                f.get("name", "") for f in files
+                if isinstance(f, dict) and f.get("name", "").lower().endswith(".csv")
+            ]
+            if csvs:
+                return f"Available CSVs in {folder}/: {', '.join(csvs)}"
+            return f"No CSVs found in {folder}/ (folder may not exist yet)."
+        except Exception:
+            return ""
+
     async def _step_query(self) -> dict:
         """Query semantic memory for all tax events in the FY date range.
 
@@ -176,6 +198,8 @@ class TaxReportHarness:
 
         # Scroll semantic collection for domain=tax entries in date range
         events = await self._query_semantic_tax_events(start, end)
+        csv_hint = await self._list_fy_csvs(year)
+        csv_hint_line = f"\n{csv_hint}" if csv_hint else ""
 
         if not events:
             await self._write_checkpoint({
@@ -196,6 +220,7 @@ class TaxReportHarness:
                     f"Provide CSV filename(s) to include (comma-separated), or reply 'none' to proceed. "
                     f"Bare filenames resolve from {_TAX_YEAR_ROOT}/FY{year}/; "
                     f"absolute Nextcloud paths (e.g. /Digiant/Tax/25-26/file.csv) are used as-is."
+                    f"{csv_hint_line}"
                 ),
                 "_translator_bypass": True,
             }
@@ -231,6 +256,7 @@ class TaxReportHarness:
                 f"or reply 'none' to proceed. "
                 f"Bare filenames are resolved from {_TAX_YEAR_ROOT}/FY{year}/; "
                 f"absolute paths (e.g. /Digiant/Tax/25-26/receipts.csv) are used as-is."
+                f"{csv_hint_line}"
             ),
             "_translator_bypass": True,
         }
@@ -556,18 +582,23 @@ class TaxReportHarness:
 
 _CARD_PREFIX_RE    = re.compile(r'^Card\s+\d+\s*:\s*', re.IGNORECASE)
 _COUNTRY_CODE_RE   = re.compile(r'\s+[A-Z]{2,3}$')
-_CITY_SUFFIX_RE    = re.compile(r'\s+[A-Z]{4,}$')
+_CITY_SUFFIX_RE    = re.compile(r'\s+[A-Z]{3,}$')
 
 
 def _clean_vendor(raw: str) -> str:
     """Strip Wirex card prefix and trailing location from vendor string.
 
     "Card 8820 : www.aliexpress.com SHENZHEN CHN" → "www.aliexpress.com"
+    "NETFLIX.COM LOS GATOS CA" → "NETFLIX.COM" (multi-pass until stable)
     Non-Wirex strings are returned unchanged.
     """
     clean = _CARD_PREFIX_RE.sub('', raw).strip()
-    clean = _COUNTRY_CODE_RE.sub('', clean).strip()   # strip country code (CHN, NZL, IE…)
-    clean = _CITY_SUFFIX_RE.sub('', clean).strip()    # strip city (SHENZHEN, AUCKLAND…)
+    while True:
+        prev = clean
+        clean = _COUNTRY_CODE_RE.sub('', clean).strip()
+        clean = _CITY_SUFFIX_RE.sub('', clean).strip()
+        if clean == prev:
+            break
     return clean or raw
 
 
@@ -589,12 +620,15 @@ def _nzd_plain(nzd_str: str) -> str:
     return nzd_str.replace("$", "").replace("NZD", "").replace(",", "").strip()
 
 
-def _source_label(source: str) -> str:
-    """Map a file source string to a human-readable Source column label."""
+def _source_label(source: str, metadata: dict | None = None) -> str:
+    """Map a file source string (and optional metadata) to a human-readable Source column label."""
     s = (source or "").lower()
     if "aliexpress" in s:
         return "AliExpress"
     if "wirex" in s:
+        return "Wirex"
+    raw_type = ((metadata or {}).get("raw_type") or "").lower()
+    if "wirex" in raw_type:
         return "Wirex"
     return "Receipt"
 
@@ -622,7 +656,7 @@ def _expense_row(ev) -> dict:
              Amount NZD (plain decimal), Reference, Notes (blank).
     """
     raw_vendor   = ev.vendor or ev.source or ""
-    src_label    = _source_label(ev.source or "")
+    src_label    = _source_label(ev.source or "", ev.metadata)
     meta_desc    = (ev.metadata or {}).get("description", "")
     description  = "" if src_label == "Wirex" else meta_desc
     date_raw     = ev.timestamp[:10] if ev.timestamp else ""
