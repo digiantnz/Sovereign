@@ -1574,18 +1574,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Financial quote/commodity price — deterministic research_gather routing",
         }
 
-    # ── Portfolio analysis save/clear shortcuts — before conversational guard ─
-    _portfolio_save_kw = any(p in u for p in ("save portfolio", "save the portfolio", "portfolio save"))
-    _portfolio_clear_kw = any(p in u for p in ("clear portfolio", "clear portfolio analysis", "discard portfolio"))
-    if _portfolio_save_kw:
-        return {"intent": "portfolio_analysis_save", "domain": "portfolio_analysis", "operation": "save",
-                "delegate_to": "business_agent", "tier": "MID", "confidence": 0.99,
-                "reasoning_summary": "Portfolio save shortcut — deterministic pre-classifier"}
-    if _portfolio_clear_kw:
-        return {"intent": "portfolio_analysis_clear", "domain": "portfolio_analysis", "operation": "clear",
-                "delegate_to": "business_agent", "tier": "LOW", "confidence": 0.99,
-                "reasoning_summary": "Portfolio clear shortcut — deterministic pre-classifier"}
-
     # ── Session flag approval — before conversational guard ──────────────────
     _session_flag_kw = (
         "approve external", "allow external providers", "confidential external approved",
@@ -1774,34 +1762,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Capability diagnostic — research_agent query fast-path",
         }
 
-    # Memory collection registry query — "what collections do you have", "list your collections"
-    # Must be before _gap_kw to avoid "your gaps" vs "your collections" ambiguity.
-    _coll_kw = (
-        "what collections", "list collections", "your collections", "memory collections",
-        "qdrant collections", "what memory collections", "list memory collections",
-        "show your collections", "show collections", "what are your collections",
-        "memory stores", "what stores do you", "memory databases",
-    )
-    if any(w in u for w in _coll_kw):
-        return {
-            "delegate_to": "memory_agent", "intent": "memory_list_collections",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Memory collection registry query — static handler",
-        }
-
-    # Knowledge gap query — must be before _self_diag_kw (shares "your" prefix words)
-    _gap_kw = (
-        "knowledge gap", "knowledge gaps", "what gaps", "your gaps",
-        "what don't you know", "what do you not know", "memory gaps",
-        "gaps in your", "gaps in memory", "what are your gaps",
-    )
-    if any(w in u for w in _gap_kw):
-        return {
-            "delegate_to": "memory_agent", "intent": "memory_list_gaps",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Knowledge gap query — deterministic pre-classifier",
-        }
-
     # Self-identity / architecture queries — "who are you", "describe yourself", "your architecture"
     # Routes to memory_recall so Rex reads from sovereign-self-architecture.md in semantic memory.
     # Must be BEFORE _self_diag_kw which also contains "your capabilities", "your toolset" etc.
@@ -1828,26 +1788,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "memory_agent", "intent": "memory_recall",
             "target": "sovereign architecture", "tier": "LOW",
             "reasoning_summary": "Self-identity/architecture query — memory_recall from semantic memory",
-        }
-
-    # Self-diagnostic — requests about Sovereign's own health, performance, or internal state
-    _self_diag_kw = (
-        "how are you running", "how are you performing", "how are you doing",
-        "your health", "your status", "your performance", "your memory",
-        "system health", "system status", "system performance",
-        "self check", "self-check", "self diagnostic", "self-diagnostic",
-        "check yourself", "check your", "how is your", "how is the system",
-        "are you healthy", "are you ok", "resource usage", "resource utilization",
-        "vram", "gpu usage", "gpu utilization", "memory usage", "cpu usage",
-        "how much memory", "how much vram", "what is your status",
-        "shortcomings", "your toolset", "your capabilities", "internal state",
-        "monitor yourself", "monitor your", "diagnos",
-    )
-    if any(w in u for w in _self_diag_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "get_stats",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Self-diagnostic request — deterministic pre-classifier",
         }
 
     # ── Skill / harness meta-queries — deterministic to avoid qwen2.5:32b giving
@@ -1905,41 +1845,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "list_containers",
             "target": None, "tier": "LOW",
             "reasoning_summary": "Container status — deterministic pre-classifier",
-        }
-
-    # Nextcloud file operations — deterministic fast-path before LLM
-    _write_kw = (
-        "write file", "write a file", "create file", "create a file",
-        "create document", "create a document", "save to nextcloud",
-        "save a file", "write to nextcloud", "put a file",
-        "new document",
-    )
-    _read_kw = (
-        "read file", "read the file", "open file", "open the file",
-        "show me the file", "get the file", "fetch the file",
-        "show me the contents", "show the contents", "contents of the file",
-        "what does the file", "what does this file", "what's in the file",
-        "what is in the file", "read the document", "open the document",
-        "show me the document", "get the document",
-    )
-    _list_kw = (
-        "list files", "list the files", "list my files", "show files",
-        "what files", "show me my files", "show me the files",
-        # "what's in" and "whats in" removed — too broad (matches "what's in my fridge" etc.)
-        "how many files", "how many templates", "how many documents", "how many items",
-        "count files", "count templates", "count the files", "count the templates",
-        "recount", "re-count",
-    )
-    # "how many X in /path/" — extract path deterministically
-    import re as _re_lk
-    _how_many_path_m = _re_lk.search(r'how many\s+\w+(?:\s+\w+)?\s+(?:are\s+)?(?:in|inside|under)\s+(/[/\w_.\- ]+)', u)
-    if _how_many_path_m:
-        _hm_path = _how_many_path_m.group(1).rstrip().rstrip('/')
-        return {
-            "delegate_to": "business_agent", "intent": "list_files",
-            "target": (_hm_path if _hm_path.startswith("/") else f"/{_hm_path}"),
-            "tier": "LOW",
-            "reasoning_summary": "File count query — deterministic pre-classifier",
         }
 
     # GitHub — deterministic fast-path for clear read/push intents
@@ -2299,110 +2204,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "BTC PSBT signing — deterministic pre-classifier",
         }
 
-    _mkdir_kw = (
-        "create a folder", "create folder", "make a folder", "make folder",
-        "new folder", "mkdir", "create a directory", "make a directory",
-    )
-    if any(w in u for w in _mkdir_kw) and "nextcloud" not in u and "downloads" not in u:
-        return {
-            "delegate_to": "business_agent", "intent": "create_folder",
-            "target": None, "tier": "MID",
-            "reasoning_summary": "Folder creation — deterministic pre-classifier",
-        }
-
-    if any(w in u for w in _write_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "write_file",
-            "target": None, "tier": "MID",
-            "reasoning_summary": "File write — deterministic pre-classifier",
-        }
-    if any(w in u for w in _read_kw) and "nextcloud" not in u and "downloads" not in u:
-        return {
-            "delegate_to": "business_agent", "intent": "read_file",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "File read — deterministic pre-classifier",
-        }
-    if any(w in u for w in _list_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "list_files",
-            "target": "/", "tier": "LOW",
-            "reasoning_summary": "File list — deterministic pre-classifier",
-        }
-
-    _recursive_list_kw = (
-        "list files recursively", "list all files", "list recursively",
-        "recursive list", "recursive file list", "all files in",
-        "show all files", "show files recursively",
-    )
-    _recursive_read_kw = (
-        "read all files", "read files recursively", "read recursively",
-        "read the folder", "read all notes", "read everything in",
-        "ingest all files", "ingest folder", "read all files in",
-    )
-    if any(w in u for w in _recursive_read_kw) or (
-        ("read" in u or "ingest" in u) and "recursive" in u
-    ):
-        return {
-            "delegate_to": "business_agent", "intent": "read_files_recursive",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Recursive file read — deterministic pre-classifier",
-        }
-    if any(w in u for w in _recursive_list_kw) or (
-        ("list" in u or "show" in u) and "recursive" in u
-    ):
-        return {
-            "delegate_to": "business_agent", "intent": "list_files_recursive",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Recursive file list — deterministic pre-classifier",
-        }
-
-    # ── Notes fast-path (Nextcloud Notes REST API) ──
-    _notes_delete_kw = ("delete note", "delete the note", "remove note", "remove the note")
-    _notes_update_kw = ("update note", "edit note", "change note", "modify note", "update the note")
-    _notes_create_kw = ("create note", "new note", "add note", "write a note", "add a note", "create a note")
-    _notes_read_kw   = ("read note", "open note", "show note", "get note", "view note")
-    _notes_list_kw   = (
-        "list notes", "show notes", "my notes", "all notes", "notes list",
-        "view notes", "nextcloud notes", "nc notes",
-        "the notes", "list the notes", "show the notes", "notes from nextcloud",
-        "get notes", "get the notes",
-    )
-    if any(w in u for w in _notes_delete_kw):
-        import re as _re_nid_del
-        _nid_del_m = _re_nid_del.search(r'\b(\d+)\b', user_input)
-        return {
-            "delegate_to": "business_agent", "intent": "delete_note",
-            "target": _nid_del_m.group(1) if _nid_del_m else None, "tier": "HIGH",
-            "reasoning_summary": "Notes delete — deterministic pre-classifier",
-        }
-    if any(w in u for w in _notes_update_kw):
-        import re as _re_nid_u
-        _nid_um = _re_nid_u.search(r'\b(\d+)\b', user_input)
-        return {
-            "delegate_to": "business_agent", "intent": "update_note",
-            "target": _nid_um.group(1) if _nid_um else None, "tier": "MID",
-            "reasoning_summary": "Notes update — deterministic pre-classifier",
-        }
-    if any(w in u for w in _notes_create_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "create_note",
-            "target": None, "tier": "MID",
-            "reasoning_summary": "Notes create — deterministic pre-classifier",
-        }
-    if any(w in u for w in _notes_read_kw):
-        import re as _re_nid
-        _nid_m = _re_nid.search(r'\b(\d+)\b', user_input)
-        return {
-            "delegate_to": "business_agent", "intent": "read_note",
-            "target": _nid_m.group(1) if _nid_m else None, "tier": "LOW",
-            "reasoning_summary": "Notes read — deterministic pre-classifier",
-        }
-    if any(w in u for w in _notes_list_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "list_notes",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Notes list — deterministic pre-classifier",
-        }
     # "read/delete/update the [title] note" — title sits between verb and "note";
     # _note_suffix was computed above near the conversational guard.
     if _note_suffix:
@@ -2436,166 +2237,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "target": _extracted_title, "tier": "LOW",
                 "reasoning_summary": "Notes read by title — deterministic suffix classifier",
             }
-
-    # ── sovereign-nextcloud-fs ──────────────────────────────────────────
-    _ncfs_list_kw   = (
-        "list nextcloud", "show nextcloud", "what's on nextcloud", "whats on nextcloud",
-        "list the downloads", "show the downloads", "what's in downloads", "whats in downloads",
-        "what is in downloads", "what's in the downloads", "whats in the downloads",
-        "in the downloads folder", "in downloads folder", "downloads folder",
-        "list my nextcloud", "show me nextcloud", "browse nextcloud",
-        "what files are on nextcloud", "what's in my nextcloud",
-    )
-    _ncfs_list_recursive_kw = (
-        "full tree", "entire nextcloud", "all files on nextcloud",
-        "everything on nextcloud", "recursive nextcloud", "nextcloud tree",
-    )
-    _ncfs_read_kw   = (
-        "read from nextcloud", "read the file from nextcloud", "show me the file on nextcloud",
-        "get the file from nextcloud", "open the file on nextcloud", "fetch from nextcloud",
-        "read nextcloud file", "read the nextcloud file",
-        "from downloads", "from the downloads",
-    )
-    _ncfs_mkdir_kw  = (
-        "create folder on nextcloud", "create a folder on nextcloud",
-        "make a folder on nextcloud", "make folder on nextcloud",
-        "new folder on nextcloud", "mkdir on nextcloud",
-    )
-    _ncfs_delete_kw = (
-        "delete from nextcloud", "delete the file on nextcloud", "delete the nextcloud file",
-        "remove from nextcloud", "remove the file on nextcloud",
-        "delete /", "remove /",  # path-style: "delete /path"
-    )
-    _ncfs_move_kw   = ("move the file", "move file", "rename file", "rename the file",
-                        "move it to", "move this to", "move to")
-    _ncfs_copy_kw   = ("copy the file", "copy file", "copy it to", "copy this to", "duplicate file",
-                        "copy /", "copy the /")  # path-style: "copy /src to /dest"
-    _ncfs_tag_kw    = ("tag the file", "tag this file", "tag it", "add tag", "label the file",
-                        "tag /", "untag /")  # path-style: "tag /path with label"
-    _ncfs_search_kw = ("search nextcloud for", "search files for", "find files named",
-                        "find file named", "search for files")
-
-    if any(w in u for w in _ncfs_list_recursive_kw):
-        return {
-            "delegate_to": "research_agent", "intent": "ncfs_list_recursive",
-            "target": "/",
-            "reasoning_summary": "Full Nextcloud tree — ncfs_list_recursive",
-        }
-
-    if any(w in u for w in _ncfs_list_kw):
-        # Extract path hint — "downloads" folder or explicit /path
-        # Use user_input (not u) for path extraction to preserve original case
-        _ncfs_path = "/downloads" if "download" in u else "/"
-        import re as _re_ncfs
-        _slash_m = _re_ncfs.search(r'(/[\w/_\-\.]+)', user_input)
-        if _slash_m:
-            _ncfs_path = _slash_m.group(1)
-        return {
-            "delegate_to": "research_agent", "intent": "ncfs_list",
-            "target": _ncfs_path,
-            "reasoning_summary": "Nextcloud directory listing — ncfs_list",
-        }
-
-    if any(w in u for w in _ncfs_read_kw):
-        # Use user_input (not u) for path/filename extraction to preserve original case
-        import re as _re_ncfs_rd
-        _rd_slash = _re_ncfs_rd.search(r'(/[\w/_\-\.]+)', user_input)
-        _rd_fname = _re_ncfs_rd.search(r'(?:file\s+|read\s+)([\w\-\.]+\.\w+)', user_input, _re_ncfs_rd.IGNORECASE)
-        if _rd_slash:
-            _ncfs_rd_path = _rd_slash.group(1)
-        elif _rd_fname and "download" in u:
-            _ncfs_rd_path = "/downloads/" + _rd_fname.group(1)
-        else:
-            _ncfs_rd_path = user_input  # let specialist resolve
-        return {
-            "delegate_to": "research_agent", "intent": "ncfs_read",
-            "target": _ncfs_rd_path,
-            "reasoning_summary": "Read file from Nextcloud — ncfs_read",
-        }
-
-    if any(w in u for w in _ncfs_mkdir_kw):
-        import re as _re_ncfs_mk
-        _mk_slash = _re_ncfs_mk.search(r'(/[\w/_\-\.]+)', user_input)
-        _mk_name  = _re_ncfs_mk.search(r'(?:called?|named?)\s+["\']?(\S+)["\']?', user_input, _re_ncfs_mk.IGNORECASE)
-        _mk_path  = (_mk_slash.group(1) if _mk_slash else
-                     ("/" + _mk_name.group(1).strip('/') if _mk_name else user_input))
-        return {
-            "delegate_to": "business_agent", "intent": "ncfs_mkdir",
-            "target": _mk_path,
-            "reasoning_summary": "Create Nextcloud folder — ncfs_mkdir",
-        }
-
-    if any(w in u for w in _ncfs_delete_kw):
-        import re as _re_del_nc
-        _del_slash = _re_del_nc.search(r'(/[\w/_\-\.]+)', user_input)
-        _del_nc_path = _del_slash.group(1) if _del_slash else user_input
-        return {
-            "delegate_to": "business_agent", "intent": "ncfs_delete",
-            "target": _del_nc_path,
-            "reasoning_summary": "Delete from Nextcloud — ncfs_delete",
-        }
-
-    if any(w in u for w in _ncfs_move_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "ncfs_move",
-            "target": user_input,
-            "reasoning_summary": "File move/rename — ncfs_move",
-        }
-
-    if any(w in u for w in _ncfs_copy_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "ncfs_copy",
-            "target": u,
-            "reasoning_summary": "File copy — ncfs_copy",
-        }
-
-    if any(w in u for w in _ncfs_tag_kw):
-        # Detect untag: "untag /" or "remove tag" patterns
-        _is_untag = "untag /" in u or "remove tag" in u or "untag" in u.split()
-        import re as _re_tag
-        _tag_slash = _re_tag.search(r'(/[\w/_\-\.]+)', u)
-        _tag_name_m = _re_tag.search(r'(?:with|label)\s+["\']?(\S+)["\']?', u, _re_tag.IGNORECASE)
-        _tag_path = _tag_slash.group(1) if _tag_slash else u
-        _tag_name = _tag_name_m.group(1) if _tag_name_m else ""
-        return {
-            "delegate_to": "business_agent",
-            "intent": "ncfs_untag" if _is_untag else "ncfs_tag",
-            "target": _tag_path,
-            "tag": _tag_name,
-            "reasoning_summary": "File untag — ncfs_untag" if _is_untag else "File tag — ncfs_tag",
-        }
-
-    if any(w in u for w in _ncfs_search_kw):
-        return {
-            "delegate_to": "business_agent", "intent": "ncfs_search",
-            "target": u,
-            "reasoning_summary": "File search — ncfs_search",
-        }
-
-    # ── sovereign-nextcloud-ingest ──────────────────────────────────────
-    # ingest_status must be checked BEFORE ingest_kw — "ingest" substring fires on "ingest status"
-    _ingest_status_kw = ("ingest status", "has this been reviewed", "check if reviewed",
-                          "sovereign-reviewed", "check tags")
-    if any(w in u for w in _ingest_status_kw):
-        return {
-            "delegate_to": "memory_agent", "intent": "ingest_status",
-            "target": u,
-            "reasoning_summary": "Ingest status check — OCS tags",
-        }
-
-    _ingest_kw = (
-        "ingest", "review and remember", "add to memory", "remember the contents",
-        "remember everything in", "ingest and remember", "read and remember",
-        "review the file and remember", "review the folder and remember",
-    )
-    if any(w in u for w in _ingest_kw):
-        _ingest_is_folder = any(w in u for w in ("folder", "directory", "everything in", "all files"))
-        return {
-            "delegate_to": "memory_agent",
-            "intent": "ingest_folder" if _ingest_is_folder else "ingest_file",
-            "target": u,
-            "reasoning_summary": "Nextcloud ingest — ncingest pipeline",
-        }
 
     # ── Session wrap-up ────────────────────────────────────────────────────
     _closure_kw = (
@@ -2678,109 +2319,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Document follow-up — answer from context_window",
         }
 
-    # Scheduler — remaining task management intents
-    _list_tasks_kw = (
-        "list tasks", "show tasks", "my tasks", "scheduled tasks", "list scheduled",
-        "what tasks", "active tasks", "what's scheduled", "whats scheduled",
-        "what do i have scheduled", "show scheduled",
-    )
-    if any(w in u for w in _list_tasks_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "list_tasks",
-            "target": "active", "tier": "LOW",
-            "reasoning_summary": "List scheduled tasks — deterministic pre-classifier",
-        }
-
-    _cancel_task_kw = ("cancel task", "cancel the task", "stop task", "delete task",
-                       "remove task", "disable task", "delete scheduled task",
-                       "cancel scheduled task", "remove scheduled task",
-                       "cancel reminder", "remove reminder", "delete reminder")
-    if any(w in u for w in _cancel_task_kw):
-        import re as _re_ct
-        _ct_uuid = _re_ct.search(
-            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-            user_input, _re_ct.IGNORECASE
-        )
-        # Extract task title after keyword if no UUID present — pass as target for title lookup
-        _ct_target = _ct_uuid.group(0) if _ct_uuid else user_input
-        return {
-            "delegate_to": "devops_agent", "intent": "cancel_task",
-            "target": _ct_target, "tier": "LOW",
-            "reasoning_summary": "Task cancellation — deterministic pre-classifier",
-        }
-
-    # "clear the X reminder" — (clear|remove) ... reminder with words between
-    import re as _re_rem
-    if _re_rem.search(r'\b(clear|remove)\b.{0,60}\breminder\b', u):
-        return {
-            "delegate_to": "devops_agent", "intent": "cancel_task",
-            "target": user_input, "tier": "LOW",
-            "reasoning_summary": "Cancel reminder — deterministic pre-classifier",
-        }
-
-    _complete_task_kw = ("mark task as complete", "mark as complete", "mark task complete",
-                         "mark scheduled task", "mark reminder", "reminder has passed",
-                         "reminder is past", "mark past", "task is complete",
-                         "no longer needed", "no longer required", "task no longer")
-    if any(w in u for w in _complete_task_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "complete_scheduled_task",
-            "target": user_input, "tier": "LOW",
-            "reasoning_summary": "Task completion — deterministic pre-classifier",
-        }
-
-    _pause_task_kw = ("pause task", "pause the task", "suspend task", "hold task")
-    if any(w in u for w in _pause_task_kw):
-        import re as _re_pt
-        _pt_uuid = _re_pt.search(
-            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-            user_input, _re_pt.IGNORECASE
-        )
-        return {
-            "delegate_to": "devops_agent", "intent": "pause_task",
-            "target": _pt_uuid.group(0) if _pt_uuid else None, "tier": "LOW",
-            "reasoning_summary": "Task pause — deterministic pre-classifier",
-        }
-
-    # ── Self-improvement harness — proposals / baseline views ─────────────
-    # Entry point is /selfimprove (Telegram command) — no NL entry keywords.
-    # Mid-session views are retained so Director can query status after /selfimprove runs.
-    _si_proposals_kw = (
-        "improvement proposals", "pending proposals", "list proposals",
-        "show proposals", "what proposals", "si proposals",
-        "report on all findings", "all findings", "show findings",
-        "what findings", "what anomalies", "anomaly report",
-        "report on findings", "what did you find", "show me what you found",
-    )
-    if any(w in u for w in _si_proposals_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "self_improve_proposals",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "List improvement proposals — deterministic pre-classifier",
-        }
-
-    _si_baseline_kw = (
-        "show baseline", "baseline report", "si baseline",
-    )
-    if any(w in u for w in _si_baseline_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "self_improve_baseline",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Self-improvement baseline report — deterministic pre-classifier",
-        }
-
-    _si_dismiss_kw = (
-        "dismiss all proposals", "dismiss proposals", "clear proposals",
-        "dismiss si proposals", "dismiss all si", "clear si proposals",
-        "dismiss improvement proposals", "clear improvement proposals",
-    )
-    if any(w in u for w in _si_dismiss_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "self_improve_dismiss",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Dismiss SI proposals — deterministic pre-classifier",
-        }
-
     # ── Dev-Harness fast-paths ─────────────────────────────────────────────
     # All dev_* intents are deterministic — bypass CEO LLM + PASS 3.
     # "approve/reject/verify dev fix {id}" carry an 8-char hex session_id_short
@@ -2790,18 +2328,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _dev_id   = _dev_id_m.group(1) if _dev_id_m else None
 
     # Entry point is /devcheck (Telegram command) — NL kept only for unambiguous dev-prefixed phrases.
-    # ── Learning-Harness status fast-path ────────────────────────────────────
-    _learning_kw = (
-        "learning harness", "learning status", "what did you learn",
-        "last learned", "learning harness status",
-    )
-    if any(w in u for w in _learning_kw):
-        return {
-            "delegate_to": "memory_agent", "intent": "learning_harness_status",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Learning-Harness status query — deterministic pre-classifier",
-        }
-
     _dev_analyse_kw = (
         "dev analyse", "dev analyze", "dev analysis", "run dev analysis",
         "dev harness analyse", "dev harness analyze", "dev harness run",
