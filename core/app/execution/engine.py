@@ -183,6 +183,7 @@ INTENT_ACTION_MAP = {
     "journalctl":         {"domain": "docker", "operation": "read", "name": "journalctl"},
     "kernel_info":        {"domain": "docker", "operation": "read", "name": "kernel_info"},
     "disk_usage":         {"domain": "docker", "operation": "read", "name": "disk_usage"},
+    "dir_usage":          {"domain": "docker", "operation": "read", "name": "dir_usage"},
     "memory_usage":       {"domain": "docker", "operation": "read", "name": "memory_usage"},
     "docker_build":       {"domain": "docker", "operation": "rebuild", "name": "docker_build"},
     "docker_prune":       {"domain": "docker", "operation": "prune",   "name": "docker_prune"},
@@ -247,7 +248,7 @@ INTENT_TIER_MAP = {
     "inspect_container": "LOW", "get_compose": "LOW", "read_host_file": "LOW",
     "get_hardware": "LOW", "list_processes": "LOW",
     "apt_check": "LOW", "systemctl_status": "LOW", "journalctl": "LOW",
-    "kernel_info": "LOW", "disk_usage": "LOW", "memory_usage": "LOW", "ollama_model_status": "LOW",
+    "kernel_info": "LOW", "disk_usage": "LOW", "dir_usage": "LOW", "memory_usage": "LOW", "ollama_model_status": "LOW",
     "docker_build": "HIGH", "docker_prune": "HIGH",
     "list_containers": "LOW", "get_logs": "LOW", "get_stats": "LOW",
     "docker_networks": "LOW", "docker_volumes": "LOW", "docker_images": "LOW", "docker_disk": "LOW",
@@ -1147,6 +1148,28 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "devops_agent", "intent": "disk_usage",
             "target": None, "tier": "LOW",
             "reasoning_summary": "Host disk usage — deterministic pre-classifier",
+        }
+    # Directory-specific size queries — vector DB, docker data, source tree, etc.
+    _dir_usage_kw = (
+        "vector db size", "vector database size", "vector store size",
+        "how big is the vector", "how much space.*vector", "qdrant size", "qdrant disk",
+        "how much space is the vector", "size of the vector",
+    )
+    _dir_path_map = {
+        "vector": "/hostfs/home/sovereign/vector",
+        "qdrant": "/hostfs/home/sovereign/vector",
+        "docker": "/hostfs/var/lib/docker",
+        "docs":   "/hostfs/home/sovereign/docs",
+        "governance": "/hostfs/home/sovereign/governance",
+        "security": "/hostfs/home/sovereign/security",
+        "sovereign": "/hostfs/home/sovereign/sovereign",
+    }
+    if any(kw in u for kw in _dir_usage_kw):
+        _dir_path = "/hostfs/home/sovereign/vector"  # default for vector-specific matches
+        return {
+            "delegate_to": "devops_agent", "intent": "dir_usage",
+            "target": _dir_path, "tier": "LOW",
+            "reasoning_summary": "Directory size query — deterministic pre-classifier",
         }
     _mem_usage_kw = (
         "memory usage", "ram usage", "how much ram", "how much memory",
@@ -4303,7 +4326,7 @@ class ExecutionEngine:
         _DIAGNOSTIC_INTENTS = frozenset({
             "list_containers", "get_logs", "get_stats", "get_hardware", "list_processes",
             "read_host_file", "get_compose", "inspect_container", "systemctl_status",
-            "journalctl", "apt_check", "kernel_info", "disk_usage", "memory_usage", "ollama_model_status", "github_read",
+            "journalctl", "apt_check", "kernel_info", "disk_usage", "dir_usage", "memory_usage", "ollama_model_status", "github_read",
             "docker_networks", "docker_volumes", "docker_images", "docker_disk",
             "list_files", "read_file", "navigate", "search_files",
             "list_files_recursive", "read_files_recursive",
@@ -5714,6 +5737,16 @@ class ExecutionEngine:
                 return await self.broker.exec_command("uname", {})
             if name == "disk_usage":
                 return await self.broker.exec_command("df", {})
+            if name == "dir_usage":
+                _du_path = (
+                    (specialist or {}).get("path")
+                    or delegation.get("target")
+                    or action.get("path")
+                    or ""
+                )
+                if not _du_path:
+                    return {"error": "dir_usage requires a path — specify which directory to measure (e.g. vector DB, Docker, docs)"}
+                return await self.broker.exec_command("du", {"path": _du_path})
             if name == "memory_usage":
                 return await self.broker.exec_command("free", {})
             if name == "docker_build":

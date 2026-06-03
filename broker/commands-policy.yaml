@@ -27,6 +27,28 @@ commands:
     tier: low
     enabled: true
 
+  du:
+    description: >
+      Directory disk usage (human-readable summary). Runs du -sh against an allowlisted
+      host path via /hostfs bind-mount. Note: du does not cross mount boundaries, so
+      Docker volume mounts (e.g. /home/sovereign/vector on RAID) must be queried directly.
+    binary: /usr/bin/du
+    fixed_args: ["-sh"]
+    params:
+      path:
+        type: string
+        required: true
+        allowlist:
+          - /hostfs/home/sovereign/vector
+          - /hostfs/home/sovereign/docs
+          - /hostfs/home/sovereign/governance
+          - /hostfs/home/sovereign/security
+          - /hostfs/home/sovereign/sovereign
+          - /hostfs/var/lib/docker
+          - /hostfs/home/sovereign
+    tier: low
+    enabled: true
+
   free:
     description: "RAM and swap usage in megabytes. Reads /proc/meminfo — reflects host kernel values."
     binary: /usr/bin/free

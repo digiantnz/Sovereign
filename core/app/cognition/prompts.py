@@ -138,6 +138,7 @@ devops_agent:
   get_compose         — read the current docker-compose.yml (LOW)
   read_host_file      — read a file or list a directory on the host filesystem (LOW; target: absolute path e.g. "/docker/sovereign/core/app/" or "/home/sovereign/docs/as-built.md")
   get_hardware        — combined hardware report: GPU, disk, memory, CPU (LOW)
+  dir_usage           — disk usage of a specific host directory (LOW; target: one of: vector DB=/hostfs/home/sovereign/vector, Docker=/hostfs/var/lib/docker, docs=/hostfs/home/sovereign/docs, governance=/hostfs/home/sovereign/governance, security=/hostfs/home/sovereign/security, source=/hostfs/home/sovereign/sovereign, sovereign home=/hostfs/home/sovereign)
   list_processes      — system process list / ps aux (LOW)
   schedule_task       — create a recurring or one-time scheduled task from NL description (MID — requires confirmation; e.g. "daily briefing at 7:30", "search weekly for X", "remind me every Monday")
   list_tasks          — list all scheduled/recurring tasks and their status (LOW)

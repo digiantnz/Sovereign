@@ -133,7 +133,8 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 
 ### Hard boundary (do not violate)
 - Broker handles system operations only; nanobot-01 handles all application skills
-- **Broker commands (LOW — `docker_read` or exec_command):** `docker_ps`, `docker_logs`, `docker_stats`, `docker_inspect`, `uname` (`kernel_info`), `df` (`disk_usage`), `free` (`memory_usage`), `ps`, `nvidia_smi`, `systemctl_status`, `journalctl`, `apt_check`; REST endpoints: `docker_networks`, `docker_volumes`, `docker_images`, `docker_disk` (→ `/system/df`)
+- **Broker commands (LOW — `docker_read` or exec_command):** `docker_ps`, `docker_logs`, `docker_stats`, `docker_inspect`, `uname` (`kernel_info`), `df` (`disk_usage`), `du` (`dir_usage` — allowlisted paths: vector, docker, docs, governance, security, sovereign, home), `free` (`memory_usage`), `ps`, `nvidia_smi`, `systemctl_status`, `journalctl`, `apt_check`
+- **`dir_usage` note:** `du` does not cross mount boundaries, so Docker volume mounts (e.g. `/home/sovereign/vector` on RAID) must be queried as their own path, not via the parent `/home/sovereign`; REST endpoints: `docker_networks`, `docker_volumes`, `docker_images`, `docker_disk` (→ `/system/df`)
 - **Broker commands (MID):** `docker_restart`, `docker_recreate` (`recreate_container`); REST: `POST /containers/*/restart`
 - **Broker commands (HIGH):** `docker_build`, `docker_prune` (→ `POST /images/prune`); REST: `POST /compose/*/rolling-recreate`
 - All other application skills (IMAP/SMTP/feeds/WebDAV/CalDAV) → nanobot-01
