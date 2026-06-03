@@ -1270,6 +1270,13 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "dev analyse", "dev analysis", "dev harness", "dev status",
         "approve dev", "reject dev", "verify dev", "dev clear",
         "code analysis", "code quality", "run analysis", "harness analyse",
+        # Self-improvement harness
+        "proposals", "improvement proposals", "si proposals", "pending proposals",
+        "show proposals", "list proposals", "dismiss proposals",
+        "si baseline", "baseline report", "show baseline",
+        "self-improvement", "self improvement",
+        # Learning harness
+        "learning harness", "learning status",
         # Session wrap-up closure signals
         "that's all", "thats all", "goodbye", "good bye", "wrap up", "wrap-up",
         "signing off", "sign off", "end of session", "we're done", "done for today",
@@ -1634,7 +1641,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     # Use word-boundary regex to avoid substring matches (e.g. "it" inside "with", "that" inside "that's")
     import re as _re_pr
     _is_pronoun_ref = bool(_re_pr.search(
-        r'\b(they|them|those|these|all of them|all of those)\b', u
+        r'\b(those|these|all of them|all of those)\b', u
     )) and len(u.split()) <= 12
 
     # Email — explicit keyword or pronoun ref when prior domain was email
@@ -2300,11 +2307,15 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     # Document follow-up — when last turn involved a file read, route content questions
     # to Ollama so the LLM answers from context_window rather than misrouting to web search.
     # Only fires when no new system/file-operation signal is present in the current message.
+    # Deliberately narrow: only clear document-analysis phrases. Single-word verbs like
+    # "what", "list", "explain", "review", "describe" removed — too broad, grabbed
+    # unrelated queries (file listings, task queries) that shared prior_domain=file.
     _doc_followup_kw = (
-        "what", "list", "summarise", "summarize", "tell me", "explain",
-        "tasks", "duties", "responsibilities", "obligations", "outline",
-        "review", "describe", "what does", "what are", "who is", "who are",
-        "key points", "main points", "observations",
+        "summarise", "summarize",
+        "key points", "main points", "key takeaways", "key findings",
+        "what does it say", "what does this say", "what does it contain",
+        "duties", "responsibilities", "obligations",
+        "conclusions", "recommendations",
     )
     _new_op_signal = any(w in u for w in (
         "read", "open", "fetch", "download", "upload", "write", "create", "delete",

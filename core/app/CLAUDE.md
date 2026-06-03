@@ -25,6 +25,7 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 ### Pass routing
 - PASS 1 (orchestrator classify), PASS 3b (specialist inbound), PASS 4 (orchestrator evaluate), PASS 5 (translator) → always local Ollama; all prepend `/no_think` to suppress Qwen3 thinking tokens
 - PASS 1 history: trimmed to last 6 turns, user capped 500 chars, assistant capped 1000 chars (mirrors PASS 3 pattern); full history not needed for routing and risks KV overflow under long sessions
+- **Re-enable thinking when hardware allows:** On upgrade to 850W+ PSU / larger GPU with ≥32GB VRAM, consider re-enabling `capture_thinking=True` on PASS 1 (`ceo_classify`, `cognition/engine.py`) and removing `/no_think` prefix. PASS 2 (specialist_reason) already uses thinking via `capture_thinking` where applicable. Thinking was disabled 2026-06-03 due to VRAM pressure on RTX 3090 (24GB) and routing latency, not a permanent design decision.
 - PASS 2 (specialist outbound) → only externally-routable pass via `_routing_decision()`
 - `_routing_decision(prompt, user_input)` scores complexity on `user_input` (NOT full specialist prompt — persona length would inflate every score)
 - DCL hard-block: tier in `{"PRIVATE","SECRET"}` → `force_local=True` regardless of explicit override
