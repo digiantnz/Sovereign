@@ -761,6 +761,11 @@ class CognitionEngine:
             _log.warning("SkillLoader[outbound/%s]: %s", agent_name, e)
 
         routing_history = await self.load_routing_history(delegation.get("intent", ""))
+        _distilled_q = None
+        if delegation.get("intent") in ("web_search", "research"):
+            _dq = await self._distil_query(user_input, "search")
+            if _dq != user_input:
+                _distilled_q = _dq
         prompt = prompts.specialist_outbound(
             agent_persona=persona,
             delegation=delegation,
@@ -768,6 +773,7 @@ class CognitionEngine:
             routing_history=routing_history,
             context_window=context_window,
             sovereign_context=sovereign_context,
+            distilled_query=_distilled_q,
         )
 
         # External routing applies to outbound (research may use any eligible provider)
@@ -1202,9 +1208,16 @@ class CognitionEngine:
         system = (
             f"You are Sovereign, a helpful personal AI assistant. Answer directly and helpfully in plain English.\n"
             f"Current time: {_time_str}\n"
-            "CRITICAL: Only reference events, requests, or context that appear explicitly in the conversation history "
-            "below. Do NOT invent, assume, or hallucinate prior requests or context that are not shown. "
-            "If you are uncertain about prior context, say so honestly rather than guessing."
+            "PERSONAL CONTEXT GUARD: only reference the Director's requests, plans, schedules, or preferences "
+            "that appear explicitly in the conversation history below. "
+            "Do NOT invent or hallucinate prior Director requests or personal context that are not shown. "
+            "If you are uncertain about prior Director context, say so honestly rather than guessing. "
+            "Do NOT claim you have conducted prior research sessions or have persistent memory of past conversations. "
+            "Do NOT fabricate research citations, prior findings, or stored preferences. "
+            "If a preference appears in this conversation, attribute it correctly: say "
+            "'you mentioned earlier in this conversation' — never 'from your prior research' or 'based on stored preferences'. "
+            "PUBLIC FACTS: for general knowledge (addresses, business hours, historical facts, public venues, etc.) "
+            "answer from your own training knowledge — never ask the Director to supply information you can provide yourself."
         )
         # Only inject memory context if it's genuinely relevant — very low scores
         # are noise, but 0.40+ is meaningful for intra-session context recall.
@@ -1225,6 +1238,59 @@ class CognitionEngine:
                         priority: "int | None" = None,
                         timeout: float = 200.0) -> dict:
         return await self._llm_generate(prompt, model=model, priority=priority, timeout=timeout)
+
+    async def _distil_query(self, raw: str, target: str = "search") -> str:
+        """Convert raw user message into an optimised query for the downstream target.
+
+        target: "search" (SearXNG 4-6 keywords), "fast_llm" (groq/gemini/openrouter/ollama_cloud
+                one-sentence question), "grok" (current-events focus), "claude" (structured task
+                prompt). Returns raw on timeout (8 s wall clock) or any error — logs WARNING.
+        """
+        import asyncio as _aio
+        _target_prompts = {
+            "search": (
+                "Convert the user message into a concise search engine query "
+                "(4–6 keywords, no question marks, no filler words like 'what is' or 'tell me').\n"
+                "Output the query only — no explanation.\n\nUser: "
+            ),
+            "fast_llm": (
+                "Rewrite the user message as a clear, self-contained one-sentence question "
+                "for a language model. Remove any session-specific context.\n"
+                "Output the question only.\n\nUser: "
+            ),
+            "grok": (
+                "Rewrite the user message as a focused, specific question about current events, "
+                "markets, or real-time data. Remove session-specific context.\n"
+                "Output the question only.\n\nUser: "
+            ),
+            "claude": (
+                "Rewrite the user message as a structured prompt with an explicit task framing. "
+                "State the objective clearly.\n"
+                "Output the reformulated prompt only.\n\nUser: "
+            ),
+        }
+        pfx = _target_prompts.get(target, _target_prompts["search"])
+        prompt = "/no_think\n" + pfx + raw
+        from adapters.inference_queue import InferenceQueue
+        try:
+            result = await _aio.wait_for(
+                self._llm_generate(
+                    prompt,
+                    model="llama3.1:8b-instruct-q4_K_M",
+                    priority=InferenceQueue.LOW,
+                    timeout=30.0,
+                ),
+                timeout=8.0,
+            )
+            distilled = result.get("response", "").strip()
+            if distilled and result.get("status") != "llm_timeout":
+                return distilled
+        except Exception:
+            pass
+        logger.warning(
+            "query_distil: timeout/error target=%s raw=%r — using raw", target, raw[:80]
+        )
+        return raw
 
     # ── External cognition — Grok ─────────────────────────────────────────
     async def ask_grok(
@@ -1503,6 +1569,7 @@ class CognitionEngine:
     # externally — governance must remain deterministic and local.
 
     _GROK_PRIORITY_TASKS       = frozenset({"news_gather", "web_aware_query", "market_sentiment", "cve_monitor"})
+    _FREE_FIRST_TASK_TYPES     = frozenset({"general_lookup"})
     _PROVIDER_QUEUE            = ["groq_inference", "gemini", "openrouter", "ollama_cloud", "grok"]
     _PROVIDER_RATE_LIMIT_TTL_S = 3600.0
 
@@ -1513,6 +1580,11 @@ class CognitionEngine:
         r"\b(use claude|use grok|use gemini|use groq|use openrouter|use ollama.?cloud"
         r"|ask claude|ask grok|ask gemini|ask groq|ask openrouter"
         r"|via claude|via grok|via gemini|via groq|via openrouter"
+        r"|check grok|check with grok|query grok"
+        r"|check claude|check with claude|query claude"
+        r"|check gemini|check with gemini|query gemini"
+        r"|check groq|check with groq|query groq"
+        r"|check openrouter|query openrouter"
         r"|external llm|external model|external ai)\b",
         __import__("re").IGNORECASE,
     )
@@ -1523,16 +1595,16 @@ class CognitionEngine:
         __import__("re").IGNORECASE,
     )
     _GROK_SIGNAL_RE = __import__("re").compile(
-        r"\b(use grok|ask grok|via grok"
+        r"\b(use grok|ask grok|via grok|check grok|check with grok|query grok"
         r"|current|latest|news|today|recent|market|trending)\b",
         __import__("re").IGNORECASE,
     )
     _GEMINI_SIGNAL_RE = __import__("re").compile(
-        r"\b(use gemini|ask gemini|via gemini)\b",
+        r"\b(use gemini|ask gemini|via gemini|check gemini|check with gemini|query gemini)\b",
         __import__("re").IGNORECASE,
     )
     _GROQ_SIGNAL_RE = __import__("re").compile(
-        r"\b(use groq|ask groq|via groq)\b",
+        r"\b(use groq|ask groq|via groq|check groq|check with groq|query groq)\b",
         __import__("re").IGNORECASE,
     )
     _OPENROUTER_SIGNAL_RE = __import__("re").compile(
@@ -1749,6 +1821,22 @@ class CognitionEngine:
                         "explicit": False, "force_local": False,
                         "reason": "alpha_vantage_data_api",
                     })
+
+                # Unconditional free-first routing for task_types that bypass the complexity gate.
+                # general_lookup: PUBLIC conversational queries — always prefer external over local
+                # regardless of complexity score so simple factual queries don't stay local.
+                if task_type in self._FREE_FIRST_TASK_TYPES:
+                    llm_eligible = {k: v for k, v in eligible.items() if k != "alpha_vantage"}
+                    if llm_eligible:
+                        for pref in self._PROVIDER_QUEUE:
+                            if pref in llm_eligible:
+                                return _d({
+                                    "use_external": True, "provider": pref,
+                                    "adapter": self._PROVIDER_ADAPTERS.get(pref, ""),
+                                    "score": round(score, 3), "penalised_score": round(penalised, 3),
+                                    "explicit": False, "force_local": False,
+                                    "reason": f"free_first_unconditional({task_type})",
+                                })
 
                 # Complexity-triggered selection among remaining eligible LLM providers
                 if penalised >= self._COMPLEXITY_THRESHOLD:

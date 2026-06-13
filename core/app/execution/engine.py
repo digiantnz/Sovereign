@@ -243,6 +243,29 @@ INTENT_ACTION_MAP = {
     "clawsec_update": {"domain": "security", "operation": "update_patterns"},
 }
 
+# Intents that require live internet data — route to current_events query_type
+_CURRENT_EVENTS_INTENTS = frozenset({
+    "web_search", "fetch_url", "research", "research_gather",
+    "news_brief", "portfolio_snapshot", "portfolio_weekly", "portfolio_monthly",
+})
+
+# Domains that operate on local/internal state — route to local_context query_type
+_LOCAL_CONTEXT_DOMAINS = frozenset({
+    "docker", "memory", "mail", "caldav", "webdav", "notes",
+    "scheduler", "wallet", "monitoring", "learning", "ncfs", "ncingest",
+    "dev_harness", "portal", "security", "github", "nanobot", "broker",
+})
+
+
+def _derive_query_type(intent: str, action: dict) -> str:
+    """Deterministic query_type for PASS 4 audit. Never calls an LLM."""
+    if intent in _CURRENT_EVENTS_INTENTS:
+        return "current_events"
+    if action.get("domain", "") in _LOCAL_CONTEXT_DOMAINS:
+        return "local_context"
+    return "general_knowledge"
+
+
 # Tier required for each operation — deterministic, never from LLM
 INTENT_TIER_MAP = {
     "inspect_container": "LOW", "get_compose": "LOW", "read_host_file": "LOW",
@@ -278,13 +301,13 @@ INTENT_TIER_MAP = {
     "delete_event": "MID", "update_event": "MID",
     "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
     "research_gather": "LOW", "research_save": "MID", "research_clear": "LOW",
-    "validator_queue_check": "NORMAL",
+    "validator_queue_check": "LOW",
     "portfolio_analysis": "LOW", "portfolio_analysis_save": "MID", "portfolio_analysis_clear": "LOW",
     "portfolio_watcher_scan": "LOW",
     "restart_container": "MID", "recreate_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
     "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
     "delete_file": "HIGH", "delete_email": "HIGH", "delete_task": "HIGH",
-    "remember_fact": "NORMAL",
+    "remember_fact": "LOW",
     "memory_recall": "LOW",
     "memory_list_keys": "LOW",
     "memory_retrieve_key": "LOW",
@@ -849,25 +872,29 @@ def _normalise_dt(value: str, default_year: int = 2026) -> str:
 
 def _infer_prior_domain(context_window) -> str | None:
     """
-    Scan the full context_window (up to HISTORY_MAX turns) to identify the active domain.
+    Scan Director (user) turns only to identify the active domain.
     Most-recent signal wins — iterates newest-first and returns on first match.
     context_window: list of {user, assistant} dicts or a single dict (legacy).
+
+    DESIGN PRINCIPLE: only Director messages set prior domain context.
+    Assistant responses discussing skills/docker/email must never poison routing —
+    Rex legitimately mentions system domains in many answers.
     """
     if not context_window:
         return None
     turns = context_window if isinstance(context_window, list) else [context_window]
     import re as _re_pd
     for turn in reversed(turns):
-        combined = (turn.get("user", "") + " " + turn.get("assistant", "")).lower()
-        if _re_pd.search(r'\b(email|inbox|subject|unread|sender|mail)\b', combined):
+        director = turn.get("user", "").lower()
+        if _re_pd.search(r'\b(email|inbox|subject|unread|sender|mail)\b', director):
             return "email"
-        if _re_pd.search(r'\b(container|docker|service|restarted|logs)\b', combined):
+        if _re_pd.search(r'\b(container|docker|service|restarted|logs)\b', director):
             return "docker"
-        if _re_pd.search(r'\b(file|nextcloud|document|folder|webdav)\b', combined):
+        if _re_pd.search(r'\b(file|nextcloud|document|folder|webdav)\b', director):
             return "file"
-        if _re_pd.search(r'\b(calendar|event|schedule|appointment)\b', combined):
+        if _re_pd.search(r'\b(calendar|event|schedule|appointment)\b', director):
             return "calendar"
-        if _re_pd.search(r'\b(skill|clawhub)\b|no skills found|skill search|candidates', combined):
+        if _re_pd.search(r'\b(skill|clawhub)\b|no skills found|skill search|candidates', director):
             return "skills"
     return None
 
@@ -1026,8 +1053,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "check daily and report", "check it daily", "check daily for",
         "monitor this daily", "watch this daily", "track this daily",
         "keep an eye on this daily", "report when", "report if",
-        "alert when", "notify when it", "let me know when it",
-        "let me know when the", "tell me when it", "tell me when the",
+        "alert when", "notify when it",
     )
     for _sk in _sched_early:
         if _sk in u:
@@ -1324,15 +1350,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     # ── Web search — direct to browser, bypass specialist + evaluate passes ──
     # Explicit web search intent → domain:browser short-circuit (no LLM passes needed).
     # Time-sensitive variants fall through to CEO so it can pick up live-data context.
-    _web_search_kw = (
-        "search the web", "search the internet", "search online", "look online",
-        "find on the internet", "find online", "look it up online", "look up online",
-        "web search", "google", "search for", "search up",
-        "look it up", "look up", "find out about", "find information",
-        "what do you know about", "find me information", "look for information",
-        "search for information", "find articles", "find news about",
-    )
-    # Narrowed for qwen2.5:32b — only keep phrases that are unambiguously live-data queries.
+    # Narrowed for Qwen3 — only keep phrases that are unambiguously live-data queries.
     # "today", "current", "what's the", "what is the", "how is the" were removed:
     # too broad — "reminders today" / "what's the file path" both fired these, routing to web_search.
     # qwen2.5:32b + PASS 0 memory consultation handles the ambiguous cases correctly via PASS 1.
@@ -1374,9 +1392,12 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     # "ask grok about the latest X" doesn't get sidetracked to web_search by "latest".
     import re as _re_xprov
     _XPROV_RE = _re_xprov.compile(
-        r'\b(use grok|ask grok|via grok|use claude|ask claude|via claude'
-        r'|use gemini|ask gemini|via gemini|use groq|ask groq|via groq'
-        r'|use openrouter|ask openrouter|use ollama.?cloud|ask ollama.?cloud)\b',
+        r'\b(use grok|ask grok|via grok|check grok|check with grok|query grok'
+        r'|use claude|ask claude|via claude|check claude|check with claude|query claude'
+        r'|use gemini|ask gemini|via gemini|check gemini|check with gemini|query gemini'
+        r'|use groq|ask groq|via groq|check groq|check with groq|query groq'
+        r'|use openrouter|ask openrouter|check openrouter|query openrouter'
+        r'|use ollama.?cloud|ask ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b',
         _re_xprov.IGNORECASE,
     )
     if _XPROV_RE.search(u):
@@ -1392,7 +1413,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _news_kw = (
         "what's in the news", "whats in the news",
         "news brief", "news update", "news summary",
-        "what's happening", "whats happening",
         "current events", "what's trending", "whats trending",
         "morning news", "today's news", "todays news",
         "latest headlines", "news today", "news briefing",
@@ -1530,7 +1550,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "research recent", "research the latest", "research current",
         "look into recent", "look into the latest", "investigate recent",
     )
-    if any(w in u for w in _research_live_kw):
+    _research_live_sys_excl = any(sig in u for sig in (
+        "email", "inbox", "mail", "file", "folder", "nextcloud",
+        "docker", "container", "service", "skill", "calendar", "event",
+    ))
+    if any(w in u for w in _research_live_kw) and not _research_live_sys_excl:
         return {
             "delegate_to": "research_agent", "intent": "web_search",
             "target": user_input, "tier": "LOW",
@@ -1594,7 +1618,17 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Director approving external LLM access for CONFIDENTIAL content",
         }
 
-    if not prior_has_system and not any(sig in u for sig in _system_signals) and not _note_suffix and not _please_prefix:
+    # Domain-reference pronoun check: "those", "these", "all of them" etc. refer back to
+    # items from a prior system-domain turn. If absent, prior_has_system is irrelevant —
+    # the message is a standalone topic change and should route to query regardless.
+    import re as _re_conv_pr
+    _has_domain_pronoun = bool(_re_conv_pr.search(
+        r'\b(they|them|those|these|all of them|all of those)\b', u
+    ))
+    if (not any(sig in u for sig in _system_signals)
+            and not _note_suffix
+            and not _please_prefix
+            and (not prior_has_system or not _has_domain_pronoun)):
         return {
             "delegate_to": "research_agent", "intent": "query",
             "target": None, "tier": "LOW",
@@ -1761,6 +1795,10 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "is your fetch", "is your web", "internet working", "search working",
         "can you use the internet", "can you go online", "can you visit",
         "are you able to browse", "are you able to search", "are you able to access",
+        "are you having issues", "are you having trouble",
+        "having issues with", "having trouble with",
+        "trouble searching", "issues searching",
+        "trouble with your", "issues with your",
     )
     if any(w in u for w in _capability_kw):
         return {
@@ -2044,7 +2082,7 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     _mem_list_kw = (
         "list my memories", "list all memories", "show my memories",
         "show memory", "memory keys", "memory index", "memory directory",
-        "what do you remember", "do you remember", "what's in memory", "what is in memory",
+        "what's in memory", "what is in memory",
         "look up in memory", "retrieve from memory",
         # Address recall — "what is this address", "do you know this address", etc.
         "what is this address", "what address is this", "do you know this address",
@@ -3279,6 +3317,7 @@ class ExecutionEngine:
                     delegation = {**delegation, "target": "personal"}
 
         action = self._delegation_to_action({**delegation, "intent": intent})
+        _msg.set_query_type(_derive_query_type(intent, action))
 
         # Governance check
         try:
@@ -3376,18 +3415,21 @@ class ExecutionEngine:
         if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
-                _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok)\b',           _re_sc.IGNORECASE)
-                _SC_CLAUDE_RE      = _re_sc.compile(r'\b(use claude|ask claude|via claude)\b',      _re_sc.IGNORECASE)
-                _SC_GEMINI_RE      = _re_sc.compile(r'\b(use gemini|ask gemini|via gemini)\b',      _re_sc.IGNORECASE)
-                _SC_GROQ_RE        = _re_sc.compile(r'\b(use groq|ask groq|via groq)\b',            _re_sc.IGNORECASE)
-                _SC_OPENROUTER_RE  = _re_sc.compile(r'\b(use openrouter|ask openrouter)\b',         _re_sc.IGNORECASE)
-                _SC_OLLAMACLOUD_RE = _re_sc.compile(r'\b(use ollama.?cloud|ask ollama.?cloud)\b',   _re_sc.IGNORECASE)
+                _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok|check grok|check with grok|query grok)\b', _re_sc.IGNORECASE)
+                _SC_CLAUDE_RE      = _re_sc.compile(r'\b(use claude|ask claude|via claude|check claude|check with claude|query claude)\b',       _re_sc.IGNORECASE)
+                _SC_GEMINI_RE      = _re_sc.compile(r'\b(use gemini|ask gemini|via gemini|check gemini|check with gemini|query gemini)\b',       _re_sc.IGNORECASE)
+                _SC_GROQ_RE        = _re_sc.compile(r'\b(use groq|ask groq|via groq|check groq|check with groq|query groq)\b',                  _re_sc.IGNORECASE)
+                _SC_OPENROUTER_RE  = _re_sc.compile(r'\b(use openrouter|ask openrouter|check openrouter|query openrouter)\b',                   _re_sc.IGNORECASE)
+                _SC_OLLAMACLOUD_RE = _re_sc.compile(r'\b(use ollama.?cloud|ask ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b',        _re_sc.IGNORECASE)
                 # Strip the routing directive before sending to the provider so
                 # "ask grok about X" doesn't make Grok defensive about its identity.
                 _sc_clean = _re_sc.sub(
-                    r'\b(use grok|ask grok|via grok|use claude|ask claude|via claude'
-                    r'|use gemini|ask gemini|via gemini|use groq|ask groq|via groq'
-                    r'|use openrouter|ask openrouter|use ollama.?cloud|ask ollama.?cloud)\b\s*',
+                    r'\b(use grok|ask grok|via grok|check grok|check with grok|query grok'
+                    r'|use claude|ask claude|via claude|check claude|check with claude|query claude'
+                    r'|use gemini|ask gemini|via gemini|check gemini|check with gemini|query gemini'
+                    r'|use groq|ask groq|via groq|check groq|check with groq|query groq'
+                    r'|use openrouter|ask openrouter|check openrouter|query openrouter'
+                    r'|use ollama.?cloud|ask ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b\s*',
                     '', user_input, flags=_re_sc.IGNORECASE,
                 ).strip(" ,;:—-")
                 _sc_prompt = _sc_clean or user_input  # fallback if strip empties the string
@@ -3426,8 +3468,85 @@ class ExecutionEngine:
                         _sc_prompt, agent="research_agent", provider="ollama_cloud", user_input=_sc_prompt)
                     conv_text = _sc_extract(_sc_routed, "Ollama Cloud")
                 else:
-                    conv_result = await self.cog.ask_conversational(user_input, context_window=context_window)
-                    conv_text = conv_result.get("response", "")
+                    # General lookup: route PUBLIC conversational queries externally (free-first).
+                    # Safety-net signals catch system-domain keywords that CEO LLM misclassified
+                    # as intent=query. _quick_classify already filters known ops before this point.
+                    _GENERAL_LOOKUP_SYS_SIGNALS = (
+                        "email", "inbox", "mail",
+                        "docker", "container", "restart", "logs", "service",
+                        "nextcloud", "file", "folder",
+                        "calendar", "event", "schedule", "appointment",
+                        "remember", "remind",
+                        "wallet", "btc", "bitcoin", "eth address",
+                        # Notes: plural "notes" is safe (not in "notebook"); singular uses
+                        # specific action phrases to avoid "notebook cafes" false-positive.
+                        "notes",
+                        "create note", "new note", "add note", "write note",
+                        "delete note", "remove note", "update note", "edit note",
+                        "read note", "open note",
+                    )
+                    _GENERAL_LOOKUP_SYS_DOMAINS = {"email", "docker", "file", "calendar"}
+                    _gl_u = user_input.lower()
+                    _gl_prior = _infer_prior_domain(context_window)
+                    _gl_has_sys = any(sig in _gl_u for sig in _GENERAL_LOOKUP_SYS_SIGNALS)
+                    if not _gl_has_sys and _gl_prior not in _GENERAL_LOOKUP_SYS_DOMAINS:
+                        _gl_decision = self.cog._routing_decision(
+                            user_input, user_input=user_input, task_type="general_lookup",
+                        )
+                        if _gl_decision.get("use_external"):
+                            _gl_provider = _gl_decision["provider"]
+                            _gl_dispatch_map = {
+                                "grok":           self.cog.ask_grok,
+                                "gemini":         self.cog.ask_gemini,
+                                "groq_inference": self.cog.ask_groq_inf,
+                                "openrouter":     self.cog.ask_openrouter,
+                                "ollama_cloud":   self.cog.ask_ollama_cloud,
+                            }
+                            _gl_fn = _gl_dispatch_map.get(_gl_provider)
+                            if _gl_fn:
+                                logger.info(
+                                    "general_lookup: routing to %s (reason=%s score=%.2f)",
+                                    _gl_provider, _gl_decision.get("reason"), _gl_decision.get("score", 0),
+                                )
+                                _gl_distil_target = "grok" if _gl_provider == "grok" else "fast_llm"
+                                _gl_query = await self.cog._distil_query(user_input, _gl_distil_target)
+                                _gl_result = await _gl_fn(
+                                    _gl_query, agent="research_agent", routing_decision=_gl_decision,
+                                    system=(
+                                        "Answer the user's question directly and helpfully in plain prose. "
+                                        "Do not include source URLs, citations, or references unless you are "
+                                        "certain they are accurate and directly relevant. "
+                                        "PERSONAL CONTEXT GUARD: do not invent details about the Director's "
+                                        "schedule, appointments, or preferences that are not stated in this conversation. "
+                                        "Do not claim persistent memory of past conversations or fabricate prior research sessions. "
+                                        "Do not fabricate research citations, prior findings, or stored preferences. "
+                                        "PUBLIC FACTS: for factual information about the world (venue addresses, business hours, "
+                                        "prices, directions, historical facts, etc.) answer from your own knowledge — "
+                                        "never ask the Director to supply information you can provide yourself."
+                                    ),
+                                )
+                                if not _gl_result.get("error"):
+                                    conv_text = _gl_result.get("response", "")
+                                else:
+                                    logger.warning(
+                                        "general_lookup: %s failed (%s) — falling back to local",
+                                        _gl_provider, _gl_result.get("error"),
+                                    )
+                                    conv_result = await self.cog.ask_conversational(
+                                        user_input, context_window=context_window)
+                                    conv_text = conv_result.get("response", "")
+                            else:
+                                conv_result = await self.cog.ask_conversational(
+                                    user_input, context_window=context_window)
+                                conv_text = conv_result.get("response", "")
+                        else:
+                            conv_result = await self.cog.ask_conversational(
+                                user_input, context_window=context_window)
+                            conv_text = conv_result.get("response", "")
+                    else:
+                        conv_result = await self.cog.ask_conversational(
+                            user_input, context_window=context_window)
+                        conv_text = conv_result.get("response", "")
                 exec_result = {"status": "ok", "response": conv_text}
                 # Detect stated intentions and commit to memory (preserve existing Bug 4 fix)
                 import re as _re_intent
@@ -3500,11 +3619,20 @@ class ExecutionEngine:
                 )
                 _rft = self._build_result_for_translator(intent, exec_result)
             else:
+                if (action.get("domain") == "browser"
+                        and action.get("operation", "search") == "search"
+                        and user_input):
+                    action["query"] = await self.cog._distil_query(user_input, "search")
                 exec_result = await self._dispatch(action, user_input,
                                                    delegation={**delegation, "intent": intent},
                                                    payload={"confirmed": confirmed},
                                                    security_confirmed=security_confirmed)
-                _rft = self._build_result_for_translator(intent, exec_result)
+                if (action.get("domain") == "browser"
+                        and action.get("operation", "search") == "search"
+                        and exec_result.get("status") == "ok"):
+                    _rft = await self._web_search_rft(exec_result)
+                else:
+                    _rft = self._build_result_for_translator(intent, exec_result)
             director_msg = await self.cog.translator_pass(_rft, tier=tier)
             result_dict = {
                 "status": "ok", "intent": intent, "tier": tier, "agent": agent,
@@ -3781,7 +3909,8 @@ class ExecutionEngine:
         # Store orchestrator evaluation result + result_for_translator in envelope
         try:
             _msg.merge_result({"orch_eval": orch_eval,
-                               "result_for_translator": orch_eval.get("result_for_translator")})
+                               "result_for_translator": orch_eval.get("result_for_translator"),
+                               "query_type": _msg.context.query_type})
             _msg.append_pass(4, "orchestrator", _p4_dur, orch_eval.get("approved", True))
         except Exception:
             pass
@@ -4855,6 +4984,94 @@ class ExecutionEngine:
             "next_action": None,
         }
 
+    async def _web_search_rft(self, exec_result: dict) -> dict:
+        """Build result_for_translator for a browser search result.
+
+        When the primary enrichment is poor (low confidence or failed synthesis),
+        fetches the top 2-3 result pages directly and assembles their content for
+        the translator to synthesise into a direct answer with inline citations.
+        Content flows through PASS 4 result_for_translator — never raw to PASS 5.
+        """
+        import asyncio as _asyncio
+
+        enriched = exec_result.get("result") or {}
+        synth = enriched.get("sovereign_synthesis") or {}
+        summary = synth.get("summary", "")
+        _conf_raw = synth.get("confidence", 0.5)
+        if isinstance(_conf_raw, dict):
+            _conf_raw = _conf_raw.get("value", 0.5)
+        try:
+            confidence = float(_conf_raw)
+        except (TypeError, ValueError):
+            confidence = 0.5
+        top_results = enriched.get("results") or []
+
+        _ENRICH_FAIL = (
+            "nanobot wrap gate failed", "enrichment skipped",
+            "enrichment unavailable", "enrichment failed", "raw results returned",
+        )
+        enrichment_ok = bool(summary and not any(m in summary.lower() for m in _ENRICH_FAIL))
+
+        # Primary enrichment is good — use the standard translator path
+        if enrichment_ok and confidence >= 0.6:
+            return self._build_result_for_translator("web_search", exec_result)
+
+        logger.info(
+            "web_search: secondary fetch triggered (enrichment_ok=%s confidence=%.2f)",
+            enrichment_ok, confidence,
+        )
+
+        # Secondary fetch: top 2-3 URLs in parallel
+        fetch_urls = [r.get("url", "") for r in top_results[:3] if r.get("url")]
+        fetched_pages: list[dict] = []
+        if fetch_urls:
+            _browser_script_s = int(getattr(_cfg.timeouts, "browser_script_s", 30))
+            _browser_http_s   = float(getattr(_cfg.timeouts, "browser_http_s", 60))
+            tasks = [
+                _asyncio.wait_for(
+                    self.nanobot.run(
+                        "sovereign-browser", "fetch",
+                        {"url": url, "extract": "text", "timeout": _browser_script_s},
+                        http_timeout=_browser_http_s,
+                    ),
+                    timeout=25.0,
+                )
+                for url in fetch_urls
+            ]
+            raw_fetches = await _asyncio.gather(*tasks, return_exceptions=True)
+            for url, res in zip(fetch_urls, raw_fetches):
+                if isinstance(res, Exception):
+                    logger.warning("web_search secondary fetch failed for %s: %s", url, res)
+                    continue
+                if res.get("status") == "ok":
+                    flat = res.get("result") if res.get("result") is not None else res
+                    content = (flat.get("content") or "").strip()[:2500]
+                    title = (flat.get("title") or "").strip()
+                    if content:
+                        fetched_pages.append({"url": url, "title": title, "content": content})
+
+        # Build sources list for inline citation (from primary search results)
+        sources = [
+            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("snippet", "")}
+            for r in top_results[:5]
+            if r.get("title") and r.get("url")
+        ]
+
+        return {
+            "success": True,
+            "outcome": "web_search_result",
+            "detail": {
+                "synthesis_summary": summary if enrichment_ok else "",
+                "synthesis_confidence": confidence,
+                "secondary_fetch": True,
+                "fetched_pages": fetched_pages,
+                "sources": sources,
+                "query": (enriched.get("query_intelligence") or {}).get("original", ""),
+            },
+            "error": None,
+            "next_action": None,
+        }
+
     async def _async_memory_write(
         self, memory_action: str, memory_payload: dict, user_input: str,
         intent: str, execution_confirmed: bool,
@@ -5289,9 +5506,37 @@ class ExecutionEngine:
                 # RAID paths are mounted in sovereign-core — route to broker hostfs, not Nextcloud WebDAV
                 if path.startswith(("/home/sovereign/", "/docker/sovereign/")):
                     return await self.broker.read_host_file(path)
-                return _nb_unwrap(await self.nanobot.run(
+                _read_result = _nb_unwrap(await self.nanobot.run(
                     "sovereign-nextcloud-fs", "fs_read", {"path": path}
                 ))
+                # 404 fallback: list the parent folder so Director can pick the right file.
+                # Handles notes that have been moved, renamed, or never existed at the
+                # guessed path. Returns candidates as a success-typed result so PASS 4
+                # can present options rather than hard-failing.
+                _is_404 = (
+                    _read_result.get("http_status") == 404
+                    or "404" in str(_read_result.get("error", ""))
+                    or (_read_result.get("status") == "error" and not _read_result.get("content"))
+                )
+                if _is_404:
+                    import posixpath as _pp
+                    _parent = _pp.dirname(path.rstrip("/")) or "/"
+                    _listing = _nb_unwrap(await self.nanobot.run(
+                        "sovereign-nextcloud-fs", "fs_list", {"path": _parent}
+                    ))
+                    _candidates = [
+                        it.get("name") for it in _listing.get("items", [])
+                        if it.get("type") == "file" and it.get("name")
+                    ]
+                    return {
+                        "success":        True,
+                        "outcome":        "file_not_found",
+                        "path_attempted": path,
+                        "parent_folder":  _parent,
+                        "message":        f"File not found at '{path}'. Files in {_parent}:",
+                        "candidates":     _candidates,
+                    }
+                return _read_result
             if name == "folder_create":
                 _fc_result = _nb_unwrap(await self.nanobot.run(
                     "sovereign-nextcloud-fs", "fs_mkdir", {"path": path}
@@ -6170,7 +6415,7 @@ class ExecutionEngine:
             # via PASS 1 _quick_classify before reaching this code.
             # "latest/today/recent" intentionally excluded — too ambiguous.
             _EXPLICIT_GROK   = _re_ext.compile(
-                r'\b(use grok|ask grok|via grok)\b',
+                r'\b(use grok|ask grok|via grok|check grok|check with grok|query grok)\b',
                 _re_ext.IGNORECASE,
             )
             _EXPLICIT_CLAUDE = _re_ext.compile(r'\b(use claude|ask claude|via claude)\b', _re_ext.IGNORECASE)
