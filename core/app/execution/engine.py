@@ -108,6 +108,9 @@ INTENT_ACTION_MAP = {
     "research_clear":     {"domain": "research", "operation": "clear"},
     # Validator queue monitor
     "validator_queue_check":    {"domain": "validator_queue", "operation": "check"},
+    # Ethereum validator node queries (direct beacon API via broker)
+    "validator_list":  {"domain": "docker", "operation": "validator_list"},
+    "validator_sync":  {"domain": "docker", "operation": "validator_sync"},
     # Portfolio analysis harness intents
     "portfolio_analysis":       {"domain": "portfolio_analysis", "operation": "gather"},
     "portfolio_analysis_save":  {"domain": "portfolio_analysis", "operation": "save"},
@@ -131,6 +134,12 @@ INTENT_ACTION_MAP = {
     "tax_report_notify": {"domain": "tax", "operation": "report_notify"},
     "tax_report_clear":  {"domain": "tax", "operation": "report_clear"},
     "tax_report_status": {"domain": "tax", "operation": "report_status"},
+    # Receipt capture harness intents (photo → Gemini Vision → TaxEvent)
+    "receipt_capture":   {"domain": "tax",      "operation": "receipt_capture"},
+    "receipt_confirm":   {"domain": "tax",      "operation": "receipt_confirm"},
+    "receipt_clear":     {"domain": "tax",      "operation": "receipt_clear"},
+    # /learn — on-demand knowledge integration
+    "learn":             {"domain": "learning", "operation": "on_demand"},
     # Memory intents
     "remember_fact":      {"domain": "memory",  "operation": "write"},
     "memory_recall":      {"domain": "memory",  "operation": "recall"},   # exact content search
@@ -296,12 +305,16 @@ INTENT_TIER_MAP = {
     "tax_query": "LOW", "tax_address_list": "LOW", "tax_ingest_status": "LOW",
     "tax_report_query": "LOW", "tax_report_ingest": "LOW", "tax_report_create": "LOW",
     "tax_report_notify": "LOW", "tax_report_clear": "LOW", "tax_report_status": "LOW",
+    "receipt_capture": "LOW", "receipt_confirm": "LOW", "receipt_clear": "LOW",
+    "learn": "LOW",
     "move_email": "MID",
     "list_calendars": "LOW", "list_events": "LOW", "list_nc_tasks": "LOW",
     "delete_event": "MID", "update_event": "MID",
     "query": "LOW", "research": "LOW", "web_search": "LOW", "fetch_url": "LOW",
     "research_gather": "LOW", "research_save": "MID", "research_clear": "LOW",
     "validator_queue_check": "LOW",
+    "validator_list":        "LOW",
+    "validator_sync":        "LOW",
     "portfolio_analysis": "LOW", "portfolio_analysis_save": "MID", "portfolio_analysis_clear": "LOW",
     "portfolio_watcher_scan": "LOW",
     "restart_container": "MID", "recreate_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
@@ -1228,21 +1241,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Memory write — deterministic pre-classifier (pre-guard)",
         }
 
-    # ── Ollama model / self-status queries ─────────────────────────────────
-    _model_kw = (
-        "what llm", "which llm", "what model", "which model", "what ai model",
-        "what ollama", "ollama model", "loaded model", "running model", "model running",
-        "current model", "what are you running", "model are you using",
-        "model do you use", "what language model", "primary model",
-        "inference model", "what version of", "what version are you",
-    )
-    if any(kw in u for kw in _model_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "ollama_model_status",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Ollama model status — deterministic pre-classifier",
-        }
-
     # ── Conversational/personal guard ──────────────────────────────────────
     # If no system-domain signal is present, route to query immediately.
     # Prevents personal/lifestyle statements (buying shirts, weekend plans, etc.)
@@ -1324,6 +1322,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "tax summary", "tax year", "tax report", "my taxes", "staking reward",
         "staking rewards", "disposal event", "income event", "wirex tax",
         "swyftx tax", "tax address", "taxable wallet", "tax wallet",
+        # Ethereum validators / staking node
+        "validator", "validators", "my validator", "minipool", "minipools",
+        "staking node", "beacon node", "node status", "validator status",
+        "are my validators", "validator offline", "validator balance",
+        "rocketpool", "rocket pool",
         # Bitcoin / BTC wallet operations
         "btc", "bitcoin", "multisig", "psbt", "propose btc", "send btc",
         "create btc", "sign btc", "sign bitcoin", "fund lightning",
@@ -1390,17 +1393,22 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
 
     # Explicit provider request — must be checked BEFORE _time_signals so that
     # "ask grok about the latest X" doesn't get sidetracked to web_search by "latest".
+    # Negation guard: "you didn't ask Gemini" / "not using Grok" must NOT route to the provider.
     import re as _re_xprov
     _XPROV_RE = _re_xprov.compile(
-        r'\b(use grok|ask grok|via grok|check grok|check with grok|query grok'
-        r'|use claude|ask claude|via claude|check claude|check with claude|query claude'
-        r'|use gemini|ask gemini|via gemini|check gemini|check with gemini|query gemini'
-        r'|use groq|ask groq|via groq|check groq|check with groq|query groq'
-        r'|use openrouter|ask openrouter|check openrouter|query openrouter'
-        r'|use ollama.?cloud|ask ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b',
+        r'\b(use grok|ask grok|via grok|from grok|check grok|check with grok|query grok'
+        r'|use claude|ask claude|via claude|from claude|check claude|check with claude|query claude'
+        r'|use gemini|ask gemini|via gemini|from gemini|check gemini|check with gemini|query gemini'
+        r'|use groq|ask groq|via groq|from groq|check groq|check with groq|query groq'
+        r'|use openrouter|ask openrouter|from openrouter|check openrouter|query openrouter'
+        r'|use ollama.?cloud|ask ollama.?cloud|from ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b',
         _re_xprov.IGNORECASE,
     )
-    if _XPROV_RE.search(u):
+    _NEGATION_RE = _re_xprov.compile(
+        r"\b(didn'?t|did not|not|never|don'?t|do not|without|no)\s+(ask|use|check|query|call|invoke)\b",
+        _re_xprov.IGNORECASE,
+    )
+    if _XPROV_RE.search(u) and not _NEGATION_RE.search(u):
         return {
             "intent": "query", "delegate_to": "research_agent",
             "tier": "LOW", "confidence": 0.95,
@@ -1411,12 +1419,14 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     # sidetracked to web_search by generic time-signal words like "what's the".
     # Must remain before the RSS block — "news feed" overlaps but news harness is preferred.
     _news_kw = (
+        # Only unambiguous morning-brief signals — no topic inside the phrase.
+        # "latest news on X", "news summary of X", "current events in X" must fall through
+        # to PASS 1 so the LLM can extract the topic and route to web_search correctly.
         "what's in the news", "whats in the news",
-        "news brief", "news update", "news summary",
-        "current events", "what's trending", "whats trending",
+        "news brief", "news briefing",
         "morning news", "today's news", "todays news",
-        "latest headlines", "news today", "news briefing",
-        "latest news", "recent news", "latest updates",
+        "latest headlines", "news today",
+        "what's trending", "whats trending",
     )
     _is_news_brief = any(w in u for w in _news_kw)
     if _is_news_brief:
@@ -1485,29 +1495,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Calendar event view for today — deterministic pre-classifier",
         }
 
-    # ── Research harness — before _time_signals so financial research requests
-    # don't get sidetracked to browser/web_search. Routes to research_gather harness.
-    _research_gather_kw = (
-        "deep financial research", "financial research on", "financial research into",
-        "investment research on", "investment research into",
-        "do deep research", "do a deep research",
-        "deep research on", "deep research into", "deep research about",
-        "deep dive into", "deep dive on",
-        "investment analysis of", "market analysis of",
-        "give me an analysis of", "give me a detailed analysis of",
-        "should i invest in", "worth investing in",
-        "due diligence on",
-        "research the company", "research this company",
-        "analyse the stock", "analyze the stock",
-        "analyse the company", "analyze the company",
-    )
-    if any(w in u for w in _research_gather_kw):
-        return {
-            "delegate_to": "research_agent", "intent": "research_gather",
-            "target": user_input, "tier": "LOW",
-            "reasoning_summary": "Explicit research phrase — research harness",
-        }
-
     # Bare "research <topic>" prefix — covers NL queries and the /research gateway command
     # (which sends "research {topic}" to /chat). Exclude "research that" (pronoun reference).
     if u.startswith("research ") and not u.startswith("research that"):
@@ -1539,48 +1526,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
 
     # "Please" prefix signals a direct command/request — always pass the guard.
     _please_prefix = u.startswith("please ")
-
-    # ── Capability query fast-paths — checked before conversational guard ─────
-    # "what can you do", "available skills", "your skills" are NOT in _system_signals
-    # so they would otherwise hit the guard and return intent:query.
-    # ── Research/lookup fast-paths — before guard, route to web_search ───────
-    # "research recent X", "look into X" with a live-data qualifier are unambiguously
-    # web searches. CEO LLM maps these to intent:query (conversational) without this block.
-    _research_live_kw = (
-        "research recent", "research the latest", "research current",
-        "look into recent", "look into the latest", "investigate recent",
-    )
-    _research_live_sys_excl = any(sig in u for sig in (
-        "email", "inbox", "mail", "file", "folder", "nextcloud",
-        "docker", "container", "service", "skill", "calendar", "event",
-    ))
-    if any(w in u for w in _research_live_kw) and not _research_live_sys_excl:
-        return {
-            "delegate_to": "research_agent", "intent": "web_search",
-            "target": user_input, "tier": "LOW",
-            "reasoning_summary": "Research/live-data request — deterministic web_search pre-classifier",
-        }
-
-    _cap_skill_kw = (
-        "what can you do", "available skills", "your skills",
-        "what skills", "list skills",
-    )
-    if any(w in u for w in _cap_skill_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "skill_audit",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Capability query — deterministic skill_audit pre-classifier",
-        }
-
-    _cap_mem_kw = (
-        "what memories", "check your memories",
-    )
-    if any(w in u for w in _cap_mem_kw):
-        return {
-            "delegate_to": "memory_agent", "intent": "memory_list_keys",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Memory query — deterministic memory_list_keys pre-classifier",
-        }
 
     _nanobot_skill_kw = ("nanobot skills", "nextcloud skills")
     if any(w in u for w in _nanobot_skill_kw):
@@ -1629,11 +1574,11 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             and not _note_suffix
             and not _please_prefix
             and (not prior_has_system or not _has_domain_pronoun)):
-        return {
-            "delegate_to": "research_agent", "intent": "query",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "No system domain signals — conversational query",
-        }
+        # Fall through to PASS 1 LLM. Qwen3-32B classifies correctly for:
+        # - purely conversational queries (routes to intent=query → ask_conversational)
+        # - research/news queries (routes to web_search with extracted topic)
+        # The old shortcut to intent=query bypassed PASS 1 and blocked research routing.
+        return None
 
     # ── Tax harness — query / status / run ────────────────────────────────────
     _tax_kw = (
@@ -1786,31 +1731,9 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Email fetch — deterministic pre-classifier",
         }
 
-    # Capability / tool diagnostics — "is X working?", "can you access X?", "do you have internet?"
-    # These must NOT reach devops_agent or PASS 4 rejection. Route as LOW query to research_agent.
-    _capability_kw = (
-        "is your internet", "is your search", "is your browser", "is the internet",
-        "is search working", "is browser working", "can you access the internet",
-        "can you browse", "can you search", "do you have internet", "have internet access",
-        "is your fetch", "is your web", "internet working", "search working",
-        "can you use the internet", "can you go online", "can you visit",
-        "are you able to browse", "are you able to search", "are you able to access",
-        "are you having issues", "are you having trouble",
-        "having issues with", "having trouble with",
-        "trouble searching", "issues searching",
-        "trouble with your", "issues with your",
-    )
-    if any(w in u for w in _capability_kw):
-        return {
-            "delegate_to": "research_agent", "intent": "query",
-            "target": user_input, "tier": "LOW",
-            "reasoning_summary": "Capability diagnostic — research_agent query fast-path",
-        }
-
-    # Self-identity / architecture queries — "who are you", "describe yourself", "your architecture"
-    # Routes to memory_recall so Rex reads from sovereign-self-architecture.md in semantic memory.
-    # Must be BEFORE _self_diag_kw which also contains "your capabilities", "your toolset" etc.
-    # Exclusion guard prevents "what are you" from matching "what are your governance tiers" etc.
+    # Self-identity / architecture queries — routes to memory_recall so Rex reads
+    # sovereign-self-architecture.md. Exclusion guard prevents "what are you" matching
+    # "what are your governance tiers" etc.
     _self_arch_kw = (
         "who are you", "what are you", "describe yourself", "tell me about yourself",
         "your architecture", "your design", "your components", "how are you built",
@@ -1835,87 +1758,35 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Self-identity/architecture query — memory_recall from semantic memory",
         }
 
-    # ── Skill / harness meta-queries — deterministic to avoid qwen2.5:32b giving
-    # training-data responses instead of routing to the actual skill/harness system.
-    # "list the skills you know" sounds like general knowledge to the LLM without this.
-    _skill_meta_kw = (
-        "list the skills", "list your skills", "what skills do you have",
-        "what skills you have", "what skills are installed", "your installed skills",
-        "skills you can run", "skills you know about", "list skills you",
-    )
-    _harness_meta_kw = (
-        "what harnesses", "list harnesses", "show harnesses",
-        "harnesses you have", "harnesses available", "available harnesses",
-        "what harnesses can you run", "which harnesses",
-    )
-    if any(w in u for w in _skill_meta_kw) or any(w in u for w in _harness_meta_kw):
+    # Ethereum validator / staking node queries — unambiguous fast-path
+    _validator_kw = ("validator", "validators", "minipool", "minipools", "staking node",
+                     "rocketpool", "rocket pool", "beacon node")
+    _validator_status_kw = ("offline", "online", "status", "list", "show", "check",
+                            "balance", "are", "any", "my", "sync")
+    if (any(w in u for w in _validator_kw)
+            and any(w in u for w in _validator_status_kw)):
+        _is_sync_query = "sync" in u
         return {
-            "delegate_to": "devops_agent", "intent": "skill_audit",
+            "delegate_to": "devops_agent",
+            "intent": "validator_sync" if _is_sync_query else "validator_list",
             "target": None, "tier": "LOW",
-            "reasoning_summary": "Skill/harness introspection — deterministic to bypass LLM generic response",
+            "reasoning_summary": "Ethereum validator query — beacon API via broker",
         }
 
-    # Governance describe — "what are your governance tiers", "describe your governance"
-    # Deterministic read of governance.json — never sent to LLM.
-    _gov_desc_kw = (
-        "governance tiers", "your governance tiers", "what are your governance tiers",
-        "describe your governance", "governance structure", "what is your governance",
-        "what's your governance", "how does governance work", "what are the tiers",
-        "what tiers do you have", "your tiers", "what are the governance", "your governance",
-        "governance policy", "your governance policy", "what governance tiers",
-        "list governance tiers", "show governance tiers",
-    )
-    if any(w in u for w in _gov_desc_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "governance_describe",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Governance description — deterministic read of governance.json",
-        }
-
-    # Docker / containers — only for list/status queries, not action verbs
-    _docker_kw = ("docker", "container", "containers", "running services",
-                  "what services", "which services", "what's running", "whats running")
+    # Docker / containers — pronoun-reference resolution only; keyword queries fall to PASS 1
     _docker_action_kw = ("restart", "stop", "start", "kill", "remove", "delete", "update",
                          "rebuild", "redeploy", "logs", "log")
-    # Exclude memory/remember context from pronoun-ref docker routing — "did you remember that?"
-    # and "did you get that last memory?" contain "that" which _is_pronoun_ref catches, but they
-    # are clearly NOT about containers even when prior_domain is docker.
     _mem_context_kw = ("remember", "memory", "forget", "recall", "memoris", "memoriz", "store that")
     _is_mem_context = any(w in u for w in _mem_context_kw)
-    docker_context = any(w in u for w in _docker_kw) or (
-        _is_pronoun_ref and prior_domain == "docker" and not _is_mem_context
-    )
-    if docker_context and not any(w in u for w in _docker_action_kw):
+    if (_is_pronoun_ref and prior_domain == "docker"
+            and not _is_mem_context
+            and not any(w in u for w in _docker_action_kw)):
         return {
             "delegate_to": "devops_agent", "intent": "list_containers",
             "target": None, "tier": "LOW",
-            "reasoning_summary": "Container status — deterministic pre-classifier",
+            "reasoning_summary": "Container status — pronoun reference resolved from prior docker context",
         }
 
-    # GitHub — deterministic fast-path for clear read/push intents
-    _github_read_kw = (
-        "github releases", "check releases", "pending updates", "security updates",
-        "github status", "check github", "what's in the repo", "whats in the repo",
-        "sovereign repo status",
-    )
-    if any(w in u for w in _github_read_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "github_read",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "GitHub read/monitor — deterministic pre-classifier",
-        }
-
-    # Skill lifecycle — deterministic fast-path
-    _skill_audit_kw = (
-        "list skills", "show skills", "what skills", "skill audit",
-        "skills installed", "check skill integrity", "installed skills",
-    )
-    if any(w in u for w in _skill_audit_kw):
-        return {
-            "delegate_to": "devops_agent", "intent": "skill_audit",
-            "target": None, "tier": "LOW",
-            "reasoning_summary": "Skill audit — deterministic pre-classifier",
-        }
     # NL skill install fallback — for plain-text "install a skill for X" requests.
     # Primary path is /install command (see gateway.py CommandHandler + _run_install_harness).
     # This fallback routes to the legacy composite flow for users who don't use the command.
@@ -2084,12 +1955,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         "show memory", "memory keys", "memory index", "memory directory",
         "what's in memory", "what is in memory",
         "look up in memory", "retrieve from memory",
-        # Address recall — "what is this address", "do you know this address", etc.
-        "what is this address", "what address is this", "do you know this address",
-        "do you know what this address", "what is that address", "what's this address",
-        "which address is", "which wallet is",
-        # Specific endpoint lookups — route to MIP not web_search
-        "validator queue url", "validator queue link", "validatorqueue",
     )
     # 0x hex address in question context → exact content recall from semantic memory.
     # "do you remember 0x...", "what is this address 0x...", "do you know 0x..." etc.
@@ -2282,48 +2147,6 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "target": _extracted_title, "tier": "LOW",
                 "reasoning_summary": "Notes read by title — deterministic suffix classifier",
             }
-
-    # ── Session wrap-up ────────────────────────────────────────────────────
-    _closure_kw = (
-        "that's all", "thats all", "goodbye", "good bye", "wrap up", "wrap-up",
-        "signing off", "sign off", "end of session", "we're done", "done for today",
-        "thanks bye", "catch you later", "until tomorrow", "close session",
-        "session wrap", "closing out", "close out",
-    )
-    if any(w in u for w in _closure_kw):
-        return {
-            "delegate_to": "research_agent",
-            "intent": "session_wrap_up",
-            "target": u,
-            "reasoning_summary": "Session closure — wrap-up synthesis",
-        }
-
-    # ── Memory curation ────────────────────────────────────────────────────
-    _memory_curate_kw = (
-        "curate memory", "curate working memory", "review working memory",
-        "memory curation", "promote memory", "memory review", "review memories",
-        "clean up memory", "cleanup memory",
-    )
-    if any(w in u for w in _memory_curate_kw):
-        return {
-            "delegate_to": "memory_agent",
-            "intent": "memory_curate",
-            "target": u,
-            "reasoning_summary": "Memory curation — promotion evaluation",
-        }
-
-    # ── Memory synthesis ────────────────────────────────────────────────────
-    _memory_synth_kw = (
-        "synthesise memory", "synthesize memory", "memory synthesis",
-        "run synthesis", "memory synthesise", "memory synthesize",
-    )
-    if any(w in u for w in _memory_synth_kw):
-        return {
-            "delegate_to": "memory_agent",
-            "intent": "memory_synthesise",
-            "target": u,
-            "reasoning_summary": "Memory synthesis — associative/relational pattern discovery",
-        }
 
     _file_delete_kw = (
         "delete file", "delete the file", "delete a file",
@@ -3144,6 +2967,14 @@ class ExecutionEngine:
                 confirmed=confirmed,
                 delegation=pending_delegation or {},
             )
+        if _harness_cmd in ("receipt_capture", "receipt"):
+            return await self._run_receipt_harness(
+                user_input=user_input,
+                confirmed=confirmed,
+                delegation=pending_delegation or {},
+            )
+        if _harness_cmd == "learn":
+            return await self._run_learn_harness(delegation=pending_delegation or {})
         if _harness_cmd == "sign_btc":
             _psbt = (
                 user_input if (user_input and user_input != "sign_btc")
@@ -3415,21 +3246,21 @@ class ExecutionEngine:
         if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
-                _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok|check grok|check with grok|query grok)\b', _re_sc.IGNORECASE)
-                _SC_CLAUDE_RE      = _re_sc.compile(r'\b(use claude|ask claude|via claude|check claude|check with claude|query claude)\b',       _re_sc.IGNORECASE)
-                _SC_GEMINI_RE      = _re_sc.compile(r'\b(use gemini|ask gemini|via gemini|check gemini|check with gemini|query gemini)\b',       _re_sc.IGNORECASE)
-                _SC_GROQ_RE        = _re_sc.compile(r'\b(use groq|ask groq|via groq|check groq|check with groq|query groq)\b',                  _re_sc.IGNORECASE)
-                _SC_OPENROUTER_RE  = _re_sc.compile(r'\b(use openrouter|ask openrouter|check openrouter|query openrouter)\b',                   _re_sc.IGNORECASE)
-                _SC_OLLAMACLOUD_RE = _re_sc.compile(r'\b(use ollama.?cloud|ask ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b',        _re_sc.IGNORECASE)
+                _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok|from grok|check grok|check with grok|query grok)\b', _re_sc.IGNORECASE)
+                _SC_CLAUDE_RE      = _re_sc.compile(r'\b(use claude|ask claude|via claude|from claude|check claude|check with claude|query claude)\b',       _re_sc.IGNORECASE)
+                _SC_GEMINI_RE      = _re_sc.compile(r'\b(use gemini|ask gemini|via gemini|from gemini|check gemini|check with gemini|query gemini)\b',       _re_sc.IGNORECASE)
+                _SC_GROQ_RE        = _re_sc.compile(r'\b(use groq|ask groq|via groq|from groq|check groq|check with groq|query groq)\b',                    _re_sc.IGNORECASE)
+                _SC_OPENROUTER_RE  = _re_sc.compile(r'\b(use openrouter|ask openrouter|from openrouter|check openrouter|query openrouter)\b',               _re_sc.IGNORECASE)
+                _SC_OLLAMACLOUD_RE = _re_sc.compile(r'\b(use ollama.?cloud|ask ollama.?cloud|from ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b', _re_sc.IGNORECASE)
                 # Strip the routing directive before sending to the provider so
                 # "ask grok about X" doesn't make Grok defensive about its identity.
                 _sc_clean = _re_sc.sub(
-                    r'\b(use grok|ask grok|via grok|check grok|check with grok|query grok'
-                    r'|use claude|ask claude|via claude|check claude|check with claude|query claude'
-                    r'|use gemini|ask gemini|via gemini|check gemini|check with gemini|query gemini'
-                    r'|use groq|ask groq|via groq|check groq|check with groq|query groq'
-                    r'|use openrouter|ask openrouter|check openrouter|query openrouter'
-                    r'|use ollama.?cloud|ask ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b\s*',
+                    r'\b(use grok|ask grok|via grok|from grok|check grok|check with grok|query grok'
+                    r'|use claude|ask claude|via claude|from claude|check claude|check with claude|query claude'
+                    r'|use gemini|ask gemini|via gemini|from gemini|check gemini|check with gemini|query gemini'
+                    r'|use groq|ask groq|via groq|from groq|check groq|check with groq|query groq'
+                    r'|use openrouter|ask openrouter|from openrouter|check openrouter|query openrouter'
+                    r'|use ollama.?cloud|ask ollama.?cloud|from ollama.?cloud|check ollama.?cloud|query ollama.?cloud)\b\s*',
                     '', user_input, flags=_re_sc.IGNORECASE,
                 ).strip(" ,;:—-")
                 _sc_prompt = _sc_clean or user_input  # fallback if strip empties the string
@@ -3984,6 +3815,10 @@ class ExecutionEngine:
             "tax_year_summary", "tax_query", "tax_address_list", "tax_ingest_status",
             "tax_report_query", "tax_report_ingest", "tax_report_create",
             "tax_report_notify", "tax_report_clear", "tax_report_status",
+            # Receipt capture harness — confirmation prompt + result pass directly to Director
+            "receipt_capture", "receipt_confirm", "receipt_clear",
+            # /learn — on-demand knowledge integration with Director-facing summary
+            "learn",
             # Wallet — structured results, pass directly to translator
             "wallet_get_address", "wallet_read_config", "wallet_get_btc_xpub",
             "wallet_list_addresses", "wallet_portfolio", "wallet_check_address",
@@ -4920,6 +4755,102 @@ class ExecutionEngine:
             out["pending_delegation"]    = pending_del
         return out
 
+    async def _run_receipt_harness(
+        self, user_input: str, confirmed: bool, delegation: dict
+    ) -> dict:
+        """/receipt — advance the receipt capture harness by one turn.
+
+        receipt_capture: image_b64 + mime_type extracted from delegation; Gemini Vision call.
+        receipt (confirm/corrections): route to handle_receipt_confirm.
+        """
+        from tax_harness.receipt import handle_receipt_capture, handle_receipt_confirm
+
+        _harness_cmd = delegation.get("_harness_cmd", "receipt")
+
+        if _harness_cmd == "receipt_capture":
+            image_b64 = delegation.get("image_b64", "")
+            mime_type = delegation.get("mime_type", "image/jpeg")
+            if not image_b64:
+                return {
+                    "status": "error",
+                    "director_message": "No image data provided. Send a photo with /receipt as the caption.",
+                    "_translator_bypass": True,
+                }
+            result = await handle_receipt_capture(
+                image_b64=image_b64,
+                mime_type=mime_type,
+                qdrant=self.qdrant,
+                dcl=self.cog.dcl,
+                gemini_adapter=self.cog.gemini,
+                ledger=self.ledger,
+            )
+        else:
+            # confirm or corrections turn
+            result = await handle_receipt_confirm(
+                user_input=user_input,
+                qdrant=self.qdrant,
+                nanobot=self.nanobot,
+            )
+
+        status        = result.get("status", "ok")
+        response_text = result.get("director_message", "")
+        needs_reply   = status == "awaiting_confirm"
+        pending_del   = {**delegation, "_harness_cmd": "receipt"}
+
+        out = {
+            "status":             status,
+            "director_message":   response_text,
+            "summary":            response_text,
+            "_translator_bypass": True,
+        }
+        if needs_reply:
+            out["requires_confirmation"] = True
+            out["pending_delegation"]    = pending_del
+        return out
+
+    async def _run_learn_harness(self, delegation: dict) -> dict:
+        """/learn — fetch (if URL) then integrate text into semantic memory; return summary."""
+        from monitoring.learning_harness import learn_on_demand
+
+        learn_input = delegation.get("learn_input", "")
+        learn_url   = delegation.get("learn_url", "")
+        text        = learn_input
+        source_url  = learn_url
+        source_label = learn_url or "inline text"
+
+        if learn_url:
+            try:
+                nb_res = await self.nanobot.run(
+                    "sovereign-browser", "fetch",
+                    {"url": learn_url, "extract": "text", "timeout": 60},
+                )
+                flat  = nb_res.get("result") if nb_res.get("result") is not None else nb_res
+                text  = flat.get("content", "") if isinstance(flat, dict) else ""
+                title = flat.get("title", "")   if isinstance(flat, dict) else ""
+                if title:
+                    source_label = f"{title} ({learn_url})"
+            except Exception as e:
+                return {"director_message": f"Could not fetch URL: {e}", "_translator_bypass": True}
+            if not text or not text.strip():
+                return {"director_message": f"URL fetch returned empty content: {learn_url}", "_translator_bypass": True}
+
+        if not text or not text.strip():
+            return {"director_message": "No content to learn from.", "_translator_bypass": True}
+
+        result = await learn_on_demand(
+            text=text,
+            source_label=source_label,
+            qdrant=self.qdrant,
+            cog=self.cog,
+            nanobot=self.nanobot,
+            source_url=source_url,
+        )
+        return {
+            "status":             result.get("status", "ok"),
+            "director_message":   result.get("result_for_translator", ""),
+            "_translator_bypass": True,
+        }
+
     # ── Cognitive loop helpers ───────────────────────────────────────────────
 
     def _set_pass(self, pass_id: str, intent: str = None, tier: str = None, agent: str = None) -> None:
@@ -5473,6 +5404,10 @@ class ExecutionEngine:
                 )
             if name == "docker_prune":
                 return await self.broker.prune_images()
+            if name == "validator_list" or operation == "validator_list":
+                return await self.broker.get_validators()
+            if name == "validator_sync" or operation == "validator_sync":
+                return await self.broker.get_validator_sync()
             return {"error": f"Unknown docker action: {name}"}
 
         if domain == "webdav":
@@ -6415,7 +6350,7 @@ class ExecutionEngine:
             # via PASS 1 _quick_classify before reaching this code.
             # "latest/today/recent" intentionally excluded — too ambiguous.
             _EXPLICIT_GROK   = _re_ext.compile(
-                r'\b(use grok|ask grok|via grok|check grok|check with grok|query grok)\b',
+                r'\b(use grok|ask grok|via grok|from grok|check grok|check with grok|query grok)\b',
                 _re_ext.IGNORECASE,
             )
             _EXPLICIT_CLAUDE = _re_ext.compile(r'\b(use claude|ask claude|via claude)\b', _re_ext.IGNORECASE)

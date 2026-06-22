@@ -13,16 +13,18 @@ logger = logging.getLogger(__name__)
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 DEFAULT_MODEL = "gemini-2.5-flash"
 TIMEOUT = 30.0
+VISION_TIMEOUT = 60.0
+
+
+class GeminiUnavailableError(Exception):
+    """Raised when GEMINI_API_KEY is absent at call time."""
 
 
 class GeminiAdapter:
-    def __init__(self):
-        self._api_key = os.environ.get("GEMINI_API_KEY", "")
-
     def _headers(self) -> dict:
         return {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.environ.get('GEMINI_API_KEY', '')}",
+            "Content-Type":  "application/json",
         }
 
     async def generate(
@@ -32,7 +34,7 @@ class GeminiAdapter:
         system: str = "You are a helpful assistant.",
     ) -> dict:
         """Single-turn prompt. Returns {response, input_tokens, output_tokens, _trust}."""
-        if not self._api_key:
+        if not os.environ.get("GEMINI_API_KEY", ""):
             return {"status": "error", "error": "API_KEY not configured", "_trust": "untrusted_external"}
         try:
             payload = {
@@ -64,7 +66,7 @@ class GeminiAdapter:
 
     async def chat(self, messages: list[dict], model: str = DEFAULT_MODEL) -> dict:
         """Multi-turn chat. Returns {response, input_tokens, output_tokens, _trust}."""
-        if not self._api_key:
+        if not os.environ.get("GEMINI_API_KEY", ""):
             return {"status": "error", "error": "API_KEY not configured", "_trust": "untrusted_external"}
         try:
             payload = {"model": model, "messages": messages}
@@ -86,6 +88,56 @@ class GeminiAdapter:
             }
         except Exception as exc:
             logger.warning("GeminiAdapter.chat error: %s", exc)
+            return {"status": "error", "error": str(exc), "_trust": "untrusted_external"}
+
+    async def generate_with_image(
+        self,
+        prompt: str,
+        image_b64: str,
+        mime_type: str,
+        model: str = DEFAULT_MODEL,
+        timeout: float = VISION_TIMEOUT,
+    ) -> dict:
+        """Vision call: text prompt + base64-encoded image. Returns {response, _trust} or error dict.
+
+        GEMINI_API_KEY is read at call time — raises GeminiUnavailableError if unset or empty.
+        Uses 60s timeout by default (vision requests are slower than text-only).
+        """
+        if not os.environ.get("GEMINI_API_KEY", ""):
+            raise GeminiUnavailableError("GEMINI_API_KEY not configured")
+        try:
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:{mime_type};base64,{image_b64}",
+                            }},
+                        ],
+                    }
+                ],
+            }
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(
+                    f"{GEMINI_BASE_URL}/chat/completions",
+                    headers=self._headers(),
+                    json=payload,
+                )
+                r.raise_for_status()
+                data = r.json()
+            text  = data["choices"][0]["message"]["content"]
+            usage = data.get("usage", {})
+            return {
+                "response":      text,
+                "input_tokens":  usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "_trust":        "untrusted_external",
+            }
+        except Exception as exc:
+            logger.warning("GeminiAdapter.generate_with_image error: %s", exc)
             return {"status": "error", "error": str(exc), "_trust": "untrusted_external"}
 
     async def health_check(self) -> dict:

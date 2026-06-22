@@ -403,6 +403,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session.pending_input = None
             await _dispatch_and_reply(payload, text, chat_id, context.bot, session)
             return
+        elif (session.pending_delegation or {}).get("_harness_cmd") == "receipt":
+            # Receipt harness: free-text is either 'yes' or corrections — route directly
+            _del = session.pending_delegation or {}
+            payload = {
+                "input":              text,
+                "_harness_cmd":       "receipt",
+                "pending_delegation": _del,
+                "confirmed":          False,
+                "context_window":     session.history,
+            }
+            session.awaiting_confirmation = False
+            session.pending_delegation = None
+            session.pending_input = None
+            await _dispatch_and_reply(payload, text, chat_id, context.bot, session)
+            return
         else:
             # New substantive message — cancel the stale pending confirmation and process fresh
             session.awaiting_confirmation = False
@@ -740,6 +755,90 @@ async def handle_do_tax(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _dispatch_and_reply(payload, f"/do_tax {year_arg}".strip(), chat_id, context.bot, session)
 
 
+async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /receipt — photo with /receipt caption triggers Gemini Vision receipt extraction.
+
+    Director must send a photo with /receipt as the caption (one-shot).
+    Text-only /receipt returns usage instructions.
+    Corrections are routed back through the awaiting_confirmation gateway path.
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+
+    msg = update.message
+    if not msg.photo:
+        await msg.reply_text(
+            "To log a receipt, send a photo of it with /receipt as the caption."
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    # Download highest-resolution photo
+    photo = sorted(msg.photo, key=lambda p: p.width * p.height)[-1]
+    try:
+        tg_file = await context.bot.get_file(photo.file_id)
+        data = await tg_file.download_as_bytearray()
+    except Exception as exc:
+        await msg.reply_text(f"Could not download photo from Telegram: {exc}")
+        return
+
+    content_b64 = base64.b64encode(bytes(data)).decode()
+
+    session = store.get_or_create(chat_id)
+    payload = {
+        "input":        "/receipt",
+        "_harness_cmd": "receipt_capture",
+        "pending_delegation": {
+            "_harness_cmd": "receipt_capture",
+            "image_b64":    content_b64,
+            "mime_type":    "image/jpeg",
+        },
+        "context_window": session.history,
+    }
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, "/receipt", chat_id, context.bot, session)
+
+
+async def handle_learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /learn <text or URL> — integrate knowledge into semantic memory on demand."""
+    user = update.effective_user
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /learn <text or URL>\n"
+            "Examples:\n"
+            "  /learn https://example.com/article\n"
+            "  /learn The NZ CGT rate is 0% for individuals"
+        )
+        return
+    learn_text   = " ".join(context.args)
+    is_url       = learn_text.startswith(("http://", "https://"))
+    learn_url    = learn_text if is_url else ""
+    learn_input  = "" if is_url else learn_text
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    session = store.get_or_create(chat_id)
+    payload = {
+        "input":        f"/learn {learn_text}",
+        "_harness_cmd": "learn",
+        "pending_delegation": {
+            "_harness_cmd": "learn",
+            "learn_input":  learn_input,
+            "learn_url":    learn_url,
+        },
+        "context_window": session.history,
+    }
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, f"/learn {learn_text}", chat_id, context.bot, session)
+
+
 async def handle_signbtc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /signbtc — create and sign a BTC PSBT with Rex's key.
 
@@ -777,8 +876,15 @@ async def handle_remember(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Usage: /remember <fact to store>")
         return
     # Forward as natural language — CEO will classify as remember_fact
-    update.message.text = f"remember that {fact}"
-    await handle_message(update, context)
+    # Cannot mutate update.message.text (read-only in PTB); dispatch directly instead
+    chat_id = update.effective_chat.id
+    bot = context.bot
+    session = store.get_or_create(chat_id)
+    synthesised = f"remember that {fact}"
+    payload = {"input": synthesised}
+    if session.history:
+        payload["context_window"] = session.history
+    await _dispatch_and_reply(payload, synthesised, chat_id, bot, session)
 
 
 async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -884,6 +990,8 @@ def main():
     app.add_handler(CommandHandler("research", handle_research))
     app.add_handler(CommandHandler("pm", handle_pm))
     app.add_handler(CommandHandler("do_tax", handle_do_tax))
+    app.add_handler(CommandHandler("receipt", handle_receipt))
+    app.add_handler(CommandHandler("learn", handle_learn))
     app.add_handler(CommandHandler("signbtc", handle_signbtc))
     app.add_handler(CommandHandler(["remember", "memorise", "memorize"], handle_remember))
     app.add_handler(CommandHandler("verify", handle_verify))

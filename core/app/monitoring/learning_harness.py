@@ -29,6 +29,11 @@ Sentinel: episodic:learning:processed:{slug} (MIP format)
   Notes API:     slug = sha256("notes-api:{id}|{modified}")[:16] — keyed to note ID + timestamp
   Written on successful plateau AND on format-skip. Prevents re-processing.
   Hard failures do NOT write sentinel — retried next tick.
+  All-timeout failures (GPU busy for every chunk, zero entries written) increment a
+  timeout-count sentinel (episodic:learning:timeout-count:{slug}). After
+  _MAX_TIMEOUT_RETRIES consecutive all-timeout runs the regular processed sentinel is
+  written with outcome "loop_timed_out", blocking further retries. Delete that sentinel
+  from qdrant-archive episodic to re-enable processing.
 
 No file-size gate — documents of any size are accepted; the chunker handles splitting.
 
@@ -148,11 +153,19 @@ def _chunk_text(text: str) -> list:
 
 # ── Sentinel helpers ──────────────────────────────────────────────────────────
 
+_MAX_TIMEOUT_RETRIES = 3  # all-timeout failures before writing terminal sentinel
+
+
+def _file_slug(file_path: str, size: int, last_modified: str) -> str:
+    return hashlib.sha256(f"{file_path}|{size}|{last_modified}".encode()).hexdigest()[:16]
+
+
 def _sentinel_key(file_path: str, size: int, last_modified: str) -> str:
-    """MIP-format sentinel key: episodic:learning:processed:{slug}"""
-    raw  = f"{file_path}|{size}|{last_modified}"
-    slug = hashlib.sha256(raw.encode()).hexdigest()[:16]
-    return f"episodic:learning:processed:{slug}"
+    return f"episodic:learning:processed:{_file_slug(file_path, size, last_modified)}"
+
+
+def _timeout_count_key(file_path: str, size: int, last_modified: str) -> str:
+    return f"episodic:learning:timeout-count:{_file_slug(file_path, size, last_modified)}"
 
 
 def _notes_api_sentinel_key(note_id: int, modified: int) -> str:
@@ -211,35 +224,6 @@ def _write_last_run(filename: str, cycles: int, created: int,
 
 
 # ── Prospective memory helpers ────────────────────────────────────────────────
-
-async def _write_gap_prospective(qdrant, gaps: list, filename: str) -> None:
-    if not gaps:
-        return
-    gap_lines = "\n".join(
-        f"  - {g.get('key', '?')}: {g.get('gap_description', '(no description)')}"
-        for g in gaps
-    )
-    body = (
-        f"Document '{filename}' was processed but {len(gaps)} knowledge gap(s) "
-        f"were flagged requiring external context:\n{gap_lines}\n\n"
-        "Review and provide context via Telegram, or approve skipping these gaps."
-    )
-    try:
-        await qdrant.store(
-            collection="prospective",
-            content=body,
-            metadata={
-                "type":           "prospective",
-                "status":         "pending_approval",
-                "title":          f"Review learning gaps — {filename}",
-                "target_session": "reasoning_and_cognition",
-                "gap_count":      len(gaps),
-                "source_file":    filename,
-                "ts":             datetime.now(timezone.utc).isoformat(),
-            },
-        )
-    except Exception as e:
-        logger.warning("LearningHarness: gap prospective write failed: %s", e)
 
 
 async def _write_failure_prospective(qdrant, failed_step: str,
@@ -548,13 +532,10 @@ async def _log_learning_timeout(cog, timeout_result: dict, cycle: int, pass_type
     """Write a GPU timeout event to episodic memory (async, non-blocking)."""
     if not cog.qdrant:
         return
-    from datetime import datetime, timezone
-    from execution.adapters.qdrant import EPISODIC
-    import uuid
     ts = datetime.now(timezone.utc).isoformat()
     try:
         await cog.qdrant.store(
-            collection=EPISODIC,
+            collection="episodic",
             content=f"Learning harness GPU timeout — cycle {cycle} pass {pass_type}",
             metadata={
                 "type": "episodic",
@@ -691,16 +672,11 @@ def _extract_text(content_raw, filename: str) -> str | None:  # noqa: F821
     if isinstance(content_raw, str):
         return content_raw
     if isinstance(content_raw, dict):
-        for field in ("content", "text", "data", "body"):
-            val = content_raw.get(field)
-            if isinstance(val, str) and val.strip():
-                return val
-        result = content_raw.get("result") or {}
-        if isinstance(result, dict):
-            for field in ("content", "text", "data", "body"):
-                val = result.get(field)
-                if isinstance(val, str) and val.strip():
-                    return val
+        for d in (content_raw, content_raw.get("result") or {}):
+            if isinstance(d, dict):
+                for f in ("content", "text", "data", "body"):
+                    if isinstance(v := d.get(f), str) and v.strip():
+                        return v
     return None
 
 
@@ -930,14 +906,50 @@ async def _process_file(app_state, file_info: dict,
     gaps            = loop_result["gaps"]
     timeout_skips   = loop_result.get("timeout_skips", 0)
 
-    # If the GPU was busy for every chunk and nothing was learned, skip the
-    # sentinel so the file is retried on the next poll cycle.
+    # If the GPU was busy for every chunk and nothing was learned, increment the
+    # timeout counter. After _MAX_TIMEOUT_RETRIES consecutive all-timeout runs,
+    # write a terminal sentinel to stop the retry loop. Delete the processed
+    # sentinel from qdrant-archive episodic to re-enable the file.
     if timeout_skips > 0 and entries_created == 0 and entries_updated == 0:
-        logger.warning(
-            "LearningHarness: GPU busy throughout — no sentinel written for %s; "
-            "will retry next cycle (%d chunk(s) skipped)",
-            filename, timeout_skips,
-        )
+        tc_key = _timeout_count_key(file_path, file_size, last_modified)
+        try:
+            _tc_entry = await qdrant.retrieve_by_key(tc_key)
+            count = int(_tc_entry.get("count", 0)) if _tc_entry else 0
+        except Exception:
+            count = 0
+        count += 1
+        if count >= _MAX_TIMEOUT_RETRIES:
+            logger.warning(
+                "LearningHarness: GPU busy on %d/%d attempts — writing terminal sentinel "
+                "for %s; delete key '%s' from episodic to retry",
+                count, _MAX_TIMEOUT_RETRIES, filename, sentinel,
+            )
+            await _write_sentinel(qdrant, sentinel, {
+                "outcome":   "loop_timed_out",
+                "file_path": file_path,
+                "attempts":  count,
+            })
+        else:
+            try:
+                await qdrant.store(
+                    collection="episodic",
+                    content=f"Learning harness timeout retry count — {filename}",
+                    metadata={
+                        "type":         "episodic",
+                        "_key":         tc_key,
+                        "event_type":   "learning_harness_timeout_count",
+                        "filename":     filename,
+                        "count":        count,
+                        "last_updated": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            except Exception as e:
+                logger.warning("LearningHarness: timeout count write failed: %s", e)
+            logger.warning(
+                "LearningHarness: GPU busy throughout — no sentinel written for %s; "
+                "will retry (attempt %d/%d, %d chunk(s) skipped)",
+                filename, count, _MAX_TIMEOUT_RETRIES, timeout_skips,
+            )
         return
 
     # ── Step 6: Write sentinel ────────────────────────────────────────────
@@ -961,7 +973,31 @@ async def _process_file(app_state, file_info: dict,
 
     # ── Step 8: Gap notification ──────────────────────────────────────────
     if gaps:
-        await _write_gap_prospective(qdrant, gaps, filename)
+        _gap_lines = "\n".join(
+            f"  - {g.get('key','?')}: {g.get('gap_description','(no description)')}"
+            for g in gaps
+        )
+        _gap_body = (
+            f"Document '{filename}' was processed but {len(gaps)} knowledge gap(s) "
+            f"were flagged requiring external context:\n{_gap_lines}\n\n"
+            "Review and provide context via Telegram, or approve skipping these gaps."
+        )
+        try:
+            await qdrant.store(
+                collection="prospective",
+                content=_gap_body,
+                metadata={
+                    "type":           "prospective",
+                    "status":         "pending_approval",
+                    "title":          f"Review learning gaps — {filename}",
+                    "target_session": "reasoning_and_cognition",
+                    "gap_count":      len(gaps),
+                    "source_file":    filename,
+                    "ts":             datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as e:
+            logger.warning("LearningHarness: gap prospective write failed: %s", e)
 
     logger.info(
         "LearningHarness: completed %s — %d cycles, %d created, %d updated, %d gaps",
@@ -1202,6 +1238,64 @@ def get_last_run_status() -> dict:
             f"Last learned: '{fn}' at {ts[:19]} UTC — "
             f"{c} cycle(s), {nc} new, {nu} updated, {gaps} gap(s) flagged."
         ),
+    }
+
+
+# ── On-demand learning (/learn command) ──────────────────────────────────────
+
+async def learn_on_demand(text: str, source_label: str, qdrant, cog, nanobot,
+                          source_url: str = "") -> dict:
+    """Run the learning pipeline on demand and return a Director-facing result dict.
+
+    No sentinel written — /learn is always re-runnable.
+    Capped at 6 chunks to stay within interactive latency bounds.
+    """
+    doc_keywords = _extract_keywords(text)
+    if not doc_keywords:
+        return {"status": "error", "result_for_translator": "No content keywords found — nothing to learn."}
+
+    chunks = _chunk_text(text)[:6]
+    if not chunks:
+        return {"status": "error", "result_for_translator": "No text chunks produced."}
+
+    doc_array = await _build_doc_array(doc_keywords, qdrant)
+
+    loop_result = await _run_confidence_loop(
+        chunks, doc_array, cog, qdrant, nanobot, source_url=source_url
+    )
+
+    created       = loop_result["created"]
+    updated       = loop_result["updated"]
+    cycles        = loop_result["cycles"]
+    gaps          = loop_result["gaps"]
+    timeout_skips = loop_result.get("timeout_skips", 0)
+
+    already_known = [e.get("title") or e.get("_key") or "?" for e in doc_array[:5]]
+
+    lines = [f"Learnt from: {source_label}"]
+    if already_known:
+        n = len(doc_array)
+        lines.append(f"\nAlready in memory ({n} related entr{'y' if n == 1 else 'ies'}):")
+        lines.extend(f"• {t}" for t in already_known)
+        if n > 5:
+            lines.append(f"  … and {n - 5} more")
+    else:
+        lines.append("\nNo related entries in memory — all knowledge is new.")
+    lines.append(
+        f"\nWritten: {created} new, {updated} updated"
+        f" | Cycles: {cycles} | Gaps: {len(gaps)} | Timeouts: {timeout_skips}"
+    )
+    if gaps:
+        gap_text = "; ".join(g.get("gap_description") or g.get("key", "?") for g in gaps[:3])
+        lines.append(f"Knowledge gaps: {gap_text}")
+
+    return {
+        "status":                "ok",
+        "created":               created,
+        "updated":               updated,
+        "cycles":                cycles,
+        "already_known_count":   len(doc_array),
+        "result_for_translator": "\n".join(lines),
     }
 
 
