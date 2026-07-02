@@ -820,9 +820,31 @@ Write the full report first, then the JSON. Be factual — never fabricate data 
 
 async def _write_episodic(qdrant, topic: str, domain_scope: str,
                            confidence: str, sources_ok: list,
-                           note_id: str | None) -> None:
+                           note_id: str | None,
+                           subject: str | None = None) -> None:
+    """Write the episodic:research-complete entry.
+
+    subject: additive metadata only (design principle — Qdrant is canonical,
+    Nextcloud is the human-readable window). Set by the Cognition Engine's
+    Subject Update step (Phase 7) so campaign-triggered research is
+    retrievable as part of "everything that has informed my understanding
+    of <subject>" — not just via the current Subject note. None (default)
+    preserves existing behavior for Director-triggered /research.
+    """
     try:
         ts = datetime.now(timezone.utc).isoformat()
+        metadata = {
+            "type":        "episodic",
+            "event_type":  "research_complete",
+            "topic":       topic,
+            "domain_scope": domain_scope,
+            "confidence":  confidence,
+            "sources_ok":  sources_ok,
+            "note_id":     note_id,
+            "ts":          ts,
+        }
+        if subject:
+            metadata["subject"] = subject
         await qdrant.store(
             collection="episodic",
             content=(
@@ -831,16 +853,7 @@ async def _write_episodic(qdrant, topic: str, domain_scope: str,
                 f"Sources: {sources_ok}. "
                 f"Note saved: {'yes id=' + str(note_id) if note_id else 'no'}."
             ),
-            metadata={
-                "type":        "episodic",
-                "event_type":  "research_complete",
-                "topic":       topic,
-                "domain_scope": domain_scope,
-                "confidence":  confidence,
-                "sources_ok":  sources_ok,
-                "note_id":     note_id,
-                "ts":          ts,
-            },
+            metadata=metadata,
         )
     except Exception as exc:
         logger.warning("research_harness: episodic write failed: %s", exc)
@@ -850,25 +863,37 @@ async def _write_research_semantic(
     qdrant, topic: str, domain_scope: str,
     note_id: str | None, note_title: str,
     full_report: str, confidence: str, report_date: str,
+    subject: str | None = None,
 ) -> None:
+    """Write the semantic:research:<slug> entry for a completed research report.
+
+    subject: set by the Cognition Engine's Subject Update step (Phase 7) for
+    campaign-triggered research — run_research_headless() itself never calls
+    this. None (default) preserves the normal Director-triggered /research
+    behavior via run_research_save().
+    """
     try:
         slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:48]
-        await qdrant.store(
-            collection="semantic",
-            content=full_report,
-            metadata={
-                "type":         "semantic",
-                "domain":       "research",
-                "_key":         f"semantic:research:{slug}",
-                "topic":        topic,
-                "domain_scope": domain_scope,
-                "note_id":      note_id,
-                "note_title":   note_title,
-                "confidence":   confidence,
-                "report_date":  report_date,
-                "event_type":   "research_note_saved",
-            },
-        )
+        # Derive WebDAV path — Nextcloud Notes strips ': ' to ' ' in filenames.
+        # This is a hint: if the note is later moved or renamed the 404-fallback
+        # in execution/engine.py file_read will list the folder and offer candidates.
+        note_path = f"/Notes/Research/{note_title.replace(': ', ' ')}.md" if note_title else None
+        metadata = {
+            "type":         "semantic",
+            "domain":       "research",
+            "_key":         f"semantic:research:{slug}",
+            "topic":        topic,
+            "domain_scope": domain_scope,
+            "note_id":      note_id,
+            "note_title":   note_title,
+            "note_path":    note_path,
+            "confidence":   confidence,
+            "report_date":  report_date,
+            "event_type":   "campaign_research" if subject else "research_note_saved",
+        }
+        if subject:
+            metadata["subject"] = subject
+        await qdrant.store(collection="semantic", content=full_report, metadata=metadata)
     except Exception as exc:
         logger.warning("research_harness: semantic write failed: %s", exc)
 
@@ -1332,49 +1357,33 @@ Output a structured research report."""
     }
 
 
-# ── Public entry points ───────────────────────────────────────────────────────
+# ── Shared core — used by both the checkpoint+confirm and headless flows ──────
 
-async def run_research_gather(cog, nanobot, qdrant,
-                               topic: str, user_input: str = "") -> dict:
-    """Gather + synthesise research on topic. Stores checkpoint.
+async def _gather_and_synthesise(cog, nanobot, qdrant, topic: str,
+                                  force_intent: str | None = None) -> dict:
+    """Classify → gather sources → synthesise. Shared by run_research_gather()
+    (Director-facing, checkpoint+confirm) and run_research_headless()
+    (Cognition Engine campaigns, no confirmation gate).
 
-    Routing:
-      security       → 6-agent security_analysis_engine() (~8 min)
-      financial_topic → _synthesise_topic() (single call)
-      general        → existing _synthesise() path (unchanged)
+    force_intent: when set, skips _classify_research_intent() and uses this
+    intent directly (the deterministic _classify_domain_scope() still runs).
+    run_research_headless() forces "financial_topic" — the security path's
+    6-agent engine takes ~8-12 min, which would turn a 3-iteration campaign
+    loop into a 24-36 min synchronous block inside one scheduler step.
 
-    Returns requires_confirmation=True so the engine can present the summary
-    and ask the Director whether to save the full report to Nextcloud Notes.
+    Returns: {intent, security_name, ticker, domain_scope, sources_ok,
+              sources_failed, synthesis_data, word_count}
     """
-    import uuid
-
-    # Strip leading "research " prefix — /research gateway sends "research {topic}"
-    if topic.lower().startswith("research "):
-        topic = topic[len("research "):].strip()
-
-    # ── Stale checkpoint guard ────────────────────────────────────────────────
-    existing_cp = await _read_checkpoint(qdrant)
-    if existing_cp:
-        synth      = (existing_cp.get("step_results") or {}).get("synthesise", {})
-        cp_topic   = synth.get("topic", "previous research")
-        cp_words   = synth.get("word_count", 0)
-        return {
-            "status":                "stale_checkpoint",
-            "requires_confirmation": False,
-            "director_message": (
-                f"There's a pending research result: <b>{cp_topic}</b> (~{cp_words} words).\n"
-                "Say <b>save research</b> to save it to Nextcloud Notes, "
-                "or <b>clear research</b> to discard and run a new gather."
-            ),
-        }
-
-    session_id = str(uuid.uuid4())
-
     # ── Intent classification ─────────────────────────────────────────────────
-    classify_result = await _classify_research_intent(cog, topic)
-    intent        = classify_result.get("intent", "general")
-    security_name = classify_result.get("security_name") or topic
-    llm_ticker    = classify_result.get("ticker")
+    if force_intent:
+        intent        = force_intent
+        security_name = topic
+        llm_ticker    = None
+    else:
+        classify_result = await _classify_research_intent(cog, topic)
+        intent        = classify_result.get("intent", "general")
+        security_name = classify_result.get("security_name") or topic
+        llm_ticker    = classify_result.get("ticker")
 
     logger.info("research_harness: gather topic=%r intent=%s security=%r ticker=%s",
                 topic, intent, security_name, llm_ticker)
@@ -1515,15 +1524,75 @@ async def run_research_gather(cog, nanobot, qdrant,
             cog, topic, domain_scope, browser_content, finance_data, grok_context,
         )
 
-    # ── Checkpoint ────────────────────────────────────────────────────────────
-    today      = date.today().isoformat()
     word_count = len((synthesis_data.get("full_report") or "").split())
+
+    return {
+        "intent":          intent,
+        "security_name":   security_name if intent == "security" else None,
+        "ticker":          ticker,
+        "domain_scope":    domain_scope,
+        "sources_ok":      sources_ok,
+        "sources_failed":  sources_failed,
+        "synthesis_data":  synthesis_data,
+        "word_count":      word_count,
+    }
+
+
+# ── Public entry points ───────────────────────────────────────────────────────
+
+async def run_research_gather(cog, nanobot, qdrant,
+                               topic: str, user_input: str = "") -> dict:
+    """Gather + synthesise research on topic. Stores checkpoint.
+
+    Routing:
+      security       → 6-agent security_analysis_engine() (~8 min)
+      financial_topic → _synthesise_topic() (single call)
+      general        → existing _synthesise() path (unchanged)
+
+    Returns requires_confirmation=True so the engine can present the summary
+    and ask the Director whether to save the full report to Nextcloud Notes.
+    """
+    import uuid
+
+    # Strip leading "research " prefix — /research gateway sends "research {topic}"
+    if topic.lower().startswith("research "):
+        topic = topic[len("research "):].strip()
+
+    # ── Stale checkpoint guard ────────────────────────────────────────────────
+    existing_cp = await _read_checkpoint(qdrant)
+    if existing_cp:
+        synth      = (existing_cp.get("step_results") or {}).get("synthesise", {})
+        cp_topic   = synth.get("topic", "previous research")
+        cp_words   = synth.get("word_count", 0)
+        return {
+            "status":                "stale_checkpoint",
+            "requires_confirmation": False,
+            "director_message": (
+                f"There's a pending research result: <b>{cp_topic}</b> (~{cp_words} words).\n"
+                "Say <b>save research</b> to save it to Nextcloud Notes, "
+                "or <b>clear research</b> to discard and run a new gather."
+            ),
+        }
+
+    session_id = str(uuid.uuid4())
+
+    core = await _gather_and_synthesise(cog, nanobot, qdrant, topic)
+    intent          = core["intent"]
+    ticker          = core["ticker"]
+    domain_scope    = core["domain_scope"]
+    sources_ok      = core["sources_ok"]
+    sources_failed  = core["sources_failed"]
+    synthesis_data  = core["synthesis_data"]
+    word_count      = core["word_count"]
+
+    # ── Checkpoint ────────────────────────────────────────────────────────────
+    today = date.today().isoformat()
 
     await _write_checkpoint(qdrant, session_id, "synthesised", {
         "gather": {
             "topic":          topic,
             "intent":         intent,
-            "security_name":  security_name if intent == "security" else None,
+            "security_name":  core["security_name"],
             "ticker":         ticker,
             "domain_scope":   domain_scope,
             "sources_ok":     sources_ok,
@@ -1567,6 +1636,37 @@ async def run_research_gather(cog, nanobot, qdrant,
         "sources_ok":            sources_ok,
         "sources_failed":        sources_failed,
         "director_message":      f"{sum_lines}\n\n{conf_ask}",
+    }
+
+
+async def run_research_headless(cog, nanobot, qdrant, topic: str) -> dict:
+    """Gather + synthesise research on topic — no checkpoint, no singleton
+    lock, no Nextcloud note, no episodic/semantic writes. Returns the
+    structured synthesis result directly.
+
+    Used by the Cognition Engine's campaign research step (cognition/
+    campaigns.py) — an autonomous, non-blocking caller that can't
+    participate in the Director confirmation flow run_research_gather()/
+    run_research_save() are built around. All persistence for
+    campaign-driven research (Nextcloud Subject note + semantic upsert +
+    episodic write) is the Subject Update step's responsibility, not this
+    function's — see the Cognition Engine MVP plan, Phase 7.
+
+    Forces intent="financial_topic" (see _gather_and_synthesise docstring).
+    """
+    core = await _gather_and_synthesise(cog, nanobot, qdrant, topic,
+                                         force_intent="financial_topic")
+    synthesis_data = core["synthesis_data"]
+    return {
+        "status":          "ok" if core["sources_ok"] else "error",
+        "topic":           synthesis_data.get("topic", topic),
+        "domain_scope":    core["domain_scope"],
+        "sources_ok":      core["sources_ok"],
+        "sources_failed":  core["sources_failed"],
+        "word_count":      core["word_count"],
+        "full_report":     synthesis_data.get("full_report", ""),
+        "telegram_summary": synthesis_data.get("telegram_summary") or [],
+        "confidence":      synthesis_data.get("confidence", ""),
     }
 
 

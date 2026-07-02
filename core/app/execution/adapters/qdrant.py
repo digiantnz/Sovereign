@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 import httpx
 from datetime import datetime, timezone
@@ -81,6 +82,7 @@ _CANONICAL_KEY_PREFIXES = (
     "semantic:infrastructure:",
     "semantic:governance:",
     "semantic:provider:",
+    "semantic:subject:",
 )
 
 # ── Query type classification ─────────────────────────────────────────────
@@ -184,6 +186,55 @@ class QdrantAdapter:
         """
         return str(uuid.uuid5(_SOV_NS, f"{item_type}:{native_id}"))
 
+    async def _delete_stale_key_duplicates(self, collection: str, key: str, keep_id: str) -> None:
+        """Delete any points carrying MIP key `key` whose ID isn't the deterministic one.
+
+        Catches legacy random-uuid duplicates written before store() derived point IDs
+        from keys (e.g. conversational "remember that..." writes that re-used an existing
+        key text but got a fresh uuid4 each time). Never raises — cleanup failure must not
+        block the write it's guarding.
+        """
+        try:
+            _client = self._client_for(collection)
+            _existing, _ = await _client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(must=[FieldCondition(key="_key", match=MatchValue(value=key))]),
+                limit=64, with_payload=False, with_vectors=False,
+            )
+            _stale = [p.id for p in _existing if str(p.id) != str(keep_id)]
+            if _stale:
+                await _client.delete(collection_name=collection, points_selector=_stale)
+                _log.info("store: collapsed %d legacy duplicate(s) for key %r in %r", len(_stale), key, collection)
+        except Exception as _dedup_err:
+            _log.warning("store: legacy-duplicate cleanup failed for key %r: %s", key, _dedup_err)
+
+    # Deterministic domain fallback for writes that omit one (conversational "remember
+    # that..." never sets domain — see save_lesson() in cognition/engine.py). Keeps the
+    # LLM key-generator's prefix out of the "general" catch-all so semantically related
+    # facts land in the same namespace as their programmatically-written counterparts.
+    # Not a substitute for an explicit domain, and not exhaustive — covers only domains
+    # already in active use across the system.
+    _DOMAIN_KEYWORDS = (
+        (("bitcoin", "btc", "xpub", "bc1", "satoshi"), "btc"),
+        (("ethereum", "eth ", "validator", "rocketpool", "rocket pool", "beacon", "staking", "gwei"), "eth"),
+        (("wallet", "safe multisig", "seed phrase"), "wallet"),
+        (("tax", " ird ", "fifo", "disposal"), "tax"),
+        (("docker", "container", "compose"), "docker"),
+        (("skill", "clawhub", "openclaw"), "skills"),
+        (("governance", "confirmation tier"), "governance"),
+        (("network", "endpoint", " rpc", "beacon api"), "network"),
+        (("email", "mailbox", "inbox"), "email"),
+        (("calendar", "event", "appointment"), "calendar"),
+    )
+
+    @staticmethod
+    def _infer_domain_hint(content: str) -> str | None:
+        _low = f" {content.lower()} "
+        for _kws, _domain in QdrantAdapter._DOMAIN_KEYWORDS:
+            if any(_kw in _low for _kw in _kws):
+                return _domain
+        return None
+
     async def _embed(self, text: str) -> list[float]:
         """Embed text via CPU-only nomic-embed-text on ollama-embed service."""
         async with httpx.AsyncClient(timeout=_cfg.timeouts.embed_generation_s) as http:
@@ -233,10 +284,9 @@ class QdrantAdapter:
                 r.raise_for_status()
                 raw = r.json().get("response", "{}")
                 # Strip markdown code fences if present
-                import re as _re_key
-                raw = _re_key.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
+                raw = re.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
                 # Extract JSON object if wrapped in prose
-                _m = _re_key.search(r'\{[^{}]*\}', raw, _re_key.DOTALL)
+                _m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
                 raw = _m.group() if _m else raw
                 parsed = json.loads(raw)
                 # Sanitise slug: lowercase, only a-z 0-9 hyphens, collapse multiples
@@ -622,10 +672,6 @@ class QdrantAdapter:
             )
 
         vector = await self._embed(content)
-        # Sovereign ID: respect existing sov_id in metadata, otherwise generate uuid4.
-        # Callers that have a stable native_id should pre-compute via sovereign_id() and
-        # pass it in metadata["sov_id"] so the deterministic UUID5 is used as the point ID.
-        point_id = metadata.get("sov_id") or str(uuid.uuid4())
         _now = datetime.now(timezone.utc).isoformat()
 
         # Key + title generation — sovereign collections only (working_memory is ephemeral)
@@ -635,15 +681,32 @@ class QdrantAdapter:
                 # Canonical key explicitly provided — skip LLM, just stamp timestamps
                 _key_fields = {"last_updated": _now}
             else:
+                _domain = metadata.get("domain") or self._infer_domain_hint(content) or "general"
                 _key, _title = await self._generate_key_and_title(
                     content,
                     metadata.get("type", collection),
-                    metadata.get("domain", "general"),
+                    _domain,
                 )
                 if _key:
                     _key_fields = {"_key": _key, "title": _title, "last_updated": _now}
                 else:
                     _key_fields = {"_no_key": True, "last_updated": _now}
+
+        # Sovereign ID: explicit sov_id wins (stable native_id case — emails, notes, etc).
+        # Otherwise, if this entry resolves to a MIP key, derive the point ID from that key
+        # so repeated writes to the same key overwrite in place instead of accumulating
+        # duplicates — this is what makes store() idempotent by key. Any pre-existing point
+        # carrying the same key under a different (legacy random-uuid) ID is collapsed into
+        # the canonical one. Only entries with neither sov_id nor a key (pure episodic/
+        # prospective log entries, append-only by design) fall back to a fresh uuid4.
+        _resolved_key = metadata.get("_key") or _key_fields.get("_key")
+        if metadata.get("sov_id"):
+            point_id = metadata["sov_id"]
+        elif _resolved_key:
+            point_id = self.sovereign_id("mip_key", _resolved_key)
+            await self._delete_stale_key_duplicates(collection, _resolved_key, point_id)
+        else:
+            point_id = str(uuid.uuid4())
 
         await self._client_for(collection).upsert(
             collection_name=collection,
@@ -790,15 +853,13 @@ class QdrantAdapter:
         if vec is None:
             return False
 
-        # Preserve sovereign ID — same point ID in RAID as in working_memory
-        new_id = payload.get("sov_id") or str(p.id)
-        if "sov_id" not in payload:
-            payload["sov_id"] = new_id
         _now = datetime.now(timezone.utc).isoformat()
+        _content = payload.get("content", "")
+        _domain = payload.get("domain") or self._infer_domain_hint(_content) or "general"
         _key, _title = await self._generate_key_and_title(
-            payload.get("content", ""),
+            _content,
             payload.get("type", target_collection),
-            payload.get("domain", "general"),
+            _domain,
         )
         if _key:
             payload["_key"] = _key
@@ -807,6 +868,16 @@ class QdrantAdapter:
         else:
             payload["_no_key"] = True
             payload["last_updated"] = _now
+
+        # Preserve sovereign ID — same point ID in RAID as in working_memory — unless this
+        # item resolves to a MIP key, in which case derive the point ID from that key so
+        # promotion converges with any existing point for the same key (see store()).
+        if _key:
+            new_id = self.sovereign_id("mip_key", _key)
+            await self._delete_stale_key_duplicates(target_collection, _key, new_id)
+        else:
+            new_id = payload.get("sov_id") or str(p.id)
+        payload["sov_id"] = new_id
 
         await self.archive_client.upsert(   # promote to RAID durable store
             collection_name=target_collection,

@@ -12,6 +12,7 @@ from adapters.broker import BrokerAdapter
 
 from adapters.nanobot import NanobotAdapter
 from execution.adapters.github import GitHubAdapter
+from execution.adapters.validator_monitor import ValidatorMonitorAdapter
 from execution.adapters.qdrant import (
     QdrantAdapter,
     WORKING, SOVEREIGN_COLLECTIONS, CONFIDENCE_THRESHOLD,
@@ -22,6 +23,7 @@ from execution.adapters.qdrant import (
 # cognition layer can always distinguish a live adapter result from Qdrant memory.
 _DOMAIN_SOURCE = {
     "docker":     "broker_live",
+    "eth_validators": "validator_monitor_live",
     "webdav":     "webdav_live",
     "caldav":     "caldav_live",
     "ollama":     "ollama_live",
@@ -111,6 +113,9 @@ INTENT_ACTION_MAP = {
     # Ethereum validator node queries (direct beacon API via broker)
     "validator_list":  {"domain": "docker", "operation": "validator_list"},
     "validator_sync":  {"domain": "docker", "operation": "validator_sync"},
+    # Validator monitor — Rocket Pool + eth-docker validator health/balance checks
+    "check_validators": {"domain": "eth_validators", "operation": "check_validators"},
+    "validator_alerts":  {"domain": "eth_validators", "operation": "validator_alerts"},
     # Portfolio analysis harness intents
     "portfolio_analysis":       {"domain": "portfolio_analysis", "operation": "gather"},
     "portfolio_analysis_save":  {"domain": "portfolio_analysis", "operation": "save"},
@@ -118,6 +123,8 @@ INTENT_ACTION_MAP = {
     "portfolio_watcher_scan":   {"domain": "portfolio_watcher",  "operation": "scan"},
     "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
     "news_brief":         {"domain": "news",    "operation": "brief"},
+    "score_rss_by_subject": {"domain": "cognition", "operation": "score_rss"},
+    "cognition_confirm_update": {"domain": "cognition", "operation": "confirm_update"},
     # Tax ingest harness intents (Phase 1 — continuous hourly ingest)
     "tax_status":        {"domain": "tax", "operation": "status"},
     "tax_ingest_run":    {"domain": "tax", "operation": "run"},
@@ -300,6 +307,8 @@ INTENT_TIER_MAP = {
     "mark_read": "LOW", "mark_unread": "LOW", "list_folders": "LOW", "list_inbox": "LOW",
     "read_feed": "LOW",
     "news_brief": "LOW",
+    "score_rss_by_subject": "LOW",
+    "cognition_confirm_update": "LOW",
     "tax_status": "LOW", "tax_ingest_run": "LOW", "tax_ingest_store": "MID",
     "tax_list_events": "LOW", "tax_year_summary": "LOW",
     "tax_query": "LOW", "tax_address_list": "LOW", "tax_ingest_status": "LOW",
@@ -315,6 +324,8 @@ INTENT_TIER_MAP = {
     "validator_queue_check": "LOW",
     "validator_list":        "LOW",
     "validator_sync":        "LOW",
+    "check_validators":      "LOW",
+    "validator_alerts":      "LOW",
     "portfolio_analysis": "LOW", "portfolio_analysis_save": "MID", "portfolio_analysis_clear": "LOW",
     "portfolio_watcher_scan": "LOW",
     "restart_container": "MID", "recreate_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
@@ -936,6 +947,21 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "intent": "session_wrap_up",
             "target": user_input,
             "reasoning_summary": "Session closure — wrap-up synthesis",
+        }
+
+    # ── Cognition Engine — Subject Update approve/reject (MID-tier HITL reply) ──
+    # Explicit command format Rex itself asks for in the Telegram notification
+    # ("Reply approve <subject> or reject <subject>") — unambiguous in isolation.
+    # Deterministic here, not LLM-routed: the confirm action IS the intent, no
+    # planning needed, and it must work even while local inference is degraded.
+    import re as _re_cog
+    _cog_confirm_m = _re_cog.search(r'\b(approve|reject)\s+([a-z][a-z0-9_-]{1,30})\b', u)
+    if _cog_confirm_m:
+        return {
+            "delegate_to": "memory_agent", "intent": "cognition_confirm_update",
+            "target": _cog_confirm_m.group(2), "tier": "LOW",
+            "approved": _cog_confirm_m.group(1) == "approve",
+            "reasoning_summary": "Subject Update approve/reject reply — deterministic pre-classifier",
         }
 
     # ── URL fetch — explicit https?:// present in input ────────────────────
@@ -1761,8 +1787,23 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
     # Ethereum validator / staking node queries — unambiguous fast-path
     _validator_kw = ("validator", "validators", "minipool", "minipools", "staking node",
                      "rocketpool", "rocket pool", "beacon node")
+    _validator_alert_kw = ("alert", "alerts", "problem", "problems", "issue", "issues", "wrong")
+    _validator_fullcheck_kw = ("full", "health", "thorough", "run a")
     _validator_status_kw = ("offline", "online", "status", "list", "show", "check",
                             "balance", "are", "any", "my", "sync")
+    if any(w in u for w in _validator_kw) and any(w in u for w in _validator_alert_kw):
+        return {
+            "delegate_to": "devops_agent", "intent": "validator_alerts",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Ethereum validator alert query — on-chain + beacon check via validator_monitor",
+        }
+    if (any(w in u for w in _validator_kw) and "check" in u
+            and any(w in u for w in _validator_fullcheck_kw)):
+        return {
+            "delegate_to": "devops_agent", "intent": "check_validators",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Full Ethereum validator health check — on-chain + beacon check via validator_monitor",
+        }
     if (any(w in u for w in _validator_kw)
             and any(w in u for w in _validator_status_kw)):
         _is_sync_query = "sync" in u
@@ -2276,6 +2317,7 @@ class ExecutionEngine:
         self.guardrail = guardrail
         self.ledger = ledger
         self.broker = BrokerAdapter()
+        self.validator_monitor = ValidatorMonitorAdapter(qdrant)
 
 
         self.github = GitHubAdapter()
@@ -3243,7 +3285,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read"):
+        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read", "cognition"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
                 _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok|from grok|check grok|check with grok|query grok)\b', _re_sc.IGNORECASE)
@@ -3340,7 +3382,8 @@ class ExecutionEngine:
                                     _gl_provider, _gl_decision.get("reason"), _gl_decision.get("score", 0),
                                 )
                                 _gl_distil_target = "grok" if _gl_provider == "grok" else "fast_llm"
-                                _gl_query = await self.cog._distil_query(user_input, _gl_distil_target)
+                                _gl_query = await self.cog._distil_query(
+                                    user_input, _gl_distil_target, context_window=context_window)
                                 _gl_result = await _gl_fn(
                                     _gl_query, agent="research_agent", routing_decision=_gl_decision,
                                     system=(
@@ -3416,6 +3459,15 @@ class ExecutionEngine:
                 if exec_result is None:
                     exec_result = {"status": "error", "error": "nanobot returned None for rss-digest"}
                 _rft = self._build_result_for_translator(intent, exec_result)
+            elif action.get("domain") == "cognition":
+                # Subject/campaign ops — direct dispatch, no LLM planning needed
+                # (score_rss_by_subject is scheduler-only in practice; confirm_update
+                # is the approve/reject reply and must work while local inference is degraded)
+                exec_result = await self._dispatch(action, user_input,
+                                                   delegation={**delegation, "intent": intent},
+                                                   payload={"confirmed": confirmed},
+                                                   security_confirmed=security_confirmed)
+                _rft = self._build_result_for_translator(intent, exec_result)
             elif action.get("domain") == "research":
                 exec_result = await self._dispatch(action, user_input,
                                                    delegation={**delegation, "intent": intent},
@@ -3453,7 +3505,8 @@ class ExecutionEngine:
                 if (action.get("domain") == "browser"
                         and action.get("operation", "search") == "search"
                         and user_input):
-                    action["query"] = await self.cog._distil_query(user_input, "search")
+                    action["query"] = await self.cog._distil_query(
+                        user_input, "search", context_window=context_window)
                 exec_result = await self._dispatch(action, user_input,
                                                    delegation={**delegation, "intent": intent},
                                                    payload={"confirmed": confirmed},
@@ -3770,6 +3823,18 @@ class ExecutionEngine:
         _mrfl_hits = _msg.context.pass0_hits or _p0_hits
         if self.qdrant and _mrfl_hits and _execution_confirmed:
             _asyncio.create_task(self._async_mrfl_increment(_mrfl_hits, intent))
+        # Cognition Engine: this turn matched a known Subject (PASS 1) — check if it
+        # warrants a campaign. Non-blocking; "was this material" is left to the
+        # campaign's own research→evaluate loop rather than duplicated here.
+        # run_campaign() (not create_campaign() alone) — a campaign that only got
+        # created and never run would sit at status:planning forever, since nothing
+        # else picks it up for the conversational trigger path.
+        if self.qdrant and self.nanobot and _execution_confirmed and delegation.get("_subject_matched"):
+            from cognition.campaigns import run_campaign
+            _asyncio.create_task(run_campaign(
+                self.qdrant, self.nanobot, self.cog,
+                delegation.get("_subject_id", ""), "conversation", user_input[:200],
+            ))
 
         # ── PASS 5 — Translator (receives ONLY result_for_translator) ─────────
         self._set_pass("P5", intent=intent, tier=tier, agent=agent)
@@ -3799,6 +3864,8 @@ class ExecutionEngine:
             "learning_harness_status",  # status query — last run summary passes directly
             "learn_url",                # structured queue result — bypass translator
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
+            "score_rss_by_subject",     # cognition harness brief — passes directly
+            "cognition_confirm_update", # approve/reject result — self-descriptive, passes directly
             "research_gather", "research_save", "research_clear",
             "portfolio_analysis", "portfolio_analysis_save", "portfolio_analysis_clear",
             "portfolio_watcher_scan",   # watcher result passes directly; harness sends its own Telegram
@@ -5324,8 +5391,10 @@ class ExecutionEngine:
                     for c in containers
                 ]}
             if name == "docker_logs":
-                logs = await self.broker.get_logs(container, tail=int(action.get("tail", 50)))
-                return {"status": "ok", "container": container, "logs": logs}
+                _SELF_NAMES = {"rex", "sovereign", "self", "myself", "me", "", None}
+                target_container = container if container not in _SELF_NAMES else "sovereign-core"
+                logs = await self.broker.get_logs(target_container, tail=int(action.get("tail", 50)))
+                return {"status": "ok", "container": target_container, "logs": logs}
             if name == "docker_stats":
                 if not container:
                     # Self-diagnostic — no specific container: return full system metrics
@@ -5409,6 +5478,20 @@ class ExecutionEngine:
             if name == "validator_sync" or operation == "validator_sync":
                 return await self.broker.get_validator_sync()
             return {"error": f"Unknown docker action: {name}"}
+
+        if domain == "eth_validators":
+            if name == "check_validators" or operation == "check_validators":
+                result = await self.validator_monitor.run_full_check()
+                return {"status": "ok", **result.model_dump(mode="json")}
+            if name == "validator_alerts" or operation == "validator_alerts":
+                result = await self.validator_monitor.run_full_check()
+                return {
+                    "status": "ok",
+                    "checked_at": result.checked_at.isoformat(),
+                    "alert_count": len(result.alerts),
+                    "alerts": [a.model_dump(mode="json") for a in result.alerts],
+                }
+            return {"error": f"Unknown eth_validators action: {name}"}
 
         if domain == "webdav":
             # WebDAV adapter removed (Phase 2 adapter removal) — all file ops now route through
@@ -5691,13 +5774,14 @@ class ExecutionEngine:
                 evt_calendar  = sp.get("calendar") or action.get("calendar", "personal")
                 evt_from_date = sp.get("from_date") or action.get("from_date", "")
                 evt_to_date   = sp.get("to_date")   or action.get("to_date",   "")
-                # Default to today → +14 days when specialist omits dates — prevents
+                # Default to today → +90 days when specialist omits dates — prevents
                 # returning all historical events and triggering PASS 4 rejection.
+                # Widened from 14 to 90 days 2026-07-02 (missed a real trip query in May).
                 if not evt_from_date and not evt_to_date:
                     from datetime import date as _date, timedelta as _td
                     _today = _date.today()
                     evt_from_date = _today.isoformat()
-                    evt_to_date   = (_today + _td(days=14)).isoformat()
+                    evt_to_date   = (_today + _td(days=90)).isoformat()
                 _evts_nb = await self.nanobot.run("openclaw-nextcloud", "calendar_list_events", {
                     "calendar": evt_calendar,
                     "from_date": evt_from_date,
@@ -6371,6 +6455,17 @@ class ExecutionEngine:
             from monitoring.news_harness import run_news_brief
             return await run_news_brief(self.cog, self.nanobot, self.qdrant, prompt or "")
 
+        if domain == "cognition":
+            if operation == "score_rss":
+                from monitoring.cognition_harness import run_score_rss_by_subject
+                return await run_score_rss_by_subject(self.cog, self.nanobot, self.qdrant)
+            if operation == "confirm_update":
+                from cognition.subjects import apply_subject_update
+                subject_id = (delegation or {}).get("target") or ""
+                approved = bool((delegation or {}).get("approved"))
+                return await apply_subject_update(self.qdrant, self.nanobot, subject_id, approved)
+            return {"status": "error", "error": f"unknown cognition operation: {operation}"}
+
         if domain == "research":
             from monitoring.research_harness import run_research_gather, run_research_save, run_research_clear
             if operation == "gather":
@@ -6421,22 +6516,17 @@ class ExecutionEngine:
             from tax_harness.harness import TaxIngestHarness
             _harness = TaxIngestHarness(self.cog, self.nanobot, self.qdrant)
 
-            if operation == "run":
-                result = await _harness.run()
+            if operation in ("run", "store"):
+                import asyncio as _asyncio
+                async def _run_tax_ingest():
+                    try:
+                        await _harness.run()
+                    except Exception as _exc:
+                        logger.warning("tax_ingest: background run failed: %s", _exc)
+                _asyncio.create_task(_run_tax_ingest())
                 return {
-                    "status":   result.get("status", "ok"),
-                    "response": result.get("summary", "Tax ingest complete."),
-                    "detail":   result,
-                    "_translator_bypass": True,
-                }
-
-            if operation == "store":
-                # Alias for run — Director-confirmed explicit store
-                result = await _harness.run()
-                return {
-                    "status":   result.get("status", "ok"),
-                    "response": result.get("summary", "Tax events stored."),
-                    "detail":   result,
+                    "status":   "ok",
+                    "response": "Tax ingest started in background. Will notify via Telegram when complete.",
                     "_translator_bypass": True,
                 }
 

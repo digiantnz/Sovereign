@@ -12,6 +12,8 @@ from adapters.ollama_cloud import OllamaCloudAdapter
 from adapters.openrouter import OpenRouterAdapter
 from cognition import prompts
 from cognition.dcl import DisclosureControlLayer
+from cognition.schemas import Pass1Output, Pass2Output, Pass3aOutput, Pass3bOutput, Pass4Output
+from pydantic import ValidationError as _PydanticValidationError
 
 from config import cfg as _cfg
 
@@ -26,6 +28,12 @@ SECURITY_AGENT_PATH = os.path.join(PERSONAS_DIR, "SECURITY_AGENT.md")
 # Flip to False to disable shadow entirely without touching routing logic.
 MEMORY_ROUTING_SHADOW_MODE = _cfg.cognitive_loop.memory_routing_shadow_mode
 MEMORY_ROUTING_THRESHOLD   = 0.85   # score at which shadow would have overridden LLM
+
+# ── Cognition Engine — subject detection (always on, independent of shadow mode) ──
+# Slightly below MEMORY_ROUTING_THRESHOLD — deliberately biased toward inclusion,
+# since a missed subject match just means one turn's specialist doesn't get extra
+# context, while a false positive is low-cost (thesis/confidence is informational).
+SUBJECT_ROUTING_THRESHOLD = 0.72
 
 TRANSLATOR_PATH = os.path.join(PERSONAS_DIR, "translator.md")
 MAX_TELEGRAM_CHARS = 12000  # Gateway splits at 4000 chars — allow longer responses
@@ -392,7 +400,6 @@ class CognitionEngine:
 
     # ── JSON-enforced LLM call with one retry ────────────────────────────
     async def call_llm_json(self, prompt: str, priority: "int | None" = None) -> dict:
-        import re as _re_json
         for attempt in range(2):
             # No fmt="json" — Qwen3 grammar-constrained mode returns empty responses.
             # Rely on prompt instruction + extraction fallback instead.
@@ -404,11 +411,11 @@ class CognitionEngine:
                 if attempt == 0:
                     continue
                 raise ValueError("LLM returned empty response after retry")
-            cleaned = _re_json.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
+            cleaned = _re_fab.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
             try:
                 return json.loads(cleaned)
             except json.JSONDecodeError:
-                m = _re_json.search(r'\{.*\}', cleaned, _re_json.DOTALL)
+                m = _re_fab.search(r'\{.*\}', cleaned, _re_fab.DOTALL)
                 if m:
                     try:
                         return json.loads(m.group())
@@ -418,8 +425,95 @@ class CognitionEngine:
                     continue
                 raise ValueError(f"LLM returned invalid JSON after retry: {raw[:200]}")
 
+    # ── Queue-aware structured output with Pydantic retry loop ───────────
+    async def _llm_generate_structured(
+        self,
+        prompt: str,
+        schema,
+        defaults: dict,
+        priority: "int | None" = None,
+        pass_name: str = "unknown",
+        max_retries: int = 2,
+    ) -> dict:
+        """Run _llm_generate() → Pydantic validate → retry with error context.
+
+        Every call routes through _llm_generate() so InferenceQueue priority is
+        preserved end-to-end.  On ValidationError the violation details are
+        injected into a follow-up prompt and the call is retried up to
+        max_retries times.
+
+        Never raises — retries exhausted → audit log + return dict(defaults).
+        /no_think prefix applied to the initial prompt and every retry.
+        """
+        base_prompt = "/no_think\n" + prompt
+        current_prompt = base_prompt
+        last_error: str = ""
+
+        for _attempt in range(max_retries + 1):
+            raw_result = await self._llm_generate(current_prompt, model=MODEL, priority=priority)
+            raw_text = raw_result.get("response", "").strip()
+
+            if not raw_text:
+                last_error = "empty response"
+                current_prompt = (
+                    base_prompt +
+                    "\n\nCORRECTION: Your previous response was missing/invalid: "
+                    "empty response. Return valid JSON only."
+                )
+                continue
+
+            cleaned = _re_fab.sub(r'```(?:json)?\s*', '', raw_text).replace('```', '').strip()
+            parsed = None
+            try:
+                parsed = json.loads(cleaned)
+            except (json.JSONDecodeError, ValueError):
+                m = _re_fab.search(r'\{.*\}', cleaned, _re_fab.DOTALL)
+                if m:
+                    try:
+                        parsed = json.loads(m.group())
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            if parsed is None:
+                last_error = f"could not parse JSON (preview: {raw_text[:100]})"
+                current_prompt = (
+                    base_prompt +
+                    "\n\nCORRECTION: Your previous response was missing/invalid: "
+                    "could not parse JSON. Return valid JSON only."
+                )
+                continue
+
+            try:
+                validated = schema.model_validate(parsed)
+                return validated.model_dump()
+            except _PydanticValidationError as exc:
+                violations = "; ".join(
+                    f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}"
+                    for e in exc.errors()
+                )
+                last_error = violations
+                current_prompt = (
+                    base_prompt +
+                    f"\n\nCORRECTION: Your previous response was missing/invalid: "
+                    f"{violations}. Return valid JSON only."
+                )
+
+        logger.warning(
+            "_llm_generate_structured [%s] exhausted %d %s — using defaults. Last error: %s",
+            pass_name, max_retries, "retry" if max_retries == 1 else "retries", last_error,
+        )
+        if self.ledger:
+            self.ledger.append("llm_structured_exhausted", "cognition", {
+                "pass_name": pass_name,
+                "schema": schema.__name__,
+                "max_retries": max_retries,
+                "last_error": last_error,
+            })
+        return dict(defaults)
+
     # ── Universal LLM output parser ───────────────────────────────────────
-    def _parse_llm_output(self, raw: str, required: list[str], defaults: dict) -> dict:
+    def _parse_llm_output(self, raw: str, required: list[str], defaults: dict,
+                          schema=None) -> dict:
         """Robust JSON parser for LLM pass outputs.
 
         Steps: strip markdown fences → json.loads → regex {…} extraction → defaults.
@@ -427,15 +521,14 @@ class CognitionEngine:
         Logs audit events on schema failure and missing fields.
         Never raises — always returns a usable dict.
         """
-        import re as _re_parse
-        cleaned = _re_parse.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
+        cleaned = _re_fab.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
         result = None
         try:
             result = json.loads(cleaned)
         except (json.JSONDecodeError, ValueError):
             pass
         if result is None:
-            m = _re_parse.search(r'\{.*\}', cleaned, _re_parse.DOTALL)
+            m = _re_fab.search(r'\{.*\}', cleaned, _re_fab.DOTALL)
             if m:
                 try:
                     result = json.loads(m.group())
@@ -454,6 +547,22 @@ class CognitionEngine:
                     if self.ledger:
                         self.ledger.append("llm_field_missing", "cognition", {"field": key})
                     result[key] = defaults[key]
+        if schema is not None:
+            try:
+                schema.model_validate(result)
+            except _PydanticValidationError as _ve:
+                _violations = [
+                    f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}"
+                    for e in _ve.errors()
+                ]
+                logger.warning("_parse_llm_output schema drift [%s]: %s",
+                               schema.__name__, _violations)
+                if self.ledger:
+                    self.ledger.append("llm_schema_drift", "cognition", {
+                        "schema": schema.__name__,
+                        "violations": _violations,
+                        "raw_preview": raw[:200],
+                    })
         return result
 
     # ── Routing history for PASS 1 ───────────────────────────────────────
@@ -497,21 +606,17 @@ class CognitionEngine:
             cognitive_context=cognitive_context,
             sovereign_context=sovereign_context,
         )
-        _raw1 = await self._llm_generate("/no_think\n" + prompt, model=MODEL, capture_thinking=False)
-        result = self._parse_llm_output(
-            _raw1.get("response", ""),
-            required=["intent", "delegate_to", "tier"],
+        result = await self._llm_generate_structured(
+            prompt,
+            schema=Pass1Output,
             defaults={
                 "intent": "query", "delegate_to": "research_agent", "tier": "LOW",
                 "preferred_provider": "local", "delegation_reason": "", "expected_output_format": "",
             },
+            pass_name="pass1",
         )
         result["_memory_confidence"] = confidence
         result["_memory_gaps"] = gaps
-        _p1_thinking = _raw1.get("thinking", "")
-        if _p1_thinking:
-            logger.info("[P1 THINK] %s", _p1_thinking[:2000])
-            result["_p1_thinking"] = _p1_thinking
         return result
 
     async def _memory_route_shadow(self, user_input: str) -> dict:
@@ -571,6 +676,59 @@ class CognitionEngine:
             }
         except Exception as exc:
             logger.debug("_memory_route_shadow: failed (non-fatal): %s", exc)
+            return _empty
+
+    async def _subject_route_check(self, user_input: str) -> dict:
+        """Cognition Engine — is this turn relevant to a known Subject?
+
+        Independent of _memory_route_shadow(): reuses the same embed call but
+        runs a separately-filtered query against semantic:subject:<id> entries
+        (never the source=="intent_seed" filter shadow routing uses — these
+        are different registries and must not be conflated).
+
+        Always on — not gated by MEMORY_ROUTING_SHADOW_MODE, which exists for
+        a different, validation-only purpose. Never raises.
+
+        Returns:
+            matched:     bool
+            subject_id:  str   — e.g. "crypto"
+            score:       float
+            thesis:      str
+            confidence:  float
+        """
+        _empty: dict = {
+            "matched": False, "subject_id": "", "score": 0.0,
+            "thesis": "", "confidence": 0.0,
+        }
+        if not self.qdrant:
+            return _empty
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            from execution.adapters.qdrant import SEMANTIC
+            vector = await self.qdrant._embed(user_input)
+            resp = await self.qdrant.archive_client.query_points(
+                collection_name=SEMANTIC,
+                query=vector,
+                query_filter=Filter(
+                    must=[FieldCondition(key="domain", match=MatchValue(value="subject"))],
+                ),
+                limit=1,
+                score_threshold=SUBJECT_ROUTING_THRESHOLD,
+                with_payload=True,
+            )
+            if not resp.points:
+                return _empty
+            hit = resp.points[0]
+            payload = hit.payload or {}
+            return {
+                "matched":    True,
+                "subject_id": payload.get("subject", ""),
+                "score":      round(hit.score, 4),
+                "thesis":     payload.get("thesis", ""),
+                "confidence": payload.get("confidence", 0.0),
+            }
+        except Exception as exc:
+            logger.debug("_subject_route_check: failed (non-fatal): %s", exc)
             return _empty
 
     async def _write_shadow_routing_episodic(
@@ -667,12 +825,21 @@ class CognitionEngine:
                     agreement=agreement,
                 ))
 
+        # ── Cognition Engine — subject detection (always on) ───────────────
+        if self.qdrant:
+            subject = await self._subject_route_check(user_input)
+            result["_subject_matched"]    = subject["matched"]
+            if subject["matched"]:
+                result["_subject_id"]         = subject["subject_id"]
+                result["_subject_score"]      = subject["score"]
+                result["_subject_thesis"]     = subject["thesis"]
+                result["_subject_confidence"] = subject["confidence"]
+
         return result
 
     # ── Pass 2: Specialist Reasoning ──────────────────────────────────────
     async def specialist_reason(self, agent_name: str, delegation: dict, user_input: str) -> dict:
         from skills.loader import SkillLoader
-        import re as _re_json
         _log = __import__("logging").getLogger(__name__)
         persona = self.load_persona(agent_name)
         try:
@@ -715,8 +882,8 @@ class CognitionEngine:
                 response_text = raw.get("response", "")
                 # External providers return freeform text; may wrap JSON in ```json...```
                 # Strip markdown code fences first, then extract the outermost {...} block.
-                stripped = _re_json.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
-                m = _re_json.search(r"\{.*\}", stripped, _re_json.DOTALL)
+                stripped = _re_fab.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
+                m = _re_fab.search(r"\{.*\}", stripped, _re_fab.DOTALL)
                 if m:
                     try:
                         result = json.loads(m.group())
@@ -750,7 +917,6 @@ class CognitionEngine:
         Externally routable (same routing logic as specialist_reason).
         Output is a flat dict compatible with _dispatch_inner() (payload fields at top level).
         """
-        import re as _re_json
         _log = __import__("logging").getLogger(__name__)
         persona = self.load_persona(agent_name)
         try:
@@ -763,7 +929,7 @@ class CognitionEngine:
         routing_history = await self.load_routing_history(delegation.get("intent", ""))
         _distilled_q = None
         if delegation.get("intent") in ("web_search", "research"):
-            _dq = await self._distil_query(user_input, "search")
+            _dq = await self._distil_query(user_input, "search", context_window=context_window)
             if _dq != user_input:
                 _distilled_q = _dq
         prompt = prompts.specialist_outbound(
@@ -797,8 +963,8 @@ class CognitionEngine:
                 }.get(decision["provider"], self.ask_grok)
                 raw = await _ask_fn(prompt, agent=agent_name, routing_decision=decision)
                 response_text = raw.get("response", "")
-                stripped = _re_json.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
-                m = _re_json.search(r"\{.*\}", stripped, _re_json.DOTALL)
+                stripped = _re_fab.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
+                m = _re_fab.search(r"\{.*\}", stripped, _re_fab.DOTALL)
                 if m:
                     try:
                         result = json.loads(m.group())
@@ -817,6 +983,7 @@ class CognitionEngine:
             _raw3a.get("response", ""),
             required=["skill", "operation"],
             defaults={"skill": "", "operation": "query"},
+            schema=Pass3aOutput,
         )
         result.setdefault("mode", "outbound")
         result["_routed_external"] = False
@@ -845,6 +1012,7 @@ class CognitionEngine:
             _raw3b.get("response", ""),
             required=["success", "outcome"],
             defaults={"success": False, "outcome": "No result available."},
+            schema=Pass3bOutput,
         )
         result.setdefault("mode", "inbound")
         result.setdefault("success", False)
@@ -865,18 +1033,23 @@ class CognitionEngine:
             delegation=delegation,
             specialist_inbound_result=specialist_inbound_result,
         )
-        _raw4 = await self._llm_generate("/no_think\n" + prompt, model=MODEL)
-        result = self._parse_llm_output(
-            _raw4.get("response", ""),
-            required=["result_for_translator"],
+        result = await self._llm_generate_structured(
+            prompt,
+            schema=Pass4Output,
             defaults={"result_for_translator": {
-                "success": False, "outcome": "Evaluation failed.",
-                "detail": {}, "error": None, "next_action": None,
+                "success": specialist_inbound_result.get("success", True),
+                "outcome": specialist_inbound_result.get("outcome", "Complete."),
+                "detail": specialist_inbound_result.get("detail", {}),
+                "error": specialist_inbound_result.get("error"),
+                "next_action": None,
             }},
+            pass_name="pass4",
         )
-        # Validate result_for_translator structure — PASS 4 sometimes emits {} or omits outcome
+        # Validate result_for_translator structure — PASS 4 sometimes emits {} or omits outcome.
+        # Guard uses falsy check (not just key-presence) because model_dump() fills outcome=""
+        # for any ResultForTranslator that validates without an explicit outcome value.
         _rft_check = result.get("result_for_translator", {})
-        if not isinstance(_rft_check, dict) or "outcome" not in _rft_check:
+        if not isinstance(_rft_check, dict) or not _rft_check.get("outcome"):
             result["result_for_translator"] = {
                 "success": specialist_inbound_result.get("success", False),
                 "outcome": specialist_inbound_result.get("outcome", "Research complete."),
@@ -1100,16 +1273,6 @@ class CognitionEngine:
         except Exception as e:
             logger.warning("translator_pass: could not write violation to episodic: %s", e)
 
-    # ── Pass 3: CEO Evaluation ────────────────────────────────────────────
-    async def ceo_evaluate(self, user_input: str, delegation: dict, specialist_output: dict) -> dict:
-        prompt = prompts.evaluate(
-            ceo_persona=self.load_orchestrator(),
-            user_input=user_input,
-            delegation=delegation,
-            specialist_output=specialist_output,
-        )
-        return await self.call_llm_json(prompt)
-
     # ── Security Evaluation Pass ──────────────────────────────────────────
     async def security_evaluate(self, scan_result, content: str) -> dict:
         """Evaluate a flagged scan result with the Security Agent persona.
@@ -1136,16 +1299,21 @@ class CognitionEngine:
             phrase_contexts=phrase_contexts,
         )
         result = await self.call_llm_json(prompt)
+        try:
+            Pass2Output.model_validate(result)
+        except _PydanticValidationError as _ve:
+            _violations = [
+                f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}"
+                for e in _ve.errors()
+            ]
+            logger.warning("security_evaluate schema drift: %s", _violations)
+            if self.ledger:
+                self.ledger.append("llm_schema_drift", "cognition", {
+                    "schema": "Pass2Output",
+                    "violations": _violations,
+                    "raw_preview": str(result)[:200],
+                })
         return result
-
-    # ── Pass 4: Memory Decision ───────────────────────────────────────────
-    async def ceo_memory_decision(self, user_input: str, execution_result: dict) -> dict:
-        prompt = prompts.memory_decision(
-            ceo_persona=self.load_orchestrator(),
-            user_input=user_input,
-            execution_result=execution_result,
-        )
-        return await self.call_llm_json(prompt)
 
     # ── CEO Agent translation (Director interface pass) ───────────────────
     # Urgency is deterministic: only allowed when result signals a security block or error.
@@ -1176,23 +1344,21 @@ class CognitionEngine:
             allow_urgent = tier == "HIGH" and has_error
             if not allow_urgent:
                 text = self._URGENT_STRIP_RE.sub("", text).strip()
-            # Strip any meta-commentary the model appended despite instructions
-            import re as _re2
             # Strip leading preamble the small model adds despite instructions
-            text = _re2.sub(
+            text = _re_fab.sub(
                 r"^(Here(?:'s| is) the (?:Director message|translated message|message)[^:]*:\s*"
                 r"|Translation:\s*"
                 r"|Translated message:\s*"
                 r"|Plain English(?:\s+message)?:\s*)",
-                "", text, flags=_re2.IGNORECASE,
+                "", text, flags=_re_fab.IGNORECASE,
             ).strip()
             # Strip trailing meta-commentary the model appends
-            text = _re2.sub(
+            text = _re_fab.sub(
                 r"\n*(This message meets|Here is the translated|Communication preference|"
                 r"Director communication|Please note that|Note:|---+|"
                 r"Urgency does not apply|The live adapter result|skills_live|"
                 r"The source of this information is).*",
-                "", text, flags=_re2.IGNORECASE | _re2.DOTALL
+                "", text, flags=_re_fab.IGNORECASE | _re_fab.DOTALL
             ).strip()
             return text
         except Exception:
@@ -1206,8 +1372,14 @@ class CognitionEngine:
         _now_nz = _now_utc + _td(hours=12)  # NZST (UTC+12); NZDT is +13 Oct–Apr
         _time_str = _now_nz.strftime("%H:%M NZST on %A %-d %B %Y") + f" ({_now_utc.strftime('%H:%M UTC')})"
         system = (
-            f"You are Sovereign, a helpful personal AI assistant. Answer directly and helpfully in plain English.\n"
+            f"You are Sovereign, a personal AI system with real-time capabilities. Answer directly and helpfully in plain English.\n"
             f"Current time: {_time_str}\n"
+            "SOVEREIGN CAPABILITIES: You have real-time internet access via Grok (live web search), Gemini, Groq, "
+            "OpenRouter, and a2a-browser. You can fetch current news, prices, and live data. "
+            "NEVER claim you lack internet access. NEVER say your knowledge is limited to a training cutoff date. "
+            "NEVER agree with the Director if they say you cannot use the internet — that claim is false. "
+            "If real-time data was not retrieved for this query, say the retrieval was not triggered, "
+            "not that you are incapable of it.\n"
             "PERSONAL CONTEXT GUARD: only reference the Director's requests, plans, schedules, or preferences "
             "that appear explicitly in the conversation history below. "
             "Do NOT invent or hallucinate prior Director requests or personal context that are not shown. "
@@ -1239,28 +1411,46 @@ class CognitionEngine:
                         timeout: float = 200.0) -> dict:
         return await self._llm_generate(prompt, model=model, priority=priority, timeout=timeout)
 
-    async def _distil_query(self, raw: str, target: str = "search") -> str:
+    async def _distil_query(self, raw: str, target: str = "search", context_window=None) -> str:
         """Convert raw user message into an optimised query for the downstream target.
 
         target: "search" (SearXNG 4-6 keywords), "fast_llm" (groq/gemini/openrouter/ollama_cloud
                 one-sentence question), "grok" (current-events focus), "claude" (structured task
                 prompt). Returns raw on timeout (8 s wall clock) or any error — logs WARNING.
+
+        context_window: optional list of {user, assistant} turn dicts (or a single dict).
+                Only the most recent Director turn is used, capped at 200 chars, so entities
+                mentioned earlier (e.g. a city name) survive distillation without pulling in
+                the full session history.
         """
         import asyncio as _aio
+        _context_snippet = ""
+        if context_window:
+            _turns = context_window if isinstance(context_window, list) else [context_window]
+            if _turns:
+                _last_user = (_turns[-1].get("user") or "")[:200]
+                if _last_user:
+                    _context_snippet = f"Recent context: {_last_user}\n"
         _target_prompts = {
             "search": (
                 "Convert the user message into a concise search engine query "
-                "(4–6 keywords, no question marks, no filler words like 'what is' or 'tell me').\n"
+                "(4–6 keywords, no question marks, no filler words like 'what is' or 'tell me'). "
+                "If 'Recent context' above names a location or entity the user is implicitly "
+                "referring to, fold it into the keywords.\n"
                 "Output the query only — no explanation.\n\nUser: "
             ),
             "fast_llm": (
                 "Rewrite the user message as a clear, self-contained one-sentence question "
-                "for a language model. Remove any session-specific context.\n"
+                "for a language model. If 'Recent context' above names a location, entity, or "
+                "topic the user is implicitly referring to, fold it into the question explicitly. "
+                "Do not mention 'the conversation' or 'context' in your output.\n"
                 "Output the question only.\n\nUser: "
             ),
             "grok": (
                 "Rewrite the user message as a focused, specific question about current events, "
-                "markets, or real-time data. Remove session-specific context.\n"
+                "markets, or real-time data. If 'Recent context' above names a location, entity, "
+                "or topic the user is implicitly referring to, fold it into the question explicitly. "
+                "Do not mention 'the conversation' or 'context' in your output.\n"
                 "Output the question only.\n\nUser: "
             ),
             "claude": (
@@ -1270,7 +1460,7 @@ class CognitionEngine:
             ),
         }
         pfx = _target_prompts.get(target, _target_prompts["search"])
-        prompt = "/no_think\n" + pfx + raw
+        prompt = "/no_think\n" + _context_snippet + pfx + raw
         from adapters.inference_queue import InferenceQueue
         try:
             result = await _aio.wait_for(
@@ -1280,7 +1470,7 @@ class CognitionEngine:
                     priority=InferenceQueue.LOW,
                     timeout=30.0,
                 ),
-                timeout=8.0,
+                timeout=20.0,
             )
             distilled = result.get("response", "").strip()
             if distilled and result.get("status") != "llm_timeout":
@@ -1291,6 +1481,9 @@ class CognitionEngine:
             "query_distil: timeout/error target=%s raw=%r — using raw", target, raw[:80]
         )
         return raw
+
+    # task_types that expect Grok's real-time web access — enables live search mode.
+    _GROK_SEARCH_TASK_TYPES = {"web_aware_query", "news_gather"}
 
     # ── External cognition — Grok ─────────────────────────────────────────
     async def ask_grok(
@@ -1311,8 +1504,10 @@ class CognitionEngine:
                 f"---\n{prompt}"
             )
             logger.info("provider_delegation: grok reason=%s", routing_decision.get("delegation_reason", ""))
+        logger.info("ask_grok[%s]: calling provider, prompt_chars=%d", agent, len(prompt))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="grok")
         if dcl_result.blocked:
+            logger.warning("ask_grok[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger)
             return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
@@ -1321,14 +1516,19 @@ class CognitionEngine:
             kwargs = {"prompt": dcl_result.content, "system": system}
             if model:
                 kwargs["model"] = model
+            if routing_decision and routing_decision.get("task_type") in self._GROK_SEARCH_TASK_TYPES:
+                kwargs["search"] = True
             raw = await self.grok.generate(**kwargs)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger,
                                   output_tokens=raw.get("output_tokens", 0))
+            logger.info("ask_grok[%s]: ok in=%d out=%d", agent,
+                        raw.get("input_tokens", 0), raw.get("output_tokens", 0))
             return {"response": raw["response"]}
         except Exception as e:
             if "429" in str(e) or "rate limit" in str(e).lower():
                 self.mark_provider_rate_limited("grok")
+            logger.warning("ask_grok[%s]: error: %s", agent, e)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e)}
@@ -1343,8 +1543,10 @@ class CognitionEngine:
     ) -> dict:
         """DCL-gated Claude call. Returns {response} or {error} if blocked.
         Every call — including blocks — is logged to audit."""
+        logger.info("ask_claude[%s]: calling provider, prompt_chars=%d", agent, len(prompt))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="claude")
         if dcl_result.blocked:
+            logger.warning("ask_claude[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger)
             return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
@@ -1357,8 +1559,11 @@ class CognitionEngine:
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger,
                                   output_tokens=raw.get("output_tokens", 0))
+            logger.info("ask_claude[%s]: ok in=%d out=%d", agent,
+                        raw.get("input_tokens", 0), raw.get("output_tokens", 0))
             return {"response": raw["response"]}
         except Exception as e:
+            logger.warning("ask_claude[%s]: error: %s", agent, e)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e)}
@@ -1381,8 +1586,10 @@ class CognitionEngine:
                 f"---\n{prompt}"
             )
             logger.info("provider_delegation: gemini reason=%s", routing_decision.get("delegation_reason", ""))
+        logger.info("ask_gemini[%s]: calling provider, prompt_chars=%d", agent, len(prompt))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="gemini")
         if dcl_result.blocked:
+            logger.warning("ask_gemini[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger)
             return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
@@ -1397,13 +1604,69 @@ class CognitionEngine:
                                   output_tokens=raw.get("output_tokens", 0))
             if raw.get("status") == "error" or not raw.get("response"):
                 raise ValueError(raw.get("error", "empty response from Gemini"))
+            logger.info("ask_gemini[%s]: ok in=%d out=%d", agent,
+                        raw.get("input_tokens", 0), raw.get("output_tokens", 0))
             return {"response": raw["response"], "_trust": "untrusted_external"}
         except Exception as e:
             if "429" in str(e) or "rate limit" in str(e).lower():
                 self.mark_provider_rate_limited("gemini")
+            logger.warning("ask_gemini[%s]: error: %s", agent, e)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
+
+    # ── External cognition — Gemini Vision ───────────────────────────────
+    async def ask_gemini_vision(
+        self,
+        image_b64: str,
+        mime_type:  str,
+        prompt:     str,
+        sensitivity: str = "WORKSPACE_INTERNAL",
+        agent:      str  = "sovereign-core",
+    ) -> dict:
+        """DCL-gated Gemini vision call. Classifies the text prompt; image bytes are not classified.
+
+        Blocks if sensitivity > WORKSPACE_INTERNAL (PRIVATE/SECRET).
+        Returns {response, _trust} or {error, message, _trust}.
+        """
+        from adapters.gemini import GeminiUnavailableError
+        logger.info("ask_gemini_vision[%s]: calling provider, prompt_chars=%d", agent, len(prompt))
+        dcl_result = self.dcl.prepare(prompt, agent=agent, provider="gemini")
+        if dcl_result.blocked:
+            logger.warning("ask_gemini_vision[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger)
+            return {
+                "error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
+                "message": "Content classified SECRET — not transmitted to external provider.",
+                "_trust": "untrusted_external",
+            }
+        try:
+            raw = await self.gemini.generate_with_image(
+                prompt=dcl_result.content,
+                image_b64=image_b64,
+                mime_type=mime_type,
+            )
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger,
+                                  output_tokens=raw.get("output_tokens", 0))
+            if raw.get("status") == "error" or not raw.get("response"):
+                raise ValueError(raw.get("error", "empty response from Gemini vision"))
+            logger.info("ask_gemini_vision[%s]: ok in=%d out=%d", agent,
+                        raw.get("input_tokens", 0), raw.get("output_tokens", 0))
+            return {"response": raw["response"], "_trust": "untrusted_external"}
+        except GeminiUnavailableError as exc:
+            logger.warning("ask_gemini_vision[%s]: unavailable: %s", agent, exc)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(exc))
+            return {"error": "GEMINI_UNAVAILABLE", "message": str(exc), "_trust": "untrusted_external"}
+        except Exception as exc:
+            if "429" in str(exc) or "rate limit" in str(exc).lower():
+                self.mark_provider_rate_limited("gemini")
+            logger.warning("ask_gemini_vision[%s]: error: %s", agent, exc)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(exc))
+            return {"error": str(exc), "_trust": "untrusted_external"}
 
     # ── External cognition — Groq Inference ──────────────────────────────
     async def ask_groq_inf(
@@ -1423,8 +1686,10 @@ class CognitionEngine:
                 f"---\n{prompt}"
             )
             logger.info("provider_delegation: groq_inference reason=%s", routing_decision.get("delegation_reason", ""))
+        logger.info("ask_groq_inf[%s]: calling provider, prompt_chars=%d", agent, len(prompt))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="groq_inference")
         if dcl_result.blocked:
+            logger.warning("ask_groq_inf[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger)
             return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
@@ -1439,13 +1704,56 @@ class CognitionEngine:
                                   output_tokens=raw.get("output_tokens", 0))
             if raw.get("status") == "error" or not raw.get("response"):
                 raise ValueError(raw.get("error", "empty response from Groq"))
+            logger.info("ask_groq_inf[%s]: ok in=%d out=%d", agent,
+                        raw.get("input_tokens", 0), raw.get("output_tokens", 0))
             return {"response": raw["response"], "_trust": "untrusted_external"}
         except Exception as e:
             if "429" in str(e) or "rate limit" in str(e).lower():
                 self.mark_provider_rate_limited("groq_inference")
+            logger.warning("ask_groq_inf[%s]: error: %s", agent, e)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
+
+    # ── External cognition — Groq structured (Instructor) ────────────────
+    async def ask_groq_inf_structured(
+        self,
+        prompt: str,
+        response_model: type,
+        agent: str = "sovereign-core",
+        system: str = "You are a helpful assistant. Return only valid JSON.",
+        model: str | None = None,
+    ) -> dict | None:
+        """DCL-gated Groq call using Instructor for structured JSON output.
+
+        Returns model_dump() dict on success, None on DCL block or error.
+        Use for passes that need validated structured output from Groq —
+        Instructor retries with validation-error context, unlike the plain generate path.
+        """
+        dcl_result = self.dcl.prepare(prompt, agent=agent, provider="groq_inference")
+        if dcl_result.blocked:
+            logger.warning("ask_groq_inf_structured[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger)
+            return None
+        try:
+            result = await self.groq_inf.generate_structured(
+                prompt=dcl_result.content,
+                response_model=response_model,
+                system=system,
+                model=model,
+            )
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger)
+            logger.info("ask_groq_inf_structured[%s]: ok model=%s", agent, model or "default")
+            return result.model_dump() if hasattr(result, "model_dump") else dict(result)
+        except Exception as exc:
+            if "429" in str(exc) or "rate limit" in str(exc).lower():
+                self.mark_provider_rate_limited("groq_inference")
+            logger.warning("ask_groq_inf_structured[%s]: error: %s", agent, exc)
+            if self.ledger:
+                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(exc))
+            return None
 
     # ── External cognition — Ollama Cloud ────────────────────────────────
     async def ask_ollama_cloud(
@@ -1465,8 +1773,10 @@ class CognitionEngine:
                 f"---\n{prompt}"
             )
             logger.info("provider_delegation: ollama_cloud reason=%s", routing_decision.get("delegation_reason", ""))
+        logger.info("ask_ollama_cloud[%s]: calling provider, prompt_chars=%d", agent, len(prompt))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="ollama_cloud")
         if dcl_result.blocked:
+            logger.warning("ask_ollama_cloud[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger)
             return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
@@ -1481,10 +1791,13 @@ class CognitionEngine:
                                   output_tokens=raw.get("output_tokens", 0))
             if raw.get("status") == "error" or not raw.get("response"):
                 raise ValueError(raw.get("error", "empty response from Ollama Cloud"))
+            logger.info("ask_ollama_cloud[%s]: ok in=%d out=%d", agent,
+                        raw.get("input_tokens", 0), raw.get("output_tokens", 0))
             return {"response": raw["response"], "_trust": "untrusted_external"}
         except Exception as e:
             if "429" in str(e) or "rate limit" in str(e).lower():
                 self.mark_provider_rate_limited("ollama_cloud")
+            logger.warning("ask_ollama_cloud[%s]: error: %s", agent, e)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
@@ -1507,8 +1820,10 @@ class CognitionEngine:
                 f"---\n{prompt}"
             )
             logger.info("provider_delegation: openrouter reason=%s", routing_decision.get("delegation_reason", ""))
+        logger.info("ask_openrouter[%s]: calling provider, prompt_chars=%d", agent, len(prompt))
         dcl_result = self.dcl.prepare(prompt, agent=agent, provider="openrouter")
         if dcl_result.blocked:
+            logger.warning("ask_openrouter[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger)
             return {"error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
@@ -1523,10 +1838,13 @@ class CognitionEngine:
                                   output_tokens=raw.get("output_tokens", 0))
             if raw.get("status") == "error" or not raw.get("response"):
                 raise ValueError(raw.get("error", "empty response from OpenRouter"))
+            logger.info("ask_openrouter[%s]: ok in=%d out=%d", agent,
+                        raw.get("input_tokens", 0), raw.get("output_tokens", 0))
             return {"response": raw["response"], "_trust": "untrusted_external"}
         except Exception as e:
             if "429" in str(e) or "rate limit" in str(e).lower():
                 self.mark_provider_rate_limited("openrouter")
+            logger.warning("ask_openrouter[%s]: error: %s", agent, e)
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
@@ -1569,7 +1887,12 @@ class CognitionEngine:
     # externally — governance must remain deterministic and local.
 
     _GROK_PRIORITY_TASKS       = frozenset({"news_gather", "web_aware_query", "market_sentiment", "cve_monitor"})
-    _FREE_FIRST_TASK_TYPES     = frozenset({"general_lookup"})
+    # _FREE_FIRST_TASK_TYPES: task types that bypass the complexity gate and route to
+    # the first eligible external provider unconditionally when DCL clears the content.
+    # llm_generate is the default — this implements "external-first for all
+    # PUBLIC/WORKSPACE_INTERNAL content". Memory/governance/docker ops never reach
+    # PASS 2 (handled by short-circuits), so local-first invariants are preserved.
+    _FREE_FIRST_TASK_TYPES     = frozenset({"general_lookup", "llm_generate", "content_synthesis"})
     _PROVIDER_QUEUE            = ["groq_inference", "gemini", "openrouter", "ollama_cloud", "grok"]
     _PROVIDER_RATE_LIMIT_TTL_S = 3600.0
 
@@ -1580,6 +1903,7 @@ class CognitionEngine:
         r"\b(use claude|use grok|use gemini|use groq|use openrouter|use ollama.?cloud"
         r"|ask claude|ask grok|ask gemini|ask groq|ask openrouter"
         r"|via claude|via grok|via gemini|via groq|via openrouter"
+        r"|from grok|from claude|from gemini|from groq|from openrouter"
         r"|check grok|check with grok|query grok"
         r"|check claude|check with claude|query claude"
         r"|check gemini|check with gemini|query gemini"
@@ -1595,16 +1919,16 @@ class CognitionEngine:
         __import__("re").IGNORECASE,
     )
     _GROK_SIGNAL_RE = __import__("re").compile(
-        r"\b(use grok|ask grok|via grok|check grok|check with grok|query grok"
+        r"\b(use grok|ask grok|via grok|from grok|check grok|check with grok|query grok"
         r"|current|latest|news|today|recent|market|trending)\b",
         __import__("re").IGNORECASE,
     )
     _GEMINI_SIGNAL_RE = __import__("re").compile(
-        r"\b(use gemini|ask gemini|via gemini|check gemini|check with gemini|query gemini)\b",
+        r"\b(use gemini|ask gemini|via gemini|from gemini|check gemini|check with gemini|query gemini)\b",
         __import__("re").IGNORECASE,
     )
     _GROQ_SIGNAL_RE = __import__("re").compile(
-        r"\b(use groq|ask groq|via groq|check groq|check with groq|query groq)\b",
+        r"\b(use groq|ask groq|via groq|from groq|check groq|check with groq|query groq)\b",
         __import__("re").IGNORECASE,
     )
     _OPENROUTER_SIGNAL_RE = __import__("re").compile(
@@ -1620,10 +1944,19 @@ class CognitionEngine:
 
     # Maps intent-derived signals in user_input to provider_registry task_type names.
     # Default: "llm_generate" for anything not in this map.
+    # NOTE: "research" maps to web_aware_query here, but _routing_decision() downgrades
+    # it to content_synthesis when no Grok recency signals are present (see below).
     _INTENT_TO_TASK_TYPE = {
         "web search":              "web_aware_query",  # natural language "web search X"
         "research":                "web_aware_query",
         "news":                    "news_gather",    # matches "latest news", "news today", "news brief"
+        "summarise":               "content_synthesis",
+        "summarize":               "content_synthesis",
+        "summarisation":           "content_synthesis",
+        "summarization":           "content_synthesis",
+        "interpret":               "content_synthesis",
+        "rss_digest":              "content_synthesis",
+        "rss":                     "content_synthesis",
         "securities_price":        "securities_price",
         "securities_fundamentals": "securities_fundamentals",
         "securities_technicals":   "securities_technicals",
@@ -1633,8 +1966,9 @@ class CognitionEngine:
 
     # Default LLM provider preferences by task_type (used when no explicit override)
     _TASK_TYPE_PREFERRED = {
-        "web_aware_query": "grok",
-        "news_gather":     "grok",
+        "web_aware_query":   "grok",            # real-time web access
+        "news_gather":       "grok",            # real-time web access
+        "content_synthesis": "groq_inference",  # heavy reasoning; Llama-70B via free tier
     }
 
     # Adapter module paths for the `adapter` return field (audit logging)
@@ -1749,6 +2083,12 @@ class CognitionEngine:
                     task_type = tt
                     break
 
+        # Downgrade web_aware_query → content_synthesis when there are no Grok recency
+        # signals in the user input. "research X" without "latest/current/news/today"
+        # should use Gemini (content synthesis) rather than Grok (real-time web access).
+        if task_type == "web_aware_query" and not self._GROK_SIGNAL_RE.search(signal_text):
+            task_type = "content_synthesis"
+
         registry = self._provider_registry  # dict loaded once at startup
         _now     = _time.monotonic()
 
@@ -1756,6 +2096,7 @@ class CognitionEngine:
             """Attach delegation context to every return dict."""
             extra["delegation_reason"]       = delegation_reason
             extra["expected_output_format"]  = expected_output_format
+            extra["task_type"]               = task_type
             return extra
 
         if registry:

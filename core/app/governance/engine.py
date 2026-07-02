@@ -39,6 +39,9 @@ class GovernanceEngine:
             if operation in ['read', 'ps', 'logs', 'stats']:
                 if rules.get('docker_read', False):
                     return rules
+            elif operation in ['validator_list', 'validator_sync']:
+                if rules.get('docker_read', False):
+                    return rules
             elif operation in rules.get('docker_workflows', []):
                 return rules
         elif domain == 'file':
@@ -208,9 +211,37 @@ class GovernanceEngine:
             # Weekly watcher — deterministic scan; no LLM unless signal fires
             if operation == 'scan' and rules.get('browser_search', False):
                 return rules
+        elif domain == 'nanobot':
+            # Delegated execution via nanobot sidecar — MID tier for run, LOW for health
+            if operation == 'health' and rules.get('docker_read', False):
+                return rules
+            if operation == 'run' and rules.get('skill_load', False):
+                return rules
+        elif domain == 'tax':
+            # Tax ingest/report harness operations
+            if operation in ('run', 'ingest_status', 'query', 'address_list', 'status') and rules.get('memory_search', False):
+                return rules
+            if operation == 'store' and rules.get('memory_write', False):
+                return rules
+        elif domain == 'validator_queue':
+            # Internal validator queue check — read-only, LOW tier
+            if operation == 'check' and rules.get('memory_search', False):
+                return rules
+        elif domain == 'eth_validators':
+            # Ethereum validator monitor — on-chain + beacon reads via validator_monitor
+            # adapter, no docker/broker involved. Read-only, LOW tier.
+            if operation in ('check_validators', 'validator_alerts') and rules.get('memory_search', False):
+                return rules
         elif domain == 'session':
             # Session flag operations (e.g. confidential_external_approved) — always LOW tier
             if operation == 'set_flag':
+                return rules
+        elif domain == 'cognition':
+            # Cognition Engine — RSS subject scoring (reads RSS, writes campaign notes +
+            # semantic/episodic memory) and Subject Update approve/reject replies (writes
+            # Nextcloud note + semantic memory). Both LOW tier — same memory_write gate
+            # already used by learning/memory_synthesise for read+write memory operations.
+            if operation in ('score_rss', 'confirm_update') and rules.get('memory_write', False):
                 return rules
         elif domain == 'governance_read':
             # Deterministic read of governance.json — always read-only, LOW tier

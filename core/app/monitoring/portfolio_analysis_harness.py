@@ -73,7 +73,7 @@ _CATEGORY_ALIAS: dict[str, str] = {
 # Maps asset slug → portfolio_targets group name.
 # Any slug absent from this map falls to "everything_else".
 _GROUP_MEMBERSHIP: dict[str, str] = {
-    "eth":  "eth",   "weth": "eth",   "pseth": "eth",
+    "eth":  "eth",   "weth": "eth",   "pseth": "eth",   "eth_staked": "eth",
     "btc":  "btc",
     "usdt": "stablecoins", "dai":  "stablecoins",
     "musd": "stablecoins", "ucap": "stablecoins",
@@ -91,6 +91,7 @@ _COINGECKO_IDS: dict[str, str | None] = {
     "eth":   "ethereum",
     "weth":  "ethereum",      # wrapped ETH tracks ETH price
     "pseth": "ethereum",      # pStake ETH ≈ ETH price
+    "eth_staked": "ethereum", # fallback only — priced from live ETH quote in _inject_crypto_live
     "btc":   "bitcoin",
     "usdt":  "tether",
     "dai":   "dai",
@@ -254,6 +255,20 @@ async def _fetch_ledger(nanobot, category_slug: str) -> str | None:
     return nb["content"]
 
 
+def _parse_subject_tag(content: str) -> str | None:
+    """Extract the subject: value from the ledger's YAML frontmatter, if present.
+
+    Phase 8b — additive context enrichment only. Portfolio files without a
+    subject: tag (or with a tag matching no bootstrapped Subject) simply get
+    no subject context — existing analysis behaviour is unaffected either way.
+    """
+    m = re.match(r'^---\n(.*?)\n---', content, re.DOTALL)
+    if not m:
+        return None
+    m2 = re.search(r'^subject:\s*(\S+)', m.group(1), re.MULTILINE)
+    return m2.group(1).strip() if m2 else None
+
+
 def _parse_ledger(content: str) -> list[AssetSpec]:
     """Parse YAML blocks from ledger content string into AssetSpec list."""
     import yaml
@@ -297,7 +312,7 @@ def _parse_ledger(content: str) -> list[AssetSpec]:
         contribs     = block.get("contributions", []) or []
         purchase_history = purchases + contribs
 
-        # Cost basis
+        # Cost basis — ledger value; overwritten for crypto in resolve_category() via _fifo_cost_basis()
         if atype == "fund":
             cost_basis = float(block.get("total_contributed_nzd", 0) or 0)
         else:
@@ -480,6 +495,23 @@ async def resolve_category(nanobot, slug: str, qdrant, sov_wallet_url: str) -> d
             "message": f"No assets found in {slug} ledger. Add YAML blocks to /portfolios/{slug}.md.",
         }
 
+    # ── Staking position (live, not ledger-tracked) ────────────────────────────
+    if slug == "crypto":
+        await _inject_staking_position(specs, qdrant)
+
+    # ── FIFO cost basis (crypto, investment-only scope) ───────────────────────
+    if slug == "crypto":
+        fifo_basis = await _fifo_cost_basis(qdrant)
+        for s in specs:
+            if s.asset_type != "crypto":
+                continue
+            derived = fifo_basis.get(s.slug)
+            if derived is not None:
+                s.cost_basis_nzd = derived
+                s.extra["cost_basis_source"] = "fifo"
+            else:
+                s.extra["cost_basis_source"] = "ledger"
+
     if slug == "crypto":
         # Stash ledger values before live inject (used as fallback below)
         for s in specs:
@@ -527,6 +559,18 @@ async def resolve_category(nanobot, slug: str, qdrant, sov_wallet_url: str) -> d
         else:
             s.weight_pct = (s.value_nzd / weight_denom * 100.0) if weight_denom else 0.0
 
+    # Phase 8b — Subject context (additive only, no effect on any field above).
+    # subject: tag in the ledger frontmatter -> matching semantic:subject:<id>
+    # from the Qdrant warm cache, if both exist. None otherwise.
+    subject_context = None
+    subject_id = _parse_subject_tag(content)
+    if subject_id:
+        try:
+            from cognition.subjects import get_subject
+            subject_context = await get_subject(qdrant, subject_id)
+        except Exception as exc:
+            logger.warning("resolve_category: subject context fetch failed for %r: %s", subject_id, exc)
+
     return {
         "status":               "ok",
         "specs":                specs,
@@ -534,7 +578,50 @@ async def resolve_category(nanobot, slug: str, qdrant, sov_wallet_url: str) -> d
         "total_cost_basis_nzd": total_cost,
         "portfolio_targets":    portfolio_targets,
         "watchlist":            watchlist,
+        "subject_context":      subject_context,
     }
+
+
+async def _inject_staking_position(specs: list[AssetSpec], qdrant) -> None:
+    """Appends a synthetic ETH_STAKED holding, live-sourced from the validator monitor
+    (Rocket Pool minipools + eth-docker solo validators). Not ledger-tracked — balance
+    lives on the beacon chain, re-derived every call (indices/groups can change as the
+    Director migrates Rocket Pool to a consolidated megapool, see validator_monitor.py).
+
+    Balance is the raw beacon-chain validator balance only. Withdrawal-wallet balances
+    (LEDGER_MINING, TREZOR_MINING) are deliberately excluded — LEDGER_MINING is already
+    in sov-wallet's watchlist and counted under the plain "eth" ticker; adding it again
+    here would double-count. value_nzd is priced later in _inject_crypto_live once the
+    live ETH quote is known.
+    """
+    try:
+        from execution.adapters.validator_monitor import ValidatorMonitorAdapter
+        summary = await ValidatorMonitorAdapter(qdrant).get_validator_summary()
+    except Exception as exc:
+        logger.warning("portfolio_harness: validator_monitor unavailable — skipping ETH_STAKED: %s", exc)
+        return
+
+    rp_count = sum(1 for v in summary["per_validator"] if v["group"] == "rocketpool")
+    ed_count = summary["validator_count"] - rp_count
+    operator_eth = summary["total_operator_eth"]
+    balance_eth  = summary["total_balance_eth"]
+
+    specs.append(AssetSpec(
+        slug="eth_staked",
+        display_name=f"ETH Staked ({rp_count} Rocket Pool + {ed_count} eth-docker validator{'s' if ed_count != 1 else ''})",
+        asset_type="crypto",
+        balance=balance_eth,
+        value_nzd=0.0,
+        cost_basis_nzd=0.0,
+        weight_pct=0.0,
+        extra={
+            "ticker": "ETH_STAKED",
+            "asset_group": "staking_position",
+            "operator_bond_eth": operator_eth,
+            "unrealised_reward_eth": balance_eth - operator_eth,
+            "validator_count": summary["validator_count"],
+        },
+    ))
 
 
 def _inject_crypto_live(specs: list[AssetSpec], wallet_data: dict) -> None:
@@ -571,6 +658,9 @@ def _inject_crypto_live(specs: list[AssetSpec], wallet_data: dict) -> None:
             spec.value_nzd = spec.balance * btc_price_nzd
             if btc_total == 0 and spec.balance > 0:
                 spec.extra["balance_source"] = "ledger_total_amount"
+        elif ticker == "ETH_STAKED" and eth_price_nzd:
+            spec.value_nzd = spec.balance * eth_price_nzd
+            spec.extra["current_price_nzd"] = eth_price_nzd
 
 
 async def _fetch_coingecko_prices(slugs: list[str]) -> dict[str, float]:
@@ -603,6 +693,90 @@ async def _fetch_coingecko_prices(slugs: list[str]) -> dict[str, float]:
         return result
     except Exception as exc:
         logger.warning("portfolio_harness: CoinGecko batch fetch failed: %s", exc)
+        return {}
+
+
+# ── FIFO cost basis (investment-only scope) ───────────────────────────────────
+
+async def _fifo_cost_basis(qdrant) -> dict[str, float]:
+    """Sum NZD acquisition cost per asset from exchange purchases in semantic memory.
+
+    Scope: exchange_acquisition only — Wirex/Swyftx/EasyCrypto buys.
+    Excluded: mining_income, staking_reward, all disposals.
+
+    No disposal matching: the portfolio view is total acquisition cost vs present
+    value. Unpriced events are skipped; partial sums are still returned so the
+    harness has a number even when some historic prices are missing.
+
+    Returns {slug_lowercase: total_acquisition_cost_nzd}, or {} on error.
+    """
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        from tax_harness.harness import _payload_to_tax_event
+        from tax_harness.classifier import classify_events
+        from tax_harness.fifo import _parse_nzd
+
+        all_events: list = []
+        offset = None
+        while True:
+            hits, next_offset = await qdrant.archive_client.scroll(
+                collection_name="semantic",
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="domain", match=MatchValue(value="tax")),
+                    FieldCondition(key="type",   match=MatchValue(value="tax_event")),
+                ]),
+                limit=200,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for h in hits:
+                ev = _payload_to_tax_event(dict(h.payload or {}))
+                if ev and ev.event_tag == "tax:crypto":
+                    all_events.append(ev)
+            if not hits or next_offset is None:
+                break
+            offset = next_offset
+
+        if not all_events:
+            logger.info("portfolio_harness: _fifo_cost_basis: no tax:crypto events in semantic memory")
+            return {}
+
+        logger.info("portfolio_harness: _fifo_cost_basis: %d tax:crypto events loaded", len(all_events))
+
+        classified = await classify_events(all_events, qdrant)
+
+        acquisitions = [ev for ev in classified.income if ev.subtype == "exchange_acquisition"]
+        logger.info("portfolio_harness: _fifo_cost_basis: %d exchange_acquisition events", len(acquisitions))
+
+        if not acquisitions:
+            logger.warning("portfolio_harness: _fifo_cost_basis: no exchange_acquisition events found")
+            return {}
+
+        cost:     dict[str, float] = {}
+        unpriced: dict[str, int]   = {}
+
+        for ev in acquisitions:
+            slug = (ev.asset or "").lower()
+            if not slug:
+                continue
+            nzd = _parse_nzd(ev.nzd_value)
+            if nzd is None:
+                unpriced[slug] = unpriced.get(slug, 0) + 1
+                continue
+            cost[slug] = cost.get(slug, 0.0) + float(nzd)
+
+        if unpriced:
+            logger.warning(
+                "portfolio_harness: _fifo_cost_basis: skipped unpriced events — %s",
+                {k: f"{v} event(s)" for k, v in unpriced.items()},
+            )
+
+        logger.info("portfolio_harness: _fifo_cost_basis: cost basis derived for %s", sorted(cost.keys()))
+        return cost
+
+    except Exception as exc:
+        logger.warning("portfolio_harness: _fifo_cost_basis failed: %s", exc)
         return {}
 
 
@@ -655,6 +829,22 @@ async def _gather_one(nanobot, cog, spec: AssetSpec) -> dict:
             "no_data":        False,
             "stablecoin":     True,
             "dry_powder_nzd": nzd_val,
+        }
+
+    # Staking position short-circuit — not a tradeable security, no research needed
+    if spec.extra.get("asset_group") == "staking_position":
+        return {
+            "slug":                 spec.slug,
+            "gathered":             (
+                f"STAKING POSITION: {spec.display_name} — operator bond "
+                f"{spec.extra.get('operator_bond_eth', 0):.2f} ETH, current beacon balance "
+                f"{spec.balance:.4f} ETH, unrealised reward "
+                f"{spec.extra.get('unrealised_reward_eth', 0):+.4f} ETH."
+            ),
+            "sources_ok":           [],
+            "sources_failed":       [],
+            "no_data":              False,
+            "staking_position":     True,
         }
 
     atype = spec.asset_type
@@ -950,6 +1140,24 @@ async def _synthesise_security(cog, spec: AssetSpec, gather_result: dict,
             "full_report":  f"## {spec.display_name}\n\nStablecoin — NZD {nzd_val:,.0f} held as dry powder. No analysis required.",
         }
 
+    # ── Staking position short-circuit ───────────────────────────────────────
+    if gather_result.get("staking_position"):
+        reward = spec.extra.get("unrealised_reward_eth", 0.0)
+        bond   = spec.extra.get("operator_bond_eth", 0.0)
+        return {
+            "slug":         spec.slug,
+            "display_name": spec.display_name,
+            "status":       "ok",
+            "verdict":      "HOLD",
+            "confidence":   "HIGH",
+            "rationale":    f"Operator bond {bond:.2f} ETH, unrealised consensus reward {reward:+.4f} ETH.",
+            "summary":      [
+                f"Beacon balance {spec.balance:.4f} ETH vs {bond:.2f} ETH bonded.",
+                "No market risk beyond ETH itself — validator infrastructure position, not a security.",
+            ],
+            "full_report":  gather_result.get("gathered", ""),
+        }
+
     # ── Zero-value short-circuit ─────────────────────────────────────────────
     if gather_result.get("zero_value"):
         return {
@@ -1089,7 +1297,7 @@ def _build_buy_signals_block(specs: list, technicals: dict) -> str:
     Returns a formatted string for injection into the overall synthesis prompt.
     Excludes stablecoins, disposal candidates, utility tokens, and eth derivatives.
     """
-    _EXCLUDED_GROUPS = {"stablecoin", "disposal", "utility", "closed", "eth_derivative"}
+    _EXCLUDED_GROUPS = {"stablecoin", "disposal", "utility", "closed", "eth_derivative", "staking_position"}
     signals = []
 
     for spec in specs:
@@ -1520,8 +1728,13 @@ async def _synthesise_overall(
     watchlist: list | None = None,
     portfolio_targets: dict | None = None,
     correlation_analysis: str | None = None,
+    subject_context: dict | None = None,
 ) -> dict:
-    """Overall cross-security synthesis with rebalancing intelligence."""
+    """Overall cross-security synthesis with rebalancing intelligence.
+
+    subject_context — Phase 8b, additive only. When the ledger's subject: tag
+    matches a bootstrapped Subject, its thesis/confidence are injected as
+    background context (see subject_block below). No other logic changes."""
     from adapters.inference_queue import InferenceQueue
 
     today   = date.today().isoformat()
@@ -1626,6 +1839,18 @@ async def _synthesise_overall(
         else ""
     )
 
+    # ── Subject context (Phase 8b) ─────────────────────────────────────────────
+    subject_block = ""
+    if subject_context:
+        _sc_thesis = subject_context.get("thesis", "")
+        _sc_conf   = subject_context.get("confidence", 0)
+        if _sc_thesis:
+            subject_block = (
+                f"\nSUBJECT CONTEXT — Rex's ongoing view on \"{subject_context.get('subject', slug)}\" "
+                f"(confidence {_sc_conf:.0%}):\n{_sc_thesis}\n"
+                "Use this as background if relevant to the review; it is not new instructions.\n"
+            )
+
     # ── Prompt ────────────────────────────────────────────────────────────────
     prompt = f"""You are a Portfolio Manager conducting a periodic review. Today is {today}.
 Review cadence: quarterly rebalancing, monthly purchases considered only on high-signal events.
@@ -1636,6 +1861,7 @@ PER-ASSET VERDICTS:
 CONCENTRATION FLAGS:
 {flag_lines}
 {corr_block}
+{subject_block}
 {buy_signals_block}
 
 PORTFOLIO WATCHLIST (assets to consider on weakness):
@@ -2308,6 +2534,7 @@ async def _run_analysis_task(cog, nanobot, qdrant, category: str, slug: str, sov
         total_cost        = resolve_result["total_cost_basis_nzd"]
         portfolio_targets = resolve_result.get("portfolio_targets", {})
         watchlist         = resolve_result.get("watchlist", [])
+        subject_context   = resolve_result.get("subject_context")
         session_id        = str(uuid.uuid4())
 
         # Concentration flags — deterministic, no LLM, computed once for all assets
@@ -2348,6 +2575,7 @@ async def _run_analysis_task(cog, nanobot, qdrant, category: str, slug: str, sov
             watchlist=watchlist,
             portfolio_targets=portfolio_targets,
             correlation_analysis=correlation_analysis,
+            subject_context=subject_context,
         )
 
         # Write back to Nextcloud ledger

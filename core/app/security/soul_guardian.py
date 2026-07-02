@@ -46,10 +46,14 @@ CHECKSUM_PATH = "/home/sovereign/security/.checksums.json"
 EXTERNAL_COGNITION_PATH        = "/home/sovereign/governance/EXTERNAL_COGNITION.md"
 EXTERNAL_COGNITION_BACKUP_PATH = "/home/sovereign/governance/soul-backup/EXTERNAL_COGNITION.md"
 
+SENSITIVITY_MODEL_PATH        = "/home/sovereign/governance/SENSITIVITY_MODEL.md"
+SENSITIVITY_MODEL_BACKUP_PATH = "/home/sovereign/governance/soul-backup/SENSITIVITY_MODEL.md"
+
 RESTORABLE: dict[str, str] = {
     SOUL_MD_PATH:              SOUL_BACKUP_PATH,
     GOVERNANCE_PATH:           GOVERNANCE_BACKUP_PATH,
     EXTERNAL_COGNITION_PATH:   EXTERNAL_COGNITION_BACKUP_PATH,
+    SENSITIVITY_MODEL_PATH:    SENSITIVITY_MODEL_BACKUP_PATH,
 }
 
 
