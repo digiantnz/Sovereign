@@ -119,6 +119,7 @@ async def score_web_search_for_subjects(cog, nanobot, qdrant, results: list[dict
     critical path. On a relevant match, spawns a real run_campaign(); on borderline,
     logs to the subject's episodic trail. Silent on no matches (no brief to build —
     this isn't a scheduled digest, just an ambient trigger)."""
+    logger.info("score_web_search_for_subjects: called with %d results", len(results) if results else 0)
     if not results:
         return
     entries = [
@@ -131,6 +132,7 @@ async def score_web_search_for_subjects(cog, nanobot, qdrant, results: list[dict
         # relevant to most (or any) Subject; triage first, full-score only hits.
         triage_text = "\n".join(f"{e['title']} — {e['summary'][:150]}" for e in entries)
         subjects = await find_relevant_subjects(qdrant, triage_text)
+        logger.info("score_web_search_for_subjects: triage found %d subject hits", len(subjects))
         for subject in subjects:
             subject_id = subject.get("subject", "")
             scores = await _score_stories_for_subject(cog, subject, entries)

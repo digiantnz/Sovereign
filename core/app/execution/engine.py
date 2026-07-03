@@ -2347,6 +2347,12 @@ class ExecutionEngine:
         self.ledger = ledger
         self.broker = BrokerAdapter()
         self.validator_monitor = ValidatorMonitorAdapter(qdrant)
+        # Strong references for fire-and-forget asyncio.create_task() calls —
+        # without this, a task with no other reference is eligible for garbage
+        # collection mid-execution (a real, reproduced failure: the web search
+        # Subject-scoring trigger's background task silently stopped after its
+        # first await point, no exception, no completion — see _fire_and_forget).
+        self._background_tasks: set = set()
 
 
         self.github = GitHubAdapter()
@@ -2377,6 +2383,20 @@ class ExecutionEngine:
 
     _ITEM_INDEX_FLAG = "_item_index"
     _ZERO_VECTOR = [0.0] * 768
+
+    def _fire_and_forget(self, coro) -> "asyncio.Task":
+        """asyncio.create_task() wrapper that keeps a strong reference until
+        completion. A bare create_task() call with no reference held anywhere
+        makes the task eligible for garbage collection mid-execution — reproduced
+        live 2026-07-03 (web search Subject-scoring trigger silently stopped
+        after its first await, no exception). Use for any new fire-and-forget
+        background work; the ~34 existing bare asyncio.create_task() call sites
+        in this file predate this and are not (yet) migrated — see task backlog."""
+        import asyncio as _asyncio_fw
+        task = _asyncio_fw.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     # SOVEREIGN_CONTEXT static cache — assembled once per boot from SKILL.md files + governance.json
     _sovereign_static_cache: str = ""
@@ -3560,7 +3580,7 @@ class ExecutionEngine:
                     _ws_results = (exec_result.get("result") or {}).get("results")
                     if self.qdrant and self.nanobot and _ws_results:
                         from monitoring.cognition_harness import score_web_search_for_subjects
-                        _asyncio.create_task(score_web_search_for_subjects(
+                        self._fire_and_forget(score_web_search_for_subjects(
                             self.cog, self.nanobot, self.qdrant, _ws_results))
                 else:
                     _rft = self._build_result_for_translator(intent, exec_result)
