@@ -787,8 +787,41 @@ def get_priority_senders() -> list[str]:
     return _cfg.cognition.priority_senders or []
 
 
+def detect_brand_mismatch(subject_line: str, sender: str, body: str = "") -> bool:
+    """Phishing signal — does the sender's display name claim a known brand
+    while the actual sending domain doesn't match that brand's legitimate
+    domain(s)? e.g. "PayPal Support <noreply@totally-not-paypal.xyz>". The
+    single strongest deterministic phishing tell available from metadata
+    alone — no body fetch needed, matches the cost discipline of the rest
+    of the email-scoring pipeline (no LLM, no per-email round-trip).
+
+    `body` is accepted but unused today — reserved for future signals that
+    need full message content (suspicious links, generic-greeting detection,
+    reply-to mismatch) so this function's callers and signature don't need
+    to change when those land; they'll likely be separate sibling functions
+    (e.g. detect_suspicious_links(body)) combined by the caller into one
+    overall phishing_flagged bool, same pattern as this function is combined
+    with future ones — not folded into this one function growing new params.
+
+    known_brands is Director-editable via the dashboard (cognition.
+    known_brands in sovereign-config.yaml) — a starter list of commonly
+    impersonated brands, not an exhaustive one; add to it as misses turn up.
+    """
+    sender_lower = (sender or "").lower()
+    known_brands = _cfg.cognition.known_brands or []
+    for brand in known_brands:
+        name = (brand.get("name") or "").lower()
+        domains = [d.lower() for d in (brand.get("domains") or [])]
+        if not name or not domains:
+            continue
+        if name in sender_lower and not any(d in sender_lower for d in domains):
+            return True
+    return False
+
+
 def derive_urgency(
     subject_line: str, sender: str = "", priority_senders: list[str] | None = None,
+    phishing_flagged: bool = False,
 ) -> tuple[str, float]:
     """Very basic urgency tag — does this need attention now, independent of
     whether it's worth remembering afterward (an ITIL-style Impact/Urgency
@@ -797,14 +830,17 @@ def derive_urgency(
     priority (nothing to learn) — the two axes are meant to diverge, not
     agree, that's the point of tracking them separately.
 
-    A sender on the Director-maintained priority list (see
-    get_priority_senders()) is always "high", full stop — an explicit
-    override takes precedence over pattern matching, not another vote
-    alongside it. Otherwise: keyword hit in the subject line AND an
-    alerting-style sender pattern -> "high". Either alone -> "medium".
-    Neither -> "low". Same 0.25/0.5/0.75 numeric scale as priority for
-    consistency (see derive_priority()'s docstring on why that's shared
-    vocabulary, not a shared meaning).
+    phishing_flagged (caller-computed — see detect_brand_mismatch(), and
+    future body/URL-based signals) DOWNGRADES rather than adds, and takes
+    precedence over everything else, including a priority-sender match: a
+    phishing email borrowing urgent language should read as LESS urgent, not
+    more, since prompting quick action is exactly the attacker's goal.
+    Otherwise: a sender on the Director-maintained priority list (see
+    get_priority_senders()) is "high", full stop. Otherwise: keyword hit in
+    the subject line AND an alerting-style sender pattern -> "high". Either
+    alone -> "medium". Neither -> "low". Same 0.25/0.5/0.75 numeric scale as
+    priority for consistency (see derive_priority()'s docstring on why
+    that's shared vocabulary, not a shared meaning).
 
     priority_senders defaults to get_priority_senders() (config-backed) when
     not passed explicitly — callers scoring many emails in one run should
@@ -814,6 +850,9 @@ def derive_urgency(
     doesn't get checked against today) — keyword-only for now, flagged as a
     known gap rather than half-built.
     """
+    if phishing_flagged:
+        return "low", confidence_to_score("LOW")
+
     if priority_senders is None:
         priority_senders = get_priority_senders()
     if priority_senders:

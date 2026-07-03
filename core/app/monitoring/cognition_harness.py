@@ -306,7 +306,9 @@ async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
     the same expensive mistake as scoring every Subject regardless of
     relevance, just moved one step earlier.
     """
-    from cognition.subjects import find_relevant_subjects, derive_urgency, get_priority_senders
+    from cognition.subjects import (
+        find_relevant_subjects, derive_urgency, get_priority_senders, detect_brand_mismatch,
+    )
 
     priority_senders = get_priority_senders()
 
@@ -328,16 +330,26 @@ async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
         return {"status": "ok", "brief": "No emails fetched this run."}
 
     urgent: list[dict] = []
+    phishing: list[dict] = []
     relevant: list[dict] = []
     routine_count = 0
 
     for email in all_emails:
         subject_line = email.get("subject", "")
         sender = email.get("from", "")
-        urgency_label, _ = derive_urgency(subject_line, sender, priority_senders=priority_senders)
+        phishing_flagged = detect_brand_mismatch(subject_line, sender)
+        urgency_label, _ = derive_urgency(
+            subject_line, sender, priority_senders=priority_senders, phishing_flagged=phishing_flagged,
+        )
         hits = await find_relevant_subjects(qdrant, f"{subject_line} — from {sender}")
 
-        if urgency_label == "high":
+        if phishing_flagged:
+            # Distinct bucket, not silently folded into "routine" — a brand-
+            # mismatch email is actively suspicious, not merely uninteresting.
+            # Urgency is deliberately capped at "low" by derive_urgency()
+            # above (see its docstring) so it never lands in "Urgent" either.
+            phishing.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
+        elif urgency_label == "high":
             urgent.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
         elif hits:
             relevant.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
@@ -350,6 +362,10 @@ async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
         for e in urgent:
             tag = f" [{', '.join(e['matched_subjects'])}]" if e["matched_subjects"] else ""
             lines.append(f"• {e.get('subject','(no subject)')} — {e.get('from','')} ({e.get('account')}){tag}")
+    if phishing:
+        lines.append(f"\n🎣 Possible phishing ({len(phishing)}) — sender name doesn't match its domain:")
+        for e in phishing:
+            lines.append(f"• {e.get('subject','(no subject)')} — {e.get('from','')} ({e.get('account')})")
     if relevant:
         lines.append(f"\nSubject-relevant ({len(relevant)}):")
         for e in relevant:

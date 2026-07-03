@@ -142,6 +142,21 @@ _DEFAULTS: dict = {
             "legal notice", "warning",
         ],
         "priority_senders": ["alert@uptimerobot.com"],
+        "known_brands": [
+            {"name": "paypal", "domains": ["paypal.com"]},
+            {"name": "microsoft", "domains": ["microsoft.com", "outlook.com", "office.com", "live.com"]},
+            {"name": "apple", "domains": ["apple.com", "icloud.com"]},
+            {"name": "google", "domains": ["google.com", "gmail.com"]},
+            {"name": "amazon", "domains": ["amazon.com", "amazon.co.nz"]},
+            {"name": "netflix", "domains": ["netflix.com"]},
+            {"name": "anz", "domains": ["anz.co.nz", "anz.com"]},
+            {"name": "asb", "domains": ["asb.co.nz"]},
+            {"name": "westpac", "domains": ["westpac.co.nz", "westpac.com.au"]},
+            {"name": "bnz", "domains": ["bnz.co.nz"]},
+            {"name": "kiwibank", "domains": ["kiwibank.co.nz"]},
+            {"name": "ird", "domains": ["ird.govt.nz"]},
+            {"name": "xero", "domains": ["xero.com"]},
+        ],
     },
 }
 
