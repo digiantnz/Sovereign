@@ -703,27 +703,17 @@ class CognitionEngine:
         if not self.qdrant:
             return _empty
         try:
-            from qdrant_client.models import Filter, FieldCondition, MatchValue
-            from execution.adapters.qdrant import SEMANTIC
-            vector = await self.qdrant._embed(user_input)
-            resp = await self.qdrant.archive_client.query_points(
-                collection_name=SEMANTIC,
-                query=vector,
-                query_filter=Filter(
-                    must=[FieldCondition(key="domain", match=MatchValue(value="subject"))],
-                ),
-                limit=1,
-                score_threshold=SUBJECT_ROUTING_THRESHOLD,
-                with_payload=True,
+            from cognition.subjects import find_relevant_subjects
+            hits = await find_relevant_subjects(
+                self.qdrant, user_input, threshold=SUBJECT_ROUTING_THRESHOLD, limit=1,
             )
-            if not resp.points:
+            if not hits:
                 return _empty
-            hit = resp.points[0]
-            payload = hit.payload or {}
+            payload = hits[0]
             return {
                 "matched":    True,
                 "subject_id": payload.get("subject", ""),
-                "score":      round(hit.score, 4),
+                "score":      payload.get("_triage_score", 0.0),
                 "thesis":     payload.get("thesis", ""),
                 "confidence": payload.get("confidence", 0.0),
             }

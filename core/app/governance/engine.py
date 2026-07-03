@@ -186,8 +186,10 @@ class GovernanceEngine:
             if operation in ('observe', 'proposals', 'baseline') and rules.get('memory_write', False):
                 return rules
         elif domain == 'learning':
-            # Learning harness — queue_url writes a .url shortcut to Nextcloud /downloads/
-            if operation == 'queue_url' and rules.get('memory_write', False):
+            # Learning harness — queue_url writes a .url shortcut to Nextcloud /downloads/;
+            # learn_email reads an email then writes semantic/relational memory (same
+            # pipeline as /learn text/URL)
+            if operation in ('queue_url', 'learn_email') and rules.get('memory_write', False):
                 return rules
         elif domain == 'memory_synthesise':
             # Nightly associative synthesis — reads semantic, writes associative collection
@@ -237,11 +239,11 @@ class GovernanceEngine:
             if operation == 'set_flag':
                 return rules
         elif domain == 'cognition':
-            # Cognition Engine — RSS subject scoring (reads RSS, writes campaign notes +
-            # semantic/episodic memory) and Subject Update approve/reject replies (writes
-            # Nextcloud note + semantic memory). Both LOW tier — same memory_write gate
-            # already used by learning/memory_synthesise for read+write memory operations.
-            if operation in ('score_rss', 'confirm_update') and rules.get('memory_write', False):
+            # Cognition Engine — RSS subject scoring (reads RSS, writes semantic/episodic
+            # memory), Subject Update approve/reject replies, and Subject note resync
+            # (writes Nextcloud note + semantic memory). All LOW tier — same memory_write
+            # gate already used by learning/memory_synthesise for read+write memory ops.
+            if operation in ('score_rss', 'confirm_update', 'resync_subject') and rules.get('memory_write', False):
                 return rules
         elif domain == 'governance_read':
             # Deterministic read of governance.json — always read-only, LOW tier

@@ -79,7 +79,8 @@ Respond with JSON only — no preamble:
 {{"scores": [{{"index": 0, "relevance": "relevant|borderline|ignore"}}, ...]}}"""
 
     try:
-        result = await cog.ask_local(prompt, timeout=90.0)
+        from adapters.inference_queue import InferenceQueue
+        result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=90.0)
         raw = result.get("response", "")
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         data = json.loads(m.group(0)) if m else {}
@@ -95,20 +96,54 @@ Respond with JSON only — no preamble:
         return {}
 
 
-async def _log_borderline(qdrant, subject_id: str, story_title: str) -> None:
+async def _log_borderline(qdrant, subject_id: str, story_title: str, trigger_source: str = "rss") -> None:
     try:
         from datetime import date
         await qdrant.store(
             collection="episodic",
-            content=f"RSS story judged borderline-relevant to subject '{subject_id}': {story_title}",
+            content=f"{trigger_source} item judged borderline-relevant to subject '{subject_id}': {story_title}",
             metadata={
                 "type": "episodic", "event_type": "borderline_relevance",
                 "subject": subject_id, "story_title": story_title,
-                "ts": date.today().isoformat(),
+                "trigger_source": trigger_source, "ts": date.today().isoformat(),
             },
         )
     except Exception as exc:
         logger.warning("_log_borderline: failed for subject=%r: %s", subject_id, exc)
+
+
+async def score_web_search_for_subjects(cog, nanobot, qdrant, results: list[dict]) -> None:
+    """Fire-and-forget: score a web search's structured results against active
+    Subjects, same scoring pattern as the RSS scorer. Called via asyncio.create_task
+    right after a "search the web" call returns — never on the Director's response
+    critical path. On a relevant match, spawns a real run_campaign(); on borderline,
+    logs to the subject's episodic trail. Silent on no matches (no brief to build —
+    this isn't a scheduled digest, just an ambient trigger)."""
+    if not results:
+        return
+    entries = [
+        {"title": r.get("title", "(no title)"), "summary": r.get("snippet", ""), "feed": r.get("url", "")}
+        for r in results
+    ]
+    try:
+        from cognition.subjects import find_relevant_subjects
+        # One embed call, not one LLM call per subject — most searches aren't
+        # relevant to most (or any) Subject; triage first, full-score only hits.
+        triage_text = "\n".join(f"{e['title']} — {e['summary'][:150]}" for e in entries)
+        subjects = await find_relevant_subjects(qdrant, triage_text)
+        for subject in subjects:
+            subject_id = subject.get("subject", "")
+            scores = await _score_stories_for_subject(cog, subject, entries)
+            for idx, relevance in scores.items():
+                if idx >= len(entries):
+                    continue
+                title = entries[idx]["title"]
+                if relevance == "relevant":
+                    await run_campaign(qdrant, nanobot, cog, subject_id, "web_search", title)
+                elif relevance == "borderline":
+                    await _log_borderline(qdrant, subject_id, title, trigger_source="web_search")
+    except Exception as exc:
+        logger.warning("score_web_search_for_subjects: failed: %s", exc)
 
 
 async def _digest_remaining_stories(cog, entries: list[dict], remaining_indices: list[int]) -> dict:
@@ -152,7 +187,8 @@ Only include indices worth keeping — omit the noise you filtered."""
         "dropped": 0,
     }
     try:
-        result = await cog.ask_local(prompt, timeout=90.0)
+        from adapters.inference_queue import InferenceQueue
+        result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=90.0)
         raw = result.get("response", "")
         m = re.search(r'\{.*\}', raw, re.DOTALL)
         data = json.loads(m.group(0)) if m else None

@@ -125,6 +125,7 @@ INTENT_ACTION_MAP = {
     "news_brief":         {"domain": "news",    "operation": "brief"},
     "score_rss_by_subject": {"domain": "cognition", "operation": "score_rss"},
     "cognition_confirm_update": {"domain": "cognition", "operation": "confirm_update"},
+    "cognition_learn_subject": {"domain": "cognition", "operation": "resync_subject"},
     # Tax ingest harness intents (Phase 1 — continuous hourly ingest)
     "tax_status":        {"domain": "tax", "operation": "status"},
     "tax_ingest_run":    {"domain": "tax", "operation": "run"},
@@ -182,6 +183,7 @@ INTENT_ACTION_MAP = {
     "self_improve_dismiss":    {"domain": "monitoring", "operation": "dismiss"},
     "learning_harness_status": {"domain": "monitoring", "operation": "learning_status"},
     "learn_url":               {"domain": "learning",   "operation": "queue_url"},
+    "learn_email":             {"domain": "learning",   "operation": "learn_email"},
     # Self-diagnostic intents — all LOW, all read-only
     "read_audit_log":          {"domain": "docker", "operation": "read", "name": "host_file_read",
                                  "path": "/home/sovereign/audit/security-ledger.jsonl"},
@@ -309,6 +311,7 @@ INTENT_TIER_MAP = {
     "news_brief": "LOW",
     "score_rss_by_subject": "LOW",
     "cognition_confirm_update": "LOW",
+    "cognition_learn_subject": "LOW",
     "tax_status": "LOW", "tax_ingest_run": "LOW", "tax_ingest_store": "MID",
     "tax_list_events": "LOW", "tax_year_summary": "LOW",
     "tax_query": "LOW", "tax_address_list": "LOW", "tax_ingest_status": "LOW",
@@ -383,6 +386,7 @@ INTENT_TIER_MAP = {
     "self_improve_dismiss":    "LOW",
     "learning_harness_status": "LOW",
     "learn_url":               "LOW",
+    "learn_email":             "LOW",
     # Self-diagnostic read intents — LOW
     "read_audit_log":          "LOW",
     "memory_promotion_status": "LOW",
@@ -962,6 +966,31 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "target": _cog_confirm_m.group(2), "tier": "LOW",
             "approved": _cog_confirm_m.group(1) == "approve",
             "reasoning_summary": "Subject Update approve/reject reply — deterministic pre-classifier",
+        }
+
+    # ── Cognition Engine — "learn subject <id>" note resync ────────────────────
+    # Director points at a Subject to reconcile hand-edited note content (pasted
+    # analysis) back into Qdrant. Deterministic — the subject name IS the target,
+    # no LLM planning needed.
+    _cog_learn_m = _re_cog.search(r'\blearn\s+subject\s+([a-z][a-z0-9_-]{1,30})\b', u)
+    if _cog_learn_m:
+        return {
+            "delegate_to": "memory_agent", "intent": "cognition_learn_subject",
+            "target": _cog_learn_m.group(1), "tier": "LOW",
+            "reasoning_summary": "Subject note resync — deterministic pre-classifier",
+        }
+
+    # ── /learn from a specific email — feeds its body through the same
+    # learn_on_demand pipeline as text/URL, including Subject scoring ─────────
+    _learn_email_m = _re_cog.search(
+        r'\blearn\s+(?:from\s+)?(?:this\s+)?(business|work|digiant|personal)?\s*email\s+(?:id\s+)?(\d+)\b', u)
+    if _learn_email_m:
+        _acct_word = _learn_email_m.group(1)
+        _acct = "business" if _acct_word in ("business", "work", "digiant") else "personal"
+        return {
+            "delegate_to": "memory_agent", "intent": "learn_email",
+            "target": _learn_email_m.group(2), "account": _acct, "tier": "LOW",
+            "reasoning_summary": "Learn from a specific email by ID — deterministic pre-classifier",
         }
 
     # ── URL fetch — explicit https?:// present in input ────────────────────
@@ -3285,7 +3314,7 @@ class ExecutionEngine:
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read", "cognition"):
+        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read", "cognition", "learning"):
             if action.get("domain") == "ollama":
                 import re as _re_sc
                 _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok|from grok|check grok|check with grok|query grok)\b', _re_sc.IGNORECASE)
@@ -3468,6 +3497,17 @@ class ExecutionEngine:
                                                    payload={"confirmed": confirmed},
                                                    security_confirmed=security_confirmed)
                 _rft = self._build_result_for_translator(intent, exec_result)
+            elif action.get("domain") == "learning":
+                # queue_url/learn_email — _quick_classify already extracts the URL/email
+                # id deterministically into `target`; direct dispatch avoids specialist
+                # re-planning inventing an operation name INTENT_ACTION_MAP didn't specify
+                # (observed: "learn_email" replanned into a nonexistent "read_email" nc-mail
+                # op, costing an extra LLM call and producing a bad action).
+                exec_result = await self._dispatch(action, user_input,
+                                                   delegation={**delegation, "intent": intent},
+                                                   payload={"confirmed": confirmed},
+                                                   security_confirmed=security_confirmed)
+                _rft = self._build_result_for_translator(intent, exec_result)
             elif action.get("domain") == "research":
                 exec_result = await self._dispatch(action, user_input,
                                                    delegation={**delegation, "intent": intent},
@@ -3515,6 +3555,13 @@ class ExecutionEngine:
                         and action.get("operation", "search") == "search"
                         and exec_result.get("status") == "ok"):
                     _rft = await self._web_search_rft(exec_result)
+                    # Cognition Engine: score search results against active Subjects,
+                    # non-blocking — never adds latency to the Director's response.
+                    _ws_results = (exec_result.get("result") or {}).get("results")
+                    if self.qdrant and self.nanobot and _ws_results:
+                        from monitoring.cognition_harness import score_web_search_for_subjects
+                        _asyncio.create_task(score_web_search_for_subjects(
+                            self.cog, self.nanobot, self.qdrant, _ws_results))
                 else:
                     _rft = self._build_result_for_translator(intent, exec_result)
             director_msg = await self.cog.translator_pass(_rft, tier=tier)
@@ -3826,9 +3873,6 @@ class ExecutionEngine:
         # Cognition Engine: this turn matched a known Subject (PASS 1) — check if it
         # warrants a campaign. Non-blocking; "was this material" is left to the
         # campaign's own research→evaluate loop rather than duplicated here.
-        # run_campaign() (not create_campaign() alone) — a campaign that only got
-        # created and never run would sit at status:planning forever, since nothing
-        # else picks it up for the conversational trigger path.
         if self.qdrant and self.nanobot and _execution_confirmed and delegation.get("_subject_matched"):
             from cognition.campaigns import run_campaign
             _asyncio.create_task(run_campaign(
@@ -3863,9 +3907,11 @@ class ExecutionEngine:
             "self_improve_observe", "self_improve_proposals", "self_improve_baseline", "self_improve_dismiss",
             "learning_harness_status",  # status query — last run summary passes directly
             "learn_url",                # structured queue result — bypass translator
+            "learn_email",              # learn_on_demand summary — self-descriptive, passes directly
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "score_rss_by_subject",     # cognition harness brief — passes directly
             "cognition_confirm_update", # approve/reject result — self-descriptive, passes directly
+            "cognition_learn_subject",  # note resync result — self-descriptive, passes directly
             "research_gather", "research_save", "research_clear",
             "portfolio_analysis", "portfolio_analysis_save", "portfolio_analysis_clear",
             "portfolio_watcher_scan",   # watcher result passes directly; harness sends its own Telegram
@@ -6464,6 +6510,10 @@ class ExecutionEngine:
                 subject_id = (delegation or {}).get("target") or ""
                 approved = bool((delegation or {}).get("approved"))
                 return await apply_subject_update(self.qdrant, self.nanobot, subject_id, approved)
+            if operation == "resync_subject":
+                from cognition.subjects import resync_subject_from_note
+                subject_id = (delegation or {}).get("target") or ""
+                return await resync_subject_from_note(self.qdrant, self.nanobot, self.cog, subject_id)
             return {"status": "error", "error": f"unknown cognition operation: {operation}"}
 
         if domain == "research":
@@ -6746,6 +6796,28 @@ class ExecutionEngine:
                     "url_slug":  _slug,
                     "sentinel_processed": f"episodic:learning:processed:{_slug}",
                     "sentinel_failed":    f"episodic:learning:failed:{_slug}",
+                }
+            if operation == "learn_email":
+                database_id = (delegation or {}).get("target") or ""
+                account = (delegation or {}).get("account") or "personal"
+                if not database_id:
+                    return {"status": "error", "error": "email databaseId required"}
+                nb = await self.nanobot.run("nc-mail", "fetch_message",
+                                             {"account": account, "database_id": database_id})
+                nb_result = nb.get("result") if nb.get("result") is not None else nb
+                body = nb_result.get("body", "") if isinstance(nb_result, dict) else ""
+                if not body:
+                    return {"status": "error", "error": f"could not fetch email {database_id!r}"}
+                subj_line = nb_result.get("subject", "")
+                sender = nb_result.get("from", "")
+                from monitoring.learning_harness import learn_on_demand
+                learn_result = await learn_on_demand(
+                    text=body, source_label=f"Email: {subj_line} (from {sender})",
+                    qdrant=self.qdrant, cog=self.cog, nanobot=self.nanobot,
+                )
+                return {
+                    "status":  learn_result.get("status", "ok"),
+                    "summary": learn_result.get("result_for_translator", ""),
                 }
             return {"status": "error", "error": f"unknown learning operation: {operation}"}
 

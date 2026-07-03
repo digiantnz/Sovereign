@@ -148,7 +148,7 @@ def _chunk_text(text: str) -> list:
     if current:
         chunks.append(" ".join(current))
 
-    return [c for c in chunks if c.strip()]
+    return chunks
 
 
 # ── Sentinel helpers ──────────────────────────────────────────────────────────
@@ -1270,6 +1270,11 @@ async def learn_on_demand(text: str, source_label: str, qdrant, cog, nanobot,
     gaps          = loop_result["gaps"]
     timeout_skips = loop_result.get("timeout_skips", 0)
 
+    from cognition.subjects import find_relevant_subjects, score_and_fold_subjects, derive_priority
+    triage_hits = await find_relevant_subjects(qdrant, text)
+    priority_label, priority_score = derive_priority(triage_hits)
+    subject_folds = await score_and_fold_subjects(qdrant, cog, text, source_label, subjects=triage_hits)
+
     already_known = [e.get("title") or e.get("_key") or "?" for e in doc_array[:5]]
 
     lines = [f"Learnt from: {source_label}"]
@@ -1288,6 +1293,11 @@ async def learn_on_demand(text: str, source_label: str, qdrant, cog, nanobot,
     if gaps:
         gap_text = "; ".join(g.get("gap_description") or g.get("key", "?") for g in gaps[:3])
         lines.append(f"Knowledge gaps: {gap_text}")
+    if subject_folds:
+        lines.append("\nSubjects updated:")
+        for f in subject_folds:
+            lines.append(f"• {f['subject_id']}: " + "; ".join(f["added"]))
+    lines.append(f"\nPriority: {priority_label} ({len(triage_hits)} subject(s) matched)")
 
     return {
         "status":                "ok",
@@ -1295,6 +1305,9 @@ async def learn_on_demand(text: str, source_label: str, qdrant, cog, nanobot,
         "updated":               updated,
         "cycles":                cycles,
         "already_known_count":   len(doc_array),
+        "priority":              priority_label,
+        "priority_score":        priority_score,
+        "subject_folds":         subject_folds,
         "result_for_translator": "\n".join(lines),
     }
 

@@ -25,6 +25,7 @@ Output: JSON to stdout.  Errors: {"status":"error","error":"..."} + exit 1.
 """
 
 import argparse
+import html as _html_mod
 import json
 import os
 import re
@@ -150,12 +151,38 @@ def _fmt_date(ts):
         return str(ts)
 
 
+# Zero-width/invisible chars email templates use for anti-clipping and open
+# tracking (zwsp ​, zwnj ‌, zwj ‍, word joiner ⁠,
+# BOM/ZWNBSP ﻿, soft hyphen ­) — silent noise to a human, but each
+# one is a real token/character an LLM has to burn context budget on.
+# Decoding HTML entities (&zwnj; etc.) turns these from inert markup into
+# literal characters, so they must be stripped explicitly (escapes, not
+# literal characters, so this stays verifiable in a diff/editor).
+_INVISIBLE_CHARS_RE = re.compile("[​‌‍⁠﻿­]")
+
+
 def _strip_html(html):
-    """Strip HTML tags; collapse whitespace for readable plain text."""
+    """Strip HTML down to dense, LLM-ready plain text — not just human-
+    readable, but token-efficient: every character surviving into the
+    output should carry actual information.
+
+    <style>/<script> blocks are removed entirely (tags AND content) before
+    the generic tag strip — CSS/JS body text doesn't use <> bracket syntax,
+    so a tags-only strip leaves it behind as "readable text" verbatim. This
+    was silently dumping hundreds of lines of inline CSS into email bodies
+    for HTML-heavy newsletter-style senders, overwhelming downstream LLM
+    calls (PASS 5 translator, /learn's content pipeline) that treat this
+    field as plain text.
+    """
     if not html or "<" not in html:
         return html or ""
-    text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"(?is)<(style|script)\b[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _html_mod.unescape(text)
+    text = _INVISIBLE_CHARS_RE.sub("", text)
+    text = text.replace(" ", " ")  # non-breaking space -> regular space
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
