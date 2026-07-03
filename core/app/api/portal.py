@@ -156,6 +156,18 @@ HARNESS_DEFS = [
         "trigger": "Director-initiated",
         "hitl":   True,
     },
+    {
+        "key":    "cognition_engine",
+        "name":   "Cognition Engine (Subjects/Campaigns)",
+        "flag":   "_cognition_campaign",   # per-campaign checkpoint — multiple can
+                                            # run concurrently; this shows whichever
+                                            # the scroll finds first, not an exhaustive
+                                            # list (see _get_harness_sessions — first
+                                            # match per flag, not accumulated)
+        "phases": ["Research", "Evaluate", "Propose Update", "Director Approve/Reject"],
+        "trigger": "RSS scan / email scan / web search / conversation / /learn",
+        "hitl":   True,
+    },
 ]
 
 
