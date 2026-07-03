@@ -38,6 +38,22 @@ from monitoring.research_harness import (
 
 logger = logging.getLogger(__name__)
 
+# Strong references for fire-and-forget asyncio.create_task() calls — a task
+# with no reference held anywhere is eligible for garbage collection mid-
+# execution (a documented Python gotcha, reproduced live 2026-07-03 in the
+# Cognition Engine's web search trigger — see ExecutionEngine._fire_and_forget
+# in execution/engine.py for the original fix and full explanation). This
+# module has no long-lived object to hang a method off, so a bare module-
+# level set does the same job.
+_background_tasks: set = set()
+
+
+def _fire_and_forget(coro) -> "asyncio.Task":
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 async def _notify_telegram(message: str) -> None:
     token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -1229,24 +1245,20 @@ async def _synthesise_security(cog, spec: AssetSpec, gather_result: dict,
 
     # ── Phase 2 — fund and property: migrate to engine when analyst prompts
     #    are designed for non-securities. Until then, existing single-call path.
+    #
+    # Forced local (2026-07-03) — this prompt carries exact position data (cost
+    # basis, balance, unrealised P&L, portfolio weight). DCL classifies it
+    # WORKSPACE_INTERNAL by default (no pattern for financial figures — see
+    # task for the proper system-wide DCL fix), which IS eligible for external
+    # routing per governance.json's provider_registry, so the old comment
+    # ("non-sensitive after DCL gate") was a blind spot, not a reviewed
+    # decision. This step doesn't need external routing's actual value
+    # (real-time web access) anyway — research/gathering already happened
+    # upstream; this is pure synthesis over already-gathered text, which
+    # Qwen3-32B handles fine locally. Narrow, scoped fix — not a DCL rewrite.
     prompt = _build_synthesis_prompt(spec, gather_result.get("gathered", ""))
     try:
-        _decision = cog._routing_decision(
-            prompt, user_input=spec.display_name, task_type="llm_generate",
-            delegation_reason="Portfolio asset synthesis — non-sensitive after DCL gate",
-        )
-        if _decision["use_external"]:
-            _dispatch_map = {
-                "grok":           cog.ask_grok,
-                "gemini":         cog.ask_gemini,
-                "groq_inference": cog.ask_groq_inf,
-                "openrouter":     cog.ask_openrouter,
-                "ollama_cloud":   cog.ask_ollama_cloud,
-            }
-            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
-            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
-        else:
-            result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT)
+        result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT)
     except Exception as exc:
         logger.error("portfolio_harness: synthesis error for %s: %s", spec.slug, exc)
         return {
@@ -1928,20 +1940,15 @@ End with ONLY this JSON block — no text after it:
 }}
 ```"""
 
+    # Forced local (2026-07-03) — same reasoning as the per-asset synthesis
+    # above: this prompt carries total portfolio value, cost basis, per-asset
+    # P&L/weight, concentration flags, tax-cost estimates, and (since Phase
+    # 8b) the Subject's thesis/confidence — the single most sensitive prompt
+    # in this file, and it was routing through the same WORKSPACE_INTERNAL-
+    # eligible external path with no real capability benefit (pure synthesis
+    # over already-gathered text, no live web access needed here).
     try:
-        _decision = cog._routing_decision(prompt, user_input=category, task_type="llm_generate")
-        if _decision["use_external"]:
-            _dispatch_map = {
-                "grok":           cog.ask_grok,
-                "gemini":         cog.ask_gemini,
-                "groq_inference": cog.ask_groq_inf,
-                "openrouter":     cog.ask_openrouter,
-                "ollama_cloud":   cog.ask_ollama_cloud,
-            }
-            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
-            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
-        else:
-            result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT)
+        result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=_SYNTHESIS_TIMEOUT)
     except Exception as exc:
         logger.error("portfolio_harness: overall synthesis error: %s", exc)
         return {
@@ -2577,6 +2584,58 @@ async def _run_analysis_task(cog, nanobot, qdrant, category: str, slug: str, sov
             correlation_analysis=correlation_analysis,
             subject_context=subject_context,
         )
+
+        # Cognition Engine gap-check — Phase 11 (2026-07-03). The portfolio's
+        # job ends at "does this analysis reveal something the Subject's
+        # thesis doesn't account for" — reuses the Cognition Engine's own
+        # evaluator (evaluate_campaign_iteration) rather than a bespoke
+        # comparison, so the portfolio harness doesn't grow a second opinion
+        # on what counts as a gap. If one is found, hand off entirely: a full
+        # campaign (its own research -> evaluate -> propose Subject Update)
+        # runs fire-and-forget, never blocking the Director-facing portfolio
+        # result. Portfolio events never spawn campaigns speculatively —
+        # only on an explicitly-identified gap (Director's design decision).
+        if subject_context and subject_context.get("subject"):
+            try:
+                from cognition.subjects import evaluate_campaign_iteration, get_confidence_target
+                from cognition.campaigns import run_campaign
+                _gap_subject_id = subject_context["subject"]
+                _portfolio_as_research = {
+                    # No natural research-confidence equivalent for a portfolio
+                    # run (health_score measures something different) — MEDIUM
+                    # is a neutral default; the LLM gap-check judges substance,
+                    # not a self-reported number that doesn't really apply here.
+                    "confidence": "MEDIUM",
+                    "telegram_summary": [
+                        overall.get("executive_summary", ""),
+                        f"Key risk: {overall.get('key_risk', '')}",
+                        f"Key opportunity: {overall.get('key_opportunity', '')}",
+                    ],
+                }
+                _gap_eval = await evaluate_campaign_iteration(
+                    cog, subject_context.get("thesis", ""),
+                    get_confidence_target(subject_context),
+                    _portfolio_as_research, iterations_used=0, max_iterations=1,
+                )
+                if _gap_eval["resolvable_gaps"]:
+                    # Carry the portfolio's actual finding, not just the extracted
+                    # questions — a campaign trigger of only "what is the probability
+                    # X is enforced within 6 months?" gives the research agent no
+                    # grounding for what X even is. Lead with what was found, then
+                    # the specific unknowns.
+                    _gap_summary = (
+                        f"Portfolio analysis found: {overall.get('key_risk', '')} "
+                        f"Open questions: {'; '.join(_gap_eval['resolvable_gaps'])}"
+                    )
+                    logger.info(
+                        "portfolio_harness: gap identified for subject=%r — spawning campaign: %s",
+                        _gap_subject_id, _gap_summary,
+                    )
+                    _fire_and_forget(run_campaign(
+                        qdrant, nanobot, cog, _gap_subject_id, "portfolio", _gap_summary,
+                    ))
+            except Exception as exc:
+                logger.warning("portfolio_harness: gap-check failed (non-fatal): %s", exc)
 
         # Write back to Nextcloud ledger
         try:
