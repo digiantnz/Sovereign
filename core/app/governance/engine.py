@@ -239,11 +239,12 @@ class GovernanceEngine:
             if operation == 'set_flag':
                 return rules
         elif domain == 'cognition':
-            # Cognition Engine — RSS subject scoring (reads RSS, writes semantic/episodic
-            # memory), Subject Update approve/reject replies, and Subject note resync
+            # Cognition Engine — RSS/email subject scoring (read-only triage, no
+            # memory writes for score_email — see run_score_email_by_subject),
+            # Subject Update approve/reject replies, and Subject note resync
             # (writes Nextcloud note + semantic memory). All LOW tier — same memory_write
             # gate already used by learning/memory_synthesise for read+write memory ops.
-            if operation in ('score_rss', 'confirm_update', 'resync_subject') and rules.get('memory_write', False):
+            if operation in ('score_rss', 'score_email', 'confirm_update', 'resync_subject') and rules.get('memory_write', False):
                 return rules
         elif domain == 'governance_read':
             # Deterministic read of governance.json — always read-only, LOW tier

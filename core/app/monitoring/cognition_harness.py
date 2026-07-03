@@ -1,9 +1,10 @@
-"""Cognition Engine — RSS subject-relevance scoring.
+"""Cognition Engine — RSS and email subject-relevance scoring for the
+Weekday Morning Briefing.
 
-Replaces the read_feed step in the Weekday Morning Briefing task (does not
-append after it — task_scheduler.py steps don't share data with each other,
-each step is dispatched independently and only its rendered summary is
-joined at the end, so a scoring step has to fetch its own RSS entries).
+Both replace (not append after) existing briefing steps — task_scheduler.py
+steps don't share data with each other, each step is dispatched independently
+and only its rendered summary is joined at the end, so a scoring step has to
+fetch its own entries.
 
 Many-to-many: every story is scored against every active subject (no
 feed-to-subject membership filtering — 14 feeds span ai/crypto/macro without
@@ -277,5 +278,84 @@ async def run_score_rss_by_subject(cog, nanobot, qdrant) -> dict:
             lines.append(f"• {s['title']} [{s['source']}]{one_line}")
     if digest["dropped"]:
         lines.append(f"\n({digest['dropped']} low-signal item(s) filtered)")
+
+    return {"status": "ok", "brief": "\n".join(lines)}
+
+
+_EMAIL_ACCOUNTS = ("personal", "business")
+_EMAIL_LIMIT = 20  # per account
+
+
+async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
+    """Weekday Morning Briefing step — replaces the flat per-account fetch_email
+    steps (same reason as run_score_rss_by_subject: steps don't share data,
+    a scoring step has to fetch its own mail).
+
+    Prioritization only — unlike RSS/web search, a subject-relevant email
+    never spawns a campaign (Director's explicit design decision: emails are
+    triaged for display, not treated as a research trigger). `/learn from
+    email <id>` remains the supported path for folding an email's content
+    into Subject knowledge on demand.
+
+    No LLM calls at all — cheap by design. Subject-relevance uses the same
+    embedding-only triage as /learn and the web search trigger
+    (find_relevant_subjects); urgency uses deterministic keyword/sender
+    pattern matching (derive_urgency) — an LLM call per email would not
+    scale with inbox volume the way a fixed handful of Subjects does.
+    Metadata only (subject/sender), not body — fetching every body would be
+    the same expensive mistake as scoring every Subject regardless of
+    relevance, just moved one step earlier.
+    """
+    from cognition.subjects import find_relevant_subjects, derive_urgency, get_priority_senders
+
+    priority_senders = await get_priority_senders(qdrant)
+
+    all_emails: list[dict] = []
+    for account in _EMAIL_ACCOUNTS:
+        try:
+            nb = await nanobot.run("nc-mail", "list_unread",
+                                    {"account": account, "limit": _EMAIL_LIMIT, "unread_only": "false"})
+            result = nb.get("result") if nb.get("result") is not None else nb
+            msgs = result.get("messages", []) if isinstance(result, dict) else []
+        except Exception as exc:
+            logger.warning("run_score_email_by_subject: fetch failed for account=%r: %s", account, exc)
+            msgs = []
+        for m in msgs:
+            m["account"] = account
+        all_emails.extend(msgs)
+
+    if not all_emails:
+        return {"status": "ok", "brief": "No emails fetched this run."}
+
+    urgent: list[dict] = []
+    relevant: list[dict] = []
+    routine_count = 0
+
+    for email in all_emails:
+        subject_line = email.get("subject", "")
+        sender = email.get("from", "")
+        urgency_label, _ = derive_urgency(subject_line, sender, priority_senders=priority_senders)
+        hits = await find_relevant_subjects(qdrant, f"{subject_line} — from {sender}")
+
+        if urgency_label == "high":
+            urgent.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
+        elif hits:
+            relevant.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
+        else:
+            routine_count += 1
+
+    lines = [f"{len(all_emails)} email(s) across {len(_EMAIL_ACCOUNTS)} account(s)."]
+    if urgent:
+        lines.append(f"\n⚠️ Urgent ({len(urgent)}):")
+        for e in urgent:
+            tag = f" [{', '.join(e['matched_subjects'])}]" if e["matched_subjects"] else ""
+            lines.append(f"• {e.get('subject','(no subject)')} — {e.get('from','')} ({e.get('account')}){tag}")
+    if relevant:
+        lines.append(f"\nSubject-relevant ({len(relevant)}):")
+        for e in relevant:
+            lines.append(f"• {e.get('subject','(no subject)')} — {e.get('from','')} "
+                         f"({e.get('account')}) [{', '.join(e['matched_subjects'])}]")
+    if routine_count:
+        lines.append(f"\n{routine_count} routine email(s) — no Subject match, not urgent.")
 
     return {"status": "ok", "brief": "\n".join(lines)}

@@ -745,6 +745,100 @@ def derive_priority(hits: list) -> tuple[str, float]:
     return label, confidence_to_score(label.upper())
 
 
+# Cheap, deterministic — no LLM, no embedding. Urgency is a fundamentally
+# different signal from priority (relevance-breadth via Subject triage):
+# Subjects encode topics, not time-sensitivity, so embedding-similarity
+# can't produce this for free the way it does for priority. An LLM call
+# per item would reintroduce the exact per-item cost problem fixed earlier
+# tonight (score_and_fold_subjects, web search trigger) — so this stays
+# pattern-matching only. Narrower than an LLM classifier (will miss novel
+# phrasings) but free, fast, and won't silently balloon briefing cost as
+# inbox volume grows.
+#
+# Categories (Director-specified 2026-07-03): time-signal, financial/legal,
+# infrastructure/service-health, harness/job failures, threshold breaches,
+# backup failures. Deliberately grouped into one regex, not one per category
+# — the label only needs "did anything match," not which category.
+_URGENCY_KEYWORDS_RE = re.compile(
+    r'\b('
+    # time-signal
+    r'urgent|action required|expires?|expired|deadline|overdue|immediately|'
+    # infrastructure / service health
+    r'down|alert|failed|failure|outage|unhealthy|unreachable|degraded|critical|'
+    # threshold breaches
+    r'threshold|missed attestation|disk full|out of memory|low disk|'
+    # backups
+    r'backup failed|backup failure|'
+    # security / access
+    r'suspended|denied|locked|breach|security|'
+    # financial / legal
+    r'invoice|payment due|overdue payment|past due|notice of|compliance|legal notice|'
+    r'warning'
+    r')\b',
+    re.IGNORECASE,
+)
+_URGENCY_SENDER_RE = re.compile(
+    r'\b(alert|monitor|noreply|no-reply|notification|security|admin)@',
+    re.IGNORECASE,
+)
+
+_PRIORITY_SENDERS_KEY = "semantic:cognition:priority_senders"
+
+
+async def get_priority_senders(qdrant) -> list[str]:
+    """Director-maintainable high-priority sender list. Stored as a plain
+    Qdrant semantic entry (mirrors semantic:tax:taxable_wallets — a simple
+    Director-populated list read by a harness at runtime) rather than a
+    Nextcloud note, since this is a short list edited rarely, not a narrative.
+    Empty/missing is a valid, non-error state — no list means no override,
+    not a failure."""
+    try:
+        entry = await qdrant.retrieve_by_key(_PRIORITY_SENDERS_KEY)
+        return (entry or {}).get("senders", []) or []
+    except Exception as exc:
+        logger.warning("get_priority_senders: failed (non-fatal): %s", exc)
+        return []
+
+
+def derive_urgency(
+    subject_line: str, sender: str = "", priority_senders: list[str] | None = None,
+) -> tuple[str, float]:
+    """Very basic urgency tag — does this need attention now, independent of
+    whether it's worth remembering afterward (an ITIL-style Impact/Urgency
+    split; see derive_priority() for the Impact side and CLAUDE.md's related
+    note). A monitor-down alert is high urgency and near-certainly low
+    priority (nothing to learn) — the two axes are meant to diverge, not
+    agree, that's the point of tracking them separately.
+
+    A sender on the Director-maintained priority list (see
+    get_priority_senders()) is always "high", full stop — an explicit
+    override takes precedence over pattern matching, not another vote
+    alongside it. Otherwise: keyword hit in the subject line AND an
+    alerting-style sender pattern -> "high". Either alone -> "medium".
+    Neither -> "low". Same 0.25/0.5/0.75 numeric scale as priority for
+    consistency (see derive_priority()'s docstring on why that's shared
+    vocabulary, not a shared meaning).
+
+    Does not do date-comparison (a "deadline" mentioning a specific date
+    doesn't get checked against today) — keyword-only for now, flagged as a
+    known gap rather than half-built.
+    """
+    if priority_senders:
+        sender_lower = (sender or "").lower()
+        if any(ps.lower() in sender_lower for ps in priority_senders):
+            return "high", confidence_to_score("HIGH")
+
+    keyword_hit = bool(_URGENCY_KEYWORDS_RE.search(subject_line or ""))
+    sender_hit = bool(_URGENCY_SENDER_RE.search(sender or ""))
+    if keyword_hit and sender_hit:
+        label = "high"
+    elif keyword_hit or sender_hit:
+        label = "medium"
+    else:
+        label = "low"
+    return label, confidence_to_score(label.upper())
+
+
 async def score_and_fold_subjects(
     qdrant, cog, text: str, source_label: str, subjects: list[dict] | None = None,
 ) -> list[dict]:

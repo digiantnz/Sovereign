@@ -124,6 +124,7 @@ INTENT_ACTION_MAP = {
     "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
     "news_brief":         {"domain": "news",    "operation": "brief"},
     "score_rss_by_subject": {"domain": "cognition", "operation": "score_rss"},
+    "score_email_by_subject": {"domain": "cognition", "operation": "score_email"},
     "cognition_confirm_update": {"domain": "cognition", "operation": "confirm_update"},
     "cognition_learn_subject": {"domain": "cognition", "operation": "resync_subject"},
     # Tax ingest harness intents (Phase 1 — continuous hourly ingest)
@@ -310,6 +311,7 @@ INTENT_TIER_MAP = {
     "read_feed": "LOW",
     "news_brief": "LOW",
     "score_rss_by_subject": "LOW",
+    "score_email_by_subject": "LOW",
     "cognition_confirm_update": "LOW",
     "cognition_learn_subject": "LOW",
     "tax_status": "LOW", "tax_ingest_run": "LOW", "tax_ingest_store": "MID",
@@ -3930,6 +3932,7 @@ class ExecutionEngine:
             "learn_email",              # learn_on_demand summary — self-descriptive, passes directly
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "score_rss_by_subject",     # cognition harness brief — passes directly
+            "score_email_by_subject",   # cognition harness brief — passes directly
             "cognition_confirm_update", # approve/reject result — self-descriptive, passes directly
             "cognition_learn_subject",  # note resync result — self-descriptive, passes directly
             "research_gather", "research_save", "research_clear",
@@ -6525,6 +6528,9 @@ class ExecutionEngine:
             if operation == "score_rss":
                 from monitoring.cognition_harness import run_score_rss_by_subject
                 return await run_score_rss_by_subject(self.cog, self.nanobot, self.qdrant)
+            if operation == "score_email":
+                from monitoring.cognition_harness import run_score_email_by_subject
+                return await run_score_email_by_subject(self.cog, self.nanobot, self.qdrant)
             if operation == "confirm_update":
                 from cognition.subjects import apply_subject_update
                 subject_id = (delegation or {}).get("target") or ""
