@@ -27,6 +27,7 @@ no cross-run resumption.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import date, datetime, timezone
@@ -39,6 +40,12 @@ from cognition.subjects import (
 logger = logging.getLogger(__name__)
 
 _MAX_ITERATIONS = 3
+
+# Strong references for fire-and-forget asyncio.create_task() calls — see
+# ExecutionEngine._fire_and_forget in execution/engine.py for why this exists
+# (reproduced live 2026-07-03: an unreferenced task was garbage-collected
+# mid-execution). No long-lived object to hang a method off here either.
+_background_tasks: set = set()
 
 
 async def _write_campaign_checkpoint(
@@ -171,3 +178,73 @@ async def run_campaign(
         "status": "ok", "subject_id": subject_id, "campaign_id": campaign_id,
         "iterations": iterations_used, "target_met": target_met, "stop_reason": stop_reason,
     }
+
+
+async def observe_for_subject(
+    qdrant, nanobot, cog, subject_id: str, trigger_source: str, observation_summary: str,
+) -> dict:
+    """Single reusable entry point: "here's something I found, you decide if
+    it's a gap." Callers (portfolio analysis, and any future source — RSS/
+    email/web search already have their own dedicated triage paths, but
+    anything that produces a one-shot finding rather than a stream of items
+    fits here) call this UNCONDITIONALLY, every time, with no pre-check of
+    their own. The gap-decision logic belongs here, in the Cognition Engine,
+    not duplicated into every caller — a caller that had to import
+    evaluate_campaign_iteration() itself would be reaching into an internal
+    implementation detail that isn't its concern.
+
+    Cheap by design for the common case: one evaluate_campaign_iteration()
+    call (no LLM cost if the Subject's confidence already meets target — see
+    its own short-circuit). A full campaign only fires (fire-and-forget) when
+    a genuine gap is found — this function's caller never spawns campaigns
+    speculatively just by calling it.
+
+    observation_summary: what the caller found — prose, not a research
+    result. This function does the confidence/research_result shimming
+    internally so callers don't need to know that shape either.
+
+    Returns {"status": "ok", "gap_found": bool, "campaign_id": str | None}.
+    Never raises — a broken observation source shouldn't be able to take
+    down whatever produced it.
+    """
+    try:
+        subject = await get_subject(qdrant, subject_id)
+        if not subject:
+            logger.warning("observe_for_subject: unknown subject %r", subject_id)
+            return {"status": "error", "error": f"unknown subject {subject_id!r}"}
+
+        pseudo_research_result = {
+            # No natural research-confidence equivalent for an external
+            # observation (health_score, urgency, etc. all measure something
+            # else) — MEDIUM is a neutral default; the LLM gap-check judges
+            # substance, not a self-reported number that doesn't apply here.
+            "confidence": "MEDIUM",
+            "telegram_summary": [observation_summary],
+        }
+        gap_eval = await evaluate_campaign_iteration(
+            cog, subject.get("thesis", ""), get_confidence_target(subject),
+            pseudo_research_result, iterations_used=0, max_iterations=1,
+        )
+        if not gap_eval["resolvable_gaps"]:
+            return {"status": "ok", "gap_found": False, "campaign_id": None}
+
+        # Lead with what was actually found, then the specific unknowns — a
+        # trigger of only extracted questions gives the research agent no
+        # grounding for what prompted them.
+        trigger_summary = (
+            f"{trigger_source.title()} finding: {observation_summary} "
+            f"Open questions: {'; '.join(gap_eval['resolvable_gaps'])}"
+        )
+        logger.info("observe_for_subject: gap found for subject=%r (source=%r) — spawning campaign",
+                    subject_id, trigger_source)
+        task = asyncio.create_task(run_campaign(
+            qdrant, nanobot, cog, subject_id, trigger_source, trigger_summary,
+        ))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        return {"status": "ok", "gap_found": True, "campaign_id": None}  # campaign_id
+        # not known yet — run_campaign generates it internally and this call
+        # doesn't await the campaign to completion to learn it
+    except Exception as exc:
+        logger.warning("observe_for_subject: failed for subject=%r (non-fatal): %s", subject_id, exc)
+        return {"status": "error", "error": str(exc)}

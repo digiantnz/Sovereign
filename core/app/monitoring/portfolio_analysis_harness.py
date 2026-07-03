@@ -38,22 +38,6 @@ from monitoring.research_harness import (
 
 logger = logging.getLogger(__name__)
 
-# Strong references for fire-and-forget asyncio.create_task() calls — a task
-# with no reference held anywhere is eligible for garbage collection mid-
-# execution (a documented Python gotcha, reproduced live 2026-07-03 in the
-# Cognition Engine's web search trigger — see ExecutionEngine._fire_and_forget
-# in execution/engine.py for the original fix and full explanation). This
-# module has no long-lived object to hang a method off, so a bare module-
-# level set does the same job.
-_background_tasks: set = set()
-
-
-def _fire_and_forget(coro) -> "asyncio.Task":
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
-
 
 async def _notify_telegram(message: str) -> None:
     token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -2585,57 +2569,21 @@ async def _run_analysis_task(cog, nanobot, qdrant, category: str, slug: str, sov
             subject_context=subject_context,
         )
 
-        # Cognition Engine gap-check — Phase 11 (2026-07-03). The portfolio's
-        # job ends at "does this analysis reveal something the Subject's
-        # thesis doesn't account for" — reuses the Cognition Engine's own
-        # evaluator (evaluate_campaign_iteration) rather than a bespoke
-        # comparison, so the portfolio harness doesn't grow a second opinion
-        # on what counts as a gap. If one is found, hand off entirely: a full
-        # campaign (its own research -> evaluate -> propose Subject Update)
-        # runs fire-and-forget, never blocking the Director-facing portfolio
-        # result. Portfolio events never spawn campaigns speculatively —
-        # only on an explicitly-identified gap (Director's design decision).
+        # Cognition Engine hand-off — Phase 11 (2026-07-03). The portfolio
+        # publishes unconditionally, every run — it doesn't pre-check whether
+        # something looks gap-worthy itself; that decision is the Cognition
+        # Engine's, made inside observe_for_subject() (cognition/campaigns.py),
+        # not duplicated here. This harness stays ignorant of what a "gap" is.
         if subject_context and subject_context.get("subject"):
-            try:
-                from cognition.subjects import evaluate_campaign_iteration, get_confidence_target
-                from cognition.campaigns import run_campaign
-                _gap_subject_id = subject_context["subject"]
-                _portfolio_as_research = {
-                    # No natural research-confidence equivalent for a portfolio
-                    # run (health_score measures something different) — MEDIUM
-                    # is a neutral default; the LLM gap-check judges substance,
-                    # not a self-reported number that doesn't really apply here.
-                    "confidence": "MEDIUM",
-                    "telegram_summary": [
-                        overall.get("executive_summary", ""),
-                        f"Key risk: {overall.get('key_risk', '')}",
-                        f"Key opportunity: {overall.get('key_opportunity', '')}",
-                    ],
-                }
-                _gap_eval = await evaluate_campaign_iteration(
-                    cog, subject_context.get("thesis", ""),
-                    get_confidence_target(subject_context),
-                    _portfolio_as_research, iterations_used=0, max_iterations=1,
-                )
-                if _gap_eval["resolvable_gaps"]:
-                    # Carry the portfolio's actual finding, not just the extracted
-                    # questions — a campaign trigger of only "what is the probability
-                    # X is enforced within 6 months?" gives the research agent no
-                    # grounding for what X even is. Lead with what was found, then
-                    # the specific unknowns.
-                    _gap_summary = (
-                        f"Portfolio analysis found: {overall.get('key_risk', '')} "
-                        f"Open questions: {'; '.join(_gap_eval['resolvable_gaps'])}"
-                    )
-                    logger.info(
-                        "portfolio_harness: gap identified for subject=%r — spawning campaign: %s",
-                        _gap_subject_id, _gap_summary,
-                    )
-                    _fire_and_forget(run_campaign(
-                        qdrant, nanobot, cog, _gap_subject_id, "portfolio", _gap_summary,
-                    ))
-            except Exception as exc:
-                logger.warning("portfolio_harness: gap-check failed (non-fatal): %s", exc)
+            from cognition.campaigns import observe_for_subject
+            observation = (
+                f"{overall.get('executive_summary', '')} "
+                f"Key risk: {overall.get('key_risk', '')} "
+                f"Key opportunity: {overall.get('key_opportunity', '')}"
+            )
+            await observe_for_subject(
+                qdrant, nanobot, cog, subject_context["subject"], "portfolio", observation,
+            )
 
         # Write back to Nextcloud ledger
         try:
