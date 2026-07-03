@@ -131,6 +131,18 @@ _DEFAULTS: dict = {
         "rss_list_default": 20,
         "credential_proxy_url": "http://sovereign-core:8000/credential_proxy",
     },
+    "cognition": {
+        "urgency_keywords": [
+            "urgent", "action required", "expires", "expired", "deadline", "overdue",
+            "immediately", "down", "alert", "failed", "failure", "outage", "unhealthy",
+            "unreachable", "degraded", "critical", "threshold", "missed attestation",
+            "disk full", "out of memory", "low disk", "backup failed", "backup failure",
+            "suspended", "denied", "locked", "breach", "security", "invoice",
+            "payment due", "overdue payment", "past due", "notice of", "compliance",
+            "legal notice", "warning",
+        ],
+        "priority_senders": ["alert@uptimerobot.com"],
+    },
 }
 
 

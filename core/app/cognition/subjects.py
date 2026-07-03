@@ -19,6 +19,8 @@ from datetime import date, datetime, timezone
 
 import httpx
 
+from config import cfg as _cfg
+
 logger = logging.getLogger(__name__)
 
 _CONFIDENCE_MAP: dict[str, float] = {"HIGH": 0.75, "MEDIUM": 0.50, "LOW": 0.25}
@@ -755,49 +757,34 @@ def derive_priority(hits: list) -> tuple[str, float]:
 # phrasings) but free, fast, and won't silently balloon briefing cost as
 # inbox volume grows.
 #
-# Categories (Director-specified 2026-07-03): time-signal, financial/legal,
-# infrastructure/service-health, harness/job failures, threshold breaches,
-# backup failures. Deliberately grouped into one regex, not one per category
-# — the label only needs "did anything match," not which category.
-_URGENCY_KEYWORDS_RE = re.compile(
-    r'\b('
-    # time-signal
-    r'urgent|action required|expires?|expired|deadline|overdue|immediately|'
-    # infrastructure / service health
-    r'down|alert|failed|failure|outage|unhealthy|unreachable|degraded|critical|'
-    # threshold breaches
-    r'threshold|missed attestation|disk full|out of memory|low disk|'
-    # backups
-    r'backup failed|backup failure|'
-    # security / access
-    r'suspended|denied|locked|breach|security|'
-    # financial / legal
-    r'invoice|payment due|overdue payment|past due|notice of|compliance|legal notice|'
-    r'warning'
-    r')\b',
-    re.IGNORECASE,
-)
-_URGENCY_SENDER_RE = re.compile(
+# Both the keyword list and the priority-sender list are Director-editable
+# via the dashboard (/config, /config/fields) — see the "cognition" section
+# in /home/sovereign/governance/sovereign-config.yaml. Edits take effect on
+# next sovereign-core restart (config/loader.py loads once at startup, same
+# as every other config.yaml-backed value in this system — not a new
+# limitation introduced here).
+_URGENCY_SENDER_PATTERN_RE = re.compile(
     r'\b(alert|monitor|noreply|no-reply|notification|security|admin)@',
     re.IGNORECASE,
 )
 
-_PRIORITY_SENDERS_KEY = "semantic:cognition:priority_senders"
+
+def _build_urgency_keywords_re() -> re.Pattern:
+    keywords = _cfg.cognition.urgency_keywords
+    return re.compile(r'\b(' + '|'.join(re.escape(k) for k in keywords) + r')\b', re.IGNORECASE)
 
 
-async def get_priority_senders(qdrant) -> list[str]:
-    """Director-maintainable high-priority sender list. Stored as a plain
-    Qdrant semantic entry (mirrors semantic:tax:taxable_wallets — a simple
-    Director-populated list read by a harness at runtime) rather than a
-    Nextcloud note, since this is a short list edited rarely, not a narrative.
-    Empty/missing is a valid, non-error state — no list means no override,
-    not a failure."""
-    try:
-        entry = await qdrant.retrieve_by_key(_PRIORITY_SENDERS_KEY)
-        return (entry or {}).get("senders", []) or []
-    except Exception as exc:
-        logger.warning("get_priority_senders: failed (non-fatal): %s", exc)
-        return []
+_URGENCY_KEYWORDS_RE = _build_urgency_keywords_re()
+
+
+def get_priority_senders() -> list[str]:
+    """Director-maintainable high-priority sender list — config.yaml-backed
+    (cognition.priority_senders), edited via the dashboard. Was a live Qdrant
+    entry (semantic:cognition:priority_senders) briefly on 2026-07-03, before
+    migrating here for dashboard visibility on the same evening — that Qdrant
+    key is no longer read. No longer async: config is loaded once at startup,
+    reading it is just attribute access."""
+    return _cfg.cognition.priority_senders or []
 
 
 def derive_urgency(
@@ -819,17 +806,23 @@ def derive_urgency(
     consistency (see derive_priority()'s docstring on why that's shared
     vocabulary, not a shared meaning).
 
+    priority_senders defaults to get_priority_senders() (config-backed) when
+    not passed explicitly — callers scoring many emails in one run should
+    fetch it once and pass it through rather than re-reading per email.
+
     Does not do date-comparison (a "deadline" mentioning a specific date
     doesn't get checked against today) — keyword-only for now, flagged as a
     known gap rather than half-built.
     """
+    if priority_senders is None:
+        priority_senders = get_priority_senders()
     if priority_senders:
         sender_lower = (sender or "").lower()
         if any(ps.lower() in sender_lower for ps in priority_senders):
             return "high", confidence_to_score("HIGH")
 
     keyword_hit = bool(_URGENCY_KEYWORDS_RE.search(subject_line or ""))
-    sender_hit = bool(_URGENCY_SENDER_RE.search(sender or ""))
+    sender_hit = bool(_URGENCY_SENDER_PATTERN_RE.search(sender or ""))
     if keyword_hit and sender_hit:
         label = "high"
     elif keyword_hit or sender_hit:

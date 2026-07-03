@@ -308,7 +308,7 @@ async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
     """
     from cognition.subjects import find_relevant_subjects, derive_urgency, get_priority_senders
 
-    priority_senders = await get_priority_senders(qdrant)
+    priority_senders = get_priority_senders()
 
     all_emails: list[dict] = []
     for account in _EMAIL_ACCOUNTS:
