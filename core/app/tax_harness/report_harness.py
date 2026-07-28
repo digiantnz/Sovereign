@@ -1,6 +1,6 @@
 """Tax Report Harness — /do_tax command handler.
 
-Triggered by /do_tax [year] Telegram command. Produces two accountant-ready
+Triggered by /do_tax [year] Telegram command. Produces three accountant-ready
 CSV files for the requested NZ financial year.
 
 Session flag: _tax_report_harness_checkpoint
@@ -22,20 +22,29 @@ Human-in-the-loop flow (3 turns):
     Checkpoint: awaiting_confirm
 
   Turn 3 — Director confirms
-    create step: generates income{year}.csv and expenses{year}.csv in memory.
+    create step: generates income, expenses, revenue, and disposals CSVs.
     Saves to /Digiant/Tax/FY{year}/ via nanobot.
+    Data gaps queued to semantic:tax:data_gaps:{year}.
     notify step: Telegram summary.
     clear step: deletes checkpoint from working_memory.
 
 Output files (saved to /Digiant/Tax/FY{year}/):
-  income{year}.csv           — all tax:crypto events with classifier labels
-  expenses_master_{year}.csv — all tax:expense events (memory + supplementary CSVs)
+  income{year}.csv     — all tax:crypto events with classifier labels
+  expenses{year}.csv   — Wirex + AliExpress + /receipt camera entries, deduped
+  revenue{year}.csv    — mining_income events only (Date, Asset, Amount, NZD Value, Reference)
+  disposals{year}.csv  — FIFO disposal gain/loss per acquisition lot
+
+Expense sources (Turn 2):
+  Wirex statement CSV and AliExpress export: Director-supplied files only.
+  /receipt camera entries: pulled automatically from semantic memory (source=receipt_camera).
+  All three merged and deduped on (Date, Amount NZD). Full overwrite every run.
 
 NZ tax year YYYY = 01 Apr YYYY-1 → 31 Mar YYYY
   e.g. /do_tax 2026 → 2025-04-01 to 2026-03-31
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -50,6 +59,9 @@ logger = logging.getLogger(__name__)
 
 _SESSION_FLAG  = "_tax_report_harness_checkpoint"
 _TAX_YEAR_ROOT = "/Digiant/Tax"
+
+# Reject any Director-supplied filename that matches a harness output file.
+_HARNESS_OUTPUT_RE = re.compile(r'^(income|expenses|revenue|disposals)\d{4}\.csv$', re.IGNORECASE)
 
 
 def _fy_date_range(tax_year: str) -> tuple[str, str]:
@@ -74,16 +86,6 @@ def _in_range(timestamp: str, start: str, end: str) -> bool:
         return False
 
 
-def _resolve_tax_year_from_now() -> str:
-    """Return the most recently *completed* NZ financial year.
-
-    FY ends 31 March each year. From 1 April onwards the previous FY is complete.
-    E.g. in May 2026: current active FY = 2027, most recently completed = 2026.
-    """
-    active = int(resolve_tax_year(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
-    return str(active - 1)
-
-
 def _nzd_decimal(nzd_str: str | None) -> Decimal | None:
     """Parse "$X.XX NZD" → Decimal, or return None."""
     if not nzd_str:
@@ -102,7 +104,9 @@ class TaxReportHarness:
         self.cog      = cog
         self.nanobot  = nanobot
         self.qdrant   = qdrant
-        self.tax_year = tax_year or _resolve_tax_year_from_now()
+        self.tax_year = tax_year or str(
+            int(resolve_tax_year(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))) - 1
+        )
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -155,7 +159,8 @@ class TaxReportHarness:
                 "response": (
                     f"Ready to generate FY{year} report: {n_income} income records, "
                     f"{n_expense} expense records. Confirm to create "
-                    f"income{year}.csv and expenses_master_{year}.csv in "
+                    f"income{year}.csv, expenses{year}.csv, revenue{year}.csv, and "
+                    f"disposals{year}.csv in "
                     f"{_TAX_YEAR_ROOT}/FY{year}/?"
                 ),
                 "_translator_bypass": True,
@@ -208,16 +213,17 @@ class TaxReportHarness:
                 "date_start":    start,
                 "date_end":      end,
                 "income_rows":   [],
-                "expense_rows":  [],
+                "receipt_rows":  [],
                 "income_count":  0,
-                "expense_count": 0,
+                "receipt_count": 0,
             })
             return {
                 "status":   "awaiting_csv_names",
                 "response": (
                     f"No tax events found in semantic memory for FY{year} "
                     f"(01 Apr {int(year)-1} – 31 Mar {year}). "
-                    f"Provide CSV filename(s) to include (comma-separated), or reply 'none' to proceed. "
+                    f"Provide Wirex statement CSV and/or AliExpress export filename(s) "
+                    f"(comma-separated), or reply 'none' to skip. "
                     f"Bare filenames resolve from {_TAX_YEAR_ROOT}/FY{year}/; "
                     f"absolute Nextcloud paths (e.g. /Digiant/Tax/25-26/file.csv) are used as-is."
                     f"{csv_hint_line}"
@@ -232,7 +238,10 @@ class TaxReportHarness:
         income_rows  = [_income_row(ev)  for ev in classified.income
                         if ev.subtype != "loan_disbursement"]
         excluded_count = sum(1 for ev in classified.income if ev.subtype == "loan_disbursement")
-        expense_rows = [_expense_row(ev) for ev in classified.expenses]
+        # Only pull /receipt camera entries from memory — Wirex and AliExpress are
+        # supplied by the Director as files at step 2 to avoid double-counting.
+        receipt_rows = [_expense_row(ev) for ev in classified.expenses
+                        if (ev.source or "") == "receipt_camera"]
 
         await self._write_checkpoint({
             "current_step":  "awaiting_csv_names",
@@ -240,9 +249,9 @@ class TaxReportHarness:
             "date_start":    start,
             "date_end":      end,
             "income_rows":   income_rows,
-            "expense_rows":  expense_rows,
+            "receipt_rows":  receipt_rows,
             "income_count":  len(income_rows),
-            "expense_count": len(expense_rows),
+            "receipt_count": len(receipt_rows),
         })
 
         excl_note = f" ({excluded_count} loan_disbursement excluded)" if excluded_count else ""
@@ -251,11 +260,11 @@ class TaxReportHarness:
             "response": (
                 f"FY{year} (01 Apr {int(year)-1} – 31 Mar {year}): "
                 f"found {len(income_rows)} crypto/income record(s){excl_note} and "
-                f"{len(expense_rows)} expense record(s) in memory. "
-                f"Provide CSV filename(s) to include in the report (comma-separated), "
-                f"or reply 'none' to proceed. "
+                f"{len(receipt_rows)} receipt capture(s) in memory. "
+                f"Provide Wirex statement CSV and/or AliExpress export filename(s) "
+                f"(comma-separated), or reply 'none' to skip. "
                 f"Bare filenames are resolved from {_TAX_YEAR_ROOT}/FY{year}/; "
-                f"absolute paths (e.g. /Digiant/Tax/25-26/receipts.csv) are used as-is."
+                f"absolute paths (e.g. /Digiant/Tax/25-26/wirex.csv) are used as-is."
                 f"{csv_hint_line}"
             ),
             "_translator_bypass": True,
@@ -264,44 +273,63 @@ class TaxReportHarness:
     # ── Step 2: ingest supplementary CSVs ─────────────────────────────────────
 
     async def _step_ingest(self, user_input: str, checkpoint: dict) -> dict:
-        """Parse Director-specified CSVs from Nextcloud. Merge into expense array.
+        """Parse Director-specified Wirex/AliExpress CSVs from Nextcloud.
 
-        Does NOT store events to memory. Does NOT tag files as ingested.
-        "none" = no supplementary files — proceed directly to confirm prompt.
+        Merges parsed file rows with /receipt camera entries already in memory.
+        Deduplicates on (Date, Amount NZD). Does NOT store events to memory.
+        "none" = no file inputs — proceed using receipt memory entries only.
         """
-        year     = checkpoint.get("tax_year", self.tax_year)
-        start    = checkpoint.get("date_start", "")
-        end      = checkpoint.get("date_end",   "")
-        folder   = f"{_TAX_YEAR_ROOT}/FY{year}"
-
-        expense_rows: list[dict] = list(checkpoint.get("expense_rows") or [])
+        year         = checkpoint.get("tax_year", self.tax_year)
+        start        = checkpoint.get("date_start", "")
+        end          = checkpoint.get("date_end",   "")
+        folder       = f"{_TAX_YEAR_ROOT}/FY{year}"
+        receipt_rows: list[dict] = list(checkpoint.get("receipt_rows") or [])
         income_rows:  list[dict] = list(checkpoint.get("income_rows")  or [])
 
         raw = user_input.strip().lower()
         skip_files = raw in ("none", "no", "skip", "n")
 
-        file_summaries: list[str] = []
-        total_new = 0
+        file_summaries:   list[str]  = []
+        file_expense_rows: list[dict] = []
 
         if not skip_files:
-            # Parse comma/newline-separated filenames
             raw_names = user_input.replace("\n", ",").split(",")
             filenames = [n.strip() for n in raw_names if n.strip()]
 
             for fname in filenames:
-                # Accept absolute Nextcloud paths (starting with /) or bare filenames
                 path = fname if fname.startswith("/") else f"{folder}/{fname}"
+                bare = path.split("/")[-1]
+
+                # Guard: reject harness output files to prevent self-feeding
+                if _HARNESS_OUTPUT_RE.match(bare):
+                    file_summaries.append(
+                        f"{fname}: REJECTED — '{bare}' is a harness output file, not a valid "
+                        f"input. Supply only source CSVs (Wirex statement, AliExpress export)."
+                    )
+                    logger.warning("report_harness: rejected output file as input: %s", bare)
+                    continue
+
                 try:
                     from .ingest import ingest_csv_file
-                    parsed_events = await ingest_csv_file(self.nanobot, path, fname)
-                    # Filter to date range and extract expense rows only
+                    parsed_events = await ingest_csv_file(
+                        self.nanobot, path, fname,
+                        start_date=start, end_date=end,
+                    )
                     in_scope = [
                         ev for ev in parsed_events
                         if _in_range(ev.timestamp, start, end)
                     ]
-                    # Separate: expense rows go to expenses, crypto rows go to income
+                    if parsed_events:
+                        _f = parsed_events[0]
+                        logger.info(
+                            "report_harness [%s]: %d parsed → %d in scope "
+                            "(first ts=%r, in_range=%s, FY%s %s→%s)",
+                            fname, len(parsed_events), len(in_scope),
+                            _f.timestamp, _in_range(_f.timestamp, start, end),
+                            year, start[:10], end[:10],
+                        )
                     new_expense = [_expense_row(ev) for ev in in_scope if ev.event_tag == "tax:expense"]
-                    new_income  = []
+                    new_income: list[dict] = []
                     if any(ev.event_tag == "tax:crypto" for ev in in_scope):
                         from .classifier import classify_events
                         crypto_evs = [ev for ev in in_scope if ev.event_tag == "tax:crypto"]
@@ -309,10 +337,8 @@ class TaxReportHarness:
                         new_income = [_income_row(ev) for ev in cls.income
                                       if ev.subtype != "loan_disbursement"]
 
-                    expense_rows.extend(new_expense)
+                    file_expense_rows.extend(new_expense)
                     income_rows.extend(new_income)
-                    n_added = len(new_expense) + len(new_income)
-                    total_new += n_added
                     file_summaries.append(
                         f"{fname}: {len(new_expense)} expense row(s), "
                         f"{len(new_income)} income row(s) in scope"
@@ -321,7 +347,8 @@ class TaxReportHarness:
                     logger.warning("report_harness: failed to parse %s: %s", path, exc)
                     file_summaries.append(f"{fname}: parse error — {exc}")
 
-        # Sort both arrays chronologically
+        # Merge file rows + receipt memory rows; dedup on (Date, Amount NZD)
+        expense_rows = _merge_expense_rows(file_expense_rows, receipt_rows)
         expense_rows.sort(key=lambda r: r.get("Date", ""))
         income_rows.sort(key=lambda r: r.get("Date", ""))
 
@@ -336,7 +363,6 @@ class TaxReportHarness:
             "expense_count": len(expense_rows),
         })
 
-        # Per-source expense breakdown for confirmation
         source_counts: dict[str, int] = {}
         for r in expense_rows:
             src = r.get("Source", "Unknown")
@@ -349,8 +375,10 @@ class TaxReportHarness:
             if source_breakdown else f"{len(expense_rows)} record(s)"
         )
 
+        revenue_count = sum(1 for r in income_rows if r.get("Classification") == "mining_income")
+
         if skip_files:
-            summary = "No supplementary files added."
+            summary = "No file inputs added."
         else:
             summary = "\n".join(file_summaries) if file_summaries else "No files parsed."
 
@@ -360,7 +388,9 @@ class TaxReportHarness:
                 f"{summary}\n\n"
                 f"Ready to generate FY{year} report:\n"
                 f"  income{year}.csv — {len(income_rows)} record(s)\n"
-                f"  expenses_master_{year}.csv — {expense_detail}\n\n"
+                f"  expenses{year}.csv — {expense_detail}\n"
+                f"  revenue{year}.csv — {revenue_count} mining_income record(s)\n"
+                f"  disposals{year}.csv — computed from FIFO (cross-year lot pool)\n\n"
                 f"Confirm to create files in {folder}/?"
             ),
             "_translator_bypass": True,
@@ -369,14 +399,18 @@ class TaxReportHarness:
     # ── Step 3: create + save CSVs ─────────────────────────────────────────────
 
     async def _step_create(self, checkpoint: dict) -> dict:
-        """Generate income and expenses CSVs and save to Nextcloud."""
+        """Generate income, expenses, and FIFO disposal CSVs and save to Nextcloud."""
         year         = checkpoint.get("tax_year", self.tax_year)
         income_rows  = checkpoint.get("income_rows",  [])
         expense_rows = checkpoint.get("expense_rows", [])
         folder       = f"{_TAX_YEAR_ROOT}/FY{year}"
+        start, end   = _fy_date_range(year)
 
-        income_csv  = _build_income_csv(income_rows)
-        expense_csv = _build_expense_csv(expense_rows)
+        income_csv    = _build_income_csv(income_rows)
+        expense_csv   = _build_expense_csv(expense_rows)
+        revenue_csv   = _build_revenue_csv(income_rows)
+        fifo_result   = await self._run_fifo_for_year(year, start, end)
+        disposals_csv = _build_disposals_csv(fifo_result)
 
         # Ensure output folder exists
         try:
@@ -391,8 +425,10 @@ class TaxReportHarness:
         errors: list[str] = []
 
         for filename, content in [
-            (f"income{year}.csv",            income_csv),
-            (f"expenses_master_{year}.csv",  expense_csv),
+            (f"income{year}.csv",    income_csv),
+            (f"expenses{year}.csv",  expense_csv),
+            (f"revenue{year}.csv",   revenue_csv),
+            (f"disposals{year}.csv", disposals_csv),
         ]:
             path = f"{folder}/{filename}"
             try:
@@ -414,8 +450,16 @@ class TaxReportHarness:
                 errors.append(f"{filename}: {exc}")
                 logger.warning("report_harness: save %s failed: %s", filename, exc)
 
-        await self._step_notify(year, income_rows, expense_rows, saved, errors)
+        # Queue unresolved FIFO gaps to semantic memory (non-blocking)
+        if fifo_result.data_gaps:
+            asyncio.create_task(self._store_data_gaps(year, fifo_result.data_gaps))
+
+        await self._step_notify(year, income_rows, expense_rows, saved, errors, fifo_result)
         await self._step_clear()
+
+        n_disposals  = len(fifo_result.disposal_results)
+        n_gaps       = len(fifo_result.data_gaps)
+        n_unresolved = len(fifo_result.unresolved)
 
         if errors:
             return {
@@ -428,12 +472,22 @@ class TaxReportHarness:
                 "_translator_bypass": True,
             }
 
+        disposal_summary = f"{n_disposals} disposal row(s)"
+        if n_gaps:
+            disposal_summary += f", {n_gaps} data gap(s) queued"
+        if n_unresolved:
+            disposal_summary += f", {n_unresolved} unresolved"
+
+        n_revenue = sum(1 for r in income_rows if r.get("Classification") == "mining_income")
+
         return {
             "status":   "ok",
             "response": (
                 f"FY{year} tax report complete.\n"
                 f"  income{year}.csv — {len(income_rows)} record(s)\n"
-                f"  expenses_master_{year}.csv — {len(expense_rows)} record(s)\n"
+                f"  expenses{year}.csv — {len(expense_rows)} record(s)\n"
+                f"  revenue{year}.csv — {n_revenue} mining_income record(s)\n"
+                f"  disposals{year}.csv — {disposal_summary}\n"
                 f"Saved to {folder}/."
             ),
             "_translator_bypass": True,
@@ -443,7 +497,7 @@ class TaxReportHarness:
 
     async def _step_notify(
         self, year: str, income_rows: list, expense_rows: list,
-        saved: list, errors: list,
+        saved: list, errors: list, fifo_result=None,
     ) -> None:
         """Send Telegram summary to Director."""
         lines = [f"Tax Report FY{year} complete."]
@@ -463,7 +517,26 @@ class TaxReportHarness:
         if unpriced:
             lines.append(f"  Unpriced income records (NZD value missing): {unpriced}")
 
-        lines.append(f"  Expense file: expenses_master_{year}.csv")
+        # FIFO disposal summary
+        if fifo_result is not None:
+            n_dr = len(fifo_result.disposal_results)
+            if n_dr:
+                total_gain = sum(d.gain_loss_nzd for d in fifo_result.disposal_results)
+                lines.append(f"  FIFO disposals: {n_dr} lot match(es), net: ${total_gain:.2f} NZD")
+            if fifo_result.data_gaps:
+                lines.append(
+                    f"  Data gaps: {len(fifo_result.data_gaps)} "
+                    f"(queued to semantic:tax:data_gaps:{year})"
+                )
+            if fifo_result.unresolved:
+                lines.append(
+                    f"  Unresolved disposals: {len(fifo_result.unresolved)} (missing NZD value)"
+                )
+
+        n_revenue = sum(1 for r in income_rows if r.get("Classification") == "mining_income")
+        if n_revenue:
+            lines.append(f"  Mining revenue: {n_revenue} record(s) → revenue{year}.csv")
+        lines.append(f"  Expense file: expenses{year}.csv")
         lines.append(f"  Files saved: {', '.join(saved) or 'none'}")
         if errors:
             lines.append(f"  Save errors: {'; '.join(errors)}")
@@ -546,6 +619,81 @@ class TaxReportHarness:
             logger.warning("report_harness: semantic query failed: %s", exc)
             return []
 
+    # ── FIFO helpers ───────────────────────────────────────────────────────────
+
+    async def _run_fifo_for_year(self, year: str, start: str, end: str):
+        """Query all-years tax events, enrich unpriced lots, run FIFO engine.
+
+        Uses a cross-year lot pool (all acquisitions from 2000-01-01 to FY end)
+        so disposals are matched against the correct historical cost basis even
+        when the acquisition fell in a prior financial year.
+
+        On-the-fly enrichment attempts to price any lot with nzd_value=None
+        before passing to run_fifo(). Lots that remain unpriced after enrichment
+        appear in FifoResult.data_gaps with reason='unpriced_acquisition_lot'.
+        """
+        from .classifier import classify_events
+        from .fifo import run_fifo, FifoResult
+        from .pricing import enrich_nzd
+
+        all_events = await self._query_semantic_tax_events("2000-01-01T00:00:00Z", end)
+        if not all_events:
+            return FifoResult()
+
+        classified = await classify_events(all_events, self.qdrant)
+
+        _ACQ = frozenset({"mining_income", "staking_reward", "exchange_acquisition"})
+        acquisition_lots = [ev for ev in classified.income if ev.subtype in _ACQ]
+        fy_disposals = [
+            ev for ev in classified.income
+            if ev.subtype == "exchange_disposal" and _in_range(ev.timestamp, start, end)
+        ]
+
+        # Enrich acquisition lots that were unpriced at ingest time
+        for ev in acquisition_lots:
+            if ev.nzd_value is None and ev.asset and ev.timestamp:
+                try:
+                    raw = (ev.amount or "").split()[0]
+                    nzd = await enrich_nzd(
+                        ev.asset, ev.timestamp,
+                        Decimal(raw) if raw else None,
+                    )
+                    if nzd:
+                        ev.nzd_value = nzd
+                except Exception as exc:
+                    logger.warning(
+                        "report_harness: on-the-fly enrichment failed %s %s: %s",
+                        ev.asset, ev.timestamp[:10], exc,
+                    )
+
+        return run_fifo(acquisition_lots, fy_disposals)
+
+    async def _store_data_gaps(self, year: str, gaps: list[dict]) -> None:
+        """Write FIFO data gaps to semantic memory as an unresolved disposal queue.
+
+        Key: semantic:tax:data_gaps:{year}
+        Re-running /do_tax with more historical data overwrites this entry.
+        """
+        try:
+            await self.qdrant.store(
+                collection="semantic",
+                content=f"FIFO data gaps FY{year}: {len(gaps)} unresolved disposal(s)",
+                metadata={
+                    "type":      "tax_data_gap",
+                    "domain":    "tax",
+                    "tax_year":  year,
+                    "gaps":      gaps,
+                    "gap_count": len(gaps),
+                    "_key":      f"semantic:tax:data_gaps:{year}",
+                },
+            )
+            logger.info(
+                "report_harness: wrote %d data gap(s) to semantic:tax:data_gaps:%s",
+                len(gaps), year,
+            )
+        except Exception as exc:
+            logger.warning("report_harness: data_gaps store failed FY%s: %s", year, exc)
+
     # ── Checkpoint helpers ─────────────────────────────────────────────────────
 
     async def _write_checkpoint(self, state: dict) -> None:
@@ -578,17 +726,43 @@ class TaxReportHarness:
         return None
 
 
+# ── Expense merge ─────────────────────────────────────────────────────────────
+
+
+def _merge_expense_rows(file_rows: list[dict], receipt_rows: list[dict]) -> list[dict]:
+    """Merge Director-supplied file rows with /receipt camera memory rows.
+
+    Dedup key: (Date, Amount NZD). Receipt description wins over blank statement
+    description when the same transaction appears in multiple sources.
+    """
+    seen: dict[tuple, dict] = {}
+    for row in file_rows + receipt_rows:
+        key = (row.get("Date", ""), row.get("Amount NZD", ""))
+        if key not in seen:
+            seen[key] = {**row}
+        else:
+            # Receipt processed last — its description overwrites blank statement fields
+            if row.get("Description") and not seen[key].get("Description"):
+                seen[key]["Description"] = row["Description"]
+            if not seen[key].get("Vendor") and row.get("Vendor"):
+                seen[key]["Vendor"] = row["Vendor"]
+    return list(seen.values())
+
+
 # ── CSV helpers ────────────────────────────────────────────────────────────────
 
 _CARD_PREFIX_RE    = re.compile(r'^Card\s+\d+\s*:\s*', re.IGNORECASE)
 _COUNTRY_CODE_RE   = re.compile(r'\s+[A-Z]{2,3}$')
 _CITY_SUFFIX_RE    = re.compile(r'\s+[A-Z]{3,}$')
+# Wirex NZD Statement uses comma-separated location: "MERCHANT,CITY,COUNTRY"
+_COMMA_LOCATION_RE = re.compile(r',\s*[^,]+,\s*[A-Z]{2,3}$')
 
 
 def _clean_vendor(raw: str) -> str:
     """Strip Wirex card prefix and trailing location from vendor string.
 
     "Card 8820 : www.aliexpress.com SHENZHEN CHN" → "www.aliexpress.com"
+    "BAR YOKU,CHRISTCHURCH,NZL" → "BAR YOKU"
     "NETFLIX.COM LOS GATOS CA" → "NETFLIX.COM" (multi-pass until stable)
     Non-Wirex strings are returned unchanged.
     """
@@ -597,6 +771,7 @@ def _clean_vendor(raw: str) -> str:
         prev = clean
         clean = _COUNTRY_CODE_RE.sub('', clean).strip()
         clean = _CITY_SUFFIX_RE.sub('', clean).strip()
+        clean = _COMMA_LOCATION_RE.sub('', clean).strip()
         if clean == prev:
             break
     return clean or raw
@@ -628,9 +803,29 @@ def _source_label(source: str, metadata: dict | None = None) -> str:
     if "wirex" in s:
         return "Wirex"
     raw_type = ((metadata or {}).get("raw_type") or "").lower()
-    if "wirex" in raw_type:
+    # "Card Payment" is the Wirex NZD Statement row type for card spend
+    if "wirex" in raw_type or raw_type == "card payment":
         return "Wirex"
     return "Receipt"
+
+
+def _rate_nzd_per_eth(ev) -> str:
+    """Return NZD/ETH rate for exchange_disposal rows (NZD Value ÷ ETH amount, 2 dp)."""
+    if ev.subtype != "exchange_disposal":
+        return ""
+    try:
+        nzd = _nzd_decimal(ev.nzd_value)
+        if nzd is None:
+            return ""
+        amount_parts = (ev.amount or "").split()
+        if not amount_parts:
+            return ""
+        eth = Decimal(amount_parts[0].replace(",", ""))
+        if eth == 0:
+            return ""
+        return f"{(nzd / eth):.2f}"
+    except (InvalidOperation, IndexError):
+        return ""
 
 
 def _income_row(ev) -> dict:
@@ -645,21 +840,18 @@ def _income_row(ev) -> dict:
         "NZD Value":      ev.nzd_value     or "",
         "Source":         ev.source        or "",
         "Reference":      ev.reference     or "",
+        "Rate NZD/ETH":   _rate_nzd_per_eth(ev),
+        "Notes":          "",
     }
 
 
 def _expense_row(ev) -> dict:
-    """Convert a TaxEvent (tax:expense) to an expenses_master CSV row dict.
-
-    Columns: Date (DD/MM/YYYY), Source (Wirex/AliExpress/Receipt), Vendor (cleaned),
-             Description (blank for Wirex; item/description for others),
-             Amount NZD (plain decimal), Reference, Notes (blank).
-    """
-    raw_vendor   = ev.vendor or ev.source or ""
-    src_label    = _source_label(ev.source or "", ev.metadata)
-    meta_desc    = (ev.metadata or {}).get("description", "")
-    description  = "" if src_label == "Wirex" else meta_desc
-    date_raw     = ev.timestamp[:10] if ev.timestamp else ""
+    """Convert a TaxEvent (tax:expense) to an expenses_master CSV row dict."""
+    raw_vendor  = ev.vendor or ev.source or ""
+    src_label   = _source_label(ev.source or "", ev.metadata)
+    meta_desc   = (ev.metadata or {}).get("description", "")
+    description = "" if src_label == "Wirex" else meta_desc
+    date_raw    = ev.timestamp[:10] if ev.timestamp else ""
     return {
         "Date":        _date_to_dmy(date_raw),
         "Source":      src_label,
@@ -676,7 +868,25 @@ def _build_income_csv(rows: list[dict]) -> str:
     if not rows:
         rows = [{}]
     headers = ["Date", "Classification", "From Address", "To Address",
-               "Asset", "Amount", "NZD Value", "Source", "Reference"]
+               "Asset", "Amount", "NZD Value", "Source", "Reference",
+               "Rate NZD/ETH", "Notes"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore",
+                            lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def _build_revenue_csv(income_rows: list[dict]) -> str:
+    """Build mining revenue CSV: mining_income classified rows only.
+
+    Narrower columns than income.csv — accountant view of ETH mining receipts.
+    """
+    rows = [r for r in income_rows if r.get("Classification") == "mining_income"]
+    if not rows:
+        rows = [{}]
+    headers = ["Date", "Asset", "Amount", "NZD Value", "Reference"]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore",
                             lineterminator="\n")
@@ -690,6 +900,73 @@ def _build_expense_csv(rows: list[dict]) -> str:
     if not rows:
         rows = [{}]
     headers = ["Date", "Source", "Vendor", "Description", "Amount NZD", "Reference", "Notes"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore",
+                            lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def _build_disposals_csv(fifo_result) -> str:
+    """Serialise FifoResult to crypto_disposals CSV string.
+
+    Sections: disposal_results (matched lots), unresolved (missing proceeds),
+    data_gaps (insufficient or unpriced lots). Multiple rows per disposal event
+    is expected when a single disposal spans more than one acquisition lot.
+    """
+    headers = [
+        "Date", "Asset", "Amount Disposed", "Proceeds NZD",
+        "Acquisition Date", "Acquisition Subtype", "Cost Basis NZD",
+        "Gain/Loss NZD", "Reference", "Notes",
+    ]
+    rows: list[dict] = []
+
+    for dr in fifo_result.disposal_results:
+        rows.append({
+            "Date":                dr.timestamp[:10] if dr.timestamp else "",
+            "Asset":               dr.asset,
+            "Amount Disposed":     f"{dr.amount_disposed:.6f}",
+            "Proceeds NZD":        f"${dr.proceeds_nzd:.2f}",
+            "Acquisition Date":    dr.acquisition_date,
+            "Acquisition Subtype": dr.acquisition_subtype,
+            "Cost Basis NZD":      f"${dr.cost_basis_nzd:.2f}",
+            "Gain/Loss NZD":       f"${dr.gain_loss_nzd:.2f}",
+            "Reference":           dr.reference,
+            "Notes":               "",
+        })
+
+    for u in fifo_result.unresolved:
+        rows.append({
+            "Date":                (u.get("timestamp") or "")[:10],
+            "Asset":               u.get("asset", ""),
+            "Amount Disposed":     u.get("amount", ""),
+            "Proceeds NZD":        "",
+            "Acquisition Date":    "",
+            "Acquisition Subtype": "",
+            "Cost Basis NZD":      "",
+            "Gain/Loss NZD":       "",
+            "Reference":           u.get("reference", ""),
+            "Notes":               "unresolved: missing proceeds NZD",
+        })
+
+    for g in fifo_result.data_gaps:
+        rows.append({
+            "Date":                (g.get("timestamp") or "")[:10],
+            "Asset":               g.get("asset", ""),
+            "Amount Disposed":     g.get("amount", ""),
+            "Proceeds NZD":        "",
+            "Acquisition Date":    g.get("acquisition_date", ""),
+            "Acquisition Subtype": "",
+            "Cost Basis NZD":      "",
+            "Gain/Loss NZD":       "",
+            "Reference":           g.get("reference", ""),
+            "Notes":               f"data_gap: {g.get('reason', 'unknown')}",
+        })
+
+    if not rows:
+        rows = [{}]
+
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore",
                             lineterminator="\n")

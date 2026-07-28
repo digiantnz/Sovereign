@@ -13,7 +13,7 @@ Rules applied to tax:crypto events (in order, first match wins):
   2. source == lightning                        → income,    inbound/outbound/unknown
   3. dust filter (ETH < 0.0001)                → income,    dust
      catches 1-WEI spam/contract probes sent to any address including mining wallets
-  4. from OR to in all_own_wallets (taxable|mining) and BOTH in all_own_wallets
+  4. from AND to in all_own_wallets (taxable|mining|watchlist-tax)
                                                → income,    internal_transfer
      own-wallet-to-own-wallet regardless of which wallet types are involved;
      this must come before mining_income so LEDGER_BUSINESS→LEDGER_MINING is internal
@@ -30,9 +30,10 @@ Rules applied to tax:crypto events (in order, first match wins):
  13. from_address in taxable_wallets           → income,    unknown_outbound
  14. none of the above                         → income,    unknown
 
-Wirex ETH deposit address (0xd14d...) is in taxable_wallets — transfers to it from
-own wallets are internal_transfer (rule 4). The disposal only materialises inside
-Wirex's own ledger and is visible in the Wirex NZD statement CSV, not on-chain.
+Wirex ETH deposit address (0xd14d...) is in wallet.watchlist tagged harness="tax"
+(loaded into all_own_wallets — see _load_watchlist_tax_addresses) — transfers to it
+from own wallets are internal_transfer (rule 4). The disposal only materialises
+inside Wirex's own ledger and is visible in the Wirex NZD statement CSV, not on-chain.
 
 All tax:crypto events land in the income list regardless of subtype — the accountant
 sees the full picture with labels. All tax:expense events land in the expenses list.
@@ -50,6 +51,7 @@ logger = logging.getLogger(__name__)
 _EXCHANGE_ACCOUNTS = {
     "wirex:account",
     "swyftx:account",
+    "easycrypto:account",
 }
 
 # Sub-threshold ETH amount treated as dust (contract probes, spam, 1-WEI attacks).
@@ -78,9 +80,47 @@ async def _load_address_set(qdrant, key: str) -> set[str]:
     return set()
 
 
+async def _load_watchlist_tax_addresses(qdrant) -> set[str]:
+    """ETH addresses from wallet.watchlist tagged harness="tax".
+
+    wallet.watchlist is the live, actively-maintained registry of every address
+    Director watches (sov-wallet polls it every 30s) — reusing it here avoids a
+    separately-maintained "internal_addresses" list that drifts out of sync with
+    reality (see semantic:tax:internal_addresses, retired — never read by this
+    module, superseded by this query). Addresses without harness="tax" (e.g. the
+    Blackwall private addresses) are deliberately excluded from tax classification.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+    try:
+        points, _ = await qdrant.archive_client.scroll(
+            collection_name="semantic",
+            scroll_filter=Filter(must=[FieldCondition(key="domain", match=MatchValue(value="wallet.watchlist"))]),
+            limit=64, with_payload=True, with_vectors=False,
+        )
+    except Exception as exc:
+        logger.warning("classifier: failed to load wallet.watchlist: %s", exc)
+        return set()
+    out = set()
+    for p in points:
+        payload = p.payload or {}
+        meta = payload.get("metadata") or {}
+        if meta.get("chain") != "eth":
+            continue
+        if "tax" not in (meta.get("harness") or []):
+            continue
+        value = payload.get("value")
+        if isinstance(value, str) and value.strip():
+            out.add(value.lower())
+    return out
+
+
 def _is_dust(ev) -> bool:
     """Return True if the event amount is below the dust threshold."""
-    if (ev.asset or "").upper() != "ETH":
+    asset = (ev.asset or "").upper()
+    if asset == "WEI":
+        # 1 WEI = 1e-18 ETH — always dust regardless of amount stored
+        return True
+    if asset != "ETH":
         return False
     try:
         raw = (ev.amount or "").split(" ")[0].replace(",", "")
@@ -110,9 +150,13 @@ async def classify_events(
     # excluded_references: references of non-taxable events (loan disbursements etc.)
     # stored as lowercased strings in the "addresses" list of this semantic entry
     excluded_refs     = await _load_address_set(qdrant, "semantic:tax:excluded_references")
+    watchlist_tax     = await _load_watchlist_tax_addresses(qdrant)
 
-    # All addresses the Director controls — used for own-wallet-to-own-wallet detection
-    all_own_wallets = taxable_wallets | mining_wallets
+    # All addresses the Director controls — used for own-wallet-to-own-wallet detection.
+    # Includes wallet.watchlist addresses tagged harness="tax" (LEDGER_BUSINESS,
+    # LEDGER_INVEST, SAFE_MULTISIG, WIREX_ETH, etc.) so transfers to/from those wallets
+    # are recognised as internal even though they never receive mining/staking income.
+    all_own_wallets = taxable_wallets | mining_wallets | watchlist_tax
 
     income:   list = []
     expenses: list = []

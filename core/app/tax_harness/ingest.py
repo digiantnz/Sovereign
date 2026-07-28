@@ -1,7 +1,7 @@
 """Tax Ingest Harness — file ingestion (CSV + PDF).
 
-CSV: Python stdlib `csv` inline — handles Wirex, Swyftx/EasyCrypto, and Etherscan exports.
-PDF: `pdf` skill via nanobot python3_exec.
+CSV: `csv` nanobot skill — handles encoding, format detection, and parsing.
+PDF: `pypdf` nanobot skill — text extraction.
 
 Ingestion is dumb and fast — it records what happened faithfully.
 No classification of income / disposal / internal transfer is performed here.
@@ -9,25 +9,19 @@ All tax treatment is determined by /do_tax at report time.
 
 Event tag rules:
   tax:crypto  — any row involving a crypto asset (non-NZD currency).
-                Exchange-side addresses populated as "wirex:account" or "swyftx:account".
+                Exchange-side addresses populated as "wirex:account",
+                "swyftx:account", or "easycrypto:account" as appropriate.
                 Etherscan rows carry the actual on-chain from/to addresses.
-  tax:expense — any NZD fiat spend row (card spend, fee, receipt).
+  tax:expense — a receipt, invoice PDF, or fiat card spend row from CSV.
 
-Etherscan format notes (newer export format as of 2026):
-  Standard:  Transaction Hash, Status, Method, Blockno, DateTime (UTC), From, From_Nametag,
-             To, To_Nametag, Amount, Value (USD), Txn Fee
-  Internal:  Parent Transaction Hash, Status, Blockno, DateTime (UTC), From, From_Nametag,
-             To, To_Nametag, Amount, Value (USD)
-  Amount field is a combined string e.g. "0.45600614 ETH".
-  Status is "Success"/"Fail" text; zero-amount and failed rows are skipped.
+Etherscan rows arrive from the csv skill without nzd_value — this module
+enriches them via CoinGecko before constructing the TaxEvent.
 """
 from __future__ import annotations
 
-import csv
-import io
 import logging
 import re
-from datetime import date as _date, datetime, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from .models import TaxEvent, format_amount, make_tax_id, resolve_tax_year
@@ -37,46 +31,28 @@ logger = logging.getLogger(__name__)
 _TAX_BASE     = "/Digiant/Tax"
 _INGESTED_TAG = "tax_file_ingested"
 
-# Currency codes that indicate a crypto asset (not fiat)
-_FIAT_CURRENCIES = {"NZD", "AUD", "USD", "EUR", "GBP", "JPY", "CAD", "CHF", "SGD"}
-
-
-def _active_fy_folders() -> list[str]:
-    """Return FY folder paths for the current and immediately prior NZ fiscal year.
-
-    NZ FY YYYY: 1 Apr (YYYY-1) → 31 Mar YYYY.
-    Example: today = May 2026 → current_fy = 2027; scan FY2027 and FY2026.
-    Archived years (renamed to FYxxxx by Director but not in this range) are skipped.
-    """
-    today = _date.today()
-    current_fy = today.year + 1 if today.month >= 4 else today.year
-    return [
-        f"{_TAX_BASE}/FY{current_fy}",
-        f"{_TAX_BASE}/FY{current_fy - 1}",
-    ]
-
 
 # ── File listing ───────────────────────────────────────────────────────────────
 
 async def list_unprocessed_files(nanobot) -> list[dict]:
-    """Return files in active FY folders that do NOT have the tax_file_ingested tag.
+    """Return untagged files anywhere under /Digiant/Tax/ (recursive).
 
-    Only scans FY{current_fy} and FY{current_fy-1} — archived prior years are ignored.
+    Scans the root rather than individual FY subfolders so files placed in the
+    root before being sorted are still picked up. Tag-based dedup prevents
+    reprocessing once a file has been ingested.
     """
-    all_files: list[dict] = []
-    for folder in _active_fy_folders():
-        try:
-            nb = await nanobot.run(
-                "sovereign-nextcloud-fs", "fs_list_recursive", {"path": folder}
-            )
-            result = nb.get("result") if nb.get("result") is not None else nb
-            files = result if isinstance(result, list) else (
-                result.get("files") or result.get("items") or []
-                if isinstance(result, dict) else []
-            )
-            all_files.extend(files)
-        except Exception as exc:
-            logger.warning("ingest: list_unprocessed_files %s failed: %s", folder, exc)
+    try:
+        nb = await nanobot.run(
+            "sovereign-nextcloud-fs", "fs_list_recursive", {"path": _TAX_BASE}
+        )
+        result = nb.get("result") if nb.get("result") is not None else nb
+        all_files = result if isinstance(result, list) else (
+            result.get("files") or result.get("items") or []
+            if isinstance(result, dict) else []
+        )
+    except Exception as exc:
+        logger.warning("ingest: list_unprocessed_files %s failed: %s", _TAX_BASE, exc)
+        return []
     return [
         f for f in all_files
         if _INGESTED_TAG not in (f.get("tags") or [])
@@ -86,514 +62,187 @@ async def list_unprocessed_files(nanobot) -> list[dict]:
 
 # ── CSV ingestion ──────────────────────────────────────────────────────────────
 
-async def ingest_csv_file(
-    nanobot, file_path: str, source_label: str
-) -> list[TaxEvent]:
-    """Download and parse a CSV file from Nextcloud, returning TaxEvents."""
-    try:
-        nb = await nanobot.run(
-            "sovereign-nextcloud-fs", "fs_read", {"path": file_path}
-        )
-        result = nb.get("result") if nb.get("result") is not None else nb
-        content = (
-            result.get("content", "") if isinstance(result, dict) else str(result)
-        )
-    except Exception as exc:
-        logger.warning("ingest: fs_read %s failed: %s", file_path, exc)
-        return []
+def _row_to_tax_event(row: dict, source_label: str) -> TaxEvent | None:
+    """Convert a parsed CSV skill row dict to a TaxEvent.
 
-    if not content.strip():
-        return []
+    Returns None if the row is missing required fields.
+    nzd_value for Etherscan rows is left as None here — caller enriches via CoinGecko.
+    """
+    date_iso  = row.get("date_iso", "")
+    event_tag = row.get("event_tag", "")
+    fmt       = row.get("format", "")
 
-    # Re-decode UTF-16 LE content that arrived latin-1-decoded (no BOM variant).
-    # Wirex NZD Statement exports are UTF-16 LE without BOM; every ASCII char has a
-    # trailing \x00 null byte which survives as U+0000 in the string when httpx falls
-    # back to latin-1.  Detect by null density in the first 40 chars.
-    if content and content[:40].count('\x00') >= 5:
+    if not date_iso or not event_tag:
+        return None
+
+    if event_tag == "tax:expense":
+        vendor     = row.get("vendor", "")
+        raw_amount = row.get("amount_nzd", "")
+        reference  = row.get("reference", "")
+        raw_type   = row.get("raw_type", "")
+        desc       = row.get("description", "")
+
         try:
-            content = content.encode('latin-1').decode('utf-16-le')
-        except Exception:
-            logger.warning("ingest: UTF-16 LE re-decode failed for %s", file_path)
-
-    # Strip UTF-8 BOM (Etherscan) or UTF-16 BOM that survived re-decode
-    content = content.lstrip('﻿')
-
-    # Auto-detect delimiter — Wirex NZD Statement uses ';', others use ','
-    _sample = content[:4096]
-    try:
-        _dialect = csv.Sniffer().sniff(_sample, delimiters=',;\t|')
-        _delim = _dialect.delimiter
-    except csv.Error:
-        _delim = ','
-
-    def _reader(text: str) -> csv.DictReader:
-        return csv.DictReader(io.StringIO(text), delimiter=_delim)
-
-    raw_headers = list(_reader(content).fieldnames or [])
-    headers = [h.lower().strip() for h in raw_headers]
-
-    if _is_receipts_format(headers):
-        return _parse_receipts_csv(_reader(content), source_label)
-    elif _is_wirex_format(headers):
-        return _parse_wirex_csv(_reader(content), source_label, headers)
-    elif _is_swyftx_format(headers):
-        return _parse_swyftx_csv(_reader(content), source_label)
-    elif _is_etherscan_internal(headers):
-        return await _parse_etherscan_csv(_reader(content), source_label, is_internal=True)
-    elif _is_etherscan_standard(headers):
-        return await _parse_etherscan_csv(_reader(content), source_label, is_internal=False)
-    else:
-        logger.warning(
-            "ingest: unknown CSV format in %s — headers: %s", file_path, headers
+            amount_d = Decimal(raw_amount)
+        except (InvalidOperation, Exception):
+            return None
+        amount_nzd = format_amount(amount_d, "NZD")
+        ref_key    = (
+            f"receipt:{reference}" if reference
+            else f"receipt:{vendor}:{date_iso}"
         )
-        return []
+        return TaxEvent(
+            id=make_tax_id(ref_key),
+            event_tag="tax:expense",
+            timestamp=date_iso,
+            tax_year=resolve_tax_year(date_iso),
+            source=source_label,
+            reference=ref_key,
+            nzd_value=amount_nzd,
+            vendor=vendor,
+            amount_nzd=amount_nzd,
+            metadata={k: v for k, v in {
+                "description": desc,
+                "raw_type": raw_type,
+            }.items() if v},
+        )
+
+    elif event_tag == "tax:crypto":
+        asset      = row.get("asset", "")
+        raw_amount = row.get("amount", "")
+        raw_nzd    = row.get("nzd_value", "")
+        tx_hash    = row.get("tx_hash", "") or None
+        from_addr  = row.get("from_address", "") or None
+        to_addr    = row.get("to_address", "") or None
+        reference  = row.get("reference", f"csv:{source_label}:{date_iso}")
+
+        try:
+            amount_d = Decimal(raw_amount)
+        except (InvalidOperation, Exception):
+            return None
+
+        nzd_value: str | None = None
+        if raw_nzd:
+            try:
+                nzd_value = format_amount(Decimal(raw_nzd), "NZD")
+            except (InvalidOperation, Exception):
+                pass
+
+        # Build metadata from format-specific fields that are present
+        meta: dict = {}
+        for k in ("raw_type", "description", "direction", "method", "order_type", "order_id"):
+            v = row.get(k, "")
+            if v:
+                meta[k] = v
+        if fmt.startswith("etherscan"):
+            meta["etherscan_type"] = "internal" if "internal" in fmt else "standard"
+
+        return TaxEvent(
+            id=make_tax_id(reference),
+            event_tag="tax:crypto",
+            timestamp=date_iso,
+            tax_year=resolve_tax_year(date_iso),
+            source=source_label,
+            reference=reference,
+            nzd_value=nzd_value,
+            from_address=from_addr,
+            to_address=to_addr,
+            asset=asset,
+            amount=format_amount(amount_d, asset),
+            tx_hash=tx_hash,
+            metadata=meta,
+        )
+
+    return None
 
 
-def _is_receipts_format(headers: list[str]) -> bool:
-    header_set = set(headers)
-    has_date   = "date" in header_set
-    has_amount = (
-        "amount nzd" in header_set
-        or "total cost (incl gst)" in header_set
-        or "total cost (incl. gst)" in header_set
-    )
-    has_desc   = "description" in header_set or "item" in header_set
-    return has_date and has_amount and has_desc
-
-
-def _is_wirex_format(headers: list[str]) -> bool:
-    # Wirex NZD Statement (semicolon-delimited, UTF-16 LE, actual export format)
-    if "completed date" in headers and "account currency" in headers:
-        return True
-    # Wirex trade export (legacy / speculative format)
-    return (
-        any("merchant" in h or "wirex" in h for h in headers)
-        or ("transaction type" in headers and "currency" in headers and "amount" in headers)
-    )
-
-
-def _is_swyftx_format(headers: list[str]) -> bool:
-    return (
-        any("asset code" in h or "assetcode" in h for h in headers)
-        or ("order type" in headers and ("asset" in headers or "amount" in headers))
-    )
-
-
-def _is_etherscan_standard(headers: list[str]) -> bool:
-    return "transaction hash" in headers and "method" in headers
-
-
-def _is_etherscan_internal(headers: list[str]) -> bool:
-    return "parent transaction hash" in headers
-
-
-async def _parse_etherscan_csv(
-    reader: csv.DictReader,
-    source: str,
-    is_internal: bool,
+async def ingest_csv_file(
+    nanobot, file_path: str, source_label: str,
+    start_date: str = "", end_date: str = "",
 ) -> list[TaxEvent]:
-    """Parse Etherscan standard or internal-transaction CSV export (2026 format).
+    """Parse a CSV file via the csv nanobot skill, returning TaxEvents.
 
-    Standard:  Transaction Hash, Status, Method, Blockno, DateTime (UTC), From,
-               From_Nametag, To, To_Nametag, Amount, Value (USD), Txn Fee
-    Internal:  Parent Transaction Hash, Status, Blockno, DateTime (UTC), From,
-               From_Nametag, To, To_Nametag, Amount, Value (USD)
+    The csv skill handles encoding, delimiter sniffing, format detection, and
+    row normalisation. Etherscan rows arrive without nzd_value and are enriched
+    here via CoinGecko.
 
-    All rows → tax:crypto.  Failed rows (Status != "Success") and zero-amount rows
-    are skipped.  NZD value fetched via CoinGecko; None on failure.
+    start_date / end_date: optional ISO8601 strings forwarded to the skill
+    for date-range filtering before payload is returned (reduces transfer size
+    for large historical files like EasyCrypto going back to 2020).
     """
     from .pricing import enrich_nzd
 
+    payload: dict = {"path": file_path, "source": source_label}
+    if start_date:
+        payload["start_date"] = start_date
+    if end_date:
+        payload["end_date"] = end_date
+
+    try:
+        nb = await nanobot.run("csv", "parse_tax_csv", payload)
+        # Status lives on the outer nb wrapper — inner result dict has no "status" field
+        if nb.get("status") != "ok":
+            logger.warning(
+                "ingest: csv skill error for %s: %s",
+                file_path, nb.get("error", "unknown"),
+            )
+            return []
+        result = nb.get("result") or {}
+        if not isinstance(result, dict):
+            logger.warning("ingest: csv skill returned unexpected type for %s", file_path)
+            return []
+        rows        = result.get("rows", [])
+        fmt         = result.get("format", "unknown")
+        total_rows  = result.get("total_rows", len(rows))
+        skipped     = result.get("skipped", 0)
+        skip_reasons = result.get("skip_reasons", [])
+    except Exception as exc:
+        logger.warning("ingest: csv skill failed for %s: %s", file_path, exc)
+        return []
+
+    logger.info(
+        "ingest [%s]: format=%s total_rows=%d parsed=%d skipped=%d",
+        source_label, fmt, total_rows, len(rows), skipped,
+    )
+    if skip_reasons:
+        logger.debug("ingest [%s]: skip reasons: %s", source_label, skip_reasons[:5])
+
     events: list[TaxEvent] = []
-    hash_field = "Parent Transaction Hash" if is_internal else "Transaction Hash"
+    for row in rows:
+        ev = _row_to_tax_event(row, source_label)
+        if ev is None:
+            continue
 
-    for row in reader:
-        try:
-            if (row.get("Status") or "").strip().lower() != "success":
-                continue
-
-            tx_hash = (row.get(hash_field) or "").strip()
-            if not tx_hash:
-                continue
-
-            raw_dt = (row.get("DateTime (UTC)") or "").strip()
-            timestamp = _normalise_timestamp(raw_dt)
-            if not timestamp:
-                continue
-
-            from_address = (row.get("From") or "").strip().lower() or None
-            to_address   = (row.get("To")   or "").strip().lower() or None
-
-            # Amount is "0.45600614 ETH" — split on last space
-            raw_amount = (row.get("Amount") or "").strip()
-            if not raw_amount:
-                continue
-            parts = raw_amount.rsplit(" ", 1)
+        # Etherscan rows need CoinGecko NZD enrichment — nzd_value is None here
+        if (
+            ev.event_tag == "tax:crypto"
+            and ev.nzd_value is None
+            and row.get("format", "").startswith("etherscan")
+        ):
             try:
-                amount_d = Decimal(parts[0].replace(",", ""))
-            except InvalidOperation:
-                continue
-            asset = parts[1].upper() if len(parts) == 2 else "ETH"
+                raw = (ev.amount or "0").split()[0].replace(",", "")
+                amount_d = Decimal(raw)
+                ev.nzd_value = await enrich_nzd(ev.asset, ev.timestamp, amount_d)
+            except Exception as exc:
+                logger.warning(
+                    "ingest: enrich_nzd failed for %s: %s", ev.reference, exc
+                )
 
-            # Normalize WEI to ETH — Etherscan labels some 1-WEI transactions as "WEI"
-            if asset == "WEI":
-                amount_d = amount_d / Decimal("1000000000000000000")
-                asset = "ETH"
-
-            # Skip zero-value and dust rows (contract probes, 1-WEI spam, RP interactions)
-            if amount_d == 0:
-                continue
-            if asset == "ETH" and amount_d < Decimal("0.0001"):
-                continue
-
-            reference = f"etherscan:{tx_hash}"
-            nzd_value = await enrich_nzd(asset, timestamp, amount_d)
-
-            events.append(TaxEvent(
-                id=make_tax_id(reference),
-                event_tag="tax:crypto",
-                timestamp=timestamp,
-                tax_year=resolve_tax_year(timestamp),
-                source=source,
-                reference=reference,
-                nzd_value=nzd_value,
-                from_address=from_address,
-                to_address=to_address,
-                asset=asset,
-                amount=format_amount(amount_d, asset),
-                tx_hash=tx_hash,
-                metadata={
-                    "etherscan_type": "internal" if is_internal else "standard",
-                    "method": (row.get("Method") or "").strip(),
-                },
-            ))
-        except Exception as exc:
-            logger.warning("ingest: etherscan row parse error: %s", exc)
+        events.append(ev)
 
     return events
 
 
-def _parse_wirex_csv(
-    reader: csv.DictReader,
-    source: str,
-    headers: list[str] | None = None,
-) -> list[TaxEvent]:
-    """Dispatch to the correct Wirex sub-parser based on column headers."""
-    if headers is None:
-        headers = [h.lower().strip() for h in (reader.fieldnames or [])]
-    if "completed date" in headers:
-        return _parse_wirex_nzd_statement(reader, source)
-    return _parse_wirex_trade_csv(reader, source)
-
-
-def _parse_wirex_nzd_statement(reader: csv.DictReader, source: str) -> list[TaxEvent]:
-    """Parse Wirex NZD Statement export (semicolon-delimited, UTF-16 LE, 2025+ format).
-
-    Columns: Completed Date; Type; Description; Amount; Account Currency;
-             Rate; Foreign Amount; Foreign Currency; Balance; Related Entity ID
-
-    Card Payment rows with negative Amount → tax:expense (NZD card spend).
-    Rows with a non-fiat Foreign Currency → tax:crypto (exchange trade; NZD value
-    taken from Amount, crypto amount from Foreign Amount).
-    All other rows (Top Up, Balance, positive Card Payment refunds, etc.) are skipped.
-    """
-    events: list[TaxEvent] = []
-    for row in reader:
-        try:
-            raw_type   = (row.get("Type") or "").strip()
-            raw_date   = (row.get("Completed Date") or "").strip()
-            raw_amount = (row.get("Amount") or "0").strip()
-            acct_ccy   = (row.get("Account Currency") or "NZD").strip().upper()
-            foreign_ccy    = (row.get("Foreign Currency") or "").strip().upper()
-            raw_foreign_amt = (row.get("Foreign Amount") or "0").strip()
-            description    = (row.get("Description") or "").strip()
-            external_id    = (row.get("Related Entity ID") or "").strip()
-
-            if not raw_date:
-                continue
-
-            timestamp = _normalise_timestamp(raw_date)
-            if not timestamp:
-                continue
-
-            try:
-                amount_d = Decimal(raw_amount.replace(",", ""))
-            except InvalidOperation:
-                continue
-
-            reference = f"wirex:{external_id}" if external_id else f"wirex:{timestamp}:{raw_type}"
-
-            # Crypto exchange row — Foreign Currency is a non-fiat asset
-            if foreign_ccy and foreign_ccy not in _FIAT_CURRENCIES:
-                try:
-                    foreign_d = abs(Decimal(raw_foreign_amt.replace(",", "")))
-                except InvalidOperation:
-                    foreign_d = None
-
-                nzd_value = format_amount(abs(amount_d), "NZD") if amount_d else None
-                # Direction: primary check from Description (reliable Wirex phrases);
-                # fallback to NZD amount sign.
-                # "Bought NZD with ETH/X" → sold crypto → disposal (sell)
-                # Negative NZD / "Bought ETH/X with NZD" → acquired crypto → acquisition (buy)
-                desc_lower = description.lower()
-                if "bought nzd" in desc_lower:
-                    direction = "sell"
-                elif amount_d > 0:
-                    direction = "sell"
-                else:
-                    direction = "buy"
-                events.append(TaxEvent(
-                    id=make_tax_id(reference),
-                    event_tag="tax:crypto",
-                    timestamp=timestamp,
-                    tax_year=resolve_tax_year(timestamp),
-                    source=source,
-                    reference=reference,
-                    nzd_value=nzd_value,
-                    from_address="wirex:account",
-                    to_address="wirex:account",
-                    asset=foreign_ccy,
-                    amount=format_amount(foreign_d, foreign_ccy) if foreign_d else None,
-                    tx_hash=external_id or None,
-                    metadata={"raw_type": raw_type, "description": description, "direction": direction},
-                ))
-                continue
-
-            # Card spend — negative NZD amount
-            if raw_type.lower() == "card payment" and amount_d < 0:
-                spend = abs(amount_d)
-                events.append(TaxEvent(
-                    id=make_tax_id(reference),
-                    event_tag="tax:expense",
-                    timestamp=timestamp,
-                    tax_year=resolve_tax_year(timestamp),
-                    source=source,
-                    reference=reference,
-                    nzd_value=format_amount(spend, "NZD"),
-                    vendor=description or raw_type,
-                    amount_nzd=format_amount(spend, "NZD"),
-                    metadata={"raw_type": raw_type},
-                ))
-                continue
-
-            # All other rows (Top Up, positive refunds, etc.) — not taxable, skip
-
-        except Exception as exc:
-            logger.warning("ingest: wirex nzd statement row parse error: %s", exc)
-
-    return events
-
-
-def _parse_wirex_trade_csv(reader: csv.DictReader, source: str) -> list[TaxEvent]:
-    """Parse legacy Wirex trade CSV export.
-
-    Card spend rows (NZD fiat) → tax:expense with vendor and amount_nzd.
-    Trade rows (crypto asset) → tax:crypto with "wirex:account" as both addresses.
-    """
-    events: list[TaxEvent] = []
-    for row in reader:
-        try:
-            raw_type  = (row.get("Transaction Type") or row.get("transaction type") or "").lower()
-            raw_amount = row.get("Amount") or row.get("amount") or "0"
-            currency   = (row.get("Currency") or row.get("currency") or "NZD").upper()
-            raw_date   = (
-                row.get("Date") or row.get("date")
-                or row.get("Transaction Date") or row.get("transaction date") or ""
-            )
-            external_id = (
-                row.get("Transaction ID") or row.get("transaction id")
-                or row.get("Reference") or row.get("reference") or ""
-            )
-            merchant = (
-                row.get("Merchant") or row.get("merchant")
-                or row.get("Description") or row.get("description") or ""
-            )
-
-            if not raw_date or not external_id:
-                continue
-
-            timestamp = _normalise_timestamp(raw_date)
-            if not timestamp:
-                continue
-
-            try:
-                amount_d = Decimal(str(raw_amount).replace(",", "").strip())
-            except InvalidOperation:
-                continue
-
-            reference = f"wirex:{external_id}"
-
-            if currency not in _FIAT_CURRENCIES:
-                # Crypto trade row → tax:crypto
-                events.append(TaxEvent(
-                    id=make_tax_id(reference),
-                    event_tag="tax:crypto",
-                    timestamp=timestamp,
-                    tax_year=resolve_tax_year(timestamp),
-                    source=source,
-                    reference=reference,
-                    nzd_value=None,
-                    from_address="wirex:account",
-                    to_address="wirex:account",
-                    asset=currency,
-                    amount=format_amount(amount_d, currency),
-                    tx_hash=external_id,
-                    metadata={"merchant": merchant, "raw_type": raw_type},
-                ))
-            else:
-                # Fiat card spend row → tax:expense
-                events.append(TaxEvent(
-                    id=make_tax_id(reference),
-                    event_tag="tax:expense",
-                    timestamp=timestamp,
-                    tax_year=resolve_tax_year(timestamp),
-                    source=source,
-                    reference=reference,
-                    nzd_value=format_amount(amount_d, "NZD"),
-                    vendor=merchant or raw_type,
-                    amount_nzd=format_amount(amount_d, "NZD"),
-                    metadata={"raw_type": raw_type},
-                ))
-        except Exception as exc:
-            logger.warning("ingest: wirex row parse error: %s", exc)
-
-    return events
-
-
-def _parse_swyftx_csv(reader: csv.DictReader, source: str) -> list[TaxEvent]:
-    """Parse Swyftx/EasyCrypto CSV export.
-
-    All rows are crypto trades → tax:crypto with "swyftx:account" as exchange addresses.
-    /do_tax determines whether each trade is an acquisition or disposal at report time.
-    """
-    events: list[TaxEvent] = []
-    for row in reader:
-        try:
-            asset = (
-                row.get("Asset Code") or row.get("AssetCode")
-                or row.get("Asset") or row.get("asset") or "NZD"
-            ).upper()
-            raw_amount  = row.get("Amount") or row.get("amount") or "0"
-            order_type  = (row.get("Order Type") or row.get("order type") or "").lower()
-            raw_date    = (
-                row.get("Date") or row.get("date")
-                or row.get("Transaction Date") or ""
-            )
-            external_id = (
-                row.get("Order ID") or row.get("order id")
-                or row.get("ID") or row.get("id") or ""
-            )
-
-            if not raw_date or not external_id:
-                continue
-
-            timestamp = _normalise_timestamp(raw_date)
-            if not timestamp:
-                continue
-
-            try:
-                amount_d = abs(Decimal(str(raw_amount).replace(",", "").strip()))
-            except InvalidOperation:
-                continue
-
-            reference = f"swyftx:{external_id}"
-            events.append(TaxEvent(
-                id=make_tax_id(reference),
-                event_tag="tax:crypto",
-                timestamp=timestamp,
-                tax_year=resolve_tax_year(timestamp),
-                source=source,
-                reference=reference,
-                nzd_value=None,
-                from_address="swyftx:account",
-                to_address="swyftx:account",
-                asset=asset,
-                amount=format_amount(amount_d, asset),
-                tx_hash=external_id,
-                metadata={"order_type": order_type},
-            ))
-        except Exception as exc:
-            logger.warning("ingest: swyftx row parse error: %s", exc)
-
-    return events
-
-
-def _parse_receipts_csv(reader: csv.DictReader, source: str) -> list[TaxEvent]:
-    """Parse manually-maintained receipts spreadsheet.
-
-    Columns: Date, Merchant, Description, Amount NZD, Reference
-    All rows → tax:expense. Description stored in full — no truncation.
-    Date format: DD/MM/YYYY (NZ standard); other formats also accepted.
-    Amount may include a leading '$' or comma thousands separators.
-    Rows with missing date, unparseable amount, or zero/negative amount are skipped.
-    """
-    events: list[TaxEvent] = []
-    for row in reader:
-        try:
-            raw_date    = (row.get("Date") or "").strip()
-            merchant    = (
-                row.get("Merchant") or row.get("Vendor") or row.get("Store") or ""
-            ).strip()
-            description = (row.get("Description") or row.get("Item") or "").strip()
-            raw_amount  = (
-                row.get("Amount NZD")
-                or row.get("Total Cost (incl GST)")
-                or row.get("Total Cost (incl. GST)")
-                or ""
-            ).strip()
-            reference   = (
-                row.get("Reference") or row.get("Order ID") or row.get("Order No.") or ""
-            ).strip()
-
-            if not raw_date or not raw_amount:
-                continue
-
-            timestamp = _normalise_timestamp(raw_date)
-            if not timestamp:
-                continue
-
-            try:
-                amount_d = Decimal(raw_amount.replace(",", "").replace("$", "").strip())
-            except InvalidOperation:
-                continue
-
-            if amount_d <= 0:
-                continue
-
-            ref_key    = f"receipt:{reference}" if reference else f"receipt:{merchant}:{timestamp}"
-            amount_nzd = format_amount(amount_d, "NZD")
-
-            events.append(TaxEvent(
-                id=make_tax_id(ref_key),
-                event_tag="tax:expense",
-                timestamp=timestamp,
-                tax_year=resolve_tax_year(timestamp),
-                source=source,
-                reference=ref_key,
-                nzd_value=amount_nzd,
-                vendor=merchant,
-                amount_nzd=amount_nzd,
-                metadata={"description": description},
-            ))
-        except Exception as exc:
-            logger.warning("ingest: receipts row parse error: %s", exc)
-
-    return events
-
+# ── PDF ingestion ──────────────────────────────────────────────────────────────
 
 def _normalise_timestamp(raw: str) -> str | None:
-    """Normalise various date/datetime strings to ISO8601 UTC."""
+    """Normalise date/datetime strings to ISO8601 UTC. Used by PDF parser."""
     raw = raw.strip()
     formats = [
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y",           # DD/MM/YYYY (four-digit year first to avoid ambiguity)
-        "%d/%m/%y",           # DD/MM/YY  (NZ receipts spreadsheet: "10/03/26")
-        "%d-%m-%Y %H:%M:%S",  # Wirex NZD Statement: "02-04-2025 00:00:03"
-        "%d-%m-%Y",
+        "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y", "%d/%m/%y",
+        "%d-%m-%Y %H:%M:%S", "%d-%m-%Y",
         "%m/%d/%Y",
     ]
     for fmt in formats:
@@ -604,22 +253,19 @@ def _normalise_timestamp(raw: str) -> str | None:
             return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
             continue
-    logger.warning("ingest: cannot normalise timestamp %r", raw)
     return None
 
-
-# ── PDF ingestion ──────────────────────────────────────────────────────────────
 
 async def ingest_pdf_receipt(
     nanobot, file_path: str, source_label: str
 ) -> list[TaxEvent]:
-    """Extract a tax:expense TaxEvent from a PDF receipt via the pdf skill."""
+    """Extract a tax:expense TaxEvent from a PDF receipt via the pypdf skill."""
     try:
-        nb = await nanobot.run("pdf", "extract_text", {"path": file_path})
+        nb = await nanobot.run("pypdf", "extract_text", {"path": file_path})
         result = nb.get("result") if nb.get("result") is not None else nb
         text = result.get("text", "") if isinstance(result, dict) else str(result)
     except Exception as exc:
-        logger.warning("ingest: pdf extract_text %s failed: %s", file_path, exc)
+        logger.warning("ingest: pypdf extract_text %s failed: %s", file_path, exc)
         return []
 
     if not text.strip():
@@ -629,7 +275,9 @@ async def ingest_pdf_receipt(
     date_match   = re.search(
         r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}-\d{2}-\d{2})", text
     )
-    vendor_match = re.search(r"(?:from|vendor|merchant|issued by)[:\s]+([^\n]+)", text, re.IGNORECASE)
+    vendor_match = re.search(
+        r"(?:from|vendor|merchant|issued by)[:\s]+([^\n]+)", text, re.IGNORECASE
+    )
 
     if not amount_match:
         logger.warning("ingest: no amount found in PDF %s", file_path)
@@ -649,7 +297,7 @@ async def ingest_pdf_receipt(
     except InvalidOperation:
         return []
 
-    reference = f"receipt:{source_label}"
+    reference  = f"receipt:{source_label}"
     amount_nzd = format_amount(amount_d, "NZD")
     return [TaxEvent(
         id=make_tax_id(reference),

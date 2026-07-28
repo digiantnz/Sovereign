@@ -17,6 +17,7 @@ Flow:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -29,7 +30,11 @@ from tax_harness.models import TaxEvent, make_tax_id, resolve_tax_year
 logger = logging.getLogger(__name__)
 
 _CHECKPOINT_FLAG = "_receipt_capture_checkpoint"
-_CHECKPOINT_KEY  = "receipt_capture:session"
+
+_CATEGORIES = (
+    "IT Equipment", "Consumables", "Travel", "Food",
+    "Telecommunications", "Professional Services", "Other", "misc",
+)
 
 _EXTRACTION_PROMPT = """\
 You are a receipt data extraction assistant. Analyse the receipt image and extract fields.
@@ -39,16 +44,18 @@ Required JSON structure:
 {
   "vendor": "merchant name exactly as shown on receipt",
   "date": "YYYY-MM-DD",
-  "amount_nzd": 45.50,
+  "amount": 45.50,
   "currency": "NZD",
   "reference": "invoice or order number if visible, null if not present",
-  "category_hint": "one of: office_supplies, software, hardware, hosting, travel, meals, other"
+  "category_hint": "one of: IT Equipment / Consumables / Travel / Food / Telecommunications / Professional Services / Other / misc"
 }
 
 Rules:
 - date MUST be YYYY-MM-DD (ISO 8601). Never DD-MM-YYYY.
-- amount_nzd MUST be a number, not a string.
+- amount MUST be a number, not a string. Use the currency shown on the receipt.
+- currency MUST be the ISO 4217 code shown on the receipt (NZD, USD, AUD, GBP, EUR, etc.).
 - reference and category_hint may be null if not determinable.
+- Use misc for purchases that clearly don't fit any listed category.
 """
 
 
@@ -57,25 +64,29 @@ Rules:
 def _strip_json_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
-        lines = text.splitlines()
-        start = 1
-        end   = len(lines)
-        for i in range(len(lines) - 1, 0, -1):
-            if lines[i].strip() == "```":
-                end = i
-                break
-        text = "\n".join(lines[start:end]).strip()
-    return text
+        text = re.sub(r"^```\w*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    return text.strip()
 
 
 def _confirmation_summary(vendor: str, date_str: str, amount_d: Decimal,
-                           currency: str, category_hint, reference: str, tax_year: str) -> str:
+                           currency: str, nzd_d: Decimal | None,
+                           category_hint, reference: str, tax_year: str) -> str:
+    nzd_line = (
+        f"NZD: ${nzd_d:.2f} NZD\n" if nzd_d
+        else "NZD equivalent: unknown — reply with 'nzd XX.XX' to set\n"
+    )
+    amount_line = (
+        f"Amount: ${amount_d:.2f} {currency}\n" if currency != "NZD"
+        else f"Amount: ${amount_d:.2f} NZD\n"
+    )
     return (
         f"*Receipt extracted:*\n"
         f"Vendor: {vendor}\n"
         f"Date: {date_str}\n"
-        f"Amount: ${amount_d:.2f} {currency}\n"
-        f"Category: {category_hint or 'unclassified'}\n"
+        + amount_line
+        + (nzd_line if currency != "NZD" else "")
+        + f"Category: {category_hint or 'unclassified'}\n"
         f"Reference: {reference}\n"
         f"Tax year: FY{tax_year}\n\n"
         "Correct? Reply 'yes' to confirm, or reply with corrections."
@@ -164,7 +175,7 @@ async def handle_receipt_capture(
 
     # Amount via Decimal(str()) — safe from float representation errors
     try:
-        amount_d = Decimal(str(parsed.get("amount_nzd") or 0))
+        amount_d = Decimal(str(parsed.get("amount") or 0))
         if amount_d <= 0:
             raise ValueError("amount must be positive")
     except (InvalidOperation, ValueError, TypeError) as exc:
@@ -172,12 +183,14 @@ async def handle_receipt_capture(
         return {
             "status": "parse_error",
             "director_message": (
-                f"Could not parse receipt amount (got: {parsed.get('amount_nzd')!r}). "
+                f"Could not parse receipt amount (got: {parsed.get('amount')!r}). "
                 "Please retake the photo and try again."
             ),
         }
 
-    amount_nzd_str = f"${amount_d:.2f} NZD"
+    # NZD value — only known immediately if the receipt is in NZD
+    nzd_d:   Decimal | None = amount_d if currency == "NZD" else None
+    nzd_str: str | None     = f"${nzd_d:.2f} NZD" if nzd_d else None
 
     # Parse date → ISO8601 UTC timestamp
     try:
@@ -197,19 +210,24 @@ async def handle_receipt_capture(
         tax_year=tax_year,
         source="receipt_camera",
         reference=reference,
-        nzd_value=amount_nzd_str,
+        nzd_value=nzd_str,
         vendor=vendor,
-        amount_nzd=amount_nzd_str,
-        metadata={"category_hint": category_hint} if category_hint else {},
+        amount_nzd=nzd_str,
+        metadata={
+            **({"category_hint": category_hint} if category_hint else {}),
+            "original_amount":   str(amount_d),
+            "original_currency": currency,
+        },
     )
 
     checkpoint = {
-        _CHECKPOINT_FLAG: True,
+        _CHECKPOINT_FLAG:  True,
         "session_id":      str(uuid.uuid4()),
         "current_step":    "pending_confirmation",
         "vendor":          vendor,
         "date":            date_str,
-        "amount_nzd":      str(amount_d),
+        "amount_original": str(amount_d),   # raw extracted amount in original currency
+        "amount_nzd":      str(nzd_d) if nzd_d else "",  # NZD decimal; empty = unknown
         "currency":        currency,
         "category_hint":   category_hint,
         "reference":       reference,
@@ -223,7 +241,7 @@ async def handle_receipt_capture(
 
     try:
         await qdrant.store(
-            content=f"Receipt capture pending confirmation: {vendor} ${amount_d:.2f} {date_str}",
+            content=f"Receipt capture pending confirmation: {vendor} ${amount_d:.2f} {currency} {date_str}",
             collection="working_memory",
             metadata=checkpoint,
         )
@@ -233,7 +251,7 @@ async def handle_receipt_capture(
     return {
         "status": "awaiting_confirm",
         "director_message": _confirmation_summary(
-            vendor, date_str, amount_d, currency, category_hint, reference, tax_year
+            vendor, date_str, amount_d, currency, nzd_d, category_hint, reference, tax_year
         ),
     }
 
@@ -303,22 +321,29 @@ async def _clear_checkpoint(qdrant) -> None:
 
 async def _confirm_and_store(checkpoint: dict, qdrant, nanobot) -> dict:
     """Write TaxEvent to semantic archive; kick off photo upload; clear checkpoint."""
-    point_id  = checkpoint["point_id"]
-    tax_year  = checkpoint["tax_year"]
-    vendor    = checkpoint["vendor"]
-    date_str  = checkpoint["date"]
-    amount_s  = checkpoint["amount_nzd"]
-    reference = checkpoint["reference"]
-    image_b64 = checkpoint.get("image_b64", "")
-    mime_type = checkpoint.get("mime_type", "image/jpeg")
+    point_id        = checkpoint["point_id"]
+    tax_year        = checkpoint["tax_year"]
+    vendor          = checkpoint["vendor"]
+    date_str        = checkpoint["date"]
+    currency        = checkpoint.get("currency", "NZD")
+    amount_original = checkpoint.get("amount_original") or checkpoint.get("amount_nzd", "")
+    amount_nzd_raw  = checkpoint.get("amount_nzd", "")
+    nzd_str         = f"${Decimal(amount_nzd_raw):.2f} NZD" if amount_nzd_raw else None
+    reference       = checkpoint["reference"]
+    image_b64       = checkpoint.get("image_b64", "")
+    mime_type       = checkpoint.get("mime_type", "image/jpeg")
 
     tax_payload = checkpoint.get("tax_event_payload", {})
+    # Re-sync nzd_value in case Director provided it via corrections after capture
+    tax_payload["nzd_value"]  = nzd_str
+    tax_payload["amount_nzd"] = nzd_str
     # Inject stable _key so qdrant.store() skips LLM key-generation
-    stable_key  = f"tax:expense:receipt:{point_id[:8]}"
+    stable_key = f"tax:expense:receipt:{point_id[:8]}"
     tax_payload.setdefault("_key",   stable_key)
     tax_payload.setdefault("sov_id", point_id)
 
-    content = f"Receipt: {vendor} — ${amount_s} NZD on {date_str} (ref: {reference})"
+    amount_display = f"${amount_original} {currency}" if currency != "NZD" else (nzd_str or f"${amount_original} NZD")
+    content = f"Receipt: {vendor} — {amount_display} on {date_str} (ref: {reference})"
 
     try:
         await qdrant.store(
@@ -349,11 +374,12 @@ async def _confirm_and_store(checkpoint: dict, qdrant, nanobot) -> dict:
 
     await _clear_checkpoint(qdrant)
 
+    nzd_note = f" | NZD: {nzd_str}" if nzd_str else " | NZD: unresolved"
     return {
         "status": "confirmed",
         "director_message": (
             f"Receipt saved.\n"
-            f"Vendor: {vendor} | Amount: ${amount_s} NZD | FY{tax_year} | ID: {point_id[:8]}"
+            f"Vendor: {vendor} | {amount_display}{nzd_note} | FY{tax_year} | ID: {point_id[:8]}"
         ),
     }
 
@@ -362,32 +388,43 @@ async def _confirm_and_store(checkpoint: dict, qdrant, nanobot) -> dict:
 
 async def _apply_corrections(user_input: str, checkpoint: dict, qdrant) -> dict:
     """Parse correction text, patch checkpoint fields, re-write WM, re-present summary."""
-    vendor        = checkpoint["vendor"]
-    date_str      = checkpoint["date"]
-    amount_d      = Decimal(checkpoint["amount_nzd"])
-    currency      = checkpoint["currency"]
-    category_hint = checkpoint.get("category_hint")
-    reference     = checkpoint["reference"]
-    timestamp     = checkpoint["timestamp"]
-    tax_year      = checkpoint["tax_year"]
-    point_id      = checkpoint["point_id"]
+    vendor          = checkpoint["vendor"]
+    date_str        = checkpoint["date"]
+    currency        = checkpoint.get("currency", "NZD")
+    amount_original = Decimal(checkpoint.get("amount_original") or checkpoint.get("amount_nzd") or "0")
+    amount_nzd_raw  = checkpoint.get("amount_nzd", "")
+    nzd_d: Decimal | None = Decimal(amount_nzd_raw) if amount_nzd_raw else None
+    category_hint   = checkpoint.get("category_hint")
+    reference       = checkpoint["reference"]
+    timestamp       = checkpoint["timestamp"]
+    tax_year        = checkpoint["tax_year"]
+    point_id        = checkpoint["point_id"]
 
     u = user_input.lower()
 
-    # Amount: "$45.50" or "45.50" or "amount is 45.50"
-    m = re.search(r"\$?([\d]+\.[\d]{1,2})\s*(?:nzd)?", u)
+    # "nzd XX.XX" — explicit NZD equivalent for foreign-currency receipts
+    m = re.search(r"nzd\s+\$?([\d]+(?:\.[\d]{1,2})?)", u)
     if m:
         try:
-            amount_d = Decimal(m.group(1))
+            nzd_d = Decimal(m.group(1))
         except InvalidOperation:
             pass
+    elif currency == "NZD":
+        # NZD receipt — a bare amount is a correction to the receipt total
+        m = re.search(r"\$?([\d]+\.[\d]{1,2})\s*(?:nzd)?", u)
+        if m:
+            try:
+                amount_original = Decimal(m.group(1))
+                nzd_d = amount_original
+            except InvalidOperation:
+                pass
 
     # Date: YYYY-MM-DD
     m = re.search(r"(\d{4}-\d{2}-\d{2})", user_input)
     if m:
         try:
-            dt       = datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            date_str = dt.strftime("%Y-%m-%d")
+            dt        = datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            date_str  = dt.strftime("%Y-%m-%d")
             timestamp = dt.isoformat().replace("+00:00", "Z")
             tax_year  = resolve_tax_year(timestamp)
         except ValueError:
@@ -398,13 +435,12 @@ async def _apply_corrections(user_input: str, checkpoint: dict, qdrant) -> dict:
     if m:
         vendor = m.group(1).strip().title()
 
-    # Category
-    for cat in ("office_supplies", "software", "hardware", "hosting", "travel", "meals", "other"):
-        if cat.replace("_", " ") in u or cat in u:
+    for cat in _CATEGORIES:
+        if cat.lower() in u:
             category_hint = cat
             break
 
-    amount_nzd_str = f"${amount_d:.2f} NZD"
+    nzd_str: str | None = f"${nzd_d:.2f} NZD" if nzd_d else None
     event = TaxEvent(
         id=point_id,
         event_tag="tax:expense",
@@ -412,17 +448,22 @@ async def _apply_corrections(user_input: str, checkpoint: dict, qdrant) -> dict:
         tax_year=tax_year,
         source="receipt_camera",
         reference=reference,
-        nzd_value=amount_nzd_str,
+        nzd_value=nzd_str,
         vendor=vendor,
-        amount_nzd=amount_nzd_str,
-        metadata={"category_hint": category_hint} if category_hint else {},
+        amount_nzd=nzd_str,
+        metadata={
+            **({"category_hint": category_hint} if category_hint else {}),
+            "original_amount":   str(amount_original),
+            "original_currency": currency,
+        },
     )
 
     updated = {
         **checkpoint,
         "vendor":          vendor,
         "date":            date_str,
-        "amount_nzd":      str(amount_d),
+        "amount_original": str(amount_original),
+        "amount_nzd":      str(nzd_d) if nzd_d else "",
         "currency":        currency,
         "category_hint":   category_hint,
         "tax_year":        tax_year,
@@ -432,7 +473,7 @@ async def _apply_corrections(user_input: str, checkpoint: dict, qdrant) -> dict:
 
     try:
         await qdrant.store(
-            content=f"Receipt capture pending confirmation: {vendor} ${amount_d:.2f} {date_str}",
+            content=f"Receipt capture pending confirmation: {vendor} ${amount_original:.2f} {currency} {date_str}",
             collection="working_memory",
             metadata=updated,
         )
@@ -442,7 +483,7 @@ async def _apply_corrections(user_input: str, checkpoint: dict, qdrant) -> dict:
     return {
         "status": "awaiting_confirm",
         "director_message": "Updated. " + _confirmation_summary(
-            vendor, date_str, amount_d, currency, category_hint, reference, tax_year
+            vendor, date_str, amount_original, currency, nzd_d, category_hint, reference, tax_year
         ),
     }
 
@@ -459,7 +500,6 @@ async def _upload_receipt_photo(
     point_id: str,
 ) -> None:
     """Upload receipt photo to Nextcloud. Non-blocking — all failures are logged only."""
-    import base64
     try:
         safe_vendor  = re.sub(r"[^a-z0-9]+", "_", vendor.lower())[:20].strip("_")
         filename     = f"{date_str}_{safe_vendor}_{point_id[:8]}.jpg"
