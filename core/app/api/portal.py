@@ -12,13 +12,11 @@ import json
 import logging
 import os
 import re
-import struct
-from typing import AsyncGenerator
 
 import httpx
 import yaml
 from fastapi import APIRouter, Body, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +30,8 @@ SKILLS_DIR       = _cfg.paths.skills_dir
 GOVERNANCE_PATH  = _cfg.paths.governance_json_container
 DASHBOARD_PATH   = _cfg.paths.portal_html
 CONFIG_PATH      = "/home/sovereign/governance/sovereign-config.yaml"
-BROKER_URL       = os.environ.get("BROKER_URL", "http://docker-broker:8088")
 OLLAMA_URL       = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 OLLAMA_EMBED_URL = os.environ.get("OLLAMA_EMBED_URL", "http://ollama-embed:11434")
-LOG_CONTAINERS   = _cfg.portal.log_containers
-LOG_TAIL_EACH    = _cfg.portal.log_tail_each_container
-LOG_HEARTBEAT_S  = _cfg.portal.log_heartbeat_s
 
 SOVEREIGN_COLLECTIONS = frozenset({
     "semantic", "episodic", "prospective", "procedural",
@@ -158,8 +152,8 @@ HARNESS_DEFS = [
     },
     {
         "key":    "cognition_engine",
-        "name":   "Cognition Engine (Subjects/Campaigns)",
-        "flag":   "_cognition_campaign",   # per-campaign checkpoint — multiple can
+        "name":   "Cognition Engine (Subjects/Thoughts)",
+        "flag":   "_cognition_thought",   # per-thought checkpoint — multiple can
                                             # run concurrently; this shows whichever
                                             # the scroll finds first, not an exhaustive
                                             # list (see _get_harness_sessions — first
@@ -239,93 +233,6 @@ async def _get_dev_harness_prospective(qdrant) -> dict | None:
     except Exception as e:
         logger.warning("portal /harnesses: PROSPECTIVE dev-harness scroll failed: %s", e)
     return None
-
-
-# ── Docker log streaming ───────────────────────────────────────────────────────
-
-async def _stream_container_logs(
-    container: str,
-    queue: "asyncio.Queue[str]",
-    tail: int = LOG_TAIL_EACH,
-) -> None:
-    """Stream Docker container logs into the shared queue with auto-reconnect.
-
-    Implements the full Docker multiplexed log stream parser (RFC 8-byte header):
-      bytes 0:   stream type (1=stdout, 2=stderr; discarded — both shown)
-      bytes 1-3: 0x00 padding
-      bytes 4-7: frame payload size (big-endian uint32)
-      bytes 8…:  frame_size bytes of UTF-8 log text
-
-    Permitted by docker-policy.yaml: GET:/containers/*/logs in trust.levels.low.allow.
-    Named policy intent: log_tail_sovereign (see named_commands section).
-    """
-    url          = f"{BROKER_URL}/containers/{container}/logs"
-    reconnect_s  = 3.0   # delay before reconnect attempt
-    first_connect = True
-    while True:
-        params = {
-            "follow": "1", "stdout": "1", "stderr": "1",
-            "tail": str(tail) if first_connect else "0",
-        }
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=5.0, read=None, write=5.0, pool=5.0)
-            ) as client:
-                async with client.stream(
-                    "GET", url, params=params, headers={"X-Trust-Level": "low"}
-                ) as response:
-                    if response.status_code != 200:
-                        await queue.put(f"[{container}] error: HTTP {response.status_code}")
-                        await asyncio.sleep(reconnect_s)
-                        continue
-                    first_connect = False
-                    buf = b""
-                    async for chunk in response.aiter_bytes():
-                        buf += chunk
-                        # Parse complete frames from buffer
-                        while len(buf) >= 8:
-                            frame_size = struct.unpack(">I", buf[4:8])[0]
-                            if len(buf) < 8 + frame_size:
-                                break   # incomplete frame — accumulate more data
-                            frame_bytes = buf[8:8 + frame_size]
-                            buf         = buf[8 + frame_size:]
-                            text = frame_bytes.decode("utf-8", errors="replace").rstrip("\n")
-                            if text:
-                                for line in text.splitlines():
-                                    if line.strip():
-                                        await queue.put(f"[{container}] {line}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("portal /logs/stream: %s reconnecting after error: %s", container, e)
-        await asyncio.sleep(reconnect_s)
-
-
-async def _sse_log_generator(request: Request) -> AsyncGenerator[str, None]:
-    """Async generator for the SSE log stream endpoint.
-
-    Opens three parallel httpx streaming connections to the broker Docker API
-    proxy, one per container. Lines are merged into a single asyncio.Queue
-    and yielded as SSE events. A 25-second heartbeat keeps the connection alive
-    through proxies and firewalls. All tasks are cancelled on client disconnect.
-    """
-    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
-    tasks = [
-        asyncio.create_task(_stream_container_logs(c, queue))
-        for c in LOG_CONTAINERS
-    ]
-    try:
-        while True:
-            if await request.is_disconnected():
-                break
-            try:
-                line = await asyncio.wait_for(queue.get(), timeout=LOG_HEARTBEAT_S)
-                yield f"data: {line}\n\n"
-            except asyncio.TimeoutError:
-                yield "data: [heartbeat]\n\n"
-    finally:
-        for t in tasks:
-            t.cancel()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -467,36 +374,29 @@ async def memory_preview(
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@router.get("/logs/stream")
-async def logs_stream(request: Request):
-    """SSE endpoint: streaming Docker logs from sovereign-core, gateway, nanobot-01.
+@router.get("/rextrics/summary")
+async def get_rextrics_summary(request: Request):
+    """Return the last cached /rextrics report for the dashboard summary card.
 
-    Routes through broker Docker API proxy using the existing
-    GET:/containers/*/logs permission (trust.levels.low.allow in docker-policy.yaml).
-    Named policy intent: log_tail_sovereign (see docker-policy.yaml named_commands).
-
-    Tier: LOW — read-only, introspective only, never execution.
-    Audit label: introspective (not execution).
+    Static snapshot only — populated by execution/engine.py's `domain == "rextrics"`
+    dispatch each time the Director runs /rextrics via Telegram
+    (cognition.rextrics.write_last_report_cache). Not live, not polled by any
+    background process — the dashboard just reads whatever was last cached.
+    Returns {"report": None} if /rextrics has never been run since this cache
+    was introduced.
     """
+    _audit(request, "portal_read", "rextrics_summary")
+    qdrant = getattr(getattr(request.app, "state", None), "qdrant", None)
+    if not qdrant:
+        return JSONResponse({"error": "Qdrant adapter not available"}, status_code=503)
     try:
-        ledger = request.app.state.ledger
-        if ledger:
-            ledger.append("portal_log_stream", "introspective", {
-                "tier":       "LOW",
-                "containers": LOG_CONTAINERS,
-                "source":     "portal",
-            })
-    except Exception:
-        pass
-    return StreamingResponse(
-        _sse_log_generator(request),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control":    "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection":       "keep-alive",
-        },
-    )
+        cached = await qdrant.retrieve_by_key("meta:rextrics:last_report")
+        if not cached:
+            return {"report": None, "generated_at": None}
+        return {"report": cached.get("report"), "generated_at": cached.get("generated_at")}
+    except Exception as e:
+        logger.warning("portal /rextrics/summary: retrieve failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @router.get("/ollama/models")

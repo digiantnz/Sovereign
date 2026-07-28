@@ -87,8 +87,15 @@ class InferenceQueue:
         priority:         int         = NORMAL,
         timeout:          float       = 200.0,
         capture_thinking: bool        = False,
+        host:             str         = "ollama",
     ) -> dict:
         """Submit a generate job and await the result.
+
+        host: which Ollama instance to target — defaults to the GPU instance.
+        Pass "ollama-distil" (or another CPU-hosted instance) for a model that
+        would otherwise contend for VRAM with the primary GPU model (found
+        2026-07-05: llama3.1:8b and qwen3-32b sharing the RTX 3090 caused
+        constant unload/reload thrashing — see ollama-distil.env).
 
         Returns the Ollama response dict on success, or a structured timeout
         dict when the job's timeout expires (status == "llm_timeout").
@@ -107,7 +114,7 @@ class InferenceQueue:
             job_id=str(_uuid.uuid4())[:8],
             call_type="generate",
             kwargs={"prompt": prompt, "model": model, "fmt": fmt,
-                    "capture_thinking": capture_thinking},
+                    "capture_thinking": capture_thinking, "host": host},
             timeout=timeout,
             future=future,
             submitted_at=time.monotonic(),
@@ -125,6 +132,7 @@ class InferenceQueue:
         fmt:      str | None  = None,
         priority: int         = NORMAL,
         timeout:  float       = 200.0,
+        host:     str         = "ollama",
     ) -> dict:
         """Submit a chat job and await the result. Same contract as generate()."""
         import uuid as _uuid
@@ -140,7 +148,7 @@ class InferenceQueue:
             priority=priority, seq=self._seq,
             job_id=str(_uuid.uuid4())[:8],
             call_type="chat",
-            kwargs={"messages": messages, "model": model, "fmt": fmt},
+            kwargs={"messages": messages, "model": model, "fmt": fmt, "host": host},
             timeout=timeout,
             future=future,
             submitted_at=time.monotonic(),
@@ -305,12 +313,14 @@ class InferenceQueue:
                 model=kw.get("model"),
                 fmt=kw.get("fmt"),
                 capture_thinking=kw.get("capture_thinking", False),
+                host=kw.get("host", "ollama"),
             )
         return await self._ollama.chat(
             messages=kw["messages"],
             model=kw.get("model"),
             fmt=kw.get("fmt"),
             capture_thinking=kw.get("capture_thinking", False),
+            host=kw.get("host", "ollama"),
         )
 
     def _timeout_result(self, job: _InferenceJob) -> dict:

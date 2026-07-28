@@ -96,6 +96,28 @@ def collect_temps() -> dict:
     return result
 
 
+def collect_cpu_load() -> dict:
+    """CPU duty as a %age — 1-min load average / core count, capped at 100.
+
+    Load average (not a /proc/stat delta sample) so this stays a single,
+    instant read with no added latency to /metrics — same reasoning as
+    collect_temps()'s sysfs reads. 2026-07-05, added to replace the low-value
+    CONTAINERS tile in the dashboard's System Health section.
+    """
+    try:
+        load1, load5, load15 = os.getloadavg()
+        cores = os.cpu_count() or 1
+        return {
+            "percent": round(min(load1 / cores * 100, 100.0), 1),
+            "load1":   round(load1, 2),
+            "load5":   round(load5, 2),
+            "load15":  round(load15, 2),
+            "cores":   cores,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def collect_host_memory() -> dict:
     """Parse /proc/meminfo for RAM stats. Available inside container."""
     try:
@@ -118,26 +140,40 @@ def collect_host_memory() -> dict:
         return {"error": str(e)}
 
 
-async def collect_ollama(ollama_url: str = OLLAMA_URL) -> dict:
-    """Get loaded models and last-inference latency.
+_OLLAMA_PROBE_CACHE: dict = {"ts": 0.0, "data": {}}
+_OLLAMA_PROBE_CACHE_TTL_S = 30.0  # 2026-07-05: this probe fires a real /api/generate call
+# directly at Ollama, bypassing InferenceQueue entirely — every dashboard poll was injecting
+# an unqueued GPU request outside the priority system's control, on top of costing ~5.5s.
+# Same slower-cadence treatment as collect_external_reachability(); models/queue state
+# (via app_state, in collect_all()) still reflect live state every call — only the
+# generation-latency number itself is cached.
+_OLLAMA_PROBE_REFRESHING = False  # de-dupes concurrent background refreshes
 
-    Generation probe uses a 6s timeout. qwen2.5:32b can take 30s+ when the GPU
-    is already processing a real request; timing out returns status='busy' rather
-    than blocking the entire /metrics endpoint.
-    """
+
+async def _refresh_ollama_probe(ollama_url: str) -> None:
+    """Actually perform the probe and update the cache. Never raises."""
+    global _OLLAMA_PROBE_REFRESHING
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r_tags = await client.get(f"{ollama_url}/api/tags")
             r_tags.raise_for_status()
             models = [m["name"] for m in r_tags.json().get("models", [])]
 
-            # Latency probe — short timeout so busy GPU doesn't block /metrics
             t0 = time.monotonic()
             try:
+                # num_ctx must match adapters/ollama.py's _NUM_CTX (found 2026-07-05):
+                # this probe fires every 30s and previously sent no options.num_ctx,
+                # falling back to secrets/ollama.env's stale 16384 server default while
+                # every real call requests 20480 — forcing a full model reload roughly
+                # every 30 seconds the whole time the dashboard was open, independent of
+                # any actual Director activity. Almost certainly the dominant contributor
+                # to the GPU timeout thrashing observed during a large /learn run tonight.
+                from adapters.ollama import _NUM_CTX as _PROBE_NUM_CTX
                 r_gen = await client.post(
                     f"{ollama_url}/api/generate",
                     json={"model": models[0] if models else "qwen2.5:32b-instruct-q4_K_M",
-                          "prompt": "/no_think\n1", "stream": False},
+                          "prompt": "/no_think\n1", "stream": False,
+                          "options": {"num_ctx": _PROBE_NUM_CTX}},
                     timeout=6.0,
                 )
                 latency_ms = round((time.monotonic() - t0) * 1000, 1)
@@ -147,14 +183,45 @@ async def collect_ollama(ollama_url: str = OLLAMA_URL) -> dict:
                 latency_ms = None
                 inference_ok = True   # model is loaded; GPU is just busy
                 inference_status = "busy"
-        return {
+        result = {
             "models": models,
             "last_inference_latency_ms": latency_ms,
             "inference_ok": inference_ok,
             "inference_status": inference_status,
         }
+        _OLLAMA_PROBE_CACHE["ts"] = time.monotonic()
+        _OLLAMA_PROBE_CACHE["data"] = result
     except Exception as e:
-        return {"error": str(e)}
+        _OLLAMA_PROBE_CACHE["ts"] = time.monotonic()
+        _OLLAMA_PROBE_CACHE["data"] = {"error": str(e)}
+    finally:
+        _OLLAMA_PROBE_REFRESHING = False
+
+
+async def collect_ollama(ollama_url: str = OLLAMA_URL) -> dict:
+    """Get loaded models and last-inference latency.
+
+    Generation probe uses a 6s timeout. qwen2.5:32b can take 30s+ when the GPU
+    is already processing a real request; timing out returns status='busy' rather
+    than blocking the entire /metrics endpoint.
+
+    Stale-while-revalidate (2026-07-05): a synchronous refresh-on-expiry, even
+    though cached, meant every ~30s one /metrics call still paid the full probe
+    cost — at a 5-15s dashboard refresh that showed up as periodic visible
+    "flapping" (fast/fast/fast/6s-stall). Now: expired cache is still returned
+    immediately, and a background task refreshes it for the *next* call — no
+    single request-serving call ever blocks on the live probe once warm.
+    """
+    global _OLLAMA_PROBE_REFRESHING
+    now = time.monotonic()
+    stale = now - _OLLAMA_PROBE_CACHE["ts"] >= _OLLAMA_PROBE_CACHE_TTL_S
+    if not _OLLAMA_PROBE_CACHE["data"]:
+        # No cache at all yet (first call since boot) — nothing to serve, must block.
+        await _refresh_ollama_probe(ollama_url)
+    elif stale and not _OLLAMA_PROBE_REFRESHING:
+        _OLLAMA_PROBE_REFRESHING = True
+        asyncio.create_task(_refresh_ollama_probe(ollama_url))
+    return _OLLAMA_PROBE_CACHE["data"]
 
 
 async def collect_qdrant(
@@ -332,33 +399,68 @@ async def _probe_ollama_cloud() -> tuple[str, dict]:
         return "ollama_cloud_api", {"reachable": False, "error": str(e), "key_set": bool(key)}
 
 
+_EXTERNAL_CACHE: dict = {"ts": 0.0, "data": {}}
+_EXTERNAL_CACHE_TTL_S = 30.0  # 2026-07-05: decouples the 10-probe external check (was
+# dominating /metrics latency at ~6.8s per call — total time = slowest single probe) from
+# the dashboard's own refresh cadence. "Is Grok reachable" doesn't need re-checking every
+# 10-15s to stay useful; the cheap local metrics (CPU/GPU/RAM/temps) do.
+_EXTERNAL_REFRESHING = False  # de-dupes concurrent background refreshes
+
+
+async def _refresh_external_reachability() -> None:
+    """Actually perform the 10-probe check and update the cache. Never raises."""
+    global _EXTERNAL_REFRESHING
+    try:
+        results = await asyncio.gather(
+            _probe_grok(),
+            _probe_webdav(),
+            _probe_telegram(),
+            _probe_gemini(),
+            _probe_groq(),
+            _probe_openrouter(),
+            _probe_ollama_cloud(),
+            _reachable("https://api.anthropic.com", timeout=6.0),
+            _reachable("http://172.16.201.4:8001/health", timeout=5.0),
+            _reachable("http://172.16.201.4:8003/health", timeout=5.0),
+            return_exceptions=True,
+        )
+        grok, webdav, telegram, gemini, groq, openrouter, ollama_cloud, claude_res, browser_res, whisper_res = results
+        checks = {}
+        for r in (grok, webdav, telegram, gemini, groq, openrouter, ollama_cloud):
+            if isinstance(r, tuple):
+                checks[r[0]] = r[1]
+        def _ok_lat(r, key):
+            if isinstance(r, tuple): checks[key] = {"reachable": r[0], "latency_ms": r[1]}
+            else: checks[key] = {"reachable": False, "error": str(r)}
+        _ok_lat(claude_res,  "claude_api")
+        _ok_lat(browser_res, "a2a_browser")
+        _ok_lat(whisper_res, "a2a_whisper")
+        _EXTERNAL_CACHE["ts"] = time.monotonic()
+        _EXTERNAL_CACHE["data"] = checks
+    except Exception as e:
+        _EXTERNAL_CACHE["ts"] = time.monotonic()
+        _EXTERNAL_CACHE["data"] = {"error": str(e)}
+    finally:
+        _EXTERNAL_REFRESHING = False
+
+
 async def collect_external_reachability() -> dict:
-    """Probe external services concurrently. Total time = slowest single probe."""
-    results = await asyncio.gather(
-        _probe_grok(),
-        _probe_webdav(),
-        _probe_telegram(),
-        _probe_gemini(),
-        _probe_groq(),
-        _probe_openrouter(),
-        _probe_ollama_cloud(),
-        _reachable("https://api.anthropic.com", timeout=6.0),
-        _reachable("http://172.16.201.4:8001/health", timeout=5.0),
-        _reachable("http://172.16.201.4:8003/health", timeout=5.0),
-        return_exceptions=True,
-    )
-    grok, webdav, telegram, gemini, groq, openrouter, ollama_cloud, claude_res, browser_res, whisper_res = results
-    checks = {}
-    for r in (grok, webdav, telegram, gemini, groq, openrouter, ollama_cloud):
-        if isinstance(r, tuple):
-            checks[r[0]] = r[1]
-    def _ok_lat(r, key):
-        if isinstance(r, tuple): checks[key] = {"reachable": r[0], "latency_ms": r[1]}
-        else: checks[key] = {"reachable": False, "error": str(r)}
-    _ok_lat(claude_res,  "claude_api")
-    _ok_lat(browser_res, "a2a_browser")
-    _ok_lat(whisper_res, "a2a_whisper")
-    return checks
+    """Probe external services concurrently. Total time = slowest single probe.
+
+    Stale-while-revalidate (2026-07-05): expired cache is still returned
+    immediately, and a background task refreshes it for the *next* call — see
+    collect_ollama()'s docstring for the full "dashboard flapping" story, same
+    fix applied here for the same reason.
+    """
+    global _EXTERNAL_REFRESHING
+    now = time.monotonic()
+    stale = now - _EXTERNAL_CACHE["ts"] >= _EXTERNAL_CACHE_TTL_S
+    if not _EXTERNAL_CACHE["data"]:
+        await _refresh_external_reachability()
+    elif stale and not _EXTERNAL_REFRESHING:
+        _EXTERNAL_REFRESHING = True
+        asyncio.create_task(_refresh_external_reachability())
+    return _EXTERNAL_CACHE["data"]
 
 
 async def collect_all(app_state=None) -> dict:
@@ -377,6 +479,7 @@ async def collect_all(app_state=None) -> dict:
 
     ram = collect_host_memory()
     temps = collect_temps()
+    cpu = collect_cpu_load()
     audit = collect_audit_count()
 
     soul_status = {}
@@ -407,5 +510,6 @@ async def collect_all(app_state=None) -> dict:
         "external":     external,
         "wallet":       wallet,
         "temps":        temps,
+        "cpu":          cpu,
         "loop_state":   loop_state,
     }

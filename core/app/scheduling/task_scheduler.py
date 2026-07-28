@@ -280,6 +280,58 @@ class TaskScheduler:
             logger.warning("TaskScheduler: find_active_by_title failed: %s", e)
         return None
 
+    async def find_pending_task_by_phrase(self, phrase: str) -> dict | None:
+        """Same ALL-significant-word matching convention as find_active_by_title(),
+        scoped to status=pending_approval instead of active — resolves a Director's
+        "approve <phrase>" Telegram reply to the scheduled task it refers to.
+
+        Built 2026-07-03 after discovering every seed_*_task() function prompts
+        "Reply approve X to activate" but no code path ever implemented X→task_id
+        resolution — every such reply was silently swallowed by the unrelated
+        Cognition Engine Subject Update approve/reject shortcut instead (see
+        _quick_classify in execution/engine.py), which grabs the first word after
+        "approve" unconditionally. Four tasks (Monthly/Weekly Portfolio, Daily
+        Validator, Personal Mailbox Scan) sat un-activatable for this reason before
+        this fix, on top of the separate procedural-write bug fixed the same day.
+        """
+        try:
+            words = [w for w in phrase.lower().split() if len(w) >= 4]
+            if not words:
+                return None
+            results, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="status", match=MatchValue(value="pending_approval")),
+                ]),
+                limit=_cfg.limits.prospective_scroll_max,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in results:
+                pt_title = (pt.payload.get("title") or "").lower()
+                if all(w in pt_title for w in words):
+                    return {"point_id": str(pt.id), **pt.payload}
+        except Exception as e:
+            logger.warning("TaskScheduler: find_pending_task_by_phrase failed: %s", e)
+        return None
+
+    async def activate_task(self, task_id: str, point_id: str) -> dict:
+        """Flip a pending_approval task to active — the terminal step of a
+        Director Telegram approval reply. next_due was already computed to a
+        valid future time at seed time (store_task -> compute_next_due()); not
+        recomputed here since the gap between seeding and approval is normally
+        minutes to hours, well before next_due arrives."""
+        try:
+            await self.qdrant.archive_client.set_payload(
+                collection_name=PROSPECTIVE,
+                payload={"status": "active"},
+                points=[point_id],
+            )
+            return {"status": "ok", "task_id": task_id}
+        except Exception as e:
+            logger.warning("TaskScheduler: activate_task failed for %s: %s", task_id, e)
+            return {"status": "error", "error": str(e)}
+
     async def store_task(self, task_def: dict, human_confirmed: bool = False) -> dict:
         """Write a validated task to Qdrant.
 
@@ -288,6 +340,22 @@ class TaskScheduler:
 
         Both entries share the same task_id.
         Returns {status, task_id, next_due, title}.
+
+        human_confirmed=True is the right value for every seed_*_task() call in
+        this module (all pass it explicitly) — those task_defs are hardcoded
+        Python, not LLM output, so the trust question the PROCEDURAL gate exists
+        for is already settled at seed time. The real activation gate for an
+        auto-proposed recurring task is the separate `status: "pending_approval"`
+        field on the PROSPECTIVE entry — the scheduler only ever executes
+        `status == "active"`, and that only flips via an explicit Director
+        Telegram reply (see _get_due_tasks()). Before 2026-07-03, four of the
+        seven seed_*_task() calls passed human_confirmed=False, which silently
+        failed to write any PROCEDURAL entry at all (qdrant.store() raises for
+        collection=PROCEDURAL without it) — those tasks sat in pending_approval
+        forever with nothing to execute even after approval. Director-confirmed
+        fix 2026-07-03: this is consistent with the broader shift toward
+        autonomous trigger/loop workflows (Cognition Engine thoughts already
+        run 1-3 research iterations with no per-iteration human gate).
         """
         task_id    = str(uuid.uuid4())
         title      = task_def.get("title", "Unnamed task")
@@ -309,6 +377,7 @@ class TaskScheduler:
         steps      = task_def.get("steps", [])
         notify_when = task_def.get("notify_when", "always")
         stop_condition = task_def.get("stop_condition")
+        execution_timeout_s = task_def.get("execution_timeout_s")
 
         next_due = compute_next_due(schedule)
         if not next_due and schedule.get("type") != "one_time":
@@ -360,6 +429,7 @@ class TaskScheduler:
                     "status": task_status,
                     "notify_when": notify_when,
                     "stop_condition": stop_condition,
+                    "execution_timeout_s": execution_timeout_s,
                     "capabilities": capabilities_needed,
                     "created_at": now_iso,
                     "last_run": None,
@@ -537,7 +607,11 @@ class TaskScheduler:
         Idempotency: checks PROCEDURAL for an existing entry with
         intent=memory_synthesise step, then verifies its PROSPECTIVE status is active.
 
-        notify_when="always": synthesis results (entry counts) are meaningful to Director.
+        notify_when="on_findings" (changed 2026-07-19, was "always" — Director's call: a
+        clean run with nothing new discovered isn't worth a Telegram message). run_synthesis()
+        returns a "count" field (associative/relational created+updated+culled) specifically
+        so this gate has something authoritative to check — its other fields don't match
+        _result_has_content()'s OR-chain at all.
 
         Returns True if written, False if already present or write failed.
         """
@@ -596,7 +670,7 @@ class TaskScheduler:
                     ),
                 }
             ],
-            "notify_when": "always",
+            "notify_when": "on_findings",
             "stop_condition": None,
             "status": "active",   # programmatic seed — exempt from NL recurring-approval gate
         }
@@ -833,6 +907,29 @@ class TaskScheduler:
             ts = latest.get("timestamp", "unknown time")
             title = latest.get("title", "Briefing")
             preview = latest.get("summary_preview") or latest.get("result_preview") or ""
+
+            # Staleness gate — a briefing that last ran weeks ago is not "recent context"
+            # for whatever the Director is asking right now. Found 2026-07-05: a
+            # session-start check surfaced a 7-week-old briefing inline as if current,
+            # glued onto an unrelated calendar question. The scheduled task runs daily
+            # on weekdays, so anything past 36h means it's been silently failing to
+            # fire or was cancelled — either way, not safe to present as fresh.
+            try:
+                _ran_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                _age_h = (datetime.now(timezone.utc) - _ran_dt).total_seconds() / 3600
+            except Exception:
+                _age_h = None
+            if _age_h is not None and _age_h > 36:
+                return {
+                    "status": "stale",
+                    "title": title,
+                    "ran_at": ts,
+                    "age_hours": round(_age_h, 1),
+                    "message": (
+                        f"No recent briefing — the last one ran {round(_age_h / 24, 1)} days ago "
+                        f"({ts}), which suggests the daily task has stopped firing."
+                    ),
+                }
             if outcome == "negative":
                 return {
                     "status": "error",
@@ -904,13 +1001,39 @@ class TaskScheduler:
                 logger.warning("TaskScheduler: no procedure found for task %s — skipping", task_id)
                 continue
             self._running.add(task_id)
+            # Per-task override (data-driven, per Task Scheduler design — see CLAUDE.md):
+            # a task_def may set "execution_timeout_s" when its steps are known to run
+            # long (e.g. sequential multi-asset analysis). Falls back to the global
+            # safety-net default otherwise.
+            timeout_s = prospective.get("execution_timeout_s") or _cfg.timeouts.task_execution_max_s
             try:
-                outcome = await self._execute_task(prospective, procedure)
+                outcome = await asyncio.wait_for(
+                    self._execute_task(prospective, procedure),
+                    timeout=timeout_s,
+                )
                 ran.append({"task_id": task_id, "title": prospective.get("title"), **outcome})
+            except asyncio.TimeoutError:
+                logger.error(
+                    "TaskScheduler: task %s '%s' exceeded %.0fs — aborting so the scheduler "
+                    "loop isn't blocked indefinitely",
+                    task_id, prospective.get("title"), timeout_s,
+                )
+                ran.append({"task_id": task_id, "title": prospective.get("title"),
+                            "outcome": "error", "error": "task execution timed out"})
+                await self._advance_next_due_after_failure(
+                    task_id, prospective.get("title", task_id), schedule,
+                    prospective.get("run_count", 0),
+                    f"Task execution timed out after {timeout_s:.0f}s.",
+                )
             except Exception as e:
                 logger.error("TaskScheduler: task %s failed: %s", task_id, e)
                 ran.append({"task_id": task_id, "title": prospective.get("title"),
                             "outcome": "error", "error": str(e)})
+                await self._advance_next_due_after_failure(
+                    task_id, prospective.get("title", task_id), schedule,
+                    prospective.get("run_count", 0),
+                    f"Task execution failed: {e}",
+                )
             finally:
                 self._running.discard(task_id)
         return ran
@@ -1003,9 +1126,20 @@ class TaskScheduler:
         def _result_has_content(res: dict) -> bool:
             if not isinstance(res, dict):
                 return False
+            # Explicit "count" is authoritative when a caller provides one —
+            # short-circuits the generic OR-fallback below. Needed because
+            # "brief" (used by news_brief/score_rss_by_subject/
+            # score_email_by_subject) is a rendered human-readable summary
+            # that's non-empty even when nothing notable happened ("10
+            # routine emails, not urgent") — falling through to the generic
+            # OR-chain made notify_when="on_findings" indistinguishable from
+            # "always" for these callers. Found live 2026-07-03 once Personal
+            # Mailbox Scan moved to 15-min cadence — every run notified
+            # regardless of content because "brief" was always truthy.
+            if "count" in res:
+                return res["count"] > 0
             return bool(
-                res.get("count", 0) > 0
-                or res.get("messages")
+                res.get("messages")
                 or res.get("response")
                 or res.get("results")
                 or res.get("data")        # browser fetch: legacy nested content
@@ -1016,6 +1150,7 @@ class TaskScheduler:
                 or res.get("files")       # file listings
                 or res.get("brief")       # news_brief harness
                 or res.get("entries")     # RSS entries
+                or res.get("alerts")      # validator monitor / watcher alerts
             )
         has_content = any(
             r.get("status") == "ok" and _result_has_content(r.get("result", {}))
@@ -1293,6 +1428,26 @@ class TaskScheduler:
         except Exception as e:
             logger.warning("TaskScheduler: failed to update next_due for %s: %s", task_id, e)
 
+    async def _advance_next_due_after_failure(self, task_id: str, title: str,
+                                               schedule: dict, run_count: int,
+                                               reason: str) -> None:
+        """Advance next_due after a task times out or raises unhandled.
+
+        _execute_task() normally advances next_due itself once all steps finish
+        (see bottom of that method) — but a timeout cancels the coroutine before
+        it gets there, and an unhandled exception can also escape before that
+        point. Without this, next_due stays in the past and the 60s scheduler
+        poll immediately re-fires the task from scratch, forever, until it
+        happens to finish inside its budget. Recurring tasks only — one_time
+        tasks fire directly with no steps and never reach this path.
+        """
+        if schedule.get("type") == "one_time":
+            return
+        now = datetime.now(timezone.utc)
+        next_due = compute_next_due(schedule, after=now)
+        await self._update_prospective_after_run(task_id, next_due, now.isoformat(), run_count)
+        await self._write_episodic(task_id, title, "negative", reason, 0)
+
     async def _write_episodic(self, task_id: str, title: str,
                                outcome: str, summary: str, steps_run: int) -> None:
         """Write a run-history entry to EPISODIC."""
@@ -1409,14 +1564,27 @@ class TaskScheduler:
                         "Delivers full verdict table + stress summary to Telegram. "
                         "last_day_guard=True: skips silently if today is not the last day of the month."
                     ),
-                }
+                },
+                {
+                    "intent": "portfolio_analysis",
+                    "params": {"category": "retirement", "last_day_guard": True},
+                    "description": (
+                        "Full 6-agent retirement analysis (no Correlation Analyst / stress tests — "
+                        "crypto-only extras) against the latest ingested Sharesies statement, plus "
+                        "staged-exit and contribution-drift checks. Balance figure is only as fresh "
+                        "as the last ingested statement (Sharesies reports quarterly at best — "
+                        "Director-confirmed 2026-07-09, acceptable lag) but per-holding technicals/"
+                        "research are current. last_day_guard=True: skips silently if today is not "
+                        "the last day of the month."
+                    ),
+                },
             ],
             "notify_when": "always",
             "stop_condition": "Director cancels",
             "status": "pending_approval",
         }
 
-        result = await self.store_task(task_def, human_confirmed=False)
+        result = await self.store_task(task_def, human_confirmed=True)
         if result.get("status") in ("ok", "partial", "pending_approval"):
             logger.info(
                 "TaskScheduler: seeded '%s' task_id=%s — pending Director approval",
@@ -1495,9 +1663,16 @@ class TaskScheduler:
             "notify_when": "never",   # watcher sends its own Telegram on signal; clean week = silence
             "stop_condition": "Director cancels",
             "status": "pending_approval",
+            # Sequential per-asset browser+LLM analysis observed at ~45-70s/asset;
+            # the global 300s safety-net timeout was found (2026-07-11) to reliably
+            # cut this off mid-scan on weeks with 4+ signalling assets, causing an
+            # infinite immediate-retry loop (see _advance_next_due_after_failure).
+            # 900s gives headroom for a slow week without risking the scheduler
+            # loop being blocked for an unreasonable stretch (this task runs weekly).
+            "execution_timeout_s": 900,
         }
 
-        result = await self.store_task(task_def, human_confirmed=False)
+        result = await self.store_task(task_def, human_confirmed=True)
         if result.get("status") in ("ok", "partial", "pending_approval"):
             logger.info(
                 "TaskScheduler: seeded '%s' task_id=%s — pending Director approval",
@@ -1508,6 +1683,253 @@ class TaskScheduler:
                 f"Schedule: Saturday 8:00 AM NZST.\n"
                 f"Deterministic RSI/MACD scan — no LLM unless a signal fires.\n"
                 f"Reply <b>approve weekly scan</b> to activate."
+            )
+            return True
+        else:
+            logger.warning("TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result)
+            return False
+
+    async def seed_daily_validator_task(self) -> bool:
+        """Seed the daily Rocket Pool / eth-docker validator health check at startup.
+        Idempotent. Creates a pending_approval task for Director activation.
+
+        Validator set is re-derived live on every run (ValidatorMonitorAdapter reads
+        semantic:eth:validator-indices at call time) — this task definition does not
+        pin a validator count or index list, so the Director's planned megapool
+        migration (tranche exits/re-entries) does not require re-seeding this task.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Daily Validator Monitor"
+        _TASK_CRON  = "0 19 * * *"   # 19:00 UTC = 07:00 NZST daily
+
+        try:
+            _words = [w for w in _TASK_TITLE.lower().split() if len(w) >= 5]
+            prosp_all, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="status", match=MatchAny(any=["active", "pending_approval"])),
+                ]),
+                limit=300,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in prosp_all:
+                pp = pt.payload or {}
+                pt_title = pp.get("title", "").lower()
+                pt_cron  = (pp.get("schedule") or {}).get("cron", "")
+                if all(w in pt_title for w in _words) or pt_cron == _TASK_CRON:
+                    logger.info(
+                        "TaskScheduler: daily validator task already exists "
+                        "(task_id=%s status=%s) — skipping seed",
+                        str(pp.get("task_id", ""))[:8], pp.get("status", ""),
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("seed_daily_validator_task: idempotency check failed: %s", exc)
+
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                "cron": _TASK_CRON,
+            },
+            "steps": [
+                {
+                    "intent": "check_validators",
+                    "params": {},
+                    "description": (
+                        "Full Rocket Pool + eth-docker validator health check: balance drift, "
+                        "sync committee membership, offline/exit detection, RPL reward-claim "
+                        "delta. Query-only, on-chain + beacon reads. Episodic entry written every "
+                        "run; Telegram sent only when alerts are non-empty."
+                    ),
+                }
+            ],
+            "notify_when": "on_findings",   # silence on clean runs; alert only on non-empty alerts
+            "stop_condition": "Director cancels",
+            "status": "pending_approval",
+        }
+
+        result = await self.store_task(task_def, human_confirmed=True)
+        if result.get("status") in ("ok", "partial", "pending_approval"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s — pending Director approval",
+                _TASK_TITLE, result.get("task_id", "?"),
+            )
+            await self._notify_director(
+                f"🔎 <b>Daily Validator Monitor</b> task created.\n"
+                f"Schedule: daily at 7:00 AM NZST.\n"
+                f"Alerts on missed sync/offline/exit/balance drop/RPL claim; silent on clean days.\n"
+                f"Reply <b>approve daily validator monitor</b> to activate."
+            )
+            return True
+        else:
+            logger.warning("TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result)
+            return False
+
+    async def seed_subject_decay_task(self) -> bool:
+        """Seed the daily Subject confidence-decay check at startup. Idempotent.
+        Creates a pending_approval task for Director activation.
+
+        Task #17 (2026-07-03): folds a calendar-staleness pull toward neutral
+        into any active Subject that hasn't had a Thought in 30+ days, via
+        decay_confidence_towards_neutral() — see cognition/subjects.py
+        decay_stale_subjects(). Silent on subjects that are current; alerts
+        only when a decayed confidence drops below 30%.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Subject Confidence Decay Check"
+        _TASK_CRON  = "0 2 * * *"   # 02:00 UTC daily — clear of every other scheduled task
+
+        try:
+            _words = [w for w in _TASK_TITLE.lower().split() if len(w) >= 5]
+            prosp_all, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="status", match=MatchAny(any=["active", "pending_approval"])),
+                ]),
+                limit=300,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in prosp_all:
+                pp = pt.payload or {}
+                pt_title = pp.get("title", "").lower()
+                pt_cron  = (pp.get("schedule") or {}).get("cron", "")
+                if all(w in pt_title for w in _words) or pt_cron == _TASK_CRON:
+                    logger.info(
+                        "TaskScheduler: subject decay task already exists "
+                        "(task_id=%s status=%s) — skipping seed",
+                        str(pp.get("task_id", ""))[:8], pp.get("status", ""),
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("seed_subject_decay_task: idempotency check failed: %s", exc)
+
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                "cron": _TASK_CRON,
+            },
+            "steps": [
+                {
+                    "intent": "subject_decay_check",
+                    "params": {},
+                    "description": (
+                        "Pull confidence toward neutral for any Subject with no Thought "
+                        "activity in 30+ days. Alerts only if confidence drops below 30%."
+                    ),
+                }
+            ],
+            "notify_when": "on_findings",   # silence when nothing decayed below threshold
+            "stop_condition": "Director cancels",
+            "status": "pending_approval",
+        }
+
+        result = await self.store_task(task_def, human_confirmed=True)
+        if result.get("status") in ("ok", "partial", "pending_approval"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s — pending Director approval",
+                _TASK_TITLE, result.get("task_id", "?"),
+            )
+            await self._notify_director(
+                f"📉 <b>Subject Confidence Decay Check</b> task created.\n"
+                f"Schedule: daily at 2:00 AM UTC.\n"
+                f"Silent unless a Subject's confidence decays below 30%.\n"
+                f"Reply <b>approve subject decay check</b> to activate."
+            )
+            return True
+        else:
+            logger.warning("TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result)
+            return False
+
+    async def seed_personal_mailbox_scan_task(self) -> bool:
+        """Seed the standalone Personal Mailbox Scan task at startup. Idempotent.
+        Creates a pending_approval task for Director activation.
+
+        Task #30 (2026-07-03): the Weekday Morning Briefing's score_email_by_subject
+        step used to scan both accounts inline; personal IMAP is much slower
+        (20-55s+) than business, so it sat in the briefing's critical path for no
+        good reason — email volume is low (~4.6/day personal, ~6.7/day business,
+        confirmed via direct IMAP check) and the scoring pass itself is free (no
+        LLM calls, CPU-only embed), so there was never a cost reason to bundle
+        them — only a latency one. The briefing step was narrowed to
+        accounts=["business"] in the same change; this task covers personal on
+        its own slower, decoupled schedule.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Personal Mailbox Scan"
+        _TASK_CRON  = "0 21 * * *"   # 21:00 UTC = 09:00 NZST daily
+
+        try:
+            _words = [w for w in _TASK_TITLE.lower().split() if len(w) >= 5]
+            prosp_all, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="status", match=MatchAny(any=["active", "pending_approval"])),
+                ]),
+                limit=300,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in prosp_all:
+                pp = pt.payload or {}
+                pt_title = pp.get("title", "").lower()
+                pt_cron  = (pp.get("schedule") or {}).get("cron", "")
+                if all(w in pt_title for w in _words) or pt_cron == _TASK_CRON:
+                    logger.info(
+                        "TaskScheduler: personal mailbox scan task already exists "
+                        "(task_id=%s status=%s) — skipping seed",
+                        str(pp.get("task_id", ""))[:8], pp.get("status", ""),
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("seed_personal_mailbox_scan_task: idempotency check failed: %s", exc)
+
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                "cron": _TASK_CRON,
+            },
+            "steps": [
+                {
+                    "intent": "score_email_by_subject",
+                    "params": {"accounts": ["personal"]},
+                    "description": (
+                        "Score personal-account emails against active subjects "
+                        "(priority + urgency). Decoupled from the Weekday Morning "
+                        "Briefing — personal IMAP is slow (20-55s+) and low-volume "
+                        "(~4.6/day), no reason to hold up business-critical-path items."
+                    ),
+                }
+            ],
+            # on_findings, not always — at 15-min cadence (Director's call,
+            # 2026-07-03) "always" meant a Telegram message every 15 minutes
+            # even when every email was routine. Needs run_score_email_by_
+            # subject()'s explicit "count" field (added same day) for
+            # _result_has_content() to tell "nothing notable" apart from
+            # "ran successfully" — brief text alone is always non-empty.
+            "notify_when": "on_findings",
+            "stop_condition": "Director cancels",
+            "status": "pending_approval",
+        }
+
+        result = await self.store_task(task_def, human_confirmed=True)
+        if result.get("status") in ("ok", "partial", "pending_approval"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s — pending Director approval",
+                _TASK_TITLE, result.get("task_id", "?"),
+            )
+            await self._notify_director(
+                f"📬 <b>Personal Mailbox Scan</b> task created.\n"
+                f"Schedule: daily at 9:00 AM NZST (decoupled from the morning briefing).\n"
+                f"Same priority/urgency scoring as the business scan, no LLM cost.\n"
+                f"Reply <b>approve personal mailbox scan</b> to activate."
             )
             return True
         else:

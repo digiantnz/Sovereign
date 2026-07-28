@@ -35,13 +35,13 @@ def _strip_think(text: str) -> str:
 
 class OllamaAdapter:
     async def generate(self, prompt: str, model: str = None, fmt: str = None,
-                       capture_thinking: bool = False) -> dict:
+                       capture_thinking: bool = False, host: str = "ollama") -> dict:
         payload = {"model": model or _cfg.models.primary_inference_model, "prompt": prompt, "stream": False,
                    "options": {"num_ctx": _NUM_CTX}}
         if fmt:
             payload["format"] = fmt
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            r = await client.post("http://ollama:11434/api/generate", json=payload)
+            r = await client.post(f"http://{host}:11434/api/generate", json=payload)
             r.raise_for_status()
             data = r.json()
         raw = data.get("response", "")
@@ -77,7 +77,7 @@ class OllamaAdapter:
             return []
 
     async def chat(self, messages: list[dict], model: str = None, fmt: str = None,
-                   capture_thinking: bool = False) -> dict:
+                   capture_thinking: bool = False, host: str = "ollama") -> dict:
         """Call /api/chat with a messages array (system/user/assistant roles).
         Returns a dict with a 'response' key containing the assistant's reply text,
         matching the shape of generate() for a consistent interface."""
@@ -86,7 +86,7 @@ class OllamaAdapter:
         if fmt:
             payload["format"] = fmt
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            r = await client.post("http://ollama:11434/api/chat", json=payload)
+            r = await client.post(f"http://{host}:11434/api/chat", json=payload)
             r.raise_for_status()
             data = r.json()
         raw_content = data.get("message", {}).get("content", "")

@@ -814,6 +814,11 @@ class SkillLifecycleManager:
             "body_checksum": body_checksum,
             "file_hash": whole_file_hash,
             "review_decision": review_result.get("decision"),
+            # source_url (2026-07-05): was already threaded into load() as a param and used
+            # for _deploy_skill_scripts() but never actually persisted — no installed skill
+            # had a recorded provenance, which blocked any future update-checking work
+            # entirely (nothing to diff against). None for bespoke skills (no upstream).
+            "source_url": raw_url,
         })
 
         # ── Soul Guardian registration ─────────────────────────────────

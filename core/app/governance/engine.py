@@ -97,6 +97,11 @@ class GovernanceEngine:
             # schedule/update — LOW tier (internal memory write, no Director confirmation)
             if operation in ('schedule', 'update') and rules.get('memory_write', False):
                 return rules
+            # activate_pending — the Director's Telegram "approve X" reply IS the
+            # confirmation; the task itself was already vetted (hardcoded Python
+            # task_def) at seed time.
+            if operation == 'activate_pending' and rules.get('memory_write', False):
+                return rules
         elif domain == 'skills':
             if operation in ('search', 'review', 'audit') and rules.get('skill_read', False):
                 return rules
@@ -240,15 +245,28 @@ class GovernanceEngine:
                 return rules
         elif domain == 'cognition':
             # Cognition Engine — RSS/email subject scoring (read-only triage, no
-            # memory writes for score_email — see run_score_email_by_subject),
-            # Subject Update approve/reject replies, and Subject note resync
-            # (writes Nextcloud note + semantic memory). All LOW tier — same memory_write
-            # gate already used by learning/memory_synthesise for read+write memory ops.
-            if operation in ('score_rss', 'score_email', 'confirm_update', 'resync_subject') and rules.get('memory_write', False):
+            # memory writes for score_email — see run_score_email_by_subject) and
+            # Subject note resync (writes Nextcloud note + semantic memory). All
+            # LOW tier — same memory_write gate already used by learning/
+            # memory_synthesise for read+write memory ops. Subject Update itself
+            # has no Director-facing intent — it auto-applies from inside
+            # resolve_thought_outcome(), not via dispatch (removed 2026-07-03).
+            if operation in ('score_rss', 'score_email', 'resync_subject', 'decay_check') and rules.get('memory_write', False):
+                return rules
+            # Subject list/detail — read-only interrogation of Cognition Engine
+            # state (Director, 2026-07-07: "make Rex subject aware and able to
+            # interrogate findings"). No memory write, same read gate as
+            # governance_read's describe.
+            if operation in ('list_subjects', 'subject_detail') and rules.get('memory_search', False):
                 return rules
         elif domain == 'governance_read':
             # Deterministic read of governance.json — always read-only, LOW tier
             if operation == 'describe' and rules.get('memory_search', False):
+                return rules
+        elif domain == 'rextrics':
+            # Rex-trics weekly flag report — deterministic META-collection read,
+            # always read-only, same LOW-tier gate as governance_read/memory_index.
+            if operation == 'report' and rules.get('memory_search', False):
                 return rules
 
         raise ValueError(f"Action {action} not allowed under tier {tier}")

@@ -197,12 +197,17 @@ async def _ollama_classify(result, cog, skill_snapshot: dict | None = None, harn
                 if resp.get("status") == "llm_timeout":
                     raise RuntimeError("DevHarness classifier: GPU timed out after retry")
         else:
-            # Direct Ollama call — only used if cog not available
+            # Direct Ollama call — only used if cog not available.
+            # num_ctx must match adapters/ollama.py's _NUM_CTX (found 2026-07-05) — a raw
+            # call with no options.num_ctx falls back to the stale 16384 server default
+            # and forces a full model reload against every other call path's 20480.
             import httpx as _httpx
+            from adapters.ollama import _NUM_CTX as _CLASSIFY_NUM_CTX
             async with _httpx.AsyncClient(timeout=60.0) as _cl:
                 r = await _cl.post(
                     "http://ollama:11434/api/generate",
-                    json={"model": _CLASSIFY_MODEL, "prompt": prompt, "stream": False},
+                    json={"model": _CLASSIFY_MODEL, "prompt": prompt, "stream": False,
+                          "options": {"num_ctx": _CLASSIFY_NUM_CTX}},
                 )
                 r.raise_for_status()
                 resp = r.json()

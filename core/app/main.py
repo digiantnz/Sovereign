@@ -221,8 +221,10 @@ async def lifespan(app: FastAPI):
             "title": "Ollama endpoint and active models",
             "content": (
                 "Ollama endpoint: http://ollama:11434 (ai_net). "
-                f"Primary model: {_cfg.models.primary_inference_model} on {_GPU_NAME} ({_GPU_VRAM_GB} GB VRAM). "
-                "Also has llama3.1:8b and mistral:7b installed. Embedding model: nomic-embed-text (768-dim)."
+                f"Primary model: {_cfg.models.primary_inference_model} on {_GPU_NAME} ({_GPU_VRAM_GB} GB VRAM) — "
+                "sole occupant since 2026-07-05 (keep_alive=-1, never evicted). "
+                "Query distillation (llama3.1:8b) moved to a separate CPU-only instance, ollama-distil, "
+                "to stop contending for VRAM. Embedding model: nomic-embed-text (768-dim) on ollama-embed (CPU)."
             ),
             "domain": "infrastructure",
         },
@@ -596,6 +598,20 @@ async def lifespan(app: FastAPI):
     except Exception as _boot_notif_err:
         logger.warning("Bootstrap Telegram notification failed (non-fatal): %s", _boot_notif_err)
 
+    # Crash-recovery sweep for Thoughts (task #41, 2026-07-03) — any
+    # meta:thought_inflight:* marker still present means that Thought was
+    # running when the process last stopped and never got to clean up. Only
+    # needs qdrant (already constructed above); cog/nanobot aren't ready yet
+    # at this point in lifespan and sweep_orphaned_thoughts() doesn't need them.
+    try:
+        from cognition.thoughts import sweep_orphaned_thoughts
+        _orphan_stats = await sweep_orphaned_thoughts(qdrant)
+        if _orphan_stats.get("orphans_found"):
+            logger.warning("sweep_orphaned_thoughts: found %d interrupted Thought(s) from a prior restart",
+                           _orphan_stats["orphans_found"])
+    except Exception as _orphan_err:
+        logger.warning("sweep_orphaned_thoughts failed (non-fatal): %s", _orphan_err)
+
     app.state.gov      = GovernanceEngine("/app/governance/governance.json")
     inference_queue    = InferenceQueue(OllamaAdapter(), ledger=ledger)
     await inference_queue.start()
@@ -687,7 +703,7 @@ async def lifespan(app: FastAPI):
 
     # ── Step 3: Start self-check scheduler + ETH watcher + hourly RAID archive sync
     _scheduler_task      = start_scheduler(app.state)
-    _eth_watcher_task    = start_eth_watcher(ledger=ledger)
+    _eth_watcher_task    = start_eth_watcher(qdrant=qdrant, ledger=ledger)
     _archive_sync_task   = start_archive_sync(qdrant, ledger)
     # Self-improvement harness — daily observe loop (baseline + anomaly detection)
     # Inject qdrant onto app.state so observe_loop() can access it
@@ -708,6 +724,9 @@ async def lifespan(app: FastAPI):
     await task_scheduler.seed_tax_ingest_task()
     await task_scheduler.seed_monthly_portfolio_task()
     await task_scheduler.seed_weekly_watcher_task()
+    await task_scheduler.seed_daily_validator_task()
+    await task_scheduler.seed_personal_mailbox_scan_task()
+    await task_scheduler.seed_subject_decay_task()
 
     # ── Step 3c: Credential proxy — session-scoped token delegation for nanobot-01
     credential_proxy = CredentialProxy(default_ttl=60, ledger=ledger)
@@ -732,6 +751,22 @@ async def lifespan(app: FastAPI):
             logger.warning("nanobot-01 /capabilities unreachable at startup — will retry on first use")
     except Exception as _e:
         logger.warning("nanobot capability fetch failed: %s", _e)
+
+    # ── Step 3e: Warm the query-distillation model on ollama-distil ──────────
+    # _distil_query() needs to be ready from the first real Director message, not
+    # cold-load ~2-3s into it (measured 2026-07-05). Non-fatal — if ollama-distil
+    # isn't reachable yet at boot, the first real call just eats the cold-load
+    # cost as before; this only removes that cost in the common case.
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=30.0) as _client:
+            await _client.post(
+                "http://ollama-distil:11434/api/generate",
+                json={"model": "llama3.1:8b-instruct-q4_K_M", "prompt": "hi", "stream": False},
+            )
+        logger.info("ollama-distil: llama3.1:8b warmed at startup")
+    except Exception as _e:
+        logger.warning("ollama-distil warm-up failed (non-fatal, will cold-load on first use): %s", _e)
 
     yield
 
@@ -914,9 +949,13 @@ async def wallet_event(request: Request):
     if cog:
         try:
             label = event.get("label") or (event.get("to_address") or "")[:12] + "…"
+            # direction defaults to "incoming" for backward compat with callers that
+            # predate this field (harness-a2a's payment-confirmation events are always
+            # genuinely incoming anyway) — only harness-crypto sends outgoing events.
+            _outgoing = event.get("direction") == "outgoing"
             result_for_translator = {
                 "domain":     "wallet_payment",
-                "event_type": "payment_confirmed",
+                "event_type": "payment_sent" if _outgoing else "payment_confirmed",
                 "chain":      event.get("chain", "").upper(),
                 "amount":     event.get("amount"),
                 "currency":   event.get("currency"),
@@ -926,11 +965,15 @@ async def wallet_event(request: Request):
                 "tx_short":   event.get("tx_hash", "")[:16] + "…",
                 "verify_cmd": f"/verify {sig_prefix}" if sig_prefix else "",
                 "summary":    (
-                    f"Received {event.get('amount')} {event.get('currency')} "
-                    f"on {event.get('chain', '').upper()} ({label})"
+                    f"{'Sent' if _outgoing else 'Received'} {event.get('amount')} {event.get('currency')} "
+                    f"{'to' if _outgoing else 'on'} {event.get('chain', '').upper()} ({label})"
                 ),
             }
-            alert_text = await cog.translator_pass(result_for_translator)
+            # No request_t0 — this is a webhook-triggered alert, not a Director
+            # request, so there's no "request received" moment to diff against.
+            alert_text = await cog.translator_pass(
+                result_for_translator,
+                intent_classified="wallet_payment_alert", domain_routed="wallet_payment")
             # Send Telegram notification
             _token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
             _chat_id = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
@@ -947,13 +990,20 @@ async def wallet_event(request: Request):
     # ── A2A Credit Dispatch ───────────────────────────────────────────────────
     # Push wallet/credit notification to a2a-browser on confirmed payment.
     # Sequence: dedup → mark seen (IMMEDIATE) → CoinGecko USD → sign → POST → retry
+    # credit_a2a gate: this pipeline is specific to the Safe/invoice payment-
+    # confirmation flow (harness-a2a.js sets this flag explicitly). Generic wallet
+    # activity from harness-crypto.js must never reach it — an outgoing transfer or
+    # an unrelated watched-address transaction is not a "payment confirmed" event,
+    # and a CoinGecko price-feed failure on one would otherwise incorrectly alert
+    # the Director that a real credit was blocked.
     _a2a_url  = os.environ.get("A2A_BROWSER_URL", "http://172.16.201.4:8001")
     _a2a_key  = os.environ.get("A2A_SHARED_SECRET", "")
     _cr_chain = event.get("chain", "").lower()
     _cr_tx    = event.get("tx_hash", "")
 
     # lightning_channel events are internal (channel opens) — never credit a2a-browser
-    if qdrant and _a2a_url and _a2a_key and _cr_tx and _cr_chain != "lightning_channel":
+    if (qdrant and _a2a_url and _a2a_key and _cr_tx and _cr_chain != "lightning_channel"
+            and event.get("credit_a2a")):
         try:
             import uuid as _uuid_mod
             import httpx as _hx_cr
@@ -1069,6 +1119,23 @@ async def wallet_event(request: Request):
                             },
                         },
                     }
+                    # 4b. Re-sign with REX_SIGNING_KEY_PEM (canonical: payload minus {amount_usd, sig_prefix, rex_sig})
+                    _rex_key_pem = os.environ.get("REX_SIGNING_KEY_PEM", "").replace("\\n", "\n")
+                    if _rex_key_pem:
+                        try:
+                            import json as _jj, base64 as _b64c
+                            from cryptography.hazmat.primitives.serialization import load_pem_private_key as _lpk2
+                            _inner = _a2a_body["params"]["payload"]
+                            _canon_dict = {k: v for k, v in _inner.items()
+                                           if k not in {"amount_usd", "sig_prefix", "rex_sig"}}
+                            _canon_bytes = _jj.dumps(_canon_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                            _wc_key = _lpk2(_rex_key_pem.encode(), password=None)
+                            _wc_sig = _b64c.b64encode(_wc_key.sign(_canon_bytes)).decode()
+                            _inner["sig_prefix"] = _wc_sig[:8]
+                            _inner["rex_sig"]    = _wc_sig
+                        except Exception as _wse:
+                            logger.warning("wallet_event: REX_SIGNING_KEY_PEM signing failed — using fallback sig: %s", _wse)
+
                     _a2a_hdrs = {"X-API-Key": _a2a_key, "Content-Type": "application/json"}
 
                     # 5. First POST attempt

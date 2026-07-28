@@ -125,8 +125,11 @@ INTENT_ACTION_MAP = {
     "news_brief":         {"domain": "news",    "operation": "brief"},
     "score_rss_by_subject": {"domain": "cognition", "operation": "score_rss"},
     "score_email_by_subject": {"domain": "cognition", "operation": "score_email"},
-    "cognition_confirm_update": {"domain": "cognition", "operation": "confirm_update"},
     "cognition_learn_subject": {"domain": "cognition", "operation": "resync_subject"},
+    "subject_decay_check": {"domain": "cognition", "operation": "decay_check"},
+    "subject_list":   {"domain": "cognition", "operation": "list_subjects"},
+    "subject_detail": {"domain": "cognition", "operation": "subject_detail"},
+    "task_activate": {"domain": "scheduler", "operation": "activate_pending"},
     # Tax ingest harness intents (Phase 1 — continuous hourly ingest)
     "tax_status":        {"domain": "tax", "operation": "status"},
     "tax_ingest_run":    {"domain": "tax", "operation": "run"},
@@ -159,6 +162,7 @@ INTENT_ACTION_MAP = {
     "memory_list_gaps":         {"domain": "memory_index", "operation": "list_gaps"},
     "memory_list_collections":  {"domain": "memory_index", "operation": "list_collections"},
     "governance_describe":      {"domain": "governance_read", "operation": "describe"},
+    "rextrics_report":          {"domain": "rextrics", "operation": "report"},
     # GitHub intents — devops_agent scope (read also available to research_agent)
     # Protected operations (PAT modification, repo creation, visibility change) NOT exposed.
     "github_read":          {"domain": "github", "operation": "read",      "name": "github_read"},
@@ -312,8 +316,11 @@ INTENT_TIER_MAP = {
     "news_brief": "LOW",
     "score_rss_by_subject": "LOW",
     "score_email_by_subject": "LOW",
-    "cognition_confirm_update": "LOW",
+    "subject_list": "LOW",
+    "subject_detail": "LOW",
+    "subject_decay_check": "LOW",
     "cognition_learn_subject": "LOW",
+    "task_activate": "LOW",
     "tax_status": "LOW", "tax_ingest_run": "LOW", "tax_ingest_store": "MID",
     "tax_list_events": "LOW", "tax_year_summary": "LOW",
     "tax_query": "LOW", "tax_address_list": "LOW", "tax_ingest_status": "LOW",
@@ -343,6 +350,7 @@ INTENT_TIER_MAP = {
     "memory_list_gaps":        "LOW",
     "memory_list_collections": "LOW",
     "governance_describe":     "LOW",
+    "rextrics_report":         "LOW",
     "memory_synthesise": "NORMAL",
     # Skill harness tiers — explicit steps with validation gates + WM checkpoints
     "skill_search":           "LOW",   # search + write checkpoint
@@ -955,19 +963,88 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "reasoning_summary": "Session closure — wrap-up synthesis",
         }
 
-    # ── Cognition Engine — Subject Update approve/reject (MID-tier HITL reply) ──
-    # Explicit command format Rex itself asks for in the Telegram notification
-    # ("Reply approve <subject> or reject <subject>") — unambiguous in isolation.
-    # Deterministic here, not LLM-routed: the confirm action IS the intent, no
-    # planning needed, and it must work even while local inference is degraded.
-    import re as _re_cog
-    _cog_confirm_m = _re_cog.search(r'\b(approve|reject)\s+([a-z][a-z0-9_-]{1,30})\b', u)
-    if _cog_confirm_m:
+    # ── Grounded email-event confirm (task #28) — checked early, before the ──────
+    # conversational-guard fall-through further down would otherwise catch a short
+    # phrase like "book it" and return None (falls to PASS 1 LLM, losing the tag).
+    # Follows a [event:{...}] suggestion tag emitted after reading an email that
+    # described a real date/time commitment. Dispatches straight to create_event
+    # with the EXACT extracted fields — deliberately bypasses PASS 3 specialist
+    # re-derivation, which is what let it invent a restaurant name/time before.
+    _event_confirm_kw = (
+        "book it", "book that", "add it to my calendar", "add that to my calendar",
+        "add it to calendar", "add that to calendar", "yes book it", "yes book that",
+        "confirm the event", "add that event", "yes add it", "yes please book it",
+        "book the table", "add this to my calendar",
+    )
+    import re as _re_ev
+    # Generic create/schedule-event phrasing (2026-07-23) — the Director may
+    # reference a scan-surfaced suggestion by name instead of one of the
+    # confirm-phrases above (observed live: "create a calendar event for
+    # Musa's Barber" after the Personal Mailbox Scan digest suggested it).
+    # Only treated as a suggestion-confirm below if a durable pending
+    # suggestion actually matches by keyword — a genuine unrelated
+    # create_event request (which states its own real date) falls through
+    # to normal routing untouched.
+    _event_create_generic_re = _re_ev.compile(
+        r'\b(create|add|make|schedule|book)\b.{0,40}\b(calendar event|appointment|event|meeting|booking)\b',
+        _re_ev.IGNORECASE,
+    )
+    if any(w in u for w in _event_confirm_kw) or _event_create_generic_re.search(u):
+        _ev_tag = None
+        for _cw_turn in reversed((context_window or [])[-6:]):
+            _cw_text = _cw_turn.get("assistant", "") if isinstance(_cw_turn, dict) else str(_cw_turn)
+            _m = _re_ev.search(r'\[event:(\{.*?\})\]', _cw_text)
+            if _m:
+                _ev_tag = _m.group(1)
+                break
+        if _ev_tag:
+            try:
+                _ev_data = json.loads(_ev_tag)
+                _ev_end = _ev_data.get("end_time") or _ev_data.get("start_time", "")
+                _desc = f"From email. Source: {_ev_data.get('source_excerpt', '')}"
+                return {
+                    "delegate_to": "business_agent", "intent": "create_event", "target": None, "tier": "MID",
+                    "summary": _ev_data.get("title", "Event from email"),
+                    "start": f"{_ev_data.get('date','')} {_ev_data.get('start_time','')}".strip(),
+                    "end": f"{_ev_data.get('date','')} {_ev_end}".strip(),
+                    "description": _desc,
+                    "calendar": "personal",
+                    "_grounded_action": True,
+                    "reasoning_summary": "Confirmed grounded event suggestion from email — deterministic dispatch, bypasses free-form extraction",
+                }
+            except Exception:
+                pass  # fall through to durable-suggestion check below
+        # No in-context tag (or it failed to parse) — the confirmed suggestion
+        # may have come from a scheduled mailbox scan digest, which is sent
+        # straight to Telegram via task_scheduler.py's _notify_telegram and
+        # never enters context_window. Signal handle_chat to check the durable
+        # meta:calendar_suggestion:* store before falling through to the LLM,
+        # which has no grounding at all for this phrase and would either
+        # fabricate a date or ask a question the Director didn't expect.
         return {
-            "delegate_to": "memory_agent", "intent": "cognition_confirm_update",
-            "target": _cog_confirm_m.group(2), "tier": "LOW",
-            "approved": _cog_confirm_m.group(1) == "approve",
-            "reasoning_summary": "Subject Update approve/reject reply — deterministic pre-classifier",
+            "_pending_calendar_lookup": True,
+            "_calendar_match_text": user_input,
+            "reasoning_summary": "Event-confirm phrasing with no in-context tag — check durable scan-surfaced suggestions",
+        }
+
+    # ── Scheduled-task activation reply ("approve X to activate") ──────────────
+    # Every seed_*_task() function in task_scheduler.py prompts this exact
+    # phrasing. Found live 2026-07-03: this path never existed at all — every
+    # "approve X" reply to a scheduled-task notification silently fell through
+    # to the (now-removed) Subject Update approve/reject shortcut and failed
+    # with "No pending update for subject 'weekly'" (or similar), leaving every
+    # auto-proposed recurring task stuck in pending_approval regardless of what
+    # the Director replied. Multi-word only (requires an embedded space) —
+    # Subject Update replies no longer exist to disambiguate against (removed
+    # same day: Subject Updates auto-apply now, no approval gate — see
+    # cognition/subjects.py resolve_thought_outcome()).
+    import re as _re_cog
+    _task_activate_m = _re_cog.search(r'\b(?:approve|activate)\s+([a-z][a-z0-9 _-]{2,40}?)\s*$', u)
+    if _task_activate_m and ' ' in _task_activate_m.group(1).strip():
+        return {
+            "delegate_to": "memory_agent", "intent": "task_activate",
+            "target": _task_activate_m.group(1).strip(), "tier": "LOW",
+            "reasoning_summary": "Scheduled-task activation reply — deterministic pre-classifier",
         }
 
     # ── Cognition Engine — "learn subject <id>" note resync ────────────────────
@@ -1023,9 +1100,18 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
                 "target": user_input, "tier": "MID",
                 "reasoning_summary": "Skill install from direct URL — deterministic pre-classifier",
             }
-        # "learn from/ingest/add to knowledge" — queue URL in learning harness
+        # "learn from/ingest/add to knowledge" — queue URL in learning harness.
+        # Also catches a bare "learn this <url>" / "learn <url>" (no trailing "url" word) —
+        # found live 2026-07-03: that exact phrasing fell through to PASS 1, which
+        # misclassified it as a plain conversational query instead of learn_url.
         _learn_url_kw = ("learn from", "ingest url", "add to knowledge", "ingest this", "learn this url")
-        if any(w in u for w in _learn_url_kw):
+        _learn_status_kw = ("what did you learn", "did you learn", "have you learned",
+                             "last learned", "what have you learned")
+        _has_bare_learn_verb = (
+            _re_url_sk.search(r'\blearn\b', u)
+            and not any(w in u for w in _learn_status_kw)
+        )
+        if any(w in u for w in _learn_url_kw) or _has_bare_learn_verb:
             return {
                 "delegate_to": "memory_agent", "intent": "learn_url",
                 "target": _raw_url, "tier": "LOW",
@@ -1404,6 +1490,12 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
         # Governance describe queries (Fix 3 — governance_describe; "governance" already present above)
         "governance tiers", "what are your governance", "governance structure",
         "what are the tiers", "your governance tiers", "list governance",
+        # Rex-trics hallucination/mismatch flag report
+        "rextrics", "rex-trics", "hallucination metrics", "hallucination report",
+        # Cognition Engine Subject queries (Director, 2026-07-07 — subject_list/subject_detail)
+        "active subjects", "your subjects", "list subjects", "what subjects",
+        "subjects are you tracking", "subjects are you investigating",
+        "cognition engine subjects", "subject findings", "interrogate",
     )
     prior_has_system = prior_domain is not None
 
@@ -1813,6 +1905,18 @@ def _quick_classify(user_input: str, context_window=None) -> dict | None:
             "delegate_to": "memory_agent", "intent": "memory_recall",
             "target": "sovereign architecture", "tier": "LOW",
             "reasoning_summary": "Self-identity/architecture query — memory_recall from semantic memory",
+        }
+
+    # Rex-trics weekly hallucination/mismatch flag report — unambiguous fast-path
+    _rextrics_kw = (
+        "/rextrics", "rextrics", "rex-trics", "rex trics",
+        "hallucination metrics", "hallucination report", "hallucination flags",
+    )
+    if any(w in u for w in _rextrics_kw):
+        return {
+            "delegate_to": "memory_agent", "intent": "rextrics_report",
+            "target": None, "tier": "LOW",
+            "reasoning_summary": "Rex-trics weekly flag report — deterministic pre-classifier",
         }
 
     # Ethereum validator / staking node queries — unambiguous fast-path
@@ -2400,6 +2504,39 @@ class ExecutionEngine:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    async def _triage_chat_input_for_subjects(self, user_input: str) -> None:
+        """Universal cheap Subject check on every fresh chat turn (Director's
+        call, 2026-07-03): "anything typed into chat — URL, file, plain text —
+        should at least get the same base check email subject/sender lines
+        already get, then hand off to the Cognition Engine in the background
+        on a hit." One embed + one vector query, no LLM — same triage primitive
+        every other trigger source (email, RSS, web search) already uses, just
+        applied at the one place every chat turn passes through regardless of
+        which intent it's ultimately routed to. Deliberately never runs for
+        explicit harness commands (/receipt, /install, /learn, etc.) — those
+        return before PASS 0, so this is never reached for them; no separate
+        exclusion list needed.
+
+        Fire-and-forget only — never blocks or affects the Director's response.
+        observe_for_subject() itself is cheap unless a genuine gap is found
+        (see its own docstring), so a hit here is not itself an LLM cost.
+        """
+        if not self.qdrant or not self.nanobot or not user_input:
+            return
+        try:
+            from cognition.subjects import find_relevant_subjects, _MAX_SUBJECT_MATCHES
+            from cognition.thoughts import observe_for_subject
+            hits = await find_relevant_subjects(self.qdrant, user_input[:2000])
+            for h in hits[:_MAX_SUBJECT_MATCHES]:
+                subject_id = h.get("subject", "")
+                if subject_id:
+                    await observe_for_subject(
+                        self.qdrant, self.nanobot, self.cog,
+                        subject_id, "chat", user_input[:500],
+                    )
+        except Exception as exc:
+            logger.warning("_triage_chat_input_for_subjects: failed (non-fatal): %s", exc)
+
     # SOVEREIGN_CONTEXT static cache — assembled once per boot from SKILL.md files + governance.json
     _sovereign_static_cache: str = ""
 
@@ -2927,6 +3064,13 @@ class ExecutionEngine:
                           context_window=None,
                           harness_cmd: str = None,
                           portfolio_category: str = "") -> dict:
+        import time as _time_mod0
+        # Rex-trics Log latency_ms — a LOCAL var, not shared self.-instance state: an
+        # earlier self._request_t0 attribute was found (live-tested 2026-07-10) to be
+        # clobbered by overlapping handle_chat() calls on the same ExecutionEngine
+        # instance, producing latency_ms values off by 30-130x. Threaded explicitly
+        # as a parameter to every /command harness method below instead.
+        _req_t0 = _time_mod0.monotonic()
         # PROSPECTIVE + HEALTH SESSION-START CHECK — fires on first message of a new session
         # (no prior context, no pending delegation = fresh session)
         # NOTE: Do NOT pass due_items through ceo_translate — the LLM fabricates briefing
@@ -2940,6 +3084,11 @@ class ExecutionEngine:
                         morning_briefing = briefing_data.get("message", "")
                     elif briefing_data.get("status") == "error" and briefing_data.get("message"):
                         morning_briefing = briefing_data["message"]
+                    elif briefing_data.get("status") == "stale":
+                        logger.warning(
+                            "recall_last_briefing: stale (%s hours old, ran_at=%s) — not surfacing",
+                            briefing_data.get("age_hours"), briefing_data.get("ran_at"),
+                        )
                     # status == "not_found" → no morning_briefing; don't fabricate
                 else:
                     # Task scheduler not yet available — fall back to due prospective items
@@ -2952,8 +3101,8 @@ class ExecutionEngine:
                                 f"{len(scheduled)} scheduled task(s) are due. "
                                 "Use 'list tasks' to see them."
                             )
-            except Exception:
-                pass
+            except Exception as _mb_e:
+                logger.warning("session-start morning_briefing lookup failed: %s", _mb_e)
 
             # Health brief — append to morning briefing
             try:
@@ -2980,14 +3129,16 @@ class ExecutionEngine:
                 health_brief = await self.cog.translator_pass(
                     self._build_result_for_translator("health_status", health_result),
                     tier="LOW",
+                    intent_classified="health_status", domain_routed="health",
+                    request_t0=_req_t0,
                 )
                 if health_brief:
                     if morning_briefing:
                         morning_briefing = morning_briefing + "\n\n" + health_brief
                     else:
                         morning_briefing = health_brief
-            except Exception:
-                pass
+            except Exception as _hb_e:
+                logger.warning("session-start health_brief lookup failed: %s", _hb_e)
 
         # SECURITY LAYER — pre-LLM inbound scan (skip if already security-confirmed)
         if not security_confirmed and self.scanner and not pending_delegation:
@@ -3024,7 +3175,6 @@ class ExecutionEngine:
         import asyncio as _asyncio
         import hashlib as _hashlib
         import time as _time_mod
-        _t_total = _time_mod.monotonic()
         _PASS_TIMEOUT  = _cfg.timeouts.pass_s
         _TOTAL_TIMEOUT = _cfg.timeouts.total_pipeline_s
         # Skill search/install involves GitHub API + multiple SKILL.md fetches + security review
@@ -3043,15 +3193,16 @@ class ExecutionEngine:
                 confirmed=confirmed,
                 delegation=pending_delegation or {},
                 context_window=context_window,
+                request_t0=_req_t0,
             )
         if _harness_cmd == "skills":
-            return await self._run_skills_browse(goal=user_input)
+            return await self._run_skills_browse(goal=user_input, request_t0=_req_t0)
         if _harness_cmd == "selfimprove":
-            return await self._run_selfimprove_harness()
+            return await self._run_selfimprove_harness(request_t0=_req_t0)
         if _harness_cmd == "devcheck":
-            return await self._run_devcheck_harness()
+            return await self._run_devcheck_harness(request_t0=_req_t0)
         if _harness_cmd == "portfolio":
-            return await self._run_portfolio_harness(category=portfolio_category)
+            return await self._run_portfolio_harness(category=portfolio_category, request_t0=_req_t0)
         if _harness_cmd == "pm":
             return {"director_message": "PM harness not yet built. Pending Director approval of the PM-Harness proposal."}
         if _harness_cmd == "tax_report":
@@ -3077,6 +3228,7 @@ class ExecutionEngine:
                 psbt_b64=_psbt,
                 confirmed=confirmed,
                 delegation=pending_delegation or {},
+                request_t0=_req_t0,
             )
 
         # Track whether the pre-LLM scanner already evaluated security
@@ -3103,6 +3255,10 @@ class ExecutionEngine:
             self._log_pass(0, "memory_consultation", user_input, {"elapsed_ms": round(_p0_ms, 1), "hits": len(_p0_hits)}, _p0_ms / 1000)
             if _p0_hits:
                 _msg.set_pass0_hits(_p0_hits)
+            # Universal Subject triage (2026-07-03) — every fresh chat turn, regardless
+            # of which intent it's routed to, gets at least this cheap check. Background
+            # only — never adds latency to the Director's response.
+            self._fire_and_forget(self._triage_chat_input_for_subjects(user_input))
 
         # PASS 1 — Orchestrator Classification (skip if re-submitting confirmed delegation)
         if pending_delegation:
@@ -3113,6 +3269,35 @@ class ExecutionEngine:
             # Deterministic pre-classifier — catches cases the small LLM routinely misroutes
             self._set_pass("quick")
             quick = _quick_classify(user_input, context_window=context_window)
+            if quick and quick.get("_pending_calendar_lookup"):
+                # _quick_classify recognised event-confirm phrasing but found no
+                # [event:{...}] tag in context_window — check the durable
+                # meta:calendar_suggestion:* store (survives scheduled-scan
+                # digests that never touch context_window at all) before
+                # giving up grounding and falling through to the LLM.
+                from monitoring.email_event_suggest import find_pending_suggestion
+                _pending_sugg = None
+                if self.qdrant:
+                    try:
+                        _pending_sugg = await find_pending_suggestion(
+                            self.qdrant, quick.get("_calendar_match_text", ""))
+                    except Exception:
+                        _pending_sugg = None
+                if _pending_sugg:
+                    _ps_end = _pending_sugg.get("end_time") or _pending_sugg.get("start_time", "")
+                    quick = {
+                        "delegate_to": "business_agent", "intent": "create_event", "target": None, "tier": "MID",
+                        "summary": _pending_sugg.get("title", "Event from email"),
+                        "start": f"{_pending_sugg.get('date','')} {_pending_sugg.get('start_time','')}".strip(),
+                        "end": f"{_pending_sugg.get('date','')} {_ps_end}".strip(),
+                        "description": f"From email. Source: {_pending_sugg.get('source_excerpt', '')}",
+                        "calendar": "personal" if _pending_sugg.get("account") != "business" else "business",
+                        "_grounded_action": True,
+                        "_pending_suggestion_id": _pending_sugg.get("suggestion_id"),
+                        "reasoning_summary": "Confirmed grounded event suggestion from a scan digest — deterministic dispatch",
+                    }
+                else:
+                    quick = None
             if quick:
                 delegation = quick
                 delegation["_routing_source"] = "quick_classify"
@@ -3133,13 +3318,15 @@ class ExecutionEngine:
                 except _asyncio.TimeoutError:
                     _rft = {"success": False, "outcome": "Classification timed out.", "detail": {},
                             "error": "PASS 1 timeout — please retry.", "next_action": None}
-                    _dm = await self.cog.translator_pass(_rft)
+                    _dm = await self.cog.translator_pass(
+                        _rft, domain_routed="orchestrator_classify", request_t0=_req_t0)
                     self._clear_pass()
                     return {"director_message": _dm, "confidence": 0.0, "gaps": []}
                 except Exception as e:
                     _rft = {"success": False, "outcome": "Classification failed.", "detail": {},
                             "error": str(e), "next_action": None}
-                    _dm = await self.cog.translator_pass(_rft)
+                    _dm = await self.cog.translator_pass(
+                        _rft, domain_routed="orchestrator_classify", request_t0=_req_t0)
                     self._clear_pass()
                     return {"director_message": _dm, "confidence": 0.0, "gaps": []}
                 self._log_pass(1, "orchestrator", user_input, delegation,
@@ -3254,7 +3441,10 @@ class ExecutionEngine:
             _gov_msg = "That action isn't permitted under the current governance policy."
             _rft = {"success": False, "outcome": _gov_msg, "detail": {},
                     "error": _gov_msg, "next_action": None}
-            dm = await self.cog.translator_pass(_rft, tier=tier)
+            dm = await self.cog.translator_pass(
+                _rft, tier=tier, intent_classified=intent, domain_routed=action.get("domain"),
+                routing_source=delegation.get("_routing_source", "llm_pass1"),
+                request_t0=_req_t0)
             self._clear_pass()
             return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps,
                     "_governance_block": str(e)}
@@ -3331,12 +3521,20 @@ class ExecutionEngine:
                         "outcome": f"Security review blocked this action: {sec2.get('reasoning_summary', '')}",
                         "detail": {}, "error": "Security block — HIGH tier action rejected.",
                         "next_action": None}
-                dm = await self.cog.translator_pass(_rft, tier=tier)
+                dm = await self.cog.translator_pass(
+                    _rft, tier=tier, intent_classified=intent, domain_routed=action.get("domain"),
+                    routing_source=delegation.get("_routing_source", "llm_pass1"),
+                    request_t0=_req_t0)
                 self._clear_pass()
                 return {"director_message": dm, "confidence": round(confidence, 3), "gaps": gaps}
 
         # Short-circuit paths — all pass through translator (no raw output to Director)
-        if intent == "session_flag_set" or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read", "cognition", "learning"):
+        # _grounded_action (task #28): a deterministically pre-filled action (e.g. confirmed
+        # email-event fields) must skip PASS 3 specialist entirely, since specialist output
+        # takes precedence over action fields in downstream field lookups — running it here
+        # would silently let it re-derive (and potentially fabricate) the same fields.
+        if (intent == "session_flag_set" or delegation.get("_grounded_action")
+                or action.get("domain") in ("ollama", "memory", "browser", "scheduler", "browser_config", "feeds", "memory_index", "wallet_watchlist", "wallet", "memory_synthesise", "research", "portfolio_analysis", "portfolio_watcher", "validator_queue", "governance_read", "cognition", "learning", "rextrics")):
             if action.get("domain") == "ollama":
                 import re as _re_sc
                 _SC_GROK_RE        = _re_sc.compile(r'\b(use grok|ask grok|via grok|from grok|check grok|check with grok|query grok)\b', _re_sc.IGNORECASE)
@@ -3505,13 +3703,25 @@ class ExecutionEngine:
                 _rft = {"success": True, "outcome": conv_text, "detail": {},
                         "error": None, "next_action": None}
             elif action.get("domain") == "feeds":
-                # RSS/feed read — direct nanobot dispatch, no LLM planning needed
-                exec_result = await self.nanobot.run("rss-digest", "get_entries", {"limit": _cfg.limits.rss_headlines_per_briefing})
+                # RSS/feed read (2026-07-06) — reuses run_score_rss_by_subject()
+                # wholesale (standing order #3, one implementation) rather than a
+                # bare get_entries dispatch. Previously an ad-hoc "get the latest
+                # RSS feeds" request never got Subject-scored at all — only the
+                # Weekday Morning Briefing's scheduled step did (confirmed via
+                # this exact function's own docstring: "score_rss_by_subject is
+                # scheduler-only in practice" was true before this change, no
+                # longer true after it). Same behavior either way: every story
+                # scored against every active Subject, relevant matches spawn a
+                # real Thought, borderline logged to episodic, everything else
+                # digested into a lightweight noise-filtered list — Director
+                # gets the identical shape on-demand as in the scheduled brief.
+                from monitoring.cognition_harness import run_score_rss_by_subject
+                exec_result = await run_score_rss_by_subject(self.cog, self.nanobot, self.qdrant)
                 if exec_result is None:
-                    exec_result = {"status": "error", "error": "nanobot returned None for rss-digest"}
+                    exec_result = {"status": "error", "error": "run_score_rss_by_subject returned None"}
                 _rft = self._build_result_for_translator(intent, exec_result)
             elif action.get("domain") == "cognition":
-                # Subject/campaign ops — direct dispatch, no LLM planning needed
+                # Subject/thought ops — direct dispatch, no LLM planning needed
                 # (score_rss_by_subject is scheduler-only in practice; confirm_update
                 # is the approve/reject reply and must work while local inference is degraded)
                 exec_result = await self._dispatch(action, user_input,
@@ -3586,7 +3796,10 @@ class ExecutionEngine:
                             self.cog, self.nanobot, self.qdrant, _ws_results))
                 else:
                     _rft = self._build_result_for_translator(intent, exec_result)
-            director_msg = await self.cog.translator_pass(_rft, tier=tier)
+            director_msg = await self.cog.translator_pass(
+                _rft, tier=tier, intent_classified=intent, domain_routed=action.get("domain"),
+                routing_source=delegation.get("_routing_source", "llm_pass1"),
+                request_t0=_req_t0)
             result_dict = {
                 "status": "ok", "intent": intent, "tier": tier, "agent": agent,
                 "result": exec_result, "confidence": round(confidence, 3), "gaps": gaps,
@@ -3626,13 +3839,31 @@ class ExecutionEngine:
             except Exception as e:
                 _rft = {"success": False, "outcome": "specialist_outbound_failed",
                         "detail": {}, "error": str(e), "next_action": None}
-                _dm = await self.cog.translator_pass(_rft, tier=tier)
+                _dm = await self.cog.translator_pass(
+                    _rft, tier=tier, intent_classified=intent, domain_routed=action.get("domain"),
+                    routing_source=delegation.get("_routing_source", "llm_pass1"),
+                    request_t0=_req_t0)
                 self._clear_pass()
                 return {"director_message": _dm, "confidence": round(confidence, 3), "gaps": gaps,
                         "status": "error", "intent": intent, "tier": tier, "agent": agent}
         _p3out_dur = (_time_mod.monotonic() - _t3out_start) * 1000
         self._log_pass(3, f"{agent}_outbound", delegation, sp_out,
                        _p3out_dur / 1000)
+        # Durable, queryable record of which provider built this payload — the hash-only
+        # debug line above is not enough to attribute a bad output to a model after the
+        # fact (found 2026-07-05 while tracing a wrong-date calendar_create).
+        if sp_out and not _confirmed_continuation:
+            try:
+                self.ledger.append("specialist_outbound_routing", "P3a", {
+                    "intent": intent,
+                    "agent": agent,
+                    "provider": sp_out.get("_provider") or sp_out.get("_intended_provider"),
+                    "routed_external": sp_out.get("_routed_external", False),
+                    "routing_reason": sp_out.get("_routing_reason"),
+                    "complexity_score": sp_out.get("_complexity_score"),
+                })
+            except Exception:
+                pass
         # Record specialist's skill/operation selection in envelope context
         try:
             _msg.set_skill(
@@ -3695,7 +3926,10 @@ class ExecutionEngine:
                 },
                 "error": None, "next_action": "confirm_or_deny",
             }
-            _dm = await self.cog.translator_pass(_confirm_ctx, tier=tier)
+            _dm = await self.cog.translator_pass(
+                _confirm_ctx, tier=tier, intent_classified=intent, domain_routed=action.get("domain"),
+                routing_source=delegation.get("_routing_source", "llm_pass1"),
+                request_t0=_req_t0)
             result_dict = {
                 "status": "ok", "intent": intent, "tier": tier, "agent": agent,
                 "specialist_plan": sp_out, "result": execution_result,
@@ -3840,7 +4074,8 @@ class ExecutionEngine:
         _t4_start = _time_mod.monotonic()
         try:
             orch_eval = await _asyncio.wait_for(
-                self.cog.orchestrator_evaluate(delegation, sp_in),
+                self.cog.orchestrator_evaluate(delegation, sp_in,
+                                                execution_confirmed=_execution_confirmed),
                 timeout=_PASS_TIMEOUT,
             )
         except (_asyncio.TimeoutError, Exception) as _e4:
@@ -3872,7 +4107,10 @@ class ExecutionEngine:
             _rft = {"success": False, "outcome": "plan_rejected",
                     "detail": {"feedback": orch_eval.get("feedback", "")},
                     "error": "Orchestrator rejected the plan.", "next_action": None}
-            _dm = await self.cog.translator_pass(_rft, tier=tier)
+            _dm = await self.cog.translator_pass(
+                _rft, tier=tier, intent_classified=intent, domain_routed=action.get("domain"),
+                routing_source=delegation.get("_routing_source", "llm_pass1"),
+                request_t0=_req_t0)
             self._clear_pass()
             return {"director_message": _dm, "confidence": round(confidence, 3), "gaps": gaps,
                     "status": "error", "intent": intent, "tier": tier, "agent": agent}
@@ -3893,11 +4131,11 @@ class ExecutionEngine:
         if self.qdrant and _mrfl_hits and _execution_confirmed:
             _asyncio.create_task(self._async_mrfl_increment(_mrfl_hits, intent))
         # Cognition Engine: this turn matched a known Subject (PASS 1) — check if it
-        # warrants a campaign. Non-blocking; "was this material" is left to the
-        # campaign's own research→evaluate loop rather than duplicated here.
+        # warrants a thought. Non-blocking; "was this material" is left to the
+        # thought's own research→evaluate loop rather than duplicated here.
         if self.qdrant and self.nanobot and _execution_confirmed and delegation.get("_subject_matched"):
-            from cognition.campaigns import run_campaign
-            _asyncio.create_task(run_campaign(
+            from cognition.thoughts import run_thought
+            _asyncio.create_task(run_thought(
                 self.qdrant, self.nanobot, self.cog,
                 delegation.get("_subject_id", ""), "conversation", user_input[:200],
             ))
@@ -3933,8 +4171,11 @@ class ExecutionEngine:
             "read_feed",   # rss-digest entries — pass raw list, no LLM summarisation
             "score_rss_by_subject",     # cognition harness brief — passes directly
             "score_email_by_subject",   # cognition harness brief — passes directly
-            "cognition_confirm_update", # approve/reject result — self-descriptive, passes directly
             "cognition_learn_subject",  # note resync result — self-descriptive, passes directly
+            "subject_decay_check",      # decay sweep result — self-descriptive, passes directly
+            "subject_list",             # Subject registry summary — self-descriptive, passes directly
+            "subject_detail",           # Subject interrogation detail — self-descriptive, passes directly
+            "task_activate",            # task activation result — self-descriptive, passes directly
             "research_gather", "research_save", "research_clear",
             "portfolio_analysis", "portfolio_analysis_save", "portfolio_analysis_clear",
             "portfolio_watcher_scan",   # watcher result passes directly; harness sends its own Telegram
@@ -3942,6 +4183,7 @@ class ExecutionEngine:
             "memory_list_collections",  # static collection registry — passes directly
             "memory_recall",   # exact content search — found/not-found result passes directly
             "governance_describe",  # deterministic governance.json read — passes directly
+            "rextrics_report",  # Rex-trics weekly flag summary — passes directly
             # remember_fact intentionally excluded — raw execution_result leaks point_id/collection
             # to the translator; let PASS 4 → translator produce plain-English confirmation instead
             # Dev-Harness — all phases return structured dicts; bypass LLM summarisation
@@ -4229,6 +4471,43 @@ class ExecutionEngine:
                     for _em in _msgs[:10] if _em.get("databaseId") or _em.get("uid")
                 ], "email"))
 
+        # Grounded event detection (task #28) — runs against the actual fetched body,
+        # never a paraphrase. Prevents the failure mode where a later "book it" turn
+        # has the specialist re-derive title/time from memory and invent details that
+        # were never in the source email.
+        if intent == "fetch_message" and isinstance(_rft.get("detail"), dict):
+            _fm_body = _rft["detail"].get("body", "")
+            if _fm_body:
+                try:
+                    import datetime as _dt_ev
+                    from monitoring.email_event_suggest import detect_calendar_event
+                    _ev = await detect_calendar_event(
+                        self.cog,
+                        _rft["detail"].get("subject", ""),
+                        _rft["detail"].get("from", ""),
+                        _fm_body,
+                        _dt_ev.date.today().isoformat(),
+                    )
+                except Exception as _ev_exc:
+                    logger.warning("event detection failed: %s", _ev_exc)
+                    _ev = None
+                if _ev:
+                    _rft = dict(_rft)
+                    _rft["detail"] = dict(_rft["detail"])
+                    _ev_end = _ev["end_time"] or _ev["start_time"]
+                    _loc_txt = f" at {_ev['location']}" if _ev["location"] else ""
+                    # [event:{...}] tag embedded in the same displayed text so a later
+                    # confirm turn's _quick_classify can parse it back out verbatim —
+                    # same convention already used for [id:1234] email/note tags.
+                    _rft["detail"]["suggested_event"] = (
+                        f"This email appears to confirm an event: \"{_ev['title']}\"{_loc_txt}, "
+                        f"{_ev['date']} {_ev['start_time']}"
+                        + (f"-{_ev_end}" if _ev_end != _ev['start_time'] else "")
+                        + f". Source: \"{_ev['source_excerpt']}\". "
+                        "Reply 'book it' to add this to your calendar.\n"
+                        f"[event:{json.dumps(_ev)}]"
+                    )
+
         # Pre-format file listings deterministically so the translator cannot miscount.
         # Items is a list of dicts {name, type, size, last_modified} — convert to numbered string.
         if intent in ("list_files", "navigate", "list_files_recursive") and isinstance(_rft.get("detail"), dict):
@@ -4328,10 +4607,18 @@ class ExecutionEngine:
                 k: v for k, v in _rft["detail"].items()
                 if not k.startswith("_") and k not in _DETAIL_STRIP
             }
+        # Rex-trics Check 2 grounding evidence — PASS 0 memory hits surfaced this
+        # turn. Extra key on the plain dict; ResultForTranslator's extra="allow"
+        # tolerates it, and translator_pass() reads it directly off the dict.
+        if _msg.context.pass0_hits:
+            _rft["_pass0_hits"] = list(_msg.context.pass0_hits)
         _t5_start = _time_mod.monotonic()
         try:
             director_msg = await _asyncio.wait_for(
-                self.cog.translator_pass(_rft, tier=tier),
+                self.cog.translator_pass(
+                    _rft, tier=tier, intent_classified=intent, domain_routed=action.get("domain"),
+                    routing_source=delegation.get("_routing_source", "llm_pass1"),
+                    request_t0=_req_t0),
                 timeout=_PASS_TIMEOUT,
             )
         except (_asyncio.TimeoutError, Exception):
@@ -4548,7 +4835,8 @@ class ExecutionEngine:
             logger.warning("_skill_harness_clear_all failed: %s", _e)
 
     async def _run_install_harness(
-        self, goal: str, confirmed: bool, delegation: dict, context_window=None
+        self, goal: str, confirmed: bool, delegation: dict, context_window=None,
+        request_t0: float | None = None,
     ) -> dict:
         """Autonomous /install harness.
 
@@ -4574,7 +4862,8 @@ class ExecutionEngine:
                         "Try a more specific description or check GitHub directly."
                     ),
                     "detail": {}, "error": "no_candidates", "next_action": None,
-                })
+                }, intent_classified="skill_install", domain_routed="skill_harness",
+                   routing_source="harness_command", request_t0=request_t0)
                 return {"director_message": dm}
 
             # LLM selects best candidate for the stated goal
@@ -4653,7 +4942,8 @@ class ExecutionEngine:
                 "success": False,
                 "outcome": "Install session expired — run /install again.",
                 "detail": {}, "error": "no_session", "next_action": None,
-            })
+            }, intent_classified="skill_install", domain_routed="skill_harness",
+               routing_source="harness_command", request_t0=request_t0)
             return {"director_message": dm}
 
         slug = selected.get("slug", "unknown")
@@ -4679,7 +4969,8 @@ class ExecutionEngine:
                 ),
                 "detail": {"clawhub_scan": _ch},
                 "error": "clawhub_scan_block", "next_action": None,
-            })
+            }, intent_classified="skill_install", domain_routed="skill_harness",
+               routing_source="harness_command", request_t0=request_t0)
             return {"director_message": dm}
 
         # Deterministic pre-scan: only unambiguous literal injection phrases hard-block.
@@ -4703,7 +4994,8 @@ class ExecutionEngine:
                 ),
                 "detail": {"categories": _hard_cats},
                 "error": "scanner_block", "next_action": None,
-            })
+            }, intent_classified="skill_install", domain_routed="skill_harness",
+               routing_source="harness_command", request_t0=request_t0)
             return {"director_message": dm}
 
         # Director already confirmed — that is the security gate.
@@ -4734,7 +5026,8 @@ class ExecutionEngine:
                 "success": True,
                 "outcome": f"Installed {slug}. Skill is ready to use.",
                 "detail": install_result, "error": None, "next_action": None,
-            })
+            }, intent_classified="skill_install", domain_routed="skill_harness",
+               routing_source="harness_command", request_t0=request_t0)
         else:
             dm = await self.cog.translator_pass({
                 "success": False,
@@ -4743,11 +5036,12 @@ class ExecutionEngine:
                     f"{install_result.get('message', 'unknown error')}"
                 ),
                 "detail": install_result, "error": "install_failed", "next_action": None,
-            })
+            }, intent_classified="skill_install", domain_routed="skill_harness",
+               routing_source="harness_command", request_t0=request_t0)
 
         return {"director_message": dm}
 
-    async def _run_skills_browse(self, goal: str) -> dict:
+    async def _run_skills_browse(self, goal: str, request_t0: float | None = None) -> dict:
         """/skills <query> — search and list skills, no install."""
         lifecycle = self._get_lifecycle()
         search_result = await lifecycle.search(query=goal, certified_only=False, limit=_cfg.limits.skill_search_candidates)
@@ -4757,7 +5051,8 @@ class ExecutionEngine:
                 "success": False,
                 "outcome": f"No skills found for '{goal}'.",
                 "detail": {}, "error": "no_candidates", "next_action": None,
-            })
+            }, intent_classified="skills_browse", domain_routed="skill_harness",
+               routing_source="harness_command", request_t0=request_t0)
             return {"director_message": dm}
         slim = [
             {k: v for k, v in c.items() if k not in ("skill_md", "raw_url")}
@@ -4768,10 +5063,11 @@ class ExecutionEngine:
             "outcome": f"Found {len(slim)} skill(s) matching '{goal}'.",
             "detail": {"candidates": slim},
             "error": None, "next_action": "Use /install <goal> to install one.",
-        })
+        }, intent_classified="skills_browse", domain_routed="skill_harness",
+           routing_source="harness_command", request_t0=request_t0)
         return {"director_message": dm}
 
-    async def _run_selfimprove_harness(self) -> dict:
+    async def _run_selfimprove_harness(self, request_t0: float | None = None) -> dict:
         """/selfimprove — run SI observe cycle then surface pending proposals."""
         from monitoring.self_improvement import run_manual_observe, list_pending_proposals
         _app_state = getattr(self, "app_state", None)
@@ -4788,7 +5084,9 @@ class ExecutionEngine:
             "error": None,
             "next_action": None,
         }
-        summary_dm = await self.cog.translator_pass(_rft_summary)
+        summary_dm = await self.cog.translator_pass(
+            _rft_summary, intent_classified="selfimprove", domain_routed="si_harness",
+            routing_source="harness_command", request_t0=request_t0)
 
         # Format all proposals as a numbered list (gateway handles Telegram chunking)
         _lines = []
@@ -4805,7 +5103,7 @@ class ExecutionEngine:
 
         return {"director_message": summary_dm + _proposal_block}
 
-    async def _run_devcheck_harness(self) -> dict:
+    async def _run_devcheck_harness(self, request_t0: float | None = None) -> dict:
         """/devcheck — run full dev harness analysis cycle."""
         dh = self._get_dev_harness()
         result = await dh.run_phase1(trigger="explicit")
@@ -4816,10 +5114,14 @@ class ExecutionEngine:
             "error": result.get("error"),
             "next_action": result.get("next_action") or result.get("next_step"),
         }
-        dm = await self.cog.translator_pass(_rft)
+        dm = await self.cog.translator_pass(
+            _rft, intent_classified="devcheck", domain_routed="dev_harness",
+            routing_source="harness_command", request_t0=request_t0)
         return {"director_message": dm}
 
-    async def _run_signbtc_harness(self, psbt_b64: str, confirmed: bool, delegation: dict) -> dict:
+    async def _run_signbtc_harness(
+        self, psbt_b64: str, confirmed: bool, delegation: dict, request_t0: float | None = None,
+    ) -> dict:
         """/signbtc — sign a BTC PSBT with Rex's key (HIGH tier, double-confirmation required)."""
         psbt = psbt_b64 or delegation.get("psbt_b64", "")
         if not confirmed:
@@ -4838,11 +5140,16 @@ class ExecutionEngine:
             "error": result.get("error"),
             "next_action": "Provide the signed PSBT to a second signer (Ledger or Exodus) to reach 2-of-3 threshold, then broadcast.",
         }
-        dm = await self.cog.translator_pass(_rft)
+        dm = await self.cog.translator_pass(
+            _rft, intent_classified="wallet_sign_btc_psbt", domain_routed="wallet",
+            routing_source="harness_command", request_t0=request_t0)
         return {"director_message": dm}
 
-    async def _run_portfolio_harness(self, category: str = "") -> dict:
+    async def _run_portfolio_harness(self, category: str = "", request_t0: float | None = None) -> dict:
         """/portfolio [category] — deep analysis if category given, else snapshot."""
+        if category == "ingest":
+            from monitoring.portfolio_statement_ingest import run_portfolio_ingest
+            return await run_portfolio_ingest(self.cog, self.nanobot, self.qdrant)
         if category:
             from monitoring.portfolio_analysis_harness import run_portfolio_analysis
             _sov_wallet_url = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
@@ -4859,7 +5166,9 @@ class ExecutionEngine:
             "error": result.get("error"),
             "next_action": None,
         }
-        dm = await self.cog.translator_pass(_rft)
+        dm = await self.cog.translator_pass(
+            _rft, intent_classified="portfolio_snapshot", domain_routed="wallet_watchlist",
+            routing_source="harness_command", request_t0=request_t0)
         return {"director_message": dm}
 
     async def _run_tax_report_harness(
@@ -4973,17 +5282,36 @@ class ExecutionEngine:
         if not text or not text.strip():
             return {"director_message": "No content to learn from.", "_translator_bypass": True}
 
-        result = await learn_on_demand(
-            text=text,
-            source_label=source_label,
-            qdrant=self.qdrant,
-            cog=self.cog,
-            nanobot=self.nanobot,
-            source_url=source_url,
-        )
+        # Backgrounded (2026-07-05) — learn_on_demand()'s confidence loop can run
+        # several chunks x cycles, each with its own 90s(+90s retry) LLM budget;
+        # for any non-trivial document that cumulative time was blowing the
+        # gateway's 360s client-side timeout even when every individual chunk
+        # call succeeded within its own budget (confirmed live: a genuine
+        # per-chunk inference_timeout, not a queue/priority bug — see
+        # project_queue_policy memory). Was previously awaited synchronously in
+        # the request/response cycle; now fires immediately and notifies via
+        # Telegram on completion, same pattern as the hourly-poll learning loop.
+        from monitoring.learning_harness import _notify_telegram as _learn_notify
+
+        async def _run_learn_and_notify():
+            try:
+                result = await learn_on_demand(
+                    text=text,
+                    source_label=source_label,
+                    qdrant=self.qdrant,
+                    cog=self.cog,
+                    nanobot=self.nanobot,
+                    source_url=source_url,
+                )
+                msg = result.get("result_for_translator") or f"Finished learning from {source_label}."
+            except Exception as exc:
+                msg = f"Learning from {source_label} failed: {exc}"
+            await _learn_notify(msg)
+
+        self._fire_and_forget(_run_learn_and_notify())
         return {
-            "status":             result.get("status", "ok"),
-            "director_message":   result.get("result_for_translator", ""),
+            "status":             "ok",
+            "director_message":   f"Learning from {source_label} now — I'll let you know what I found.",
             "_translator_bypass": True,
         }
 
@@ -5023,6 +5351,27 @@ class ExecutionEngine:
         if exec_result is None:
             return {"success": False, "outcome": "no_result", "detail": {},
                     "error": "dispatch returned None", "next_action": None}
+        # needs_clarification (schedule_task): a legitimate follow-up question,
+        # not a failure. Same status-string mismatch as queue_url's "queued" bug
+        # earlier tonight — _build_result_for_translator's generic success check
+        # only recognises status=="ok", so this fell through to "That action
+        # failed: error" instead of surfacing the actual clarifying question
+        # (observed 2026-07-05: "wiring into UniFi" misclassified as
+        # schedule_task, its own clarification question got reported as a
+        # hard failure). Does not yet loop the Director's answer back into
+        # resuming task creation — that needs pending_delegation plumbing,
+        # a bigger follow-up — but at minimum the question now reaches them
+        # honestly instead of a confusing generic error.
+        if intent == "schedule_task" and exec_result.get("status") == "needs_clarification":
+            _q = exec_result.get("question") or exec_result.get("message", "")
+            return {
+                "success": True,
+                "outcome": _q,
+                "detail": {},
+                "error": None,
+                "next_action": None,
+                "_intent": intent,
+            }
         # remember_fact: descriptive outcome so translator echoes what was stored
         if intent == "remember_fact":
             _rf_ok  = exec_result.get("status") == "ok"
@@ -5034,6 +5383,7 @@ class ExecutionEngine:
                 "detail": {"mip_key": _rf_key} if _rf_key else {},
                 "error": None if _rf_ok else _rf_msg,
                 "next_action": None,
+                "_intent": intent,
             }
         success = (
             (exec_result.get("status") == "ok" or exec_result.get("success") is True
@@ -5049,6 +5399,10 @@ class ExecutionEngine:
             "detail": detail,
             "error": exec_result.get("error"),
             "next_action": None,
+            # Internal-only — lets PASS 5 tell a read apart from a write so it never
+            # narrates a list/get/fetch result as if something was just created
+            # (found 2026-07-05: a list_events read got phrased as "has been added").
+            "_intent": intent,
         }
 
     async def _web_search_rft(self, exec_result: dict) -> dict:
@@ -5355,6 +5709,13 @@ class ExecutionEngine:
             if target:
                 action["path"] = target
             # path defaults to "/" — will be overridden in _dispatch if specialist provides one
+            if action["domain"] == "caldav":
+                # Grounded-confirm path (task #28) pre-fills these directly in delegation,
+                # skipping specialist re-derivation. No-op for normal free-form create_event
+                # requests, which don't set these keys here.
+                for _cf in ("start", "end", "summary", "description", "calendar"):
+                    if delegation.get(_cf):
+                        action[_cf] = delegation[_cf]
         elif action["domain"] == "mail" and target:
             action["account"] = target
         elif action["domain"] == "browser":
@@ -5462,8 +5823,28 @@ class ExecutionEngine:
             if name == "docker_logs":
                 _SELF_NAMES = {"rex", "sovereign", "self", "myself", "me", "", None}
                 target_container = container if container not in _SELF_NAMES else "sovereign-core"
-                logs = await self.broker.get_logs(target_container, tail=int(action.get("tail", 50)))
-                return {"status": "ok", "container": target_container, "logs": logs}
+                try:
+                    logs = await self.broker.get_logs(target_container, tail=int(action.get("tail", 50)))
+                    return {"status": "ok", "container": target_container, "logs": logs}
+                except Exception as exc:
+                    # 2026-07-05: a 403 here (e.g. docker-broker itself, which is deliberately
+                    # in docker-policy.yaml's deny_names — the broker doesn't expose its own
+                    # logs) was previously an uncaught exception that some downstream pass
+                    # tried to creatively narrate, producing fabricated descriptions like
+                    # "logs contain unexpected byte sequences" instead of the real, boring
+                    # "permission denied" reason. Return a deterministic, honest message
+                    # instead — _DIAGNOSTIC_INTENTS already routes get_logs straight to the
+                    # translator, so this reaches the Director verbatim, not narrated.
+                    is_403 = "403" in str(exc)
+                    return {
+                        "status": "error",
+                        "container": target_container,
+                        "error": (
+                            f"Can't read logs for '{target_container}' — access denied by "
+                            "docker-policy.yaml (likely an intentional exclusion, not a fault)."
+                            if is_403 else f"Failed to fetch logs for '{target_container}': {exc}"
+                        ),
+                    }
             if name == "docker_stats":
                 if not container:
                     # Self-diagnostic — no specific container: return full system metrics
@@ -5819,6 +6200,14 @@ class ExecutionEngine:
                         self.qdrant, cal_summary, cal_start, cal_end,
                         cal_calendar, cal_description,
                     ))
+                    # Clear the durable scan-suggestion record (if this create
+                    # came from one) only now that the event is genuinely
+                    # created — a failed create must leave it pending so
+                    # "book it" can still be retried.
+                    _pending_sugg_id = d.get("_pending_suggestion_id")
+                    if _pending_sugg_id:
+                        from monitoring.email_event_suggest import clear_pending_suggestion
+                        asyncio.create_task(clear_pending_suggestion(self.qdrant, _pending_sugg_id))
                 return _ev_result
             if name == "task_create":
                 d = delegation or {}
@@ -6358,6 +6747,18 @@ class ExecutionEngine:
                                or (delegation or {}).get("database_id") or action.get("database_id", ""))
                 from_addr   = sp.get("from_addr") or action.get("from_addr", "")
                 subject     = sp.get("subject")   or action.get("subject", "")
+                # TEMP diagnostic (2026-07-06) — "read email <id>" was reliably
+                # classifying to fetch_message but returning a plain inbox list
+                # instead of the body in live Telegram use; couldn't reproduce
+                # in isolation (context-dependent). Logs the actual resolved
+                # values + raw nanobot result so the next live occurrence is
+                # diagnosable instead of guessed at. Remove once root-caused.
+                logger.info(
+                    "fetch_message DEBUG: database_id=%r from_addr=%r subject=%r "
+                    "sp=%r delegation_db_id=%r action_db_id=%r",
+                    database_id, from_addr, subject, sp,
+                    (delegation or {}).get("database_id"), action.get("database_id"),
+                )
                 if not database_id and not from_addr and not subject:
                     return {"error": "fetch_message requires database_id, from_addr, or subject"}
                 nb = await self.nanobot.run(
@@ -6365,7 +6766,12 @@ class ExecutionEngine:
                     {"account": account, "database_id": database_id,
                      "from_addr": from_addr, "subject": subject, "timeout": _NC_MAIL_TIMEOUT},
                 )
-                return _unwrap_nb(nb)
+                result = _unwrap_nb(nb)
+                logger.info("fetch_message DEBUG: raw nanobot result=%r", nb)
+                logger.info("fetch_message DEBUG: unwrapped result keys=%r has_body=%s",
+                            list(result.keys()) if isinstance(result, dict) else type(result),
+                            isinstance(result, dict) and bool(result.get("body")))
+                return result
 
             if op == "search":
                 criteria = sp.get("criteria") or action.get("criteria") or {}
@@ -6376,10 +6782,16 @@ class ExecutionEngine:
                 query = (" ".join(query_parts) if query_parts
                          else (sp.get("query") or action.get("query", "")
                                or (delegation or {}).get("query", "")))
-                # Route search through list_unread with filter — NC Mail has no separate search endpoint
-                nb = await self.nanobot.run(_skill_nc_mail, "list_unread", {
-                    "account": account, "filter": query, "unread_only": "false",
-                    "limit": _cfg.limits.nc_mail_list_default, "timeout": _NC_MAIL_TIMEOUT,
+                # Real search (2026-07-06) — queries Nextcloud's own oc_mail_messages
+                # cache directly (nc_mail.py's cmd_search), not the Mail REST API's
+                # /messages endpoint via list_unread+filter. That path only ever saw
+                # the most recent 10 messages (measured: ~25-70s per REST call, hard
+                # capped at 100 server-side regardless of requested limit) — anything
+                # older silently returned "not found," confidently and wrongly. The DB
+                # query covers the Subject's whole synced mailbox in ~50ms.
+                nb = await self.nanobot.run(_skill_nc_mail, "search", {
+                    "account": account, "filter": query,
+                    "limit": 50, "timeout": _NC_MAIL_TIMEOUT,
                 })
                 result = _unwrap_nb(nb)
                 if isinstance(result, dict) and result.get("messages") == [] and not result.get("error"):
@@ -6530,17 +6942,49 @@ class ExecutionEngine:
                 return await run_score_rss_by_subject(self.cog, self.nanobot, self.qdrant)
             if operation == "score_email":
                 from monitoring.cognition_harness import run_score_email_by_subject
-                return await run_score_email_by_subject(self.cog, self.nanobot, self.qdrant)
-            if operation == "confirm_update":
-                from cognition.subjects import apply_subject_update
-                subject_id = (delegation or {}).get("target") or ""
-                approved = bool((delegation or {}).get("approved"))
-                return await apply_subject_update(self.qdrant, self.nanobot, subject_id, approved)
+                accounts = action.get("accounts")
+                return await run_score_email_by_subject(self.cog, self.nanobot, self.qdrant, accounts=accounts)
             if operation == "resync_subject":
                 from cognition.subjects import resync_subject_from_note
                 subject_id = (delegation or {}).get("target") or ""
                 return await resync_subject_from_note(self.qdrant, self.nanobot, self.cog, subject_id)
+            if operation == "decay_check":
+                from cognition.subjects import decay_stale_subjects
+                return await decay_stale_subjects(self.qdrant, self.nanobot)
+            if operation == "list_subjects":
+                from cognition.subjects import list_active_subjects, format_subject_list
+                subjects = await list_active_subjects(self.qdrant)
+                return {"status": "ok", "result_for_translator": format_subject_list(subjects)}
+            if operation == "subject_detail":
+                from cognition.subjects import find_subject_by_reference, format_subject_detail
+                ref = (delegation or {}).get("target") or ""
+                subject = await find_subject_by_reference(self.qdrant, ref) if ref else None
+                if not subject:
+                    return {"status": "error",
+                            "error": f"No active Subject matching {ref!r}.",
+                            "result_for_translator": f"I don't have an active Subject matching '{ref}'."}
+                return {"status": "ok", "result_for_translator": format_subject_detail(subject)}
             return {"status": "error", "error": f"unknown cognition operation: {operation}"}
+
+        if domain == "scheduler" and operation == "activate_pending":
+            phrase = (delegation or {}).get("target") or ""
+            if not self.task_scheduler:
+                return {"status": "error", "error": "task scheduler not available"}
+            match = await self.task_scheduler.find_pending_task_by_phrase(phrase)
+            if not match:
+                return {"status": "error",
+                        "error": f"No pending task found matching {phrase!r}."}
+            # find_pending_task_by_phrase() doesn't filter by `type` — it matches
+            # ANY pending_approval PROSPECTIVE entry by title, including a
+            # subject_proposal (cognition/subjects.py's propose_successor_thesis()).
+            # Branch on type rather than assuming every match is a scheduled task —
+            # reuses the existing lookup + NL routing wholesale, no new intent added.
+            if match.get("type") == "subject_proposal":
+                from cognition.subjects import create_subject_from_proposal
+                return await create_subject_from_proposal(self.qdrant, self.nanobot, match)
+            return await self.task_scheduler.activate_task(
+                match["task_id"], match["point_id"],
+            )
 
         if domain == "research":
             from monitoring.research_harness import run_research_gather, run_research_save, run_research_clear
@@ -6586,7 +7030,19 @@ class ExecutionEngine:
         if domain == "portfolio_watcher":
             from monitoring.portfolio_analysis_harness import run_portfolio_watcher_scan
             _pw_url = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
-            return await run_portfolio_watcher_scan(self.cog, self.nanobot, self.qdrant, _pw_url)
+            # Retirement added 2026-07-08 (statement-ingestion redesign) — same
+            # weekly cadence covers both categories now, no new scheduled task.
+            _crypto = await run_portfolio_watcher_scan(
+                self.cog, self.nanobot, self.qdrant, _pw_url, category="crypto")
+            _retirement = await run_portfolio_watcher_scan(
+                self.cog, self.nanobot, self.qdrant, _pw_url, category="retirement")
+            return {
+                "status": "ok",
+                "crypto": _crypto,
+                "retirement": _retirement,
+                "signals_fired": (_crypto.get("signals_fired", []) + _retirement.get("signals_fired", [])),
+                "assets_scanned": (_crypto.get("assets_scanned", 0) + _retirement.get("assets_scanned", 0)),
+            }
 
         if domain == "tax":
             from tax_harness.harness import TaxIngestHarness
@@ -6816,7 +7272,15 @@ class ExecutionEngine:
                     from monitoring.learning_harness import check_downloads as _check_dl
                     _asyncio.create_task(_check_dl(_app_state, immediate=True))
                 return {
-                    "status":    "queued",
+                    # "ok" not "queued" — _build_result_for_translator's generic success
+                    # check only recognises status=="ok" (or success is True / execution_
+                    # confirmed is True). "queued" matched none of those, so a fully
+                    # successful dispatch (file written, learning triggered) was flagged
+                    # success=False and surfaced as "That action failed: error" (found
+                    # 2026-07-05 testing the no-slash-command "learn this <url>" path —
+                    # the /learn harness command uses a different code path unaffected).
+                    "status":    "ok",
+                    "outcome":   f"Queued {_url} for learning.",
                     "url":       _url,
                     "file":      _nc_path,
                     "url_slug":  _slug,
@@ -7818,6 +8282,24 @@ class ExecutionEngine:
                 "tier_names": list(_tiers.keys()),
                 "intent_tier_count": len(_intent_tiers),
             }
+
+        if domain == "rextrics":
+            from cognition.rextrics import get_weekly_report, write_last_report_cache
+            report = await get_weekly_report(self.qdrant)
+            if "error" in report:
+                return {"status": "error", "error": report["error"]}
+            _tw = report["this_week"]
+            def _rt_trend(delta: int) -> str:
+                return f"{'+' if delta > 0 else ''}{delta}"
+            _summary = (
+                f"Rex-trics — last 7 days: {_tw['total_responses']} responses, "
+                f"{_tw['execution_mismatches']} execution mismatches "
+                f"({_rt_trend(report['execution_mismatches_trend'])} vs prior week), "
+                f"{_tw['unverified_claims_stripped']} unverified claims stripped "
+                f"({_rt_trend(report['unverified_claims_stripped_trend'])} vs prior week)."
+            )
+            await write_last_report_cache(self.qdrant, report)
+            return {"status": "ok", "description": _summary, **report}
 
         if domain == "validator_queue":
             from monitoring.validator_queue_harness import run_validator_queue_check

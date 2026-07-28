@@ -2,6 +2,12 @@
 
 API: https://api.groq.com/openai/v1
 Key: GROQ_API_KEY in secrets/providers.env
+
+Two call paths:
+  generate() / chat()       — freeform text via raw httpx (used by PASS 2/3a routing)
+  generate_structured()     — Instructor-decorated structured JSON output
+                              requires: pip install groq instructor
+                              falls back gracefully if packages absent (logs WARNING, returns None)
 """
 
 import logging
@@ -10,9 +16,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
-TIMEOUT = 30.0
+GROQ_BASE_URL    = "https://api.groq.com/openai/v1"
+DEFAULT_MODEL    = "llama-3.3-70b-versatile"
+REASONING_MODEL  = "deepseek-r1-distill-llama-70b"   # preferred for structured/heavy reasoning
+TIMEOUT          = 30.0
 
 
 class GroqInferenceAdapter:
@@ -87,6 +94,52 @@ class GroqInferenceAdapter:
         except Exception as exc:
             logger.warning("GroqInferenceAdapter.chat error: %s", exc)
             return {"status": "error", "error": str(exc), "_trust": "untrusted_external"}
+
+    async def generate_structured(
+        self,
+        prompt: str,
+        response_model: type,
+        model: str | None = None,
+        system: str = "You are a helpful assistant. Return only valid JSON.",
+        max_retries: int = 2,
+    ):
+        """Instructor-decorated structured output via Groq.
+
+        Uses deepseek-r1-distill-llama-70b by default (reasoning model).
+        Returns a validated Pydantic model instance, or None if groq/instructor
+        packages are unavailable or the call fails after retries.
+        """
+        if not self._api_key:
+            logger.warning("generate_structured: GROQ_API_KEY not configured")
+            return None
+        try:
+            from groq import AsyncGroq
+            import instructor
+        except ImportError:
+            logger.warning(
+                "generate_structured: groq/instructor packages not installed — "
+                "add 'groq' and 'instructor[groq]' to requirements.txt and rebuild"
+            )
+            return None
+        try:
+            client = instructor.from_groq(
+                AsyncGroq(api_key=self._api_key),
+                mode=instructor.Mode.GROQ_TOOLS,
+            )
+            chosen_model = model or REASONING_MODEL
+            result = await client.chat.completions.create(
+                model=chosen_model,
+                response_model=response_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": prompt},
+                ],
+                max_retries=max_retries,
+            )
+            return result
+        except Exception as exc:
+            logger.warning("generate_structured error (model=%s): %s", model or REASONING_MODEL, exc)
+            return None
 
     async def health_check(self) -> dict:
         try:
