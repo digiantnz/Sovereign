@@ -1,3 +1,5 @@
+# HISTORICAL — pre-March 2026 (RTX 3060 Ti / llama3.1:8b era — architecture superseded)
+
 **1️⃣ Design Overview**
 
 **Core Philosophy**

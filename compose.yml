@@ -9,6 +9,7 @@ networks:
 volumes:
   compose_ollama_models:      # GPU inference models — RAID-bound per §2 (llama3.1:8b, mistral:7b)
   compose_ollama_embed_models: # CPU embed models — separate volume for ollama-embed (nomic-embed-text)
+  compose_ollama_distil_models: # CPU distil models — separate volume for ollama-distil (llama3.1:8b)
   sovereign_runtime:          # tmpfs — 4GB RAM-backed ephemeral scratch shared by qdrant + sovereign-core
     driver: local
     driver_opts:
@@ -125,6 +126,8 @@ services:
         condition: service_healthy
       ollama-embed:
         condition: service_healthy
+      ollama-distil:
+        condition: service_healthy
       qdrant:
         condition: service_healthy
       qdrant-archive:
@@ -233,6 +236,34 @@ services:
         limits:
           memory: 2g  # nomic-embed-text is ~274MB; 2GB headroom for CPU inference batching
     cpuset: "8-11,20-23"   # adapter cores — CPU-only, no GPU contention
+
+  ollama-distil:
+    image: ollama/ollama:latest
+    container_name: ollama-distil
+    restart: always
+    networks: [ai_net]
+    # No host port — only reachable from ai_net (sovereign-core)
+    env_file: ./secrets/ollama-distil.env
+    volumes:
+      - compose_ollama_distil_models:/root/.ollama  # Separate model store for llama3.1:8b
+    # No GPU deploy section — CPU-only by design (OLLAMA_NUM_GPU=0 in ollama-distil.env).
+    # Host has ~25GB free RAM (see `free -h`); llama3.1:8b-instruct-q4_K_M is ~5GB — moving
+    # it here removes it from RTX 3090 VRAM contention with qwen3-32b entirely. 2026-07-05.
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    mem_limit: 8g
+    deploy:
+      resources:
+        limits:
+          memory: 8g  # llama3.1:8b-instruct-q4_K_M ~5GB + headroom for CPU inference batching
+    # No cpuset — unlike ollama-embed (274MB embedding model, light enough for the 4-core
+    # adapter cpuset), this runs full generative inference. Measured 2026-07-05: cpuset
+    # "8-11,20-23" (4 physical cores) gave ~0.28 tok/s on qwen2.5:3b — hopelessly slow.
+    # Needs the full 24 threads available, same reasoning as `ollama` (GPU service) having
+    # no cpuset — CPU-side inference work is genuinely heavier than the other adapter tenants.
 
   # whisper removed 2026-03-20 — migrated to node04 (172.16.201.4)
   # Update WHISPER_URL in secrets/whisper.env to the node04 service URL when ready.

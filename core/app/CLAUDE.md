@@ -113,6 +113,29 @@ This file is loaded by Claude Code when working inside `core/app/`. It supplemen
 
 ---
 
+## Cognition Engine (`cognition/subjects.py`, `cognition/thoughts.py`, `monitoring/cognition_harness.py`)
+
+See root `CLAUDE.md`'s "Cognition Engine — current operational model" for the conceptual overview. This section is implementation-level detail for anyone touching this code.
+
+### Files
+- `cognition/subjects.py` — Subject CRUD (`create_subject`, `get_subject`, `list_active_subjects`, `resync_subject_from_note`), confidence math (`label_to_weight` — was `confidence_to_score`, `apply_confidence_delta` — replaces the deleted `rolling_confidence`, `decay_confidence_towards_neutral`), epistemic status (`get_epistemic_status`, `propose_successor_thesis`, `create_subject_from_proposal`), the novelty-only apply gate (`resolve_thought_outcome`, `assess_thought_quality`, `evaluate_thought_iteration`), decay (`decay_stale_subjects`), memory signals (`score_memory_signals`), email/spam primitives (`detect_brand_mismatch`, `record_spam_sender`, `record_urgent_sender`), and the Cognition Engine primitives (`find_relevant_subjects`, `derive_impact`, `derive_urgency`)
+- `cognition/thoughts.py` — Thought lifecycle (`run_thought`, `observe_for_subject`), crash-recovery (`_write_thought_inflight_marker`/`_clear_thought_inflight_marker`/`sweep_orphaned_thoughts`)
+- `monitoring/cognition_harness.py` — scheduler-facing wrappers (`run_score_rss_by_subject`, `run_score_email_by_subject`) that fetch their own data (RSS/email) and call into `subjects.py`/`thoughts.py`
+
+### No pending-approval state for Subject Updates
+Removed 2026-07-03 along with `propose_subject_update()`/`apply_subject_update()`/`_PENDING_FLAG`/`cognition_confirm_update` (intent, INTENT_ACTION_MAP/TIER_MAP/_DIAGNOSTIC_INTENTS entries, `_quick_classify` regex, governance handler) — all deleted, not deprecated-in-place, since there is no reply flow left to route to. `resolve_thought_outcome()` decides and writes in one call. Do not reintroduce a parallel approval path for Subject Updates without checking with the Director first — this was a deliberate architecture change, not an oversight.
+
+### `score_memory_signals()` scope
+Only stamps the Thought-outcome memory writes (`_log_thought_stop_episodic`'s episodic entry, `_write_research_semantic`/`_write_episodic`'s semantic+episodic pair) — never the Subject's own `semantic:subject:<id>` record (scoring a Subject's confidence record for relevance-to-Subjects would be circular), and not yet wired into any other memory-writing path (RSS digest, `/learn` fold-ins). If extending signal-stamping to a new writer, reuse `score_memory_signals()` as-is — do not reimplement impact/urgency scoring with different thresholds or vocabulary (see root CLAUDE.md's note on task #27's first draft getting rejected for exactly this).
+
+### `notify_when="on_findings"` gotcha
+`task_scheduler._result_has_content()` treats any of several OR-chained result fields as "content" — including `"brief"`, a rendered human-readable summary string that several harnesses (`run_score_email_by_subject`, `run_score_rss_by_subject`, `run_news_brief`) always return non-empty regardless of whether anything notable happened. `notify_when="on_findings"` is therefore silently equivalent to `"always"` for any harness that only returns `"brief"`. Fix: have the harness also return an explicit `"count"` field (count of genuinely notable items, not total items processed) — `_result_has_content()` treats an explicit `"count"` key as authoritative and skips the OR-fallback entirely. This exact bug has now been found twice independently (Validator-Monitor-Harness's `"alerts"` key, 2026-07-01; email/RSS scoring's `"brief"` key, 2026-07-03) — check for it whenever wiring a new harness into `notify_when="on_findings"`.
+
+### Crash-recovery pattern (reusable beyond Thoughts)
+`working_memory` is wiped on every restart by design (`setup()` recreates it fresh at boot) — a working_memory-only checkpoint can never reveal an interrupted operation after a restart, because the checkpoint that would show it is already gone by the time the new process boots. The fix pattern (see `cognition/thoughts.py`'s `_write_thought_inflight_marker`/`sweep_orphaned_thoughts`): a second, durable marker in `meta` (survives restarts) written at operation-start and cleared at normal completion; a boot-time sweep (wired in `main.py`'s lifespan) reports anything still marked in-flight. Reuse this pattern for any other long-running, checkpoint-tracked operation that needs the same guarantee — don't reinvent it per-subsystem.
+
+---
+
 ## Nanobot Adapter (`adapters/nanobot.py`)
 
 ### Dispatch model
@@ -289,6 +312,8 @@ Session-scoped index of all items Rex processes that have a stable native ID (no
 - `seed_nightly_dev_task()` idempotency: checks PROCEDURAL for `type=task_procedure` + step `intent=dev_analyse + trigger=nightly`, then verifies PROSPECTIVE `status=active`. Title-based check unreliable — `qdrant.store()` overwrites `metadata["title"]` with LLM-generated `_key_fields["title"]` (last in payload merge order).
 - `qdrant.store()` title overwrite invariant: if you need a stable title in a stored entry, pass `_key` in `metadata` so LLM generation is skipped and only `last_updated` is added to `_key_fields`.
 - SI harness `_write_proposal()` + `propose()`: dedup gate via `_existing_pending_proposal()` — checks PROSPECTIVE for existing `pending_approval` proposal with same `trigger` + dedup field (`task_id`/`intent`/`event_type`/`metric`). Dedup fields stored in proposal payload so filter works on next cycle.
+- **Timeout ≠ safe no-op (fixed 2026-07-12):** `run_due_tasks()` wraps `_execute_task()` in `asyncio.wait_for(timeout=...)`. The `next_due` advance lives at the *end* of `_execute_task()` — a timeout cancels the coroutine before it gets there, so a task that routinely exceeds its budget will re-fire immediately every scheduler tick (60s) forever, redoing all steps from scratch each time, until it happens to finish inside budget. `_advance_next_due_after_failure()` now runs on both `asyncio.TimeoutError` and any unhandled `Exception` escaping `_execute_task()` to defer `next_due` to the next scheduled slot instead. Applies scheduler-wide — check for this pattern before assuming a new long-running task step is safe.
+- **Per-task timeout override:** `run_due_tasks()` reads `prospective.get("execution_timeout_s") or _cfg.timeouts.task_execution_max_s` — a `task_def` can set `execution_timeout_s` (persisted by `store_task()`) to raise its budget above the global default without a global change or task-specific scheduler code. Use for any task whose steps are known to routinely run long (see Weekly Portfolio Technical Scan, `execution_timeout_s: 900` — sequential multi-asset browser+LLM analysis observed at ~45-70s/asset).
 
 ---
 

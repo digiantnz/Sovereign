@@ -1,3 +1,5 @@
+# HISTORICAL — March 2026 (original loop rework design, now fully implemented and superseded by 9-stage loop)
+
 # Sovereign Cognitive Loop Rework — Design & Implementation Plan
 
 **Status**: ALL STEPS COMPLETE — envelope, nanobot contract, untrusted tagging, tests validated

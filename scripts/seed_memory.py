@@ -4,17 +4,30 @@
 Chunks source docs into ~200-word sections and POSTs each to the
 semantic collection via the /query API. Run once to bootstrap confidence.
 
-Usage:
-    python3 seed_memory.py [--dry-run]
+Usage (from inside the container):
+    python3 /opt/sovereign/scripts/seed_memory.py [--dry-run]
+
+Chunking: TokenChunker(WordTokenizer, chunk_size=200, chunk_overlap=30).
+WordTokenizer counts on split(" ") — single-space only.  Single-newline
+separators (markdown tables, code blocks) count as part of the preceding
+token, so real word counts may run ~10% over TARGET_WORDS on dense
+markdown sections.  Still well within nomic-embed-text's 8192-token limit.
+30-word overlap (~15%) prevents facts/sentences from being severed at a
+chunk boundary and losing meaning in both resulting embeddings.
 """
 import json
 import sys
 import time
 import urllib.request
 
+from chonkie import TokenChunker, WordTokenizer
+
 SOVEREIGN_URL = "http://localhost:8000"
-TARGET_WORDS  = 200   # approx words per chunk
+TARGET_WORDS  = 200   # approx words per chunk (passed as chunk_size)
+CHUNK_OVERLAP = 30    # ~15% overlap — stops facts being severed at a chunk boundary
 PAUSE_S       = 0.5   # brief pause between embeds to avoid hammering Ollama
+
+CHUNKER = TokenChunker(tokenizer=WordTokenizer(), chunk_size=TARGET_WORDS, chunk_overlap=CHUNK_OVERLAP)
 
 SOURCES = [
     {
@@ -40,29 +53,6 @@ SOURCES = [
 ]
 
 DRY_RUN = "--dry-run" in sys.argv
-
-
-def chunk_text(text: str, source_label: str) -> list[str]:
-    """Split text into ~TARGET_WORDS-word chunks on paragraph boundaries."""
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks = []
-    current_parts = []
-    current_words = 0
-
-    for para in paragraphs:
-        words = len(para.split())
-        if current_words + words > TARGET_WORDS and current_parts:
-            chunks.append(f"[{source_label}]\n" + "\n\n".join(current_parts))
-            current_parts = [para]
-            current_words = words
-        else:
-            current_parts.append(para)
-            current_words += words
-
-    if current_parts:
-        chunks.append(f"[{source_label}]\n" + "\n\n".join(current_parts))
-
-    return chunks
 
 
 def store_chunk(chunk: str) -> dict:
@@ -111,7 +101,7 @@ def main():
             print(f"  SKIP {label} — file not found: {path}")
             continue
 
-        chunks = chunk_text(text, label)
+        chunks = [f"[{label}]\n{c.text}" for c in CHUNKER.chunk(text)]
         print(f"  {label}: {len(chunks)} chunks from {len(text.split())} words")
         total_chunks += len(chunks)
 

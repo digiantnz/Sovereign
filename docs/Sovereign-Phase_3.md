@@ -1,3 +1,5 @@
+# HISTORICAL — pre-March 2026 (design proposal, superseded by current cognitive loop)
+
 Phase 3 --- Gateway + Multi-Pass Cognitive Orchestration
 
 This will give you a working:

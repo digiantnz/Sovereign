@@ -1,3 +1,4 @@
+# HISTORICAL — February 2026 (initial project context from original Claude conversation, pre-Sovereign)
 
 I need halpe with an AI project I'm building...and I'm a bit of a novice coder
 
