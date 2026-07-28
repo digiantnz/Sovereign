@@ -21,9 +21,14 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 AUTHORIZED_USER_ID = int(os.environ["OPENCLAW_TELEGRAM_ADMIN_CHAT_ID"])
 SOVEREIGN_URL = os.environ.get("SOVEREIGN_CORE_URL", "http://sovereign-core:8000")
 
-# Telegram splits pastes >4096 chars into sequential messages. We wait this
-# many seconds after the last chunk before forwarding the assembled text.
-CHUNK_TIMEOUT = float(os.environ.get("GATEWAY_CHUNK_TIMEOUT", "1.5"))
+# Telegram splits pastes >4096 chars into sequential messages arriving within
+# milliseconds of each other — that's what this debounce is for. 1.5s was wide
+# enough to also catch two genuinely distinct rapid-fire messages (observed
+# 2026-07-05: two separate test questions sent ~1s apart got merged into one
+# input, and PASS 1 — a single-intent classifier — silently acted on only one
+# of them). Lowered to 0.6s: still comfortably wider than a real Telegram
+# paste-split gap, narrow enough that two deliberately-typed messages won't merge.
+CHUNK_TIMEOUT = float(os.environ.get("GATEWAY_CHUNK_TIMEOUT", "0.6"))
 
 store = SessionStore()
 
@@ -127,6 +132,25 @@ def _format_result(data: dict) -> str:
     return "\n".join(lines).strip()
 
 
+async def _safe_send(bot, chat_id: int, text: str, retries: int = 2) -> bool:
+    """send_message with retry — a bare call meant one transient ConnectTimeout to
+    api.telegram.org (observed 2026-07-05) could silently eat a fully-computed reply.
+    _dispatch_and_reply runs as a fire-and-forget task (asyncio.create_task with no
+    done-callback), so an uncaught exception here just vanishes as an untracked task
+    error — the Director never sees it and never gets the answer.
+    """
+    for attempt in range(retries + 1):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            return True
+        except Exception as e:
+            logger.warning("send_message failed (attempt %d/%d): %s", attempt + 1, retries + 1, e)
+            if attempt < retries:
+                await asyncio.sleep(2.0)
+    logger.error("send_message permanently failed after %d attempts — reply lost: %r", retries + 1, text[:200])
+    return False
+
+
 async def _dispatch_and_reply(
     payload: dict,
     input_text: str,
@@ -144,16 +168,16 @@ async def _dispatch_and_reply(
             r.raise_for_status()
             data = r.json()
     except httpx.TimeoutException:
-        await bot.send_message(chat_id=chat_id, text="Core timed out — the cognitive loop took too long.")
+        await _safe_send(bot, chat_id, "Core timed out — the cognitive loop took too long.")
         return
     except httpx.ConnectError:
-        await bot.send_message(chat_id=chat_id, text="Could not reach sovereign-core — it may be restarting. Try again in a few seconds.")
+        await _safe_send(bot, chat_id, "Could not reach sovereign-core — it may be restarting. Try again in a few seconds.")
         return
     except httpx.HTTPStatusError as e:
-        await bot.send_message(chat_id=chat_id, text=f"Core returned HTTP {e.response.status_code}: {e.response.text[:200]}")
+        await _safe_send(bot, chat_id, f"Core returned HTTP {e.response.status_code}: {e.response.text[:200]}")
         return
     except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"Core error ({type(e).__name__}): {e}")
+        await _safe_send(bot, chat_id, f"Core error ({type(e).__name__}): {e}")
         return
 
     # Security guardrail confirmation
@@ -169,7 +193,7 @@ async def _dispatch_and_reply(
         if rules:
             msg += f"Matched rules: {', '.join(rules)}\n"
         msg += "\nProceed? Reply yes or no."
-        await bot.send_message(chat_id=chat_id, text=msg)
+        await _safe_send(bot, chat_id, msg)
         return
 
     # Low memory confidence gate
@@ -193,7 +217,7 @@ async def _dispatch_and_reply(
         if gaps:
             msg += f"Known gaps: {', '.join(gaps)}\n"
         msg += "\nProceed anyway? Reply yes or no."
-        await bot.send_message(chat_id=chat_id, text=msg)
+        await _safe_send(bot, chat_id, msg)
         return
 
     # Confirmation required (MID or HIGH tier)
@@ -203,10 +227,7 @@ async def _dispatch_and_reply(
         session.pending_input = input_text
         summary = data.get("summary", "")
         kind = "DOUBLE CONFIRMATION" if data.get("requires_double_confirmation") else "Confirmation"
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"[{kind} required]\n{summary}\n\nReply yes to proceed or no to cancel.",
-        )
+        await _safe_send(bot, chat_id, f"[{kind} required]\n{summary}\n\nReply yes to proceed or no to cancel.")
         return
 
     # Error from core
@@ -215,31 +236,29 @@ async def _dispatch_and_reply(
         msg = f"Error: {data['error']}"
         if feedback:
             msg += f"\nFeedback: {feedback}"
-        await bot.send_message(chat_id=chat_id, text=msg)
+        await _safe_send(bot, chat_id, msg)
         return
 
     # Morning briefing — prospective items due today, sent before the main response
     if data.get("morning_briefing"):
-        await bot.send_message(chat_id=chat_id, text=f"[Morning briefing]\n\n{data['morning_briefing']}")
+        await _safe_send(bot, chat_id, f"[Morning briefing]\n\n{data['morning_briefing']}")
 
     # Chunked input indicator — shown when Telegram split a large paste
     if chunk_count > 1:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ [Input arrived in {chunk_count} parts ({len(input_text)} chars total) "
-                f"and was reassembled before processing.]"
-            ),
+        await _safe_send(
+            bot, chat_id,
+            f"⚠️ [Input arrived in {chunk_count} parts ({len(input_text)} chars total) "
+            f"and was reassembled before processing.]"
         )
 
     # Success — CEO translation takes priority; fallback to structured formatter
     if data.get("director_message"):
         for chunk in _split_for_telegram(data["director_message"]):
-            await bot.send_message(chat_id=chat_id, text=chunk)
+            await _safe_send(bot, chat_id, chunk)
     else:
         reply = _format_result(data)
         for chunk in _split_for_telegram(reply):
-            await bot.send_message(chat_id=chat_id, text=chunk)
+            await _safe_send(bot, chat_id, chunk)
 
     # Store turn in history for follow-up context (pronouns, "summarise that", etc.)
     session.push_turn(
@@ -281,7 +300,15 @@ async def _flush_buffer(chat_id: int, bot, session: Session) -> None:
         payload = {"input": assembled}
         if session.history:
             payload["context_window"] = session.history
-        await _dispatch_and_reply(payload, assembled, chat_id, bot, session, chunk_count=chunk_count)
+        try:
+            await _dispatch_and_reply(payload, assembled, chat_id, bot, session, chunk_count=chunk_count)
+        except Exception as e:
+            # This task runs fire-and-forget (asyncio.create_task, no done-callback) —
+            # anything escaping _dispatch_and_reply's own error handling previously
+            # vanished silently (observed 2026-07-05: a computed calendar answer was
+            # lost with zero trace). Surface it instead of losing the turn.
+            logger.exception("[chat=%s] _dispatch_and_reply crashed", chat_id)
+            await _safe_send(bot, chat_id, f"Internal gateway error — your message may not have been answered: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -352,6 +379,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Previous action cancelled — processing your new request.")
 
     if session.awaiting_confirmation:
+        # Receipt harness: intercept before generic yes/no — harness needs current text,
+        # not the original saved input ("yes" or correction text must reach handle_receipt_confirm)
+        if (session.pending_delegation or {}).get("_harness_cmd") == "receipt":
+            _del = session.pending_delegation or {}
+            payload = {
+                "input":              text,
+                "_harness_cmd":       "receipt",
+                "pending_delegation": _del,
+                "confirmed":          False,
+                "context_window":     session.history,
+            }
+            session.awaiting_confirmation = False
+            session.pending_delegation = None
+            session.pending_input = None
+            await _dispatch_and_reply(payload, text, chat_id, context.bot, session)
+            return
+
         if text.lower() in ("yes", "y", "confirm"):
             saved = session.pending_input
             payload = {
@@ -398,21 +442,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "context_window":     session.history,
             }
             # Don't clear awaiting_confirmation — harness will re-set it if another reply is needed
-            session.awaiting_confirmation = False
-            session.pending_delegation = None
-            session.pending_input = None
-            await _dispatch_and_reply(payload, text, chat_id, context.bot, session)
-            return
-        elif (session.pending_delegation or {}).get("_harness_cmd") == "receipt":
-            # Receipt harness: free-text is either 'yes' or corrections — route directly
-            _del = session.pending_delegation or {}
-            payload = {
-                "input":              text,
-                "_harness_cmd":       "receipt",
-                "pending_delegation": _del,
-                "confirmed":          False,
-                "context_window":     session.history,
-            }
             session.awaiting_confirmation = False
             session.pending_delegation = None
             session.pending_input = None
@@ -548,6 +577,27 @@ async def handle_devcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _dispatch_and_reply(payload, "/devcheck", chat_id, context.bot, session)
 
 
+async def handle_rextrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /rextrics — weekly Rex-trics self-assessment report.
+
+    Not a _harness_cmd fast-path (unlike /devcheck etc above) — rextrics has
+    no session/checkpoint state, it's a single deterministic read handled by
+    execution/engine.py's existing `domain == "rextrics"` dispatch via the
+    ordinary `_quick_classify` NL keyword match. This handler just automates
+    typing the same plain-text "rextrics" that already worked before this
+    command existed.
+    """
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user.id != AUTHORIZED_USER_ID:
+        return
+    session = store.get_or_create(chat_id)
+    payload = {"input": "rextrics", "context_window": session.history}
+    lock = store.get_lock(chat_id)
+    async with lock:
+        await _dispatch_and_reply(payload, "/rextrics", chat_id, context.bot, session)
+
+
 async def handle_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /portfolio [category] — snapshot or deep analysis per category."""
     user = update.effective_user
@@ -556,7 +606,9 @@ async def handle_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     session = store.get_or_create(chat_id)
     category = " ".join(context.args).lower().strip() if context.args else ""
-    if category:
+    if category == "ingest":
+        await update.message.reply_text("Scanning for new Sharesies statements...")
+    elif category:
         await update.message.reply_text(
             f"Researching your {category} portfolio — this takes several minutes. I'll message you when it's ready."
         )
@@ -905,6 +957,11 @@ async def handle_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     filename = None
     mime_type = "application/octet-stream"
 
+    # Photo sent with /receipt caption — route to receipt harness, not attachment upload
+    if msg.photo and (msg.caption or "").strip().lower().startswith("/receipt"):
+        await handle_receipt(update, context)
+        return
+
     if msg.document:
         file_id = msg.document.file_id
         filename = msg.document.file_name or f"doc_{ts}"
@@ -986,6 +1043,7 @@ def main():
     app.add_handler(CommandHandler("skills", handle_skills))
     app.add_handler(CommandHandler("selfimprove", handle_selfimprove))
     app.add_handler(CommandHandler("devcheck", handle_devcheck))
+    app.add_handler(CommandHandler("rextrics", handle_rextrics))
     app.add_handler(CommandHandler("portfolio", handle_portfolio))
     app.add_handler(CommandHandler("research", handle_research))
     app.add_handler(CommandHandler("pm", handle_pm))
