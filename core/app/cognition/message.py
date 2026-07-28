@@ -92,6 +92,7 @@ class MessageContext:
     skill:                str  = ""    # null until specialist_outbound sets it
     operation:            str  = ""    # null until specialist_outbound sets it
     pass0_hits:           list = field(default_factory=list)  # WM point_ids surfaced by PASS 0; used by MRFL
+    query_type:           str  = ""    # current_events | local_context | general_knowledge; set at PASS 1
 
     def to_dict(self) -> dict:
         return {
@@ -102,6 +103,7 @@ class MessageContext:
             "skill":               self.skill,
             "operation":           self.operation,
             "pass0_hits":          self.pass0_hits,
+            "query_type":          self.query_type,
         }
 
 
@@ -230,6 +232,7 @@ class InternalMessage:
             skill=self.context.skill,
             operation=self.context.operation,
             pass0_hits=self.context.pass0_hits,
+            query_type=self.context.query_type,
         )
         return self
 
@@ -243,6 +246,7 @@ class InternalMessage:
             skill=skill,
             operation=operation,
             pass0_hits=self.context.pass0_hits,
+            query_type=self.context.query_type,
         )
         return self
 
@@ -256,7 +260,13 @@ class InternalMessage:
             skill=self.context.skill,
             operation=self.context.operation,
             pass0_hits=list(hits),
+            query_type=self.context.query_type,
         )
+        return self
+
+    def set_query_type(self, query_type: str) -> "InternalMessage":
+        """Derived deterministically from intent + domain at PASS 1 for PASS 4 audit."""
+        self.context.query_type = query_type
         return self
 
     # ── Boundary slices ──────────────────────────────────────────────────────

@@ -728,8 +728,9 @@ _COMPONENTS: list[dict] = [
         "title": "Container: ollama (GPU LLM inference)",
         "content": (
             f"ollama container: local GPU-accelerated LLM inference. "
-            f"Primary model: {_cfg.models.primary_inference_model} (~20GB VRAM). "
-            f"Also has llama3.1:8b and mistral:7b installed. {_GPU_NAME} ({_GPU_VRAM_GB}GB VRAM). "
+            f"Primary model: {_cfg.models.primary_inference_model} (~20GB VRAM) — sole occupant since "
+            f"2026-07-05, keep_alive=-1 (never evicted). {_GPU_NAME} ({_GPU_VRAM_GB}GB VRAM). "
+            "llama3.1:8b (query distillation) runs on the separate CPU-only ollama-distil container instead. "
             "mem_limit: 22g. Networks: ai_net."
         ),
         "location": "compose.yml:ollama",
@@ -880,7 +881,7 @@ _COMPONENTS: list[dict] = [
         "title": "Module: memory/component_registry.py — sov_id registry",
         "content": (
             "component_registry.py: deterministic UUID5 sov_ids for all system components. "
-            "69 components across 8 types (cognitive_pass, adapter, harness, skill, "
+            "72 components across 8 types (cognitive_pass, adapter, harness, skill, "
             "gateway, container, module + short_circuit subtype). "
             "Writes semantic:component:{name} entries + meta:system:component-registry index."
         ),
@@ -959,6 +960,25 @@ _COMPONENTS: list[dict] = [
             "to SEMANTIC collection at startup."
         ),
         "location": "memory/entity_registry.py",
+    },
+    {
+        "name": "module-rextrics",
+        "component_type": "module",
+        "title": "Module: cognition/rextrics.py — Rex-trics counters + per-interaction log",
+        "content": (
+            "rextrics.py: deterministic hallucination/performance flag counters "
+            "(Check 1 execution_mismatch in orchestrator_evaluate/PASS4, Check 2 "
+            "unverified_claim in translator_pass/PASS5) plus Phase 1 per-interaction "
+            "retention (Rex-trics Log: ts/intent_classified/domain_routed/outcome/"
+            "reason/latency_ms), fired from the same translator_pass() chokepoint "
+            "every path funnels through — 22 confirmed call sites, short-circuits "
+            "included. Storage: META collection, meta:rextrics:daily:{date}:counters "
+            "(aggregates) + meta:rextrics:daily:{date}:entries (per-interaction list), "
+            "no new Qdrant collection. Read via /rextrics — get_weekly_report() merges "
+            "counter trend deltas with read-time-only Log stats (success/fail/fallback "
+            "rate, active days, median/p90 latency, top 3 fail reasons)."
+        ),
+        "location": "cognition/rextrics.py",
     },
 ]
 

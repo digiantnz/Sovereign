@@ -83,6 +83,7 @@ _CANONICAL_KEY_PREFIXES = (
     "semantic:governance:",
     "semantic:provider:",
     "semantic:subject:",
+    "semantic:portfolio:",
 )
 
 # ── Query type classification ─────────────────────────────────────────────
@@ -273,12 +274,24 @@ class QdrantAdapter:
                 # MIP key generation — direct Ollama call, documented B1 exclusion.
                 # Rationale: qdrant adapter is the LLM interface layer, not a caller of it.
                 # If this pattern spreads to other files, add a B5 rule for raw /api/generate URLs.
+                #
+                # num_ctx MUST match adapters/ollama.py's _NUM_CTX (found 2026-07-05 causing
+                # severe GPU thrashing): this call previously sent no options.num_ctx at all,
+                # silently falling back to secrets/ollama.env's stale OLLAMA_CONTEXT_LENGTH=
+                # 16384 server default, while every other call path requests 20480. Ollama
+                # can't share one running instance across two different KV cache sizes, so
+                # every interleaving of a key-generation call with a normal call forced a full
+                # reload of the 23GB model — observed live during a large /learn confidence
+                # loop (which calls this on every new entry) as repeated 90s timeouts, 7
+                # skipped chunks, ~35 minutes for what should take a few.
+                from adapters.ollama import _NUM_CTX as _MIP_NUM_CTX
                 r = await http.post(
                     f"{self._ollama_url}/api/generate",
                     json={
                         "model": _cfg.models.primary_inference_model,
                         "prompt": _prompt,
                         "stream": False,
+                        "options": {"num_ctx": _MIP_NUM_CTX},
                     },
                 )
                 r.raise_for_status()

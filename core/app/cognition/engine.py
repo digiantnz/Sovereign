@@ -152,6 +152,64 @@ def _translator_sanitise(text: str) -> tuple[str, int, int]:
     return "\n".join(out_lines).strip(), stripped_count, total_count
 
 
+# ── Rex-trics Check 2: unverified memory/entity claims ───────────────────────
+# Deterministic phrase-shape detection only — never entity extraction from
+# narrative text. A memory-claim-shaped sentence ("I remember...", "per our
+# earlier conversation...") is stripped only when NO grounding evidence is
+# present anywhere in result_for_translator for this pass (pass0_hits injected
+# by the main PASS 4→5 call site, or a real memory_recall/retrieve_key result
+# already carried in detail). Anything we can't determine is left alone —
+# no flag, no claim — to keep the false-positive rate at zero.
+_MEMORY_CLAIM_RE = _re_fab.compile(
+    r'\bI (?:remember|recall)\b'
+    r'|\bas (?:you|we)(?:\s+\w+){0,2}\s+(?:mentioned|discussed|said|told me)\b'
+    r'|\bper our (?:earlier |prior )?conversation\b'
+    r'|\bfrom (?:your|our) (?:earlier|previous) (?:message|conversation)\b'
+    r'|\b(?:the file|this file) at .+? exists\b',
+    _re_fab.IGNORECASE,
+)
+
+
+def _has_grounding_evidence(rft: dict) -> bool:
+    """True if this pass surfaced any actual point-id-backed evidence."""
+    if rft.get("_pass0_hits"):
+        return True
+    detail = rft.get("detail")
+    if isinstance(detail, dict) and (
+        detail.get("results") or detail.get("point_id")
+        or detail.get("_key") or detail.get("found")
+    ):
+        return True
+    return False
+
+
+def _check_unverified_claims(text: str, rft: dict) -> tuple[str, list[str]]:
+    """Strip memory-claim-shaped sentences unbacked by any surfaced evidence.
+
+    Returns (cleaned_text, stripped_sentences). Line structure is preserved
+    (split/rejoin per line) so bullets/paragraphs aren't collapsed.
+    """
+    if _has_grounding_evidence(rft):
+        return text, []
+    stripped: list[str] = []
+    out_lines = []
+    for line in text.splitlines():
+        if not line.strip():
+            out_lines.append(line)
+            continue
+        sentences = _SENTENCE_SPLIT_RE.split(line)
+        kept = []
+        for s in sentences:
+            if _MEMORY_CLAIM_RE.search(s):
+                stripped.append(s.strip())
+                logger.warning(
+                    "translator_pass: Rex-trics unverified_claim stripped: %r", s[:120])
+            else:
+                kept.append(s)
+        out_lines.append(" ".join(kept))
+    return "\n".join(out_lines).strip(), stripped
+
+
 class CognitionEngine:
     def __init__(self, qdrant=None, ledger=None, inference_queue=None):
         self.ollama       = OllamaAdapter()
@@ -369,19 +427,20 @@ class CognitionEngine:
                             fmt: "str | None" = None,
                             priority: "int | None" = None,
                             timeout: float = 200.0,
-                            capture_thinking: bool = False) -> dict:
+                            capture_thinking: bool = False,
+                            host: str = "ollama") -> dict:
         if self._queue is not None:
             from adapters.inference_queue import InferenceQueue
             p = priority if priority is not None else InferenceQueue.HIGH
             result = await self._queue.generate(
                 prompt, model=model, fmt=fmt, priority=p, timeout=timeout,
-                capture_thinking=capture_thinking,
+                capture_thinking=capture_thinking, host=host,
             )
             if result.get("_queue_waited") and result.get("_queue_wait_seconds", 0) > 3.0:
                 self._had_queue_wait = True
             return result
         return await self.ollama.generate(prompt, model=model, fmt=fmt,
-                                          capture_thinking=capture_thinking)
+                                          capture_thinking=capture_thinking, host=host)
 
     async def _llm_chat(self, messages: "list[dict]", model: str = MODEL,
                         fmt: "str | None" = None,
@@ -1012,7 +1071,8 @@ class CognitionEngine:
         return result
 
     # ── Pass 4: Orchestrator evaluation (merged evaluate + memory decision) ─
-    async def orchestrator_evaluate(self, delegation: dict, specialist_inbound_result: dict) -> dict:
+    async def orchestrator_evaluate(self, delegation: dict, specialist_inbound_result: dict,
+                                     execution_confirmed: bool | None = None) -> dict:
         """PASS 4: Orchestrator evaluates result and decides memory action.
 
         ALWAYS uses local Ollama — governance must be deterministic and local.
@@ -1050,6 +1110,48 @@ class CognitionEngine:
             if self.ledger:
                 self.ledger.append("pass4_rft_fallback", "internal",
                                    {"reason": "invalid_rft_structure"})
+
+        # ── Rex-trics Check 1: execution outcome mismatch ──────────────────
+        # Ground the draft's claimed success against execution_confirmed — the
+        # transport-level ground truth (HTTP status + no error field) computed
+        # in execution/engine.py. NOT specialist_inbound_result's own success
+        # field: PASS 4's draft defaults from that same field (see defaults=
+        # above), so the two are correlated by construction and a mismatch
+        # essentially never fires against it. Deterministic override — no LLM
+        # re-query — since a semantic truth mismatch isn't reliably fixed by
+        # re-asking the same model; overriding with ground truth is guaranteed
+        # correct. Same remediation style as the invalid-structure fallback
+        # just above.
+        _rft_now = result.get("result_for_translator", {})
+        _actual_success = execution_confirmed
+        _claimed_success = _rft_now.get("success") if isinstance(_rft_now, dict) else None
+        if (_actual_success is not None and _claimed_success is not None
+                and bool(_actual_success) != bool(_claimed_success)):
+            logger.warning(
+                "orchestrator_evaluate: Rex-trics execution_mismatch — execution_confirmed"
+                "=%r but draft result_for_translator success=%r. Overriding "
+                "with ground truth.",
+                _actual_success, _claimed_success,
+            )
+            result["result_for_translator"] = {
+                "success": _actual_success,
+                "outcome": specialist_inbound_result.get(
+                    "outcome", "Complete." if _actual_success else "Action failed."),
+                "detail": specialist_inbound_result.get("detail", {}),
+                "error": specialist_inbound_result.get("error"),
+                "next_action": None,
+            }
+            if self.ledger:
+                self.ledger.append("rextrics_execution_mismatch", "cognition", {
+                    "execution_confirmed": _actual_success,
+                    "claimed_success": _claimed_success,
+                })
+            if self.qdrant:
+                import asyncio as _asyncio_rt1
+                from cognition import rextrics as _rextrics
+                _asyncio_rt1.create_task(
+                    _rextrics.record_flag(self.qdrant, self.ledger, "execution_mismatch"))
+
         result.setdefault("approved", True)
         result.setdefault("feedback", None)
         result.setdefault("memory_action", "none")
@@ -1103,16 +1205,40 @@ class CognitionEngine:
                 return fallback if fallback else "I don't have that information in memory or current context."
         return None
 
-    async def translator_pass(self, result_for_translator: dict, tier: str = "LOW") -> str:
+    async def translator_pass(
+        self, result_for_translator: dict, tier: str = "LOW",
+        intent_classified: str | None = None, domain_routed: str | None = None,
+        routing_source: str | None = None, request_t0: float | None = None,
+    ) -> str:
         """PASS 5: Translator receives ONLY result_for_translator — nothing else.
 
         Hard pre-check: empty/failed results bypass the LLM entirely — deterministic
         Python messages are returned immediately, eliminating the hallucination risk.
         Post-check: after LLM translation, verify all numbers in output exist in the
         result.  Any invented number is a fabrication violation → block + fallback.
+
+        intent_classified/domain_routed/routing_source/request_t0 are optional —
+        callers that have them (the main 5-pass flow, most short-circuits) pass them
+        for Rex-trics Log (see below); callers that don't (system-generated alerts
+        with no Director request behind them, e.g. main.py's wallet-event webhook)
+        leave them at their defaults and the log entry records what's knowable.
         """
         _had_wait = self._had_queue_wait
         self._had_queue_wait = False
+        if self.qdrant:
+            import asyncio as _asyncio_rt0
+            from cognition import rextrics as _rextrics0
+            _asyncio_rt0.create_task(_rextrics0.record_response(self.qdrant))
+            # ── Rex-trics Log (Phase 1) — one per-interaction record per call ──
+            # Same chokepoint as record_response() above — zero new call sites.
+            _rt_latency_ms = (
+                round((_time.monotonic() - request_t0) * 1000, 1)
+                if request_t0 is not None else None
+            )
+            _asyncio_rt0.create_task(_rextrics0.record_entry(
+                self.qdrant, intent_classified, domain_routed,
+                routing_source, result_for_translator, _rt_latency_ms,
+            ))
         success  = result_for_translator.get("success", True)
         has_error = bool(result_for_translator.get("error"))
 
@@ -1132,13 +1258,15 @@ class CognitionEngine:
                 or result_for_translator.get("status")
             )
             if not error_detail:
-                # Log the full dict so the failure is diagnosable in container logs
-                logger.warning(
-                    "translator_pass: failure result with no error/outcome — full dict: %s",
-                    json.dumps(result_for_translator)[:2000],
-                )
                 error_detail = "no error detail returned (check sovereign-core logs)"
-            logger.info("translator_pass: failure result — bypassing LLM")
+            # Always log the full dict — even when a field is populated, a bare
+            # {"status": "error"} with nothing else produces a useless "That action
+            # failed: error" message with no way to diagnose it after the fact
+            # (found 2026-07-05 tracing a silently-failed calendar query).
+            logger.warning(
+                "translator_pass: failure result (detail=%r) — full dict: %s",
+                error_detail, json.dumps(result_for_translator, default=str)[:2000],
+            )
             return f"That action failed: {error_detail}"
 
         # ── Hard pre-check B: empty result — deterministic, no LLM ───────────
@@ -1159,7 +1287,21 @@ class CognitionEngine:
             # ── Post-check: fabrication detection (numbers) ───────────────────
             fabrication_fallback = self._check_fabrication(text, result_for_translator)
             if fabrication_fallback is not None:
+                if self.qdrant:
+                    import asyncio as _asyncio_rt3
+                    from cognition import rextrics as _rextrics3
+                    _asyncio_rt3.create_task(_rextrics3.record_flag(
+                        self.qdrant, self.ledger, "unverified_claim", text))
                 return fabrication_fallback
+
+            # ── Rex-trics Check 2 ──────────────────────────────────────────
+            text, _rt_stripped = _check_unverified_claims(text, result_for_translator)
+            if _rt_stripped and self.qdrant:
+                import asyncio as _asyncio_rt2
+                from cognition import rextrics as _rextrics2
+                for _claim in _rt_stripped:
+                    _asyncio_rt2.create_task(_rextrics2.record_flag(
+                        self.qdrant, self.ledger, "unverified_claim", _claim))
 
             # Strip spurious urgency unless HIGH-tier error
             allow_urgent = tier == "HIGH"  # error already handled above
@@ -1406,7 +1548,10 @@ class CognitionEngine:
 
         target: "search" (SearXNG 4-6 keywords), "fast_llm" (groq/gemini/openrouter/ollama_cloud
                 one-sentence question), "grok" (current-events focus), "claude" (structured task
-                prompt). Returns raw on timeout (8 s wall clock) or any error — logs WARNING.
+                prompt). Returns raw on timeout (30 s wall clock) or any error — logs WARNING.
+                Runs on llama3.1:8b via ollama-distil (CPU-hosted, 2026-07-05) — moved off the
+                RTX 3090 to stop contending with qwen3-32b for VRAM (was causing model
+                unload/reload thrashing under load, see ollama-distil.env for detail).
 
         context_window: optional list of {user, assistant} turn dicts (or a single dict).
                 Only the most recent Director turn is used, capped at 200 chars, so entities
@@ -1457,10 +1602,15 @@ class CognitionEngine:
                 self._llm_generate(
                     prompt,
                     model="llama3.1:8b-instruct-q4_K_M",
-                    priority=InferenceQueue.LOW,
-                    timeout=30.0,
+                    priority=InferenceQueue.HIGH,
+                    timeout=45.0,
+                    # CPU-hosted (2026-07-05) — was sharing the RTX 3090 with qwen3-32b,
+                    # causing constant model unload/reload thrashing (see ollama-distil.env).
+                    # Moved off GPU entirely; CPU inference is slower per-call but no longer
+                    # forces a multi-GB VRAM swap on every turn that calls this.
+                    host="ollama-distil",
                 ),
-                timeout=20.0,
+                timeout=30.0,
             )
             distilled = result.get("response", "").strip()
             if distilled and result.get("status") != "llm_timeout":

@@ -9,7 +9,7 @@ fetch its own entries.
 Many-to-many: every story is scored against every active subject (no
 feed-to-subject membership filtering — 14 feeds span ai/crypto/macro without
 a clean 1:1 mapping, and per-subject batch scoring is cheap enough that the
-LLM can just judge relevance directly). One story can spawn campaigns for
+LLM can just judge relevance directly). One story can spawn thoughts for
 more than one subject (e.g. a Fed-rate story relevant to both crypto and
 macro).
 
@@ -23,31 +23,13 @@ import json
 import logging
 import re
 
-from cognition.campaigns import run_campaign
+from cognition.thoughts import spawn_thought
+from cognition.subjects import list_active_subjects as _list_active_subjects
+from cognition.subjects import _MAX_SUBJECT_MATCHES
 
 logger = logging.getLogger(__name__)
 
 _RSS_LIMIT = 20  # generous — batched scoring makes a wider net cheap
-
-
-async def _list_active_subjects(qdrant) -> list[dict]:
-    """Enumerate all semantic:subject:<id> entries — deterministic scroll,
-    not vector search, since we want every active subject, not top-K."""
-    try:
-        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
-        from execution.adapters.qdrant import SEMANTIC
-        points, _ = await qdrant.archive_client.scroll(
-            collection_name=SEMANTIC,
-            scroll_filter=Filter(must=[
-                FieldCondition(key="domain", match=MatchValue(value="subject")),
-                FieldCondition(key="status", match=MatchValue(value="active")),
-            ]),
-            limit=50, with_payload=True, with_vectors=False,
-        )
-        return [dict(p.payload or {}) for p in points]
-    except Exception as exc:
-        logger.warning("_list_active_subjects: failed: %s", exc)
-        return []
 
 
 async def _score_stories_for_subject(cog, subject: dict, entries: list[dict]) -> dict[int, str]:
@@ -55,7 +37,7 @@ async def _score_stories_for_subject(cog, subject: dict, entries: list[dict]) ->
 
     Returns {story_index: "relevant"|"borderline"|"ignore"}. Missing/unparsed
     indices default to "ignore" (fail closed — a scoring miss should not
-    silently spawn an unreviewed campaign).
+    silently spawn an unreviewed thought).
     """
     subject_id = subject.get("subject", "")
     thesis = subject.get("thesis", "")
@@ -72,8 +54,8 @@ Stories:
 {stories_block}
 
 For each story index, respond with:
-- relevant: materially tests or changes the thesis — worth a research campaign
-- borderline: tangentially related, worth logging but not campaign-worthy
+- relevant: materially tests or changes the thesis — worth a research thought
+- borderline: tangentially related, worth logging but not thought-worthy
 - ignore: not relevant to this subject
 
 Respond with JSON only — no preamble:
@@ -117,7 +99,7 @@ async def score_web_search_for_subjects(cog, nanobot, qdrant, results: list[dict
     """Fire-and-forget: score a web search's structured results against active
     Subjects, same scoring pattern as the RSS scorer. Called via asyncio.create_task
     right after a "search the web" call returns — never on the Director's response
-    critical path. On a relevant match, spawns a real run_campaign(); on borderline,
+    critical path. On a relevant match, spawns a real run_thought(); on borderline,
     logs to the subject's episodic trail. Silent on no matches (no brief to build —
     this isn't a scheduled digest, just an ambient trigger)."""
     logger.info("score_web_search_for_subjects: called with %d results", len(results) if results else 0)
@@ -142,7 +124,7 @@ async def score_web_search_for_subjects(cog, nanobot, qdrant, results: list[dict
                     continue
                 title = entries[idx]["title"]
                 if relevance == "relevant":
-                    await run_campaign(qdrant, nanobot, cog, subject_id, "web_search", title)
+                    await spawn_thought(qdrant, nanobot, cog, subject_id, "web_search", title)
                 elif relevance == "borderline":
                     await _log_borderline(qdrant, subject_id, title, trigger_source="web_search")
     except Exception as exc:
@@ -215,10 +197,10 @@ Only include indices worth keeping — omit the noise you filtered."""
 
 async def run_score_rss_by_subject(cog, nanobot, qdrant) -> dict:
     """Scheduler step entry point. Fetches RSS, scores against every active
-    subject, spawns campaigns for relevant matches, returns a brief summary.
+    subject, spawns thoughts for relevant matches, returns a brief summary.
 
     Phase 8a — two output buckets, Director always sees everything:
-    subject-relevant stories lead (grouped, full campaign/borderline detail),
+    subject-relevant stories lead (grouped, full thought/borderline detail),
     remaining stories follow as a lightweight noise-filtered digest. Nothing
     is silently discarded — the digest's `dropped` count surfaces how many
     the noise filter removed.
@@ -238,7 +220,7 @@ async def run_score_rss_by_subject(cog, nanobot, qdrant) -> dict:
     if not subjects:
         return {"status": "ok", "brief": f"{len(entries)} headlines fetched — no active subjects to score against."}
 
-    campaigns_spawned: list[str] = []
+    thoughts_spawned: list[str] = []
     borderline_count = 0
     matched_indices: set[int] = set()
 
@@ -253,8 +235,9 @@ async def run_score_rss_by_subject(cog, nanobot, qdrant) -> dict:
             story = entries[idx]
             title = story.get("title", "(no title)")
             if relevance == "relevant":
-                await run_campaign(qdrant, nanobot, cog, subject_id, "rss", title)
-                campaigns_spawned.append(f"{subject_id}: {title}")
+                task = await spawn_thought(qdrant, nanobot, cog, subject_id, "rss", title)
+                if task is not None:
+                    thoughts_spawned.append(f"{subject_id}: {title}")
             elif relevance == "borderline":
                 await _log_borderline(qdrant, subject_id, title)
                 borderline_count += 1
@@ -263,11 +246,11 @@ async def run_score_rss_by_subject(cog, nanobot, qdrant) -> dict:
     digest = await _digest_remaining_stories(cog, entries, remaining_indices)
 
     lines = [f"{len(entries)} headlines scored against {len(subjects)} subject(s)."]
-    if campaigns_spawned:
-        lines.append(f"\n{len(campaigns_spawned)} campaign(s) spawned:")
-        lines += [f"• {c}" for c in campaigns_spawned]
+    if thoughts_spawned:
+        lines.append(f"\n{len(thoughts_spawned)} thought(s) spawned:")
+        lines += [f"• {c}" for c in thoughts_spawned]
     else:
-        lines.append("No stories judged campaign-worthy this run.")
+        lines.append("No stories judged thought-worthy this run.")
     if borderline_count:
         lines.append(f"\n{borderline_count} borderline stories logged to subject episodic trails.")
 
@@ -279,41 +262,73 @@ async def run_score_rss_by_subject(cog, nanobot, qdrant) -> dict:
     if digest["dropped"]:
         lines.append(f"\n({digest['dropped']} low-signal item(s) filtered)")
 
-    return {"status": "ok", "brief": "\n".join(lines)}
+    # Same fix as score_email_by_subject below — "brief" is always non-empty
+    # even on a no-op run, so an explicit "count" is needed for
+    # notify_when="on_findings" to mean anything.
+    return {
+        "status": "ok", "brief": "\n".join(lines),
+        "count": len(thoughts_spawned) + borderline_count,
+    }
 
 
 _EMAIL_ACCOUNTS = ("personal", "business")
 _EMAIL_LIMIT = 20  # per account
 
 
-async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
-    """Weekday Morning Briefing step — replaces the flat per-account fetch_email
-    steps (same reason as run_score_rss_by_subject: steps don't share data,
-    a scoring step has to fetch its own mail).
+async def run_score_email_by_subject(cog, nanobot, qdrant, accounts: list[str] | None = None) -> dict:
+    """Scores unread mail against active Subjects for priority + urgency.
 
-    Prioritization only — unlike RSS/web search, a subject-relevant email
-    never spawns a campaign (Director's explicit design decision: emails are
-    triaged for display, not treated as a research trigger). `/learn from
-    email <id>` remains the supported path for folding an email's content
-    into Subject knowledge on demand.
+    Two callers, same function (standing order #3 — one implementation):
+    the Weekday Morning Briefing step (accounts=["business"], on the
+    briefing's critical path — business IMAP is fast) and the standalone
+    Personal Mailbox Scan task (accounts=["personal"], its own slower daily
+    schedule — personal IMAP is much slower, 20-55s+, and was blocking the
+    briefing before this split; see task #30 2026-07-03). `accounts=None`
+    (default) scores both, for any future ad-hoc/manual call.
 
-    No LLM calls at all — cheap by design. Subject-relevance uses the same
-    embedding-only triage as /learn and the web search trigger
-    (find_relevant_subjects); urgency uses deterministic keyword/sender
-    pattern matching (derive_urgency) — an LLM call per email would not
-    scale with inbox volume the way a fixed handful of Subjects does.
-    Metadata only (subject/sender), not body — fetching every body would be
-    the same expensive mistake as scoring every Subject regardless of
-    relevance, just moved one step earlier.
+    Now also a Thought trigger (task #44, 2026-07-03) — reverses the earlier
+    "prioritization only" decision. Every non-phishing Subject match calls
+    observe_for_subject() (cognition/thoughts.py), the same generic gap-check
+    entry point Portfolio uses — cheap for the common case (one
+    evaluate_thought_iteration call), and only actually spawns a Thought when
+    a genuine gap is found. This harness stays exactly as ignorant of what a "gap" is
+    as Portfolio does — no gap-detection logic duplicated here. Phishing
+    emails are excluded (not a genuine finding). `/learn from email <id>`
+    remains available for folding a specific email in on demand regardless.
+
+    Triage itself is still zero-LLM — embedding-only (find_relevant_subjects)
+    for relevance, deterministic keyword/sender pattern matching
+    (derive_urgency) for urgency. Metadata only (subject/sender), not body —
+    fetching every body would be the same expensive mistake as scoring every
+    Subject regardless of relevance, just moved one step earlier. The one
+    new cost is observe_for_subject()'s own cheap gap-check call, made only
+    for actual Subject matches (a small fraction of inbox volume), not per
+    email.
     """
+    import asyncio
+    import datetime as _dt_mod
+    import uuid
+
+    from config import cfg as _cfg
     from cognition.subjects import (
         find_relevant_subjects, derive_urgency, get_priority_senders, detect_brand_mismatch,
+        record_spam_sender, record_urgent_sender,
+    )
+    from cognition.thoughts import observe_for_subject
+    from monitoring.email_event_suggest import (
+        looks_like_calendar_candidate, detect_calendar_event, write_pending_suggestion,
     )
 
+    # Bounds the (fetch body + LLM) cost of calendar-invite detection per run —
+    # looks_like_calendar_candidate() is a cheap keyword pre-filter, but this
+    # cap is the hard backstop in case a run has an unusually high hit rate.
+    _MAX_CALENDAR_CHECKS = 5
+
     priority_senders = get_priority_senders()
+    scan_accounts = accounts or _EMAIL_ACCOUNTS
 
     all_emails: list[dict] = []
-    for account in _EMAIL_ACCOUNTS:
+    for account in scan_accounts:
         try:
             nb = await nanobot.run("nc-mail", "list_unread",
                                     {"account": account, "limit": _EMAIL_LIMIT, "unread_only": "false"})
@@ -327,12 +342,15 @@ async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
         all_emails.extend(msgs)
 
     if not all_emails:
-        return {"status": "ok", "brief": "No emails fetched this run."}
+        return {"status": "ok", "brief": "No emails fetched this run.", "count": 0}
 
     urgent: list[dict] = []
     phishing: list[dict] = []
+    deleted_spam: list[dict] = []
     relevant: list[dict] = []
+    calendar_candidates: list[dict] = []
     routine_count = 0
+    calendar_checks_used = 0
 
     for email in all_emails:
         subject_line = email.get("subject", "")
@@ -344,26 +362,102 @@ async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
         hits = await find_relevant_subjects(qdrant, f"{subject_line} — from {sender}")
 
         if phishing_flagged:
-            # Distinct bucket, not silently folded into "routine" — a brand-
-            # mismatch email is actively suspicious, not merely uninteresting.
-            # Urgency is deliberately capped at "low" by derive_urgency()
-            # above (see its docstring) so it never lands in "Urgent" either.
-            phishing.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
+            # Urgency is deliberately capped at "low" by derive_urgency() above
+            # (see its docstring) so this never also lands in "Urgent".
+            # Excluded from observe_for_subject() below — not a genuine finding.
+            #
+            # Auto-delete exception (Director, 2026-07-07): detect_brand_mismatch()
+            # is the one well-established, low-ambiguity spam signal in the system
+            # (sender claims a known brand, sending domain doesn't match it) — the
+            # classification itself IS the confirmation, so this bypasses
+            # delete_email's normal HIGH-tier confirmation gate rather than
+            # flagging-then-waiting-to-be-told-to-delete. Nextcloud Mail's delete
+            # moves to that account's Trash (not instant permanent erase), so
+            # there's still a recovery window. Toggle: cognition.spam_auto_delete.
+            asyncio.create_task(record_spam_sender(qdrant, sender, subject_line, reason="brand_mismatch"))
+            deleted = False
+            if _cfg.cognition.spam_auto_delete:
+                database_id = email.get("databaseId") or email.get("uid") or ""
+                if database_id:
+                    try:
+                        del_nb = await nanobot.run("nc-mail", "delete_message", {
+                            "account": email.get("account", "personal"), "database_id": database_id,
+                        })
+                        del_result = del_nb.get("result") if del_nb.get("result") is not None else del_nb
+                        deleted = isinstance(del_result, dict) and not del_result.get("error")
+                    except Exception as exc:
+                        logger.warning("run_score_email_by_subject: spam auto-delete failed: %s", exc)
+            if deleted:
+                deleted_spam.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
+            else:
+                phishing.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
         elif urgency_label == "high":
             urgent.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
+            asyncio.create_task(record_urgent_sender(
+                qdrant, sender, subject_line,
+                reason="priority_sender" if sender in priority_senders else "urgency_keyword_match",
+            ))
         elif hits:
             relevant.append({**email, "matched_subjects": [h.get("subject") for h in hits]})
         else:
             routine_count += 1
 
-    lines = [f"{len(all_emails)} email(s) across {len(_EMAIL_ACCOUNTS)} account(s)."]
+        if hits and not phishing_flagged:
+            observation = f"Email: '{subject_line}' from {sender}"
+            for h in hits[:_MAX_SUBJECT_MATCHES]:
+                subject_id = h.get("subject", "")
+                if subject_id:
+                    await observe_for_subject(qdrant, nanobot, cog, subject_id, "email", observation)
+
+        # Calendar-invite suggestion (Director, 2026-07-07) — cheap keyword
+        # pre-filter first; body fetch + detect_calendar_event()'s LLM call
+        # only for the small fraction that clears it, never for phishing.
+        # Suggests only — never auto-creates the event.
+        if (not phishing_flagged and calendar_checks_used < _MAX_CALENDAR_CHECKS
+                and looks_like_calendar_candidate(subject_line, sender)):
+            calendar_checks_used += 1
+            database_id = email.get("databaseId") or email.get("uid") or ""
+            body_text = ""
+            if database_id:
+                try:
+                    fb = await nanobot.run("nc-mail", "fetch_message", {
+                        "account": email.get("account", "personal"), "database_id": database_id,
+                    })
+                    fb_result = fb.get("result") if fb.get("result") is not None else fb
+                    body_text = fb_result.get("body", "") if isinstance(fb_result, dict) else ""
+                except Exception as exc:
+                    logger.warning("run_score_email_by_subject: body fetch failed for calendar check: %s", exc)
+            if body_text:
+                try:
+                    ev = await detect_calendar_event(
+                        cog, subject_line, sender, body_text, _dt_mod.date.today().isoformat(),
+                    )
+                except Exception as exc:
+                    logger.warning("run_score_email_by_subject: calendar detection failed: %s", exc)
+                    ev = None
+                if ev:
+                    _acct = email.get("account", "personal")
+                    _suggestion_id = str(uuid.uuid5(
+                        uuid.NAMESPACE_URL, f"calendar_suggestion:{_acct}:{database_id}",
+                    ))
+                    calendar_candidates.append({**email, **ev, "_suggestion_id": _suggestion_id})
+                    asyncio.create_task(write_pending_suggestion(
+                        qdrant, _suggestion_id, ev, _acct, subject_line, sender,
+                    ))
+
+    lines = [f"{len(all_emails)} email(s) across {len(scan_accounts)} account(s)."]
     if urgent:
         lines.append(f"\n⚠️ Urgent ({len(urgent)}):")
         for e in urgent:
             tag = f" [{', '.join(e['matched_subjects'])}]" if e["matched_subjects"] else ""
             lines.append(f"• {e.get('subject','(no subject)')} — {e.get('from','')} ({e.get('account')}){tag}")
+    if deleted_spam:
+        lines.append(f"\n🗑️ Deleted as spam ({len(deleted_spam)}) — sender name doesn't match its domain:")
+        for e in deleted_spam:
+            lines.append(f"• {e.get('subject','(no subject)')} — {e.get('from','')} ({e.get('account')})")
     if phishing:
-        lines.append(f"\n🎣 Possible phishing ({len(phishing)}) — sender name doesn't match its domain:")
+        lines.append(f"\n🎣 Possible phishing, not deleted ({len(phishing)}) — sender name doesn't match its "
+                      f"domain (delete failed or spam_auto_delete is off):")
         for e in phishing:
             lines.append(f"• {e.get('subject','(no subject)')} — {e.get('from','')} ({e.get('account')})")
     if relevant:
@@ -371,7 +465,22 @@ async def run_score_email_by_subject(cog, nanobot, qdrant) -> dict:
         for e in relevant:
             lines.append(f"• {e.get('subject','(no subject)')} — {e.get('from','')} "
                          f"({e.get('account')}) [{', '.join(e['matched_subjects'])}]")
+    if calendar_candidates:
+        lines.append(f"\n📅 Possible calendar event(s) ({len(calendar_candidates)}) — not created, "
+                      f"reply \"book it\" (or name the event) any time to confirm:")
+        for e in calendar_candidates:
+            when = f"{e.get('date','?')} {e.get('start_time','')}".strip()
+            lines.append(f"• {e.get('title', e.get('subject','(no subject)'))} — {when} "
+                         f"({e.get('account')}) — \"{e.get('source_excerpt','')}\"")
     if routine_count:
         lines.append(f"\n{routine_count} routine email(s) — no Subject match, not urgent.")
 
-    return {"status": "ok", "brief": "\n".join(lines)}
+    # count of NOTABLE items only (not routine_count) — this is what
+    # task_scheduler._result_has_content() gates notify_when="on_findings" on.
+    # Without this, "brief" (always non-empty, even all-routine) would make
+    # has_content always True regardless of notify_when — found live
+    # 2026-07-03 as spam once Personal Mailbox Scan moved to 15-min cadence.
+    return {
+        "status": "ok", "brief": "\n".join(lines),
+        "count": len(urgent) + len(phishing) + len(deleted_spam) + len(relevant) + len(calendar_candidates),
+    }

@@ -155,6 +155,8 @@ memory_agent:
   memory_list_collections — list all Qdrant collection names with descriptions (LOW)
   memory_list_gaps        — list known knowledge gaps recorded in sovereign memory (LOW)
   learning_harness_status — summary of last learning harness run: what was ingested, when (LOW)
+  subject_list            — list all active Cognition Engine Subjects (crypto, macro, retirement, ai, etc.) with confidence/status (LOW)
+  subject_detail          — full interrogation of one Subject: thesis, confidence, open questions, risk flags, recent findings; REQUIRES target: the subject name (LOW)
 
 research_agent:
   web_search       — search the internet / web for current information, news, or facts requiring live data
@@ -209,7 +211,8 @@ business_agent:
   portfolio_analysis_clear — discard the current in-session portfolio analysis without saving; use for "clear portfolio", "discard portfolio" (LOW)
 
 ROUTING RULES:
-- CRITICAL: Personal/lifestyle/consumer topics (buying, shopping, food, clothing, fitness, hobbies, entertainment, social plans, opinions, feelings, weather) → research_agent, intent=query. NEVER route personal statements to file, email, or docker operations.
+- CRITICAL: Personal/lifestyle/consumer topics (buying, shopping, food, clothing, fitness, hobbies, entertainment, social plans, opinions, feelings) → research_agent, intent=query. NEVER route personal statements to file, email, or docker operations.
+- Current weather / forecast questions ("what's the weather like", "is it going to rain", "how hot is it outside") → research_agent, intent=web_search — needs a live web lookup, not training data. (2026-07-05: first fix routed this to intent=query, which is hardcoded in INTENT_ACTION_MAP to domain=ollama/operation=query — pure conversational chat with zero skill dispatch regardless of delegate_to. intent=query can NEVER invoke a tool; only intent=web_search reaches the browser/SearXNG skill. Confirmed via ledger: zero dispatch trace for weather across two full test rounds.)
 - Explicit web/internet reference ("search the web", "look online", "find on the internet", "get on the internet", "what does the internet say", "latest news on") → research_agent, intent=web_search. OVERRIDE: if the request contains both a summarise/explain verb AND a live-data signal ("latest news on", "recent news", "current events about", "what's happening with", "what happened with"), ALWAYS route to web_search — the live-data signal beats the verb.
 - "write up", "summarise", "draft", "explain", "describe", "tell me about", "what is" without a live-data signal → research_agent, intent=query (use internal knowledge — do NOT web_search)
 - Greetings, casual statements, acknowledgements ("we're back", "thanks", "got it", "ok") → research_agent, intent=query
@@ -277,6 +280,8 @@ ROUTING RULES:
 - "learning harness", "learning status", "what did you learn", "last learned", "learning harness status" → memory_agent, intent=learning_harness_status (LOW)
 - "what collections", "memory collections", "your collections", "qdrant collections", "memory stores" → memory_agent, intent=memory_list_collections (LOW)
 - "knowledge gaps", "what gaps", "your gaps", "what don't you know", "memory gaps" → memory_agent, intent=memory_list_gaps (LOW)
+- "what subjects", "list subjects", "subjects are you tracking", "subjects are you investigating", "active subjects", "your subjects", "cognition engine subjects" → memory_agent, intent=subject_list (LOW)
+- "tell me about the X subject", "what do you know about X", "status of X subject", "findings on X", "interrogate X" (X = a Subject like crypto/macro/retirement/ai) → memory_agent, intent=subject_detail (LOW; target=X, the subject name)
 - "list notes", "show notes", "my notes", "all notes", "nextcloud notes", "nc notes" → business_agent, intent=list_notes (LOW)
 - "create note", "new note", "add note", "write a note", "add a note" → business_agent, intent=create_note (MID)
 - "read note", "open note", "show note", "get note", "view note" → business_agent, intent=read_note (LOW; target=note ID or title)
@@ -1223,6 +1228,26 @@ URGENCY RULE: {urgency_rule}
 
 Respond with ONLY the synthesised answer for the Director."""
 
+    # Read-vs-write guard — a list/get/fetch result must never be narrated as if
+    # something was just created or written (found 2026-07-05: a list_events read
+    # got phrased as "has been added to the calendar" — no write ever happened,
+    # ledger confirmed operation=read; PASS 5 had no signal to tell the two apart).
+    _READ_INTENT_PREFIXES = (
+        "list_", "get_", "fetch_", "check_", "recall_", "read_", "search_",
+        "memory_", "validator_", "docker_ps", "docker_logs", "docker_stats",
+        "ingest_status",
+    )
+    _intent_name = str(result_for_translator.get("_intent") or "")
+    _is_read = _intent_name.startswith(_READ_INTENT_PREFIXES)
+    read_write_rule = (
+        "\nREAD-VS-WRITE GUARD: This result came from a read/list/fetch operation — nothing was "
+        "created, added, scheduled, booked, or written just now. Describe what already exists "
+        "using neutral language ('you have...', 'there is...', 'the calendar shows...'). NEVER "
+        "use verbs implying an action just happened (added, created, scheduled, booked, saved, "
+        "written) for this result."
+        if _is_read else ""
+    )
+
     iron_rule = (
         "IRON RULE — FAILURE: This action FAILED. Report failure clearly. "
         "Do NOT claim it succeeded. Do NOT invent a positive outcome. "
@@ -1254,6 +1279,7 @@ result_for_translator:
 {json.dumps(result_for_translator, indent=2)}
 
 {iron_rule}
+{read_write_rule}
 URGENCY RULE: {urgency_rule}
 
 ABSOLUTE CONSTRAINT: result_for_translator is the SOLE source of truth.
@@ -1264,6 +1290,8 @@ Do NOT use your training knowledge to answer the Director's question. Only repor
 Rules:
 - Lead with the answer, not the reasoning.
 - Plain English. No JSON. No HTTP codes. No adapter names. No technical internals.
+- Fields prefixed with "_" (e.g. "_intent") are internal routing metadata for you to reason
+  with — never quote them, name them, or mention their existence in your output.
 - If outcome is already plain English in Rex's voice, return it substantially unchanged.
 - If next_action is present and non-null, append it naturally as a final sentence.
 - No preamble ("Here is the message:", "Translation:", etc.).

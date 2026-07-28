@@ -735,7 +735,7 @@ async def run_synthesis(qdrant, cog=None) -> dict:
     logger.info("synthesis: scanned %d episodic entries", len(episodic_entries))
 
     if not episodic_entries:
-        return {"status": "ok", **stats}
+        return {"status": "ok", "count": 0, **stats}
 
     # ── Step 2: Group by intent → collect phrasing + outcomes ────────────────
     # intent_stats[intent] = {"success": N, "failure": N, "total": N}
@@ -1022,4 +1022,14 @@ async def run_synthesis(qdrant, cog=None) -> dict:
         stats["skipped_existing"],
         stats.get("culled_relational", 0), stats.get("culled_associative", 0),
     )
-    return {"status": "ok", **stats}
+    # "count" is authoritative for _result_has_content() (task_scheduler.py) — without
+    # it, this harness's return shape (associative_created/relational_created/etc.) matches
+    # none of that function's OR-chained field names, so notify_when="on_findings" would be
+    # silently equivalent to "never" rather than "always" (same class of bug documented for
+    # the validator monitor's "alerts" key and news_brief's "brief" key, inverted outcome).
+    count = (
+        stats["associative_created"] + stats["associative_updated"]
+        + stats["relational_created"] + stats["relational_updated"]
+        + stats.get("culled_relational", 0) + stats.get("culled_associative", 0)
+    )
+    return {"status": "ok", "count": count, **stats}
