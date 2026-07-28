@@ -51,32 +51,48 @@ def _load_rex_address() -> str:
         return ""
 
 
-def _load_btc_watched() -> list[str]:
-    """Return list of BTC addresses to watch from wallet-config.json.
-
-    Activates when multisig_fingerprint is populated (post-Specter setup).
-    Currently watches the multisig receive address once it's known.
+async def _load_btc_watched(qdrant=None) -> list[str]:
+    """Return list of BTC addresses to watch: wallet-config.json's Specter
+    multisig (once configured) plus every bc1... address in the canonical
+    taxable_wallets list — same source as the ETH side.
     """
+    addrs = []
     try:
         import json
         cfg = json.loads(_WALLET_CONFIG_PATH.read_text())
         btc = cfg.get("bitcoin", {})
-        # Populate when Specter multisig address is stored in config
-        addrs = []
         if btc.get("multisig_address"):
             addrs.append(btc["multisig_address"])
-        return addrs
     except Exception:
-        return []
+        pass
+    if qdrant:
+        try:
+            entry = await qdrant.retrieve_by_key("semantic:tax:taxable_wallets")
+            if entry:
+                for a in entry.get("addresses", []):
+                    if a.startswith("bc1") and a not in addrs:
+                        addrs.append(a)
+        except Exception as e:
+            logger.debug("Watcher: BTC taxable_wallets fetch failed: %s", e)
+    return addrs
 
 
-def _eth_watched() -> set[str]:
+async def _eth_watched(qdrant=None) -> set[str]:
     addrs = set()
     if _SAFE_ADDRESS:
         addrs.add(_SAFE_ADDRESS)
     rex = _load_rex_address()
     if rex:
         addrs.add(rex)
+    if qdrant:
+        try:
+            entry = await qdrant.retrieve_by_key("semantic:tax:taxable_wallets")
+            if entry:
+                for a in entry.get("addresses", []):
+                    if a.startswith("0x"):
+                        addrs.add(a.lower())
+        except Exception as e:
+            logger.debug("Watcher: taxable_wallets fetch failed: %s", e)
     return addrs
 
 
@@ -288,7 +304,7 @@ async def check_now(address: str = None, ledger=None) -> dict:
 
 # ── Main watcher loop ─────────────────────────────────────────────────────────
 
-async def eth_watch_loop(ledger=None) -> None:
+async def eth_watch_loop(qdrant=None, ledger=None) -> None:
     """Background task — polls every 15 seconds for new ETH + BTC activity."""
     last_eth_block: int | None = None
     startup_notified = False
@@ -299,7 +315,7 @@ async def eth_watch_loop(ledger=None) -> None:
         while True:
             try:
                 # ── ETH ──────────────────────────────────────────────────
-                watched = _eth_watched()
+                watched = await _eth_watched(qdrant)
                 if watched:
                     result = await _eth_rpc_fb(client, "eth_blockNumber", [])
                     if result is not None:
@@ -323,7 +339,7 @@ async def eth_watch_loop(ledger=None) -> None:
                         logger.warning("Watcher: ETH nodes unreachable — will retry")
 
                 # ── BTC ──────────────────────────────────────────────────
-                btc_addrs = _load_btc_watched()
+                btc_addrs = await _load_btc_watched(qdrant)
                 if btc_addrs and _BTC_RPC_USER:
                     await _check_btc_addresses(client, btc_addrs, ledger)
 
@@ -336,7 +352,7 @@ async def eth_watch_loop(ledger=None) -> None:
             await asyncio.sleep(POLL_INTERVAL)
 
 
-def start_eth_watcher(ledger=None) -> asyncio.Task:
-    task = asyncio.create_task(eth_watch_loop(ledger=ledger))
+def start_eth_watcher(qdrant=None, ledger=None) -> asyncio.Task:
+    task = asyncio.create_task(eth_watch_loop(qdrant=qdrant, ledger=ledger))
     logger.info("Watcher: started (ETH + BTC when configured)")
     return task

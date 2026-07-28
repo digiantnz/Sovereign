@@ -228,6 +228,13 @@ def _write_last_run(filename: str, cycles: int, created: int,
 
 async def _write_failure_prospective(qdrant, failed_step: str,
                                      reason: str, filename: str) -> None:
+    """Keyed by filename (2026-07-03 fix) — qdrant.store() is idempotent by
+    _key, so re-processing the same failing file overwrites its existing
+    notice (fresh reason/timestamp) instead of accumulating a new point every
+    retry. Before this fix, a file that kept failing across every hourly poll
+    (never marked processed, so never stopped being retried) produced one
+    PROSPECTIVE entry per attempt — found live as 4x duplicate notices each
+    for 3 different stuck files, task #38."""
     body = (
         f"Learning harness failed while processing '{filename}'.\n"
         f"Failed step: {failed_step}\n"
@@ -242,6 +249,7 @@ async def _write_failure_prospective(qdrant, failed_step: str,
                 "type":           "prospective",
                 "status":         "pending_approval",
                 "title":          f"Learning harness failure — {filename}",
+                "_key":           f"prospective:learning_failure:{filename}",
                 "target_session": "morning_briefing",
                 "failed_step":    failed_step,
                 "source_file":    filename,
@@ -283,11 +291,23 @@ async def _build_doc_array(doc_keywords: set, qdrant) -> list:
                 entry_tokens = _extract_keywords(content)
                 if not (doc_keywords & entry_tokens):
                     continue
+                _raw_confidence = payload.get("confidence", 1.0)
+                try:
+                    _confidence = float(_raw_confidence)
+                except (TypeError, ValueError):
+                    # Research-harness entries store confidence as a "HIGH"/"MEDIUM"/"LOW"
+                    # label, not a number — this collection is shared across writers with
+                    # different confidence shapes. Found live 2026-07-04: this crashed the
+                    # whole scroll (caught, but silently returned zero context) whenever a
+                    # keyword-overlapping research entry existed.
+                    _confidence = {"HIGH": 0.75, "MEDIUM": 0.5, "LOW": 0.25}.get(
+                        str(_raw_confidence).upper(), 0.5
+                    )
                 filtered.append({
                     "_point_id":   str(rec.id),
                     "_key":        payload.get("_key", ""),
                     "content":     content,
-                    "confidence":  float(payload.get("confidence", 1.0)),
+                    "confidence":  _confidence,
                     "type":        payload.get("type", "semantic"),
                     "title":       payload.get("title", ""),
                     "relational":  [],
@@ -952,6 +972,14 @@ async def _process_file(app_state, file_info: dict,
             )
         return
 
+    # ── Step 5b: Cognition Engine pass (Director, 2026-07-05: "the cognition_engine
+    # will also process from downloads now" — previously only /learn got this; every
+    # ingestion path should feed the Cognition Engine and let it decide whether a
+    # Subject-relevant finding warrants a Thought, not just write raw facts and stop) ──
+    cog_result = await _run_cognition_engine_pass(
+        document_text, qdrant, cog, nanobot, source="learn"
+    )
+
     # ── Step 6: Write sentinel ────────────────────────────────────────────
     file_hash = hashlib.sha256(document_text.encode()).hexdigest()[:16]
     outcome   = "partial" if timeout_skips > 0 else "positive"
@@ -965,11 +993,25 @@ async def _process_file(app_state, file_info: dict,
         "gaps_flagged":     len(gaps),
         "timeout_skips":    timeout_skips,
         "completed_at":     datetime.now(timezone.utc).isoformat(),
+        "impact":           cog_result["impact_label"],
+        "subject_folds":    cog_result["subject_folds"],
         **_source_meta,
     })
 
     # ── Step 7: Update last-run summary ──────────────────────────────────
     _write_last_run(filename, cycles, entries_created, entries_updated, len(gaps))
+
+    # ── Step 7b: Completion notification — this path (Learning-Harness: hourly poll /
+    # queue_url) previously had no success notification at all, unlike /learn's
+    # immediate Director-facing summary. Now that a Cognition Engine pass runs here
+    # too, its outcome needs to actually reach the Director, not happen invisibly.
+    _completion_lines = [
+        f"Learnt from: {filename}",
+        f"\nWritten: {entries_created} new, {entries_updated} updated"
+        f" | Cycles: {cycles} | Gaps: {len(gaps)} | Timeouts: {timeout_skips}",
+    ]
+    _completion_lines.extend(_format_cognition_engine_lines(cog_result))
+    await _notify_telegram("\n".join(_completion_lines))
 
     # ── Step 8: Gap notification ──────────────────────────────────────────
     if gaps:
@@ -990,6 +1032,7 @@ async def _process_file(app_state, file_info: dict,
                     "type":           "prospective",
                     "status":         "pending_approval",
                     "title":          f"Review learning gaps — {filename}",
+                    "_key":           f"prospective:learning_gaps:{filename}",
                     "target_session": "reasoning_and_cognition",
                     "gap_count":      len(gaps),
                     "source_file":    filename,
@@ -1123,7 +1166,13 @@ async def check_notes(app_state) -> None:
         return
 
     # ── Find unprocessed notes ────────────────────────────────────────────
-    _SKIP_CATEGORIES = {"Research"}
+    # "subject" (cognition/subjects.py) excluded 2026-07-08: Subject notes are
+    # rewritten by every Thought that touches them, so without this exclusion
+    # the Learning Harness re-ingests its own Cognition Engine output as "new"
+    # content on the next poll — triage matches a Subject, spawns another
+    # Thought, which rewrites the note again. Self-feeding loop, not a source
+    # of genuinely new information.
+    _SKIP_CATEGORIES = {"Research", "subject"}
 
     pending = []
     for n in notes_raw:
@@ -1241,6 +1290,69 @@ def get_last_run_status() -> dict:
     }
 
 
+async def _run_cognition_engine_pass(text: str, qdrant, cog, nanobot, source: str = "learn") -> dict:
+    """Canonical Cognition Engine triage + observe pass (standing order #2/#3 — single
+    implementation, no duplicates). Used by both learn_on_demand() (/learn command) and
+    _process_file() (Learning-Harness downloads/URL pipeline) so a Subject-relevant
+    document gets the same treatment regardless of which entry point ingested it —
+    extended to _process_file() 2026-07-05 (Director: "the cognition_engine will also
+    process from downloads now") after discovering "learn this <url>" (no slash command,
+    routes through queue_url -> check_downloads -> _process_file) never got a Cognition
+    Engine pass at all, only /learn did.
+
+    Threshold history (2026-07-05, Director): originally /learn used a stricter 0.72
+    cutoff (vs chat's base 0.62) capped at the top 2 matches — backwards, since /learn
+    is an explicit human-curated relevance signal and should clear the bar *more* easily
+    than an offhand chat remark, not less. Both restrictions were a GPU-cost mitigation
+    from 2026-07-04 (one article hit 6 Subjects, 4 genuine gaps, judged too much
+    concurrent load) that no longer holds now queue priority/grace-period handling is
+    validated live. Now uses the same base 0.62 triage threshold as chat, uncapped, plus
+    a guaranteed floor: if nothing clears 0.62, the single closest-matching Subject still
+    gets a pass regardless of score — curated content earns at least one research pass.
+    """
+    from cognition.subjects import find_relevant_subjects, derive_impact, _MAX_SUBJECT_MATCHES
+    from cognition.thoughts import observe_for_subject
+    triage_hits = await find_relevant_subjects(qdrant, text)
+    impact_label, impact_score = derive_impact(triage_hits)
+    passed_hits = sorted(triage_hits, key=lambda h: h.get("_triage_score", 0.0), reverse=True)
+    if not passed_hits:
+        _floor_hits = await find_relevant_subjects(qdrant, text, threshold=0.0, limit=1)
+        if _floor_hits:
+            passed_hits = _floor_hits
+    subject_folds = []
+    for h in passed_hits[:_MAX_SUBJECT_MATCHES]:
+        subject_id = h.get("subject", "")
+        if not subject_id:
+            continue
+        obs = await observe_for_subject(qdrant, nanobot, cog, subject_id, source, text[:1500])
+        subject_folds.append({
+            "subject_id": subject_id,
+            "gap_found": obs.get("gap_found", False),
+            "thought_id": obs.get("thought_id"),
+        })
+    return {
+        "impact_label": impact_label,
+        "impact_score": impact_score,
+        "triage_hits": triage_hits,
+        "subject_folds": subject_folds,
+    }
+
+
+def _format_cognition_engine_lines(cog_result: dict) -> list[str]:
+    """Shared Director-facing formatting for a _run_cognition_engine_pass() result."""
+    lines = []
+    subject_folds = cog_result["subject_folds"]
+    if subject_folds:
+        lines.append("\nCognition Engine:")
+        for f in subject_folds:
+            status = "gap found — Thought spawned" if f["gap_found"] else "no new gap (checked, nothing to research)"
+            lines.append(f"• {f['subject_id']}: {status}")
+    lines.append(
+        f"\nImpact: {cog_result['impact_label']} ({len(cog_result['triage_hits'])} subject(s) matched)"
+    )
+    return lines
+
+
 # ── On-demand learning (/learn command) ──────────────────────────────────────
 
 async def learn_on_demand(text: str, source_label: str, qdrant, cog, nanobot,
@@ -1270,10 +1382,11 @@ async def learn_on_demand(text: str, source_label: str, qdrant, cog, nanobot,
     gaps          = loop_result["gaps"]
     timeout_skips = loop_result.get("timeout_skips", 0)
 
-    from cognition.subjects import find_relevant_subjects, score_and_fold_subjects, derive_priority
-    triage_hits = await find_relevant_subjects(qdrant, text)
-    priority_label, priority_score = derive_priority(triage_hits)
-    subject_folds = await score_and_fold_subjects(qdrant, cog, text, source_label, subjects=triage_hits)
+    # Cognition Engine pass — see _run_cognition_engine_pass() docstring for full
+    # history (threshold reversal + guaranteed floor, both Director 2026-07-05).
+    cog_result = await _run_cognition_engine_pass(text, qdrant, cog, nanobot, source="learn")
+    triage_hits = cog_result["triage_hits"]
+    impact_label = cog_result["impact_label"]
 
     already_known = [e.get("title") or e.get("_key") or "?" for e in doc_array[:5]]
 
@@ -1293,11 +1406,7 @@ async def learn_on_demand(text: str, source_label: str, qdrant, cog, nanobot,
     if gaps:
         gap_text = "; ".join(g.get("gap_description") or g.get("key", "?") for g in gaps[:3])
         lines.append(f"Knowledge gaps: {gap_text}")
-    if subject_folds:
-        lines.append("\nSubjects updated:")
-        for f in subject_folds:
-            lines.append(f"• {f['subject_id']}: " + "; ".join(f["added"]))
-    lines.append(f"\nPriority: {priority_label} ({len(triage_hits)} subject(s) matched)")
+    lines.extend(_format_cognition_engine_lines(cog_result))
 
     return {
         "status":                "ok",
@@ -1305,9 +1414,9 @@ async def learn_on_demand(text: str, source_label: str, qdrant, cog, nanobot,
         "updated":               updated,
         "cycles":                cycles,
         "already_known_count":   len(doc_array),
-        "priority":              priority_label,
-        "priority_score":        priority_score,
-        "subject_folds":         subject_folds,
+        "impact":                impact_label,
+        "impact_score":          cog_result["impact_score"],
+        "subject_folds":         cog_result["subject_folds"],
         "result_for_translator": "\n".join(lines),
     }
 

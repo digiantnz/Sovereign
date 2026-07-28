@@ -92,6 +92,7 @@ YAHOO_SYMBOLS: dict[str, str | None] = {
     "uni":   "UNI-USD",
     "yfi":   "YFI-USD",
     "weth":  "ETH-USD",   # same underlying as ETH
+    "eth_btc_ratio": "ETH-BTC",  # relative-value pair, not a held asset — rotation timing only
     "rkl":   "RKLB",      # Rocket Lab — NASDAQ primary listing (crypto portfolio slug)
     # Retirement fund — NZX equities
     "fph":   "FPH.NZ",    # Fisher & Paykel Healthcare
@@ -100,9 +101,27 @@ YAHOO_SYMBOLS: dict[str, str | None] = {
     "ift":   "IFT.NZ",    # Infratil
     "chi":   "CHI.NZ",    # Channel Infrastructure
     "smi":   "SMI.NZ",    # Santana Minerals (exploration — speculative)
+    "mcy":   "MCY.NZ",    # Mercury NZ
+    "mel":   "MEL.NZ",    # Meridian Energy
+    "rym":   "RYM.NZ",    # Ryman Healthcare
+    "kfl":   "KFL.NZ",    # Kingfish
+    "aft":   "AFT.NZ",    # AFT Pharmaceuticals
+    "cnu":   "CNU.NZ",    # Chorus
+    "sko":   "SKO.NZ",    # Serko
+    "vhp":   "VHP.NZ",    # Vital Healthcare Property Trust
+    "ebo":   "EBO.NZ",    # EBOS Group — planned, not yet purchased (added ahead of need)
+    "rklb":  "RKLB",      # Rocket Lab — retirement-portfolio slug (ticker-lowercase
+                          # convention); "rkl" above is the separate crypto-portfolio
+                          # ledger slug for the same underlying NASDAQ listing
     # Retirement fund — NZX ETFs
     "npf":   "NPF.NZ",    # Smart NZ Property
     "asr":   "ASR.NZ",    # Smart Australian Resources
+    "div":   "DIV.NZ",    # Smart NZ Dividend
+    "bot":   "BOT.NZ",    # Smart Automation and Robotics
+    "liv":   "LIV.NZ",    # Smart Healthcare Innovation
+    "nzb":   "NZB.NZ",    # Smart NZ Bond
+    "nzc":   "NZC.NZ",    # Smart NZ Cash
+    "gld":   "GLD",       # SPDR Gold ETF — US-listed (NYSEArca), no .NZ suffix
     "aiq":   "AIQ.AX",    # Global X AI ETF — NZX-listed but only ASX ticker in Yahoo Finance
     # Disposal candidates / stablecoins / no reliable technicals
     "matic": None,
@@ -432,14 +451,31 @@ async def _gather_alpha_vantage(ticker: str) -> tuple[str, str | None]:
         return "", str(exc)
 
 
-async def _gather_grok(cog, topic: str) -> tuple[str, str | None]:
+async def _gather_groq_news_synthesis(cog, security_name: str, browser_text: str) -> tuple[str, str | None]:
+    """Distil already-fetched live search content into a market-context summary.
+
+    Replaces the old ungrounded _gather_grok() (deleted 2026-07-04, no
+    remaining call sites) everywhere it was used — Grok's own live web search
+    was deprecated by xAI (search_parameters removed 2026-06-30), so asking
+    Grok directly for "market sentiment" got answered from stale training
+    knowledge (e.g. citing the ETH PoS merge as an upcoming catalyst — it
+    happened in 2022). This grounds the summary in browser_text (real SearXNG
+    results gathered the same run) instead, routed content_synthesis-first
+    (groq_inference, free).
+    """
+    if not browser_text:
+        return "", "no source content to synthesise"
     try:
         prompt = (
-            f"Provide a concise market sentiment summary and recent analyst commentary for: {topic}. "
-            "Include: recent price action narrative, key bull/bear factors, notable news this week. "
-            "Factual and concise — 3–5 sentences."
+            f"Here is live search content gathered just now about {security_name}:\n\n"
+            f"{browser_text}\n\n"
+            "Distil ONLY the content above into a concise market-context summary "
+            "(recent price action narrative, key bull/bear factors, notable news). "
+            "Use only what is stated above — do not add facts, events, or context "
+            "from your own training data. If the content above doesn't mention "
+            "something, omit it rather than filling the gap. 3–5 sentences."
         )
-        _decision = cog._routing_decision(prompt, user_input=topic, task_type="web_aware_query")
+        _decision = cog._routing_decision(prompt, user_input=security_name, task_type="content_synthesis")
         if _decision["use_external"]:
             _dispatch_map = {
                 "grok":           cog.ask_grok,
@@ -448,7 +484,7 @@ async def _gather_grok(cog, topic: str) -> tuple[str, str | None]:
                 "openrouter":     cog.ask_openrouter,
                 "ollama_cloud":   cog.ask_ollama_cloud,
             }
-            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
+            _fn = _dispatch_map.get(_decision["provider"], cog.ask_groq_inf)
             result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
         else:
             from adapters.inference_queue import InferenceQueue
@@ -457,7 +493,7 @@ async def _gather_grok(cog, topic: str) -> tuple[str, str | None]:
             return "", result["error"]
         return result.get("response", ""), None
     except Exception as exc:
-        logger.warning("research_harness: web enrichment failed: %s", exc)
+        logger.warning("research_harness: groq news synthesis failed: %s", exc)
         return "", str(exc)
 
 
@@ -761,6 +797,14 @@ Write the full report first, then the JSON. Be factual — never fabricate data 
     try:
         from adapters.inference_queue import InferenceQueue
         _decision = cog._routing_decision(prompt, user_input=topic, task_type="llm_generate")
+        # Visibility fix (Director, 2026-07-05: "could low confidence be an external
+        # LLM issue?") — this call had no durable record of which provider actually
+        # wrote a Thought's synthesis, so "was it the model or the gathered sources"
+        # was unanswerable after the fact. Now logged every time.
+        logger.info(
+            "_synthesise: topic=%r provider=%s use_external=%s reason=%s",
+            topic, _decision.get("provider"), _decision.get("use_external"), _decision.get("reason"),
+        )
         if _decision["use_external"]:
             _dispatch_map = {
                 "grok":           cog.ask_grok,
@@ -821,15 +865,20 @@ Write the full report first, then the JSON. Be factual — never fabricate data 
 async def _write_episodic(qdrant, topic: str, domain_scope: str,
                            confidence: str, sources_ok: list,
                            note_id: str | None,
-                           subject: str | None = None) -> None:
+                           subject: str | None = None,
+                           signals: dict | None = None) -> None:
     """Write the episodic:research-complete entry.
 
     subject: additive metadata only (design principle — Qdrant is canonical,
     Nextcloud is the human-readable window). Set by the Cognition Engine's
-    Subject Update step (Phase 7) so campaign-triggered research is
+    Subject Update step (Phase 7) so thought-triggered research is
     retrievable as part of "everything that has informed my understanding
     of <subject>" — not just via the current Subject note. None (default)
     preserves existing behavior for Director-triggered /research.
+
+    signals: impact/urgency from cognition.subjects.score_memory_signals()
+    (task #27) — additive, None preserves existing behavior for callers
+    that don't compute signals (plain Director-triggered /research).
     """
     try:
         ts = datetime.now(timezone.utc).isoformat()
@@ -845,6 +894,9 @@ async def _write_episodic(qdrant, topic: str, domain_scope: str,
         }
         if subject:
             metadata["subject"] = subject
+        if signals:
+            metadata["impact"] = signals.get("impact")
+            metadata["urgency"] = signals.get("urgency")
         await qdrant.store(
             collection="episodic",
             content=(
@@ -864,13 +916,17 @@ async def _write_research_semantic(
     note_id: str | None, note_title: str,
     full_report: str, confidence: str, report_date: str,
     subject: str | None = None,
+    signals: dict | None = None,
 ) -> None:
     """Write the semantic:research:<slug> entry for a completed research report.
 
     subject: set by the Cognition Engine's Subject Update step (Phase 7) for
-    campaign-triggered research — run_research_headless() itself never calls
+    thought-triggered research — run_research_headless() itself never calls
     this. None (default) preserves the normal Director-triggered /research
     behavior via run_research_save().
+
+    signals: impact/urgency from cognition.subjects.score_memory_signals()
+    (task #27) — additive, None preserves existing behavior.
     """
     try:
         slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:48]
@@ -889,10 +945,13 @@ async def _write_research_semantic(
             "note_path":    note_path,
             "confidence":   confidence,
             "report_date":  report_date,
-            "event_type":   "campaign_research" if subject else "research_note_saved",
+            "event_type":   "thought_research" if subject else "research_note_saved",
         }
         if subject:
             metadata["subject"] = subject
+        if signals:
+            metadata["impact"] = signals.get("impact")
+            metadata["urgency"] = signals.get("urgency")
         await qdrant.store(collection="semantic", content=full_report, metadata=metadata)
     except Exception as exc:
         logger.warning("research_harness: semantic write failed: %s", exc)
@@ -926,7 +985,7 @@ Respond with JSON only — no preamble:
 Use null for fields that do not apply."""
 
     try:
-        result = await cog.ask_local(prompt, priority=InferenceQueue.HIGH, timeout=90.0)
+        result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL, timeout=90.0)
         if result.get("status") == "llm_timeout":
             logger.warning("research_harness: classifier timed out — falling back to general")
             return {"intent": "general", "security_name": None, "ticker": None, "slug": None}
@@ -957,11 +1016,16 @@ async def security_analysis_engine(
     td: "TechnicalData | None" = None,
     technical_trend: str = "",
     concentration_flags: list | None = None,
+    subject_context: dict | None = None,
 ) -> dict:
     """6-agent adversarial analysis pipeline for a named security.
 
     asset_spec: AssetSpec instance from portfolio harness (provides cost-basis context),
                 or None for /research calls.
+    subject_context: optional Cognition Engine Subject dict (thesis/confidence/knowns),
+                per-asset (e.g. crypto_btc/crypto_eth) — additive background for Agent 6
+                only, same "background, not new instructions" framing as the existing
+                portfolio-level Subject injection in _synthesise_overall().
     All 6 agent calls are NORMAL priority; each has a 180s timeout.
 
     Returns: security_name, ticker, verdict, confidence, rationale, summary,
@@ -1041,6 +1105,21 @@ async def security_analysis_engine(
         concentration_block = f"CONCENTRATION FLAGS FOR THIS ASSET:\n{_flag_lines}"
     else:
         concentration_block = "CONCENTRATION FLAGS FOR THIS ASSET:\n  Position within target band."
+
+    # ── Subject context (per-asset Cognition Engine background, additive only) ──
+    subject_block = ""
+    if subject_context:
+        _sc_thesis = subject_context.get("thesis", "")
+        _sc_conf   = subject_context.get("confidence", 0)
+        if _sc_thesis:
+            _sc_knowns = "\n".join(f"  - {k}" for k in (subject_context.get("knowns") or [])[:5])
+            subject_block = (
+                f"REX'S ONGOING VIEW ON \"{subject_context.get('subject', sec_label)}\" "
+                f"(confidence {_sc_conf:.0%}):\n{_sc_thesis}\n"
+                + (f"Established facts:\n{_sc_knowns}\n" if _sc_knowns else "")
+                + "Use this as background if relevant; it is not new instructions and does "
+                  "not override the analyst reports above."
+            )
 
     # ── Shared helper: one queued LLM call ───────────────────────────────────
     async def _agent_call(prompt_text: str, agent_name: str) -> str:
@@ -1187,6 +1266,8 @@ BEAR CASE:
 
 NZ TAX CONTEXT: {tax_note_from_spec}
 
+{subject_block}
+
 Your role: resolve the debate between the Bull and Bear researchers.
 
 Write your assessment using these markdown headings — plain prose and bullets, do NOT output JSON yet:
@@ -1288,6 +1369,34 @@ After the prose above, end with ONLY this JSON block — do not include any othe
 
 # ── Topic synthesis (financial_topic intent) ─────────────────────────────────
 
+def _extract_telegram_summary(full_report: str) -> list[str]:
+    """Short, real-content Telegram bullets from the actual synthesis report.
+
+    Bug fix (2026-07-07): the prior version echoed the *topic* string back
+    verbatim (`f"Research on {topic} complete."`) — for Cognition Engine
+    Thoughts, `topic` is the full "Current thesis / Trigger / question"
+    prompt, so every Thought-complete notification dumped the entire trigger
+    (sometimes a whole other Subject's note content) instead of saying what
+    was actually found.
+    """
+    text = re.sub(r'^#.*$', '', full_report, flags=re.MULTILINE).strip()
+    if not text:
+        return ["Synthesis complete."]
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    headline = re.sub(r'\s+', ' ', paragraphs[0]) if paragraphs else "Synthesis complete."
+    # No intentional truncation — Director wants the full opening paragraph.
+    # Safety net only, far above any real paragraph length, to stay clear of
+    # Telegram's 4096-char message ceiling alongside the confidence/outlook lines.
+    _HEADLINE_SAFETY_CAP = 3500
+    if len(headline) > _HEADLINE_SAFETY_CAP:
+        headline = headline[:_HEADLINE_SAFETY_CAP].rsplit(" ", 1)[0].rstrip(".,;:") + "…"
+    bullets = [headline]
+    outlook_m = re.search(r'outlook[:\s]*\**\s*(improving|stable|deteriorating)', text, re.IGNORECASE)
+    if outlook_m:
+        bullets.append(f"Outlook: {outlook_m.group(1).lower()}")
+    return bullets
+
+
 async def _synthesise_topic(cog, topic: str, gathered: GatheredSources) -> dict:
     """Single-call synthesis for financial_topic queries (interest rates, sectors, etc.)."""
     from adapters.inference_queue import InferenceQueue
@@ -1299,7 +1408,33 @@ async def _synthesise_topic(cog, topic: str, gathered: GatheredSources) -> dict:
         sections.append(f"## Market Data\n{gathered.finance[:1500]}")
     if gathered.grok:
         sections.append(f"## Market Sentiment\n{gathered.grok}")
-    gathered_text = "\n\n".join(sections) or "No sources returned results."
+
+    if not sections:
+        # No grounding data at all — do not ask the LLM to fill in 6 sections
+        # of analysis from pretrained knowledge alone. Observed failure mode
+        # (2026-07-19/20, a2a-browser outage): with the prompt's RESEARCH block
+        # reduced to "No sources returned results.", the LLM still free-
+        # associated a full report — for "robinhood chain" it substituted the
+        # famous Robinhood Markets brokerage and stated as fact that HOOD was
+        # "delisted from U.S. exchanges in 2023" (false — still listed on
+        # Nasdaq). A deterministic refusal here is safer than trusting the
+        # prompt's confidence-rubric hedging to prevent fabrication when there
+        # is nothing real to reason over.
+        full_report = (
+            f"No research sources were available for \"{topic}\" — web search, "
+            "financial data, and market sentiment gathering all returned nothing. "
+            "This is most often caused by the a2a-browser service being "
+            "unreachable rather than a genuine absence of published information. "
+            "Re-run once a2a-browser connectivity is confirmed."
+        )
+        return {
+            "full_report":      full_report,
+            "telegram_summary": [full_report],
+            "confidence":       "LOW",
+            "topic":            topic,
+        }
+
+    gathered_text = "\n\n".join(sections)
 
     prompt = f"""You are a financial analyst. Today is {today}.
 Topic: {topic}
@@ -1313,11 +1448,19 @@ Provide:
 3. NZ-specific implications
 4. Outlook: improving / stable / deteriorating
 5. Relevance to a crypto/property/equity investor in NZ
+6. **Confidence** — HIGH (multiple corroborating sources), MEDIUM (single/mixed), LOW (sparse/conflicting)
 
-Output a structured research report."""
+Write the full report first, then this JSON block exactly:
+```json
+{{"confidence": "HIGH|MEDIUM|LOW"}}
+```"""
 
     try:
         _decision = cog._routing_decision(prompt, user_input=topic, task_type="llm_generate")
+        logger.info(
+            "_synthesise_topic: topic=%r provider=%s use_external=%s reason=%s",
+            topic, _decision.get("provider"), _decision.get("use_external"), _decision.get("reason"),
+        )
         if _decision["use_external"]:
             _dispatch_map = {
                 "grok":           cog.ask_grok,
@@ -1349,10 +1492,28 @@ Output a structured research report."""
             "topic":            topic,
         }
 
+    # Extract trailing JSON block for the confidence rating (bug fix
+    # 2026-07-05: this function previously hardcoded "MEDIUM" unconditionally
+    # regardless of source quality or what the model actually reported —
+    # the single reason every Cognition Engine Thought, which always routes
+    # through this financial_topic path via run_research_headless's forced
+    # intent, stopped at exactly 50% confidence with the target never met.
+    # Mirrors _synthesise()'s existing JSON-block parsing above.)
+    confidence = "MEDIUM"
+    full_report = raw
+    json_m = re.search(r'```json\s*(\{.*?\})\s*```', raw, re.DOTALL)
+    if json_m:
+        try:
+            meta = json.loads(json_m.group(1))
+            confidence  = meta.get("confidence", confidence)
+            full_report = raw[:json_m.start()].strip()
+        except json.JSONDecodeError:
+            pass
+
     return {
-        "full_report":      raw,
-        "telegram_summary": [f"Research on {topic} complete."],
-        "confidence":       "MEDIUM",
+        "full_report":      full_report,
+        "telegram_summary": _extract_telegram_summary(full_report),
+        "confidence":       confidence,
         "topic":            topic,
     }
 
@@ -1363,12 +1524,12 @@ async def _gather_and_synthesise(cog, nanobot, qdrant, topic: str,
                                   force_intent: str | None = None) -> dict:
     """Classify → gather sources → synthesise. Shared by run_research_gather()
     (Director-facing, checkpoint+confirm) and run_research_headless()
-    (Cognition Engine campaigns, no confirmation gate).
+    (Cognition Engine thoughts, no confirmation gate).
 
     force_intent: when set, skips _classify_research_intent() and uses this
     intent directly (the deterministic _classify_domain_scope() still runs).
     run_research_headless() forces "financial_topic" — the security path's
-    6-agent engine takes ~8-12 min, which would turn a 3-iteration campaign
+    6-agent engine takes ~8-12 min, which would turn a 3-iteration thought
     loop into a 24-36 min synchronous block inside one scheduler step.
 
     Returns: {intent, security_name, ticker, domain_scope, sources_ok,
@@ -1397,39 +1558,55 @@ async def _gather_and_synthesise(cog, nanobot, qdrant, topic: str,
     sources_failed: list[str] = []
     year = date.today().year
 
+    # Distill topic into a search-friendly essence before it hits SearXNG
+    # (Director, 2026-07-05). Thought-driven topics arrive as a template —
+    # "Current thesis: X / Trigger: Y / Does this change the thesis for Z?" —
+    # not search keywords. Same problem _distil_query() already solves for
+    # the main chat search path; reusing it here rather than stuffing a whole
+    # paragraph into a search-engine query. security_name is already a clean
+    # entity name for the "security" branch, so this only matters for the
+    # thematic/general branch below — topic itself stays untouched everywhere
+    # else (synthesis prompt, domain classification, finance-URL building)
+    # so the full question still has a home for anything that needs context.
+    _search_essence = topic
+    if intent != "security":
+        try:
+            _search_essence = await cog._distil_query(topic, target="search") or topic
+        except Exception as exc:
+            logger.warning("research_harness: query distillation failed, using raw topic: %s", exc)
+
+    def _safe(r) -> tuple[str, str | None]:
+        if isinstance(r, Exception):
+            return "", str(r)
+        return r  # already (text, err)
+
+    grok_source_label = "grok"
     if intent == "security":
         # Use security_name only for browser queries — tickers confuse SearXNG
         query_a = f"{security_name} {year}"
         query_b = f"{security_name} stock analysis {year}"
         finance_url = _build_finance_url(domain_scope, ticker, topic)
         nzx_url     = _build_nzx_url(ticker, topic)
-        grok_query  = f"{security_name} market sentiment and recent analyst commentary"
 
-        # Parallel: two browser queries + Yahoo Finance + Grok + NZX.com + Alpha Vantage + technicals
+        # Parallel: two browser queries + Yahoo Finance + NZX.com + Alpha Vantage + technicals.
+        # Grok dropped (deprecated live search — see _gather_groq_news_synthesis docstring);
+        # groq synthesis runs after, grounded in the real browser results below.
         slug         = classify_result.get("slug") or ""
         finance_coro = _gather_finance(nanobot, finance_url) if finance_url else _no_data()
         nzx_coro     = _gather_browser(nanobot, nzx_url) if nzx_url else _no_data()
         av_ticker    = _resolve_yahoo_ticker(ticker, topic)  # use US/ASX ticker for AV
         av_coro      = _gather_alpha_vantage(av_ticker) if av_ticker else _no_data()
-        res_a, res_b, res_f, res_g, res_nzx, res_av, td = await asyncio.gather(
+        res_a, res_b, res_f, res_nzx, res_av, td = await asyncio.gather(
             _gather_browser(nanobot, query_a),
             _gather_browser(nanobot, query_b),
             finance_coro,
-            _gather_grok(cog, grok_query),
             nzx_coro,
             av_coro,
             _gather_technicals(slug),
             return_exceptions=True,
         )
-        def _safe(r, label: str) -> tuple[str, str | None]:
-            if isinstance(r, Exception):
-                return "", str(r)
-            return r  # already (text, err)
-
-        res_a, res_b, res_f, res_g, res_nzx, res_av = (
-            _safe(res_a, "browser_a"), _safe(res_b, "browser_b"),
-            _safe(res_f, "yahoo_finance"), _safe(res_g, "grok"),
-            _safe(res_nzx, "nzx"), _safe(res_av, "alpha_vantage"),
+        res_a, res_b, res_f, res_nzx, res_av = (
+            _safe(res_a), _safe(res_b), _safe(res_f), _safe(res_nzx), _safe(res_av),
         )
         if isinstance(td, Exception):
             td = _no_td(slug)
@@ -1439,7 +1616,8 @@ async def _gather_and_synthesise(cog, nanobot, qdrant, topic: str,
         finance_parts   = [p for p in [res_f[0], res_nzx[0], res_av[0]] if p]
         finance_data    = "\n\n---\n\n".join(finance_parts)
         finance_err     = res_f[1] if not res_f[0] else None
-        grok_context    = res_g[0]
+        grok_context, _ = await _gather_groq_news_synthesis(cog, security_name, browser_content)
+        grok_source_label = "groq_news_synthesis"
         if res_nzx[0]:
             sources_ok.append("nzx")
         if res_av[0]:
@@ -1450,22 +1628,43 @@ async def _gather_and_synthesise(cog, nanobot, qdrant, topic: str,
             sources_ok.append("technicals")
 
     else:
-        # financial_topic or general — single browser query
-        search_query = (
-            f"{topic} stock analysis recent performance"
-            if domain_scope == "securities"
-            else f"{topic} {year}"
+        # financial_topic or general — two independent parallel browser queries,
+        # not one. (Director, 2026-07-05: "we're obviously wasting processor
+        # cycles" — run_research_headless() forces intent="financial_topic" for
+        # EVERY Cognition Engine Thought regardless of the Subject's actual
+        # nature, and most Subjects are thematic/policy, not ticker-based. A
+        # single search here meant almost every non-security Thought could only
+        # ever gather one source — the synthesis prompt's own confidence rubric
+        # maps that straight to MEDIUM regardless of model or content quality,
+        # which is why 50% became the single most common confidence result
+        # across the whole Subject list, not just the ones checked directly.
+        # Mirrors the "security" branch's dual-query pattern — same two
+        # independent searches, minus the ticker-specific NZX/Alpha Vantage/
+        # technicals calls that don't apply to non-security topics.)
+        if domain_scope == "securities":
+            query_a = f"{_search_essence} stock analysis recent performance"
+            query_b = f"{_search_essence} financial results {year}"
+        else:
+            query_a = f"{_search_essence} {year}"
+            query_b = f"{_search_essence} analysis {year}"
+        finance_url  = _build_finance_url(domain_scope, det_ticker, topic)
+        finance_coro = _gather_finance(nanobot, finance_url) if finance_url else _no_data()
+        res_a, res_b, res_f = await asyncio.gather(
+            _gather_browser(nanobot, query_a),
+            _gather_browser(nanobot, query_b),
+            finance_coro,
+            return_exceptions=True,
         )
-        browser_content, browser_err = await _gather_browser(nanobot, search_query)
-
-        finance_data, finance_err = "", None
-        finance_url = _build_finance_url(domain_scope, det_ticker, topic)
-        if finance_url:
-            finance_data, finance_err = await _gather_finance(nanobot, finance_url)
+        res_a, res_b, res_f = _safe(res_a), _safe(res_b), _safe(res_f)
+        browser_content = "\n\n".join(t for t in [res_a[0], res_b[0]] if t)
+        browser_err     = res_a[1] or res_b[1]
+        finance_data    = res_f[0]
+        finance_err     = res_f[1] if not res_f[0] else None
 
         grok_context = ""
         if domain_scope in ("securities", "commodities") or intent == "financial_topic":
-            grok_context, _ = await _gather_grok(cog, topic)
+            grok_context, _ = await _gather_groq_news_synthesis(cog, topic, browser_content)
+            grok_source_label = "groq_news_synthesis"
 
     # Source accounting
     if browser_content:
@@ -1477,7 +1676,7 @@ async def _gather_and_synthesise(cog, nanobot, qdrant, topic: str,
     elif finance_err:
         sources_failed.append(f"yahoo_finance: {finance_err}")
     if grok_context:
-        sources_ok.append("grok")
+        sources_ok.append(grok_source_label)
 
     gathered = GatheredSources(news=browser_content, finance=finance_data, grok=grok_context)
     logger.info(
@@ -1644,11 +1843,11 @@ async def run_research_headless(cog, nanobot, qdrant, topic: str) -> dict:
     lock, no Nextcloud note, no episodic/semantic writes. Returns the
     structured synthesis result directly.
 
-    Used by the Cognition Engine's campaign research step (cognition/
-    campaigns.py) — an autonomous, non-blocking caller that can't
+    Used by the Cognition Engine's thought research step (cognition/
+    thoughts.py) — an autonomous, non-blocking caller that can't
     participate in the Director confirmation flow run_research_gather()/
     run_research_save() are built around. All persistence for
-    campaign-driven research (Nextcloud Subject note + semantic upsert +
+    thought-driven research (Nextcloud Subject note + semantic upsert +
     episodic write) is the Subject Update step's responsibility, not this
     function's — see the Cognition Engine MVP plan, Phase 7.
 

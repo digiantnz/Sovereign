@@ -1,13 +1,15 @@
 """Sovereign News Harness — run_news_brief()
 
-Fetches news from RSS, Grok, and browser search in parallel; deduplicates;
-synthesises into a single brief via one local Ollama call.
+Fetches news from RSS and browser search (default topics + Subject-bound
+keywords) in parallel; deduplicates; synthesises into a single brief via one
+local Ollama call. Grok dropped 2026-07-04 — its live web search was
+deprecated by xAI, so asking it for "current headlines" answered from stale
+training knowledge instead of anything real; RSS + browser are both grounded
+sources, Grok added nothing but risk of fabricated "current" items.
 """
 
 import asyncio
-import json
 import logging
-import re
 import string
 from datetime import datetime, timezone
 
@@ -78,54 +80,13 @@ async def _fetch_rss(nanobot) -> tuple[list[dict], str | None]:
         return [], str(exc)
 
 
-async def _fetch_grok(cog, topics: list[str]) -> tuple[list[dict], str | None]:
-    """Ask best-available external provider for current news on Matt's preferred topics."""
-    try:
-        topic_str = ", ".join(topics)
-        prompt = (
-            f"Give me the top 8–10 current news headlines (today or this week) on these topics: "
-            f"{topic_str}. "
-            "Format your response as a JSON array of objects with keys 'title' and 'summary'. "
-            "Each summary should be 1–2 sentences. Return ONLY the JSON array — no other text."
-        )
-        _decision = cog._routing_decision(prompt, user_input=topic_str, task_type="news_gather")
-        if _decision["use_external"]:
-            _dispatch_map = {
-                "grok":           cog.ask_grok,
-                "gemini":         cog.ask_gemini,
-                "groq_inference": cog.ask_groq_inf,
-                "openrouter":     cog.ask_openrouter,
-                "ollama_cloud":   cog.ask_ollama_cloud,
-            }
-            _fn = _dispatch_map.get(_decision["provider"], cog.ask_grok)
-            result = await _fn(prompt, agent="research_agent", routing_decision=_decision)
-        else:
-            from adapters.inference_queue import InferenceQueue
-            result = await cog.ask_local(prompt, priority=InferenceQueue.NORMAL)
-        raw = result.get("response", "") if isinstance(result, dict) else str(result)
-        # Extract JSON array from response
-        match = re.search(r'\[.*\]', raw, re.DOTALL)
-        if not match:
-            logger.warning("news_harness: Grok response had no JSON array")
-            return [], "no JSON array in response"
-        items_raw = json.loads(match.group(0))
-        items = []
-        for entry in items_raw:
-            if not isinstance(entry, dict):
-                continue
-            title = entry.get("title") or ""
-            summary = entry.get("summary") or ""
-            if title:
-                items.append({"title": str(title), "summary": str(summary)[:300], "source": "grok"})
-        logger.info("news_harness: Grok returned %d items", len(items))
-        return items, None
-    except Exception as exc:
-        logger.warning("news_harness: Grok source failed: %s", exc)
-        return [], str(exc)
+async def _fetch_browser(nanobot, topics: list[str], source_tag: str = "browser") -> tuple[list[dict], str | None]:
+    """Search via sovereign-browser for current news.
 
-
-async def _fetch_browser(nanobot, topics: list[str]) -> tuple[list[dict], str | None]:
-    """Search via sovereign-browser for current news."""
+    source_tag lets callers distinguish which topic set produced which items
+    (e.g. "browser" for default/preference topics vs "browser_subjects" for
+    Subject-bound search) without duplicating this function.
+    """
     try:
         query = " ".join(topics[:3]) + " news today"
         nb = await nanobot.run(
@@ -148,11 +109,11 @@ async def _fetch_browser(nanobot, topics: list[str]) -> tuple[list[dict], str | 
             title = r.get("title") or ""
             content = r.get("content") or r.get("snippet") or r.get("description") or ""
             if title:
-                items.append({"title": str(title), "summary": str(content)[:300], "source": "browser"})
-        logger.info("news_harness: browser search returned %d items", len(items))
+                items.append({"title": str(title), "summary": str(content)[:300], "source": source_tag})
+        logger.info("news_harness: browser search (%s) returned %d items", source_tag, len(items))
         return items, None
     except Exception as exc:
-        logger.warning("news_harness: browser source failed: %s", exc)
+        logger.warning("news_harness: browser source (%s) failed: %s", source_tag, exc)
         return [], str(exc)
 
 
@@ -252,7 +213,8 @@ async def _write_episodic(qdrant, sources_ok: list, sources_failed: list,
 
 async def run_news_brief(cog, nanobot, qdrant, user_input: str = "") -> dict:
     """
-    Fetch news from RSS, Grok, and browser in parallel; dedup; synthesise.
+    Fetch news from RSS and browser (default topics + Subject-bound keywords)
+    in parallel; dedup; synthesise.
 
     Returns:
         {
@@ -279,14 +241,31 @@ async def run_news_brief(cog, nanobot, qdrant, user_input: str = "") -> dict:
     except Exception as exc:
         logger.warning("news_harness: preference retrieval failed: %s", exc)
 
-    # ── 2. Parallel fetch from all three sources ───────────────────────────
-    rss_task     = asyncio.create_task(_fetch_rss(nanobot))
-    grok_task    = asyncio.create_task(_fetch_grok(cog, topics))
-    browser_task = asyncio.create_task(_fetch_browser(nanobot, topics))
+    # ── 1b. Subject-bound keywords (2026-07-04) — high-level Subjects only
+    #        (crypto/ai/macro/retirement/property, not their _sub-focus
+    #        children — Matt's call, narrower Subjects would just multiply
+    #        query volume for marginal benefit).
+    subject_keywords: list[str] = []
+    try:
+        from cognition.subjects import get_subject_news_keywords
+        subject_keywords = await get_subject_news_keywords(qdrant)
+    except Exception as exc:
+        logger.warning("news_harness: subject keyword fetch failed: %s", exc)
 
-    rss_items,     rss_err     = await rss_task
-    grok_items,    grok_err    = await grok_task
-    browser_items, browser_err = await browser_task
+    # ── 2. Parallel fetch — RSS, default-topic browser search, and (if any
+    #      high-level Subjects have search_keywords) a second Subject-bound
+    #      browser search. Grok dropped (see module docstring).
+    tasks = [
+        asyncio.create_task(_fetch_rss(nanobot)),
+        asyncio.create_task(_fetch_browser(nanobot, topics)),
+    ]
+    if subject_keywords:
+        tasks.append(asyncio.create_task(_fetch_browser(nanobot, subject_keywords, source_tag="browser_subjects")))
+
+    results = await asyncio.gather(*tasks)
+    rss_items,     rss_err     = results[0]
+    browser_items, browser_err = results[1]
+    subject_items,  subject_err = results[2] if len(results) > 2 else ([], None)
 
     sources_ok     = []
     sources_failed = []
@@ -296,17 +275,18 @@ async def run_news_brief(cog, nanobot, qdrant, user_input: str = "") -> dict:
     else:
         sources_failed.append(f"rss: {rss_err}")
 
-    if grok_err is None:
-        sources_ok.append("grok")
-    else:
-        sources_failed.append(f"grok: {grok_err}")
-
     if browser_err is None:
         sources_ok.append("browser")
     else:
         sources_failed.append(f"browser: {browser_err}")
 
-    all_items = rss_items + grok_items + browser_items
+    if subject_keywords:
+        if subject_err is None:
+            sources_ok.append("browser_subjects")
+        else:
+            sources_failed.append(f"browser_subjects: {subject_err}")
+
+    all_items = rss_items + browser_items + subject_items
 
     if not all_items:
         asyncio.create_task(_write_episodic(qdrant, sources_ok, sources_failed, 0, 0))
