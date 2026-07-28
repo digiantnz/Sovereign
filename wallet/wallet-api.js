@@ -27,6 +27,7 @@ const watcher   = require('./wallet-watcher');
 const harnessA2A       = require('./wallet-harness-a2a');
 const harnessPortfolio = require('./wallet-harness-portfolio');
 const harnessLightning = require('./wallet-harness-lightning');
+const harnessCrypto    = require('./wallet-harness-crypto');
 
 const app  = express();
 app.use(express.json());
@@ -77,6 +78,7 @@ async function _startup() {
   // 4. Register harnesses
   watcher.registerHarness(harnessA2A.handle);
   watcher.registerHarness(harnessPortfolio.handle);
+  watcher.registerHarness(harnessCrypto.handle);
 
   // 5. Start background tasks
   watchlist.startPolling();

@@ -287,14 +287,19 @@ app.all('/:methodPath(*)', async (req, res) => {
 
     // GET /system/gpu — nvidia-smi via nsenter+su (NVML only works for uid≥1000 with open kernel module)
     if (req.method === 'GET' && fullPath === '/system/gpu') {
+      // temperature.memory (GDDR6X junction temp) queried but not included below — confirmed
+      // N/A on this consumer RTX 3090/driver combo (that field is HBM-only per nvidia-smi's own
+      // help text, not GDDR6X). Nearest available proxy for the FULLCHIP_RESET thermal theory:
+      // clocks_event_reasons.hw_thermal_slowdown (current bool) + its cumulative-microseconds
+      // counter — HW slowdown only engages under genuine thermal stress. 2026-07-05.
       const r = await spawnRun('/usr/bin/nsenter', [
         '-t', '1', '-m', '-p', '--',
         '/bin/su', '-s', '/bin/sh', 'matt', '-c',
-        'nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu,power.draw --format=csv,noheader,nounits',
+        'nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,utilization.memory,temperature.gpu,power.draw,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons_counters.hw_thermal_slowdown --format=csv,noheader,nounits',
       ], 10000);
       const line = (r.stdout || '').trim().split('\n').find(l => l.trim());
       if (!line) return res.json({ error: r.stderr || 'no nvidia-smi output' });
-      const [name, mem_used, mem_total, gpu_util, mem_util, temp, power] = line.split(',').map(s => s.trim());
+      const [name, mem_used, mem_total, gpu_util, mem_util, temp, power, hw_thermal_active, hw_thermal_us] = line.split(',').map(s => s.trim());
       return res.json({
         gpu_name:        name,
         vram_used_mb:    parseInt(mem_used, 10)  || 0,
@@ -303,6 +308,8 @@ app.all('/:methodPath(*)', async (req, res) => {
         mem_utilization: parseInt(mem_util, 10)  || 0,
         temperature_c:   parseInt(temp, 10)      || 0,
         power_w:         parseFloat(power)       || 0,
+        hw_thermal_slowdown_active: hw_thermal_active === 'Active',
+        hw_thermal_slowdown_s:      Math.round((parseInt(hw_thermal_us, 10) || 0) / 1e6),
       });
     }
 
@@ -398,6 +405,89 @@ app.all('/:methodPath(*)', async (req, res) => {
       } catch (e) {
         return res.json({ status: 'ok', path: reqPath, type: 'file', size: stat.size, binary: true,
           note: 'file appears to be binary — text decode failed' });
+      }
+    }
+
+    // GET /system/validators — Ethereum validator status via local Nimbus beacon API
+    if (req.method === 'GET' && fullPath === '/system/validators') {
+      let cfg;
+      try {
+        cfg = JSON.parse(fs.readFileSync('/app/validators.json', 'utf8'));
+      } catch (e) {
+        return res.status(503).json({ error: 'validators.json not found — add indices to broker config' });
+      }
+      const { beacon_url, validator_indices, node_address } = cfg;
+      if (!validator_indices || validator_indices.length === 0) {
+        return res.json({ status: 'ok', validators: [], count: 0, node_address });
+      }
+      try {
+        const idParam = validator_indices.join(',');
+        const beaconRes = await fetch(`${beacon_url}/eth/v1/beacon/states/head/validators?id=${idParam}`);
+        if (!beaconRes.ok) {
+          return res.status(502).json({ error: `Beacon API error: ${beaconRes.status}` });
+        }
+        const beaconData = await beaconRes.json();
+        const validators = (beaconData.data || []).map(v => ({
+          index:   parseInt(v.index, 10),
+          status:  v.status,
+          balance: parseFloat((parseInt(v.balance, 10) / 1e9).toFixed(6)),
+          pubkey:  v.validator.pubkey,
+          effective_balance: parseFloat((parseInt(v.validator.effective_balance, 10) / 1e9).toFixed(0)),
+        })).sort((a, b) => a.index - b.index);
+
+        const active    = validators.filter(v => v.status === 'active_ongoing').length;
+        const offline   = validators.filter(v => !v.status.startsWith('active')).length;
+        const totalEth  = validators.reduce((s, v) => s + v.balance, 0);
+
+        return res.json({
+          status: 'ok',
+          node_address,
+          count: validators.length,
+          summary: {
+            active_ongoing: active,
+            offline_or_other: offline,
+            total_balance_eth: parseFloat(totalEth.toFixed(4)),
+          },
+          validators,
+        });
+      } catch (e) {
+        return res.status(502).json({ error: `Beacon fetch failed: ${e.message}`, beacon_url });
+      }
+    }
+
+    // GET /system/validators/sync — beacon + execution client sync status
+    if (req.method === 'GET' && fullPath === '/system/validators/sync') {
+      let cfg;
+      try {
+        cfg = JSON.parse(fs.readFileSync('/app/validators.json', 'utf8'));
+      } catch (e) {
+        return res.status(503).json({ error: 'validators.json not found' });
+      }
+      try {
+        const [clRes, elRes] = await Promise.all([
+          fetch(`${cfg.beacon_url}/eth/v1/node/syncing`),
+          fetch(`http://172.16.201.2:8545`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_syncing', params: [], id: 1 }),
+          }),
+        ]);
+        const clData = await clRes.json();
+        const elData = await elRes.json();
+        return res.json({
+          status: 'ok',
+          consensus: {
+            syncing:      clData.data?.is_syncing ?? null,
+            head_slot:    parseInt(clData.data?.head_slot || '0', 10),
+            sync_distance: parseInt(clData.data?.sync_distance || '0', 10),
+            el_offline:   clData.data?.el_offline ?? null,
+          },
+          execution: {
+            syncing: elData.result === false ? false : elData.result,
+          },
+        });
+      } catch (e) {
+        return res.status(502).json({ error: `Sync fetch failed: ${e.message}` });
       }
     }
 

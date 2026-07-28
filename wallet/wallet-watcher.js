@@ -139,6 +139,7 @@ function _buildEthEvent(chain, tx, matchedAddress, label, blockNumber) {
     timestamp:    new Date().toISOString(),
     block_number: blockNumber,
     label:        label || matchedAddress.slice(0, 10) + '…',
+    direction:    (tx.to || '').toLowerCase() === matchedAddress.toLowerCase() ? 'incoming' : 'outgoing',
   };
 }
 
@@ -271,6 +272,11 @@ async function _pollBtc(state) {
           timestamp:    blockTime,
           block_number: bn,
           label:        labels.get(addr) || addr.slice(0, 10) + '…',
+          // BTC detection only scans tx outputs (vout) against watched addresses —
+          // it cannot see a watched address spending (vin) with the current RPC
+          // approach, so every event this loop can ever produce is incoming by
+          // construction. Same limitation on the Python eth_watcher.py BTC side.
+          direction:    'incoming',
         });
       }
     }

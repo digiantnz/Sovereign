@@ -174,6 +174,20 @@ class BrokerAdapter:
             r.raise_for_status()
             return r.json()
 
+    async def get_validators(self) -> dict:
+        """Ethereum validator status for known indices via local Nimbus beacon API."""
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(f"{BROKER_URL}/system/validators", headers={"X-Trust-Level": "low"})
+            r.raise_for_status()
+            return r.json()
+
+    async def get_validator_sync(self) -> dict:
+        """Beacon + execution client sync status for the staking node."""
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(f"{BROKER_URL}/system/validators/sync", headers={"X-Trust-Level": "low"})
+            r.raise_for_status()
+            return r.json()
+
     async def exec_command(
         self,
         command_name: str,

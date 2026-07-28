@@ -55,7 +55,11 @@ async function _emitToSovereignCore(event) {
     params:  {
       skill:     'wallet',
       operation: 'payment_confirmed',
-      payload:   event,
+      // credit_a2a flags this event for /wallet_event's CoinGecko + a2a-browser
+      // credit-dispatch section — that pipeline is specific to confirmed-payment
+      // crediting (Safe/invoice flow) and must not fire for generic wallet
+      // activity (see wallet-harness-crypto.js, which deliberately omits this).
+      payload:   { ...event, credit_a2a: true },
     },
   });
   const res = await fetch(`${SOVEREIGN_URL}/wallet_event`, {
