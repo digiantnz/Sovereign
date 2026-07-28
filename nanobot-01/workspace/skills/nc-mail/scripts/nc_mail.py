@@ -53,6 +53,27 @@ _ACCOUNT_IDS = {"business": 1, "personal": 2}
 # Falls back to API discovery if not in cache.
 _INBOX_CACHE = {1: 1, 2: 19}
 
+# nc-db direct read access (2026-07-06) — see cmd_search()'s docstring for why.
+# Same MYSQL_* creds nc-db's own container already uses; already present in
+# nanobot-01's env (Nextcloud's compose env_file), no new credential plumbing.
+_DB_HOST = os.environ.get("NC_DB_HOST", "nc-db")
+_DB_USER = os.environ.get("MYSQL_USER", "")
+_DB_PASS = os.environ.get("MYSQL_PASSWORD", "")
+_DB_NAME = os.environ.get("MYSQL_DATABASE", "")
+
+
+def _db_conn():
+    """Read-only connection to Nextcloud's own MariaDB — direct access to the
+    already-synced oc_mail_messages/oc_mail_recipients cache tables. This
+    process NEVER writes to this connection; every mutating mail operation
+    (delete/move/mark/send) still goes through the official Mail REST API
+    exclusively — this is a read-side-only optimization for search."""
+    import pymysql
+    return pymysql.connect(
+        host=_DB_HOST, user=_DB_USER, password=_DB_PASS, database=_DB_NAME,
+        connect_timeout=10, read_timeout=15, cursorclass=pymysql.cursors.DictCursor,
+    )
+
 
 def _auth():
     return HTTPBasicAuth(_NC_USER, _NC_PASS)
@@ -270,6 +291,236 @@ def cmd_list_unread(args):
             break
 
     _ok({"messages": messages, "count": len(messages), "account_id": account_id})
+
+
+def cmd_search(args):
+    """Real mailbox search — queries Nextcloud's own oc_mail_messages/
+    oc_mail_recipients cache tables directly (read-only) instead of the Mail
+    REST API's /messages endpoint.
+
+    Root cause this replaces (2026-07-06): "search" was previously routed
+    through list_unread with a client-side filter, which only ever looks at
+    the most recent 10 (business) or 30 (personal, when filtering) messages —
+    fetched via a REST endpoint that's genuinely slow (measured live: ~25s for
+    50 messages, ~68s for 100, and hard-capped at 100 server-side regardless
+    of requested limit). A search for anything older than that tiny recent
+    window always silently returned "not found," confident and wrong, rather
+    than erroring — worse than no answer at all.
+
+    The DB tables underneath are the SAME data the Nextcloud web UI already
+    reads when you browse mailboxes in the browser (that's why browsing feels
+    instant — it's reading this cache too, not live IMAP). Querying it
+    directly here: 45ms measured for a full-mailbox search (167 messages,
+    business INBOX) vs 25-70s+ through the REST endpoint, and no artificial
+    depth limit — a real search of the whole synced mailbox, not just
+    whatever happened to sync most recently.
+
+    Recursive across folders (2026-07-06 — Director: "it is actually in the
+    archive folder so the search would have to be recursive"): searches every
+    mailbox for the account, not just INBOX — Nextcloud shards Archive by year
+    (INBOX.Archive.2021 .. .2026, confirmed live), so an INBOX-only search
+    misses anything the Director has ever archived. Trash/Junk/spam excluded
+    by default (special_use) — noise, not a real search target; Sent/Drafts/
+    Archive/INBOX all included.
+
+    Read-only, always — every mutating operation (delete/move/mark/send)
+    still goes exclusively through the official Mail REST API. This is a
+    read-side-only optimization, not a new write path.
+    """
+    account_id = _account_id(args.account)
+    query = (args.filter or "").strip()
+    limit = max(1, min(args.limit or 20, 200))
+
+    try:
+        conn = _db_conn()
+    except Exception as exc:
+        _err(f"search: could not reach nc-db: {exc}")
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, special_use FROM oc_mail_mailboxes WHERE account_id = %s",
+                (account_id,),
+            )
+            mailboxes = cur.fetchall()
+            search_ids = [
+                mb["id"] for mb in mailboxes
+                if not any(noise in (mb.get("special_use") or "").lower()
+                           for noise in ("trash", "junk"))
+            ]
+            mailbox_names = {mb["id"]: mb["name"] for mb in mailboxes}
+            if not search_ids:
+                _err(f"No mailboxes found for account {args.account!r}")
+                return
+
+            placeholders = ",".join(["%s"] * len(search_ids))
+            if query:
+                # subject is utf8mb4_bin (case-SENSITIVE collation) — LOWER() on both
+                # sides for a normal case-insensitive search; "Grok" would otherwise
+                # never match a lowercase query string. Join key is message_id, NOT
+                # local_message_id (that column is for local/draft messages only —
+                # confirmed empirically: it's NULL on every synced IMAP message).
+                like = f"%{query.lower()}%"
+                cur.execute(
+                    f"""
+                    SELECT m.id AS databaseId, m.mailbox_id, m.subject, m.sent_at, m.flag_seen,
+                           (SELECT r.email FROM oc_mail_recipients r
+                            WHERE r.message_id = m.id AND r.type = 0 LIMIT 1) AS from_addr
+                    FROM oc_mail_messages m
+                    WHERE m.mailbox_id IN ({placeholders})
+                      AND (LOWER(m.subject) LIKE %s OR EXISTS (
+                          SELECT 1 FROM oc_mail_recipients r2
+                          WHERE r2.message_id = m.id AND r2.type = 0 AND LOWER(r2.email) LIKE %s
+                      ))
+                    ORDER BY m.sent_at DESC
+                    LIMIT %s
+                    """,
+                    (*search_ids, like, like, limit),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT m.id AS databaseId, m.mailbox_id, m.subject, m.sent_at, m.flag_seen,
+                           (SELECT r.email FROM oc_mail_recipients r
+                            WHERE r.message_id = m.id AND r.type = 0 LIMIT 1) AS from_addr
+                    FROM oc_mail_messages m
+                    WHERE m.mailbox_id IN ({placeholders})
+                    ORDER BY m.sent_at DESC
+                    LIMIT %s
+                    """,
+                    (*search_ids, limit),
+                )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    messages = [
+        {
+            "databaseId": row["databaseId"],
+            "from":       row.get("from_addr") or "unknown",
+            "subject":    row.get("subject", ""),
+            "date":       _fmt_date(row.get("sent_at")),
+            "seen":       bool(row.get("flag_seen")),
+            "folder":     mailbox_names.get(row["mailbox_id"], ""),
+        }
+        for row in rows
+    ]
+    _ok({"messages": messages, "count": len(messages), "account_id": account_id})
+
+
+def _manifest_path(account_id):
+    return f"/tmp/nc_mail_manifest_{account_id}.json"
+
+
+def cmd_build_manifest(args):
+    """Fetch unread headers once, validate, write a session manifest. Consolidated
+    from the dormant email-harness skill (2026-07-03) — same three-phase pattern
+    (build once -> list/search off the manifest, zero extra API calls -> per-item
+    ops), rebuilt against nc-mail's actual backend (Nextcloud Mail REST API,
+    databaseId) rather than email-harness's separate raw-IMAP/uid implementation,
+    which is deleted rather than kept as a second code path (no dupes)."""
+    account_id = _account_id(args.account)
+    inbox_id = _get_inbox_id(account_id)
+    if not inbox_id:
+        _err(f"Could not find INBOX for account {args.account!r}")
+    _sync_account(account_id)
+    fetch_limit = min(args.limit, 50)
+    try:
+        r = requests.get(
+            f"{_MAIL_API}/messages",
+            params={"mailboxId": inbox_id, "limit": fetch_limit},
+            auth=_auth(), headers=_hdr(), timeout=57,
+        )
+    except requests.exceptions.Timeout:
+        _err(f"{args.account} inbox timed out building manifest — try again in a moment")
+        return
+    if r.status_code != 200:
+        _err(f"build_manifest HTTP {r.status_code}: {r.text[:200]}")
+
+    msgs_raw = r.json()
+    if not isinstance(msgs_raw, list):
+        msgs_raw = []
+
+    entries = []
+    for msg in msgs_raw:
+        db_id = msg.get("databaseId")
+        from_str = _from_str(msg.get("from", []))
+        subject = msg.get("subject", "")
+        # Validation gate: every entry needs databaseId/from/subject/date before
+        # it's trusted for later per-item ops (see SKILL.md gate table).
+        if db_id is None or not from_str:
+            continue
+        seen = bool(msg.get("flags", {}).get("seen"))
+        entries.append({
+            "databaseId":   db_id,
+            "from":         from_str,
+            "subject":      subject,
+            "date":         _fmt_date(msg.get("dateInt")),
+            "seen":         seen,
+            "status":       "read" if seen else "unread",
+            "action_taken": None,
+        })
+
+    manifest = {
+        "account_id": account_id,
+        "built_at":   datetime.now(timezone.utc).isoformat(),
+        "entries":    entries,
+    }
+    with open(_manifest_path(account_id), "w") as f:
+        json.dump(manifest, f)
+    _ok({"built_at": manifest["built_at"], "count": len(entries)})
+
+
+def cmd_list_manifest(args):
+    """Return current manifest entries with status. No API call — reads the
+    session manifest file only; safe to call repeatedly at zero cost."""
+    account_id = _account_id(args.account)
+    path = _manifest_path(account_id)
+    if not os.path.exists(path):
+        _err(f"No manifest built for account {args.account!r} — run build_manifest first")
+        return
+    with open(path) as f:
+        manifest = json.load(f)
+    entries = manifest.get("entries", [])
+    _ok({"built_at": manifest.get("built_at"), "count": len(entries), "entries": entries})
+
+
+def cmd_search_manifest(args):
+    """In-RAM filter by keyword (--filter, matched against subject)/sender
+    (--from_addr)/status (--status). No API call — safe to call repeatedly."""
+    account_id = _account_id(args.account)
+    path = _manifest_path(account_id)
+    if not os.path.exists(path):
+        _err(f"No manifest built for account {args.account!r} — run build_manifest first")
+        return
+    with open(path) as f:
+        manifest = json.load(f)
+    entries = manifest.get("entries", [])
+
+    kw = (args.filter or "").lower()
+    sender = (args.from_addr or "").lower()
+    status = (args.status or "").lower()
+    filtered = []
+    for e in entries:
+        if kw and kw not in e.get("subject", "").lower():
+            continue
+        if sender and sender not in e.get("from", "").lower():
+            continue
+        if status and e.get("status", "").lower() != status:
+            continue
+        filtered.append(e)
+    _ok({"count": len(filtered), "entries": filtered})
+
+
+def cmd_clear_manifest(args):
+    """Delete the session manifest file for an account. No side effects on
+    the mailbox itself — purely local session-state cleanup."""
+    account_id = _account_id(args.account)
+    path = _manifest_path(account_id)
+    if os.path.exists(path):
+        os.remove(path)
+    _ok({"message": f"manifest cleared for account {args.account!r}"})
 
 
 def cmd_fetch_message(args):
@@ -550,6 +801,7 @@ def cmd_list_accounts(_args):
 
 _COMMANDS = {
     "list_unread":     cmd_list_unread,
+    "search":          cmd_search,
     "fetch_message":   cmd_fetch_message,
     "delete_message":  cmd_delete_message,
     "move_message":    cmd_move_message,
@@ -558,6 +810,10 @@ _COMMANDS = {
     "send":            cmd_send,
     "list_mailboxes":  cmd_list_mailboxes,
     "list_accounts":   cmd_list_accounts,
+    "build_manifest":  cmd_build_manifest,
+    "list_manifest":   cmd_list_manifest,
+    "search_manifest": cmd_search_manifest,
+    "clear_manifest":  cmd_clear_manifest,
 }
 
 
@@ -575,6 +831,7 @@ def main():
     p.add_argument("--to",          default="",         help="Recipient for send: 'Name <email>' or plain email")
     p.add_argument("--body",        default="",         help="Plain-text email body for send")
     p.add_argument("--cc",          default="",         help="CC address for send (currently unused)")
+    p.add_argument("--status",      default="",         help="unread/read/actioned filter for search_manifest")
     args = p.parse_args()
 
     # Normalise boolean string → bool
