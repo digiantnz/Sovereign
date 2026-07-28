@@ -1,0 +1,54 @@
+{
+  "_meta": {
+    "version": "1.0",
+    "created": "2026-07-05",
+    "description": "Shadow evaluation corpus for _distil_query() (cognition/engine.py) — the CPU-hosted (ollama-distil) query distillation step used by general_lookup/browser-search/specialist_outbound, NOT the main cognitive loop. Distinct from corpus.json (PASS 1/3a/4 routing/classification for candidate PRIMARY models) — that harness tests a different, much harder skill (intent classification, governance-tier judgment, structured JSON) and is not a valid stand-in for evaluating a distillation-helper model. This corpus tests only: query compression, context-folding, and graceful behavior when no context is present.",
+    "prompt_source": "Templates copied verbatim from cognition/engine.py _distil_query()'s _target_prompts dict — keep in sync if that function's wording changes.",
+    "schema_notes": {
+      "target": "Which _distil_query() target template this case exercises: search | fast_llm | grok | claude",
+      "context_window": "Simulates the 'Recent context: ...' snippet _distil_query() injects when context_window is non-empty. null = no context (tests the no-context edge case).",
+      "known_failure_patterns": "Literal substrings that must NOT appear in the response — a model emitting these has leaked the prompt's own instruction text instead of writing a clean paraphrase. Found live 2026-07-05: qwen2.5:3b-instruct-q4_K_M reproducibly (3/3 runs) output things like 'Is it any good at Recent_context?' on the no-context fast_llm case.",
+      "must_fold_in": "For context-fold cases, a substring that must appear in the response, confirming the model actually used the injected context rather than ignoring it.",
+      "known_failure_patterns_fabrication": "Second failure category, found 2026-07-05 during the phi4-mini/llama3.2:3b vs llama3.1:8b comparison — smaller models confidently invented a specific fake entity (a city, a venue) to fill a no-context gap instead of staying generic, e.g. phi4-mini producing 'Seattle'/'Brooklyn' pizza queries and llama3.2:3b inventing 'Tokyo Stadium', when nothing in the input or context named any of these. Worse than a template-leak — it's a confident wrong answer, not an obviously-broken artifact. llama3.1:8b did not exhibit this in the same test round. Per-case entries below list the specific fabrications actually observed so a regression to the exact same hallucination is caught automatically; this list is NOT exhaustive (can't pattern-match arbitrary invented entities generically) — still requires reading new models' raw output, not just running the automated check."
+    }
+  },
+  "cases": [
+    {
+      "id": "DISTIL-1",
+      "target": "search",
+      "description": "Search query compression, no context available",
+      "context_window": null,
+      "input_text": "what's the best pizza place around here",
+      "known_failure_patterns": ["Recent context", "Recent_context", "recent_context", "[context]", "seattle", "brooklyn"],
+      "notes": "No location to fold in here — 'here' stays unresolved. Not itself a failure; just checks the model doesn't invent a fake location or leak template text. 'seattle'/'brooklyn' added 2026-07-05 — both observed as phi4-mini fabrications on this exact case (2 of 3 runs); the honest answer is to leave the location unresolved ('near me'), not invent one."
+    },
+    {
+      "id": "DISTIL-2",
+      "target": "search",
+      "description": "Search query compression, with a location to fold in from context",
+      "context_window": "I'm visiting Wellington this week for a conference",
+      "input_text": "what's the best pizza place around here",
+      "must_fold_in": "wellington",
+      "known_failure_patterns": ["Recent context", "Recent_context", "recent_context"],
+      "notes": "The core context-carry-forward test — this is the exact bug class the 2026-07-02 query-distillation context fix targeted."
+    },
+    {
+      "id": "DISTIL-3",
+      "target": "fast_llm",
+      "description": "Self-contained question rewrite, no context available",
+      "context_window": null,
+      "input_text": "is it any good",
+      "known_failure_patterns": ["Recent context", "Recent_context", "recent_context", "the conversation", "context above", "tokyo stadium"],
+      "notes": "The case that actually broke qwen2.5:3b — the prompt's own conditional instruction ('if Recent context above names...') has nothing to bind to when context_window is empty, and a weak model can hallucinate a literal placeholder instead of falling back to a generic paraphrase. This is NOT a contrived edge case — real _distil_query() calls hit this whenever there's no relevant prior entity, which is common. 'tokyo stadium' added 2026-07-05 — observed llama3.2:3b fabrication on this exact case (invented a venue with zero basis in the input)."
+    },
+    {
+      "id": "DISTIL-4",
+      "target": "grok",
+      "description": "Current-events question rewrite, vague input, no context",
+      "context_window": null,
+      "input_text": "how's it doing today",
+      "known_failure_patterns": ["Recent context", "Recent_context", "recent_context", "the conversation"],
+      "notes": "Vague input with no real topic — acceptable for the model to guess a plausible generic topic (e.g. markets), not acceptable to leak template artifacts. Open finding 2026-07-05: ALL THREE models tested (llama3.1:8b, phi4-mini, llama3.2:3b) invented a specific fake company/topic here (Apple, Tesla, 'emerging economies' respectively) — this looks like a flaw in _distil_query()'s own 'grok' prompt template (explicitly asks for a 'focused, specific question' even when the input gives nothing to be specific about), not a model-differentiating issue. Not scored as a per-model failure since it's shared across every model tested; flagged separately as a prompt-design fix for _distil_query() itself."
+    }
+  ]
+}

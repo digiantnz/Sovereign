@@ -1,0 +1,689 @@
+{
+  "_meta": {
+    "version": "1.0",
+    "created": "2026-06-19",
+    "description": "Shadow evaluation corpus for PASS 1 routing, PASS 3a skill payloads, and PASS 4 structured output. Derived from as-built.md regression entries: NC-T1–T12, NC-Notes T1–T6, NC-Mail T-M1–T-M7, UAT-S1, Scheduler-TZ-Fix, routing-fixes-jun18.",
+    "schema_notes": {
+      "pass": "Which cognitive pass the LLM output is evaluated against (1=classify, 3a=specialist_outbound, 4=orchestrator_evaluate)",
+      "expected_json_schema": "Required top-level keys in the LLM JSON response, with accepted_values where constrained",
+      "routing_source": "How this intent is expected to be reached: quick_classify (deterministic shortcut) or llm_pass1 (LLM decision)",
+      "tolerance": "strict = exact match required; prefix = startswith match; contains = substring match"
+    }
+  },
+  "cases": [
+    {
+      "id": "NC-T1",
+      "pass": 1,
+      "source": "NC-E2E T1",
+      "description": "File listing — Nextcloud root",
+      "input_text": "list my nextcloud files",
+      "expected_intent": "list_files",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["list_files", "ncfs_list", "ncfs_list_recursive"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Fast-path via _list_kw. Both list_files (legacy webdav) and ncfs_list (newer ncfs skill) are valid. target defaults to '/'."
+    },
+    {
+      "id": "NC-T2",
+      "pass": 1,
+      "source": "NC-E2E T2",
+      "description": "File listing — subdirectory",
+      "input_text": "list the files in /Notes/",
+      "expected_intent": "list_files",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["list_files", "ncfs_list", "ncfs_list_recursive"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Path present in input; target should capture /Notes/. Both list_files and ncfs_list are valid routing choices."
+    },
+    {
+      "id": "NC-T4",
+      "pass": 1,
+      "source": "NC-E2E T4",
+      "description": "File read",
+      "input_text": "read the file /Notes/todo.md",
+      "expected_intent": "read_file",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["read_file", "ncfs_read"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Either read_file or ncfs_read is acceptable. Target must be /Notes/todo.md."
+    },
+    {
+      "id": "NC-T7",
+      "pass": 1,
+      "source": "NC-E2E T7",
+      "description": "File write — requires MID confirmation",
+      "input_text": "write a file to /Notes/test.md with the content: Hello world",
+      "expected_intent": "write_file",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "MID",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["write_file"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["MID"]}
+      },
+      "notes": "_write_kw triggers via 'write'. Requires requires_confirmation in governance output."
+    },
+    {
+      "id": "NC-T9",
+      "pass": 1,
+      "source": "NC-E2E T9",
+      "description": "File delete — requires HIGH double confirmation",
+      "input_text": "delete the file /Notes/old.md",
+      "expected_intent": "delete_file",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "HIGH",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["delete_file"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["HIGH"]}
+      },
+      "notes": "_file_delete_kw fast-path. Must not fall through to intent=query. requires_double_confirmation expected."
+    },
+    {
+      "id": "NC-NOTES-T1",
+      "pass": 1,
+      "source": "NC-Notes T1",
+      "description": "List notes",
+      "input_text": "list notes",
+      "expected_intent": "list_notes",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["list_notes"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Should return 17 notes as numbered list with IDs. Must NOT route to list_files."
+    },
+    {
+      "id": "NC-NOTES-T2",
+      "pass": 1,
+      "source": "NC-Notes T2",
+      "description": "Read note by ID",
+      "input_text": "read note 1478",
+      "expected_intent": "read_note",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["read_note"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Fast-path regex extracts 1478 as target. target field must contain '1478'."
+    },
+    {
+      "id": "NC-NOTES-T3",
+      "pass": 1,
+      "source": "NC-Notes T3/T4",
+      "description": "Create note — requires MID confirmation",
+      "input_text": "create a note titled NC-Notes test",
+      "expected_intent": "create_note",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "MID",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["create_note"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["MID"]}
+      },
+      "notes": "Must NOT route to write_file (notes keywords removed from _write_kw). Title 'NC-Notes test' in target."
+    },
+    {
+      "id": "NC-NOTES-T5",
+      "pass": 1,
+      "source": "NC-Notes T5 / UAT-S1",
+      "description": "Delete note — MID tier (changed from HIGH in UAT-S1)",
+      "input_text": "delete the NC-Notes test note",
+      "expected_intent": "delete_note",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "MID",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["delete_note"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["MID"]}
+      },
+      "notes": "delete_note tier is MID (not HIGH — notes are not critical state). Title extracted as target."
+    },
+    {
+      "id": "NC-NOTES-T6",
+      "pass": 1,
+      "source": "NC-Notes T6",
+      "description": "Update note by ID — requires MID confirmation",
+      "input_text": "update note 1478 title to NextCloud API Updated",
+      "expected_intent": "update_note",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "MID",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["update_note"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["MID"]}
+      },
+      "notes": "Fast-path regex extracts note ID 1478. target must contain '1478'."
+    },
+    {
+      "id": "NC-MAIL-T-M1",
+      "pass": 1,
+      "source": "NC-Mail T-M1",
+      "description": "List unread business emails",
+      "input_text": "list my unread business emails",
+      "expected_intent": "fetch_email",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["fetch_email", "list_inbox"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Should set account=business in delegation. execution_confirmed should be true after EXEC."
+    },
+    {
+      "id": "NC-MAIL-T-M2",
+      "pass": 1,
+      "source": "NC-Mail T-M2",
+      "description": "List unread personal emails",
+      "input_text": "list unread personal emails",
+      "expected_intent": "fetch_email",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["fetch_email", "list_inbox"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Personal inbox has 57s graceful timeout — result should be status:ok with a note."
+    },
+    {
+      "id": "NC-MAIL-T-M3",
+      "pass": 1,
+      "source": "NC-Mail T-M3",
+      "description": "Fetch specific email by databaseId",
+      "input_text": "fetch email 3256",
+      "expected_intent": "fetch_message",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["fetch_message"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Deterministic databaseId extraction from input. target must contain '3256'."
+    },
+    {
+      "id": "NC-MAIL-T-M5",
+      "pass": 1,
+      "source": "NC-Mail T-M5",
+      "description": "Delete email — HIGH tier",
+      "input_text": "delete email 3230",
+      "expected_intent": "delete_email",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "HIGH",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["delete_email"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["HIGH"]}
+      },
+      "notes": "databaseId 3230 extracted. Outcome should be 'Email 3230 was deleted.' with execution_confirmed:true."
+    },
+    {
+      "id": "NC-MAIL-T-M6",
+      "pass": 1,
+      "source": "NC-Mail T-M6",
+      "description": "Move email to archive — MID tier",
+      "input_text": "move email 3319 to archive",
+      "expected_intent": "move_email",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "MID",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["move_email"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["MID"]}
+      },
+      "notes": "databaseId 3319 extracted. Expected outcome: 'Email 3319 was moved.'"
+    },
+    {
+      "id": "NC-MAIL-T-M7",
+      "pass": 1,
+      "source": "NC-Mail T-M7",
+      "description": "Send email — MID tier",
+      "input_text": "send email to test@digiant.co.nz subject Test body Hello",
+      "expected_intent": "send_email",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "MID",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["send_email"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["MID"]}
+      },
+      "notes": "to/subject/body extracted deterministically in _quick_classify. MID requires confirmation."
+    },
+    {
+      "id": "UAT-S1-WEATHER",
+      "pass": 1,
+      "source": "UAT-S1",
+      "description": "Weather query — skill invocation via query",
+      "input_text": "what's the weather like in Auckland today",
+      "expected_intent": "query",
+      "expected_delegate_to": "research_agent",
+      "expected_tier": "LOW",
+      "routing_source": "llm_pass1",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["query", "web_search"]},
+        "delegate_to": {"accepted_values": ["research_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Weather queries use web_search or query intent. Acceptable either way — web_search preferred for live data."
+    },
+    {
+      "id": "UAT-S1-DOCKER",
+      "pass": 1,
+      "source": "UAT-S1 / standard devops",
+      "description": "List running containers",
+      "input_text": "show me the running containers",
+      "expected_intent": "list_containers",
+      "expected_delegate_to": "devops_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["list_containers"]},
+        "delegate_to": {"accepted_values": ["devops_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Docker ps path. Should not route to get_stats or get_logs."
+    },
+    {
+      "id": "SCHED-TZ-LIST",
+      "pass": 1,
+      "source": "Scheduler-TZ-Fix",
+      "description": "List scheduled tasks",
+      "input_text": "show me my scheduled tasks",
+      "expected_intent": "list_tasks",
+      "expected_delegate_to": "devops_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["list_tasks"]},
+        "delegate_to": {"accepted_values": ["devops_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Scheduler keywords must be checked BEFORE conversational guard. Should NOT route to list_nc_tasks."
+    },
+    {
+      "id": "SCHED-TZ-NC-TASKS",
+      "pass": 1,
+      "source": "Routing fix 2026-06-18 (PASS 4 incident)",
+      "description": "List Nextcloud tasks — must not go to scheduler",
+      "input_text": "show me my nextcloud tasks",
+      "expected_intent": "list_nc_tasks",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "LOW",
+      "routing_source": "llm_pass1",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["list_nc_tasks"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "Key disambiguation case. 'nextcloud' qualifier must steer away from list_tasks (scheduler) to list_nc_tasks (caldav)."
+    },
+    {
+      "id": "ROUTE-SPACEX-NEWS",
+      "pass": 1,
+      "source": "routing-fixes-jun18 Fix A",
+      "description": "SpaceX IPO news — must route to web_search not news_brief",
+      "input_text": "get me a summary on the latest news on SpaceX IPO",
+      "expected_intent": "web_search",
+      "expected_delegate_to": "research_agent",
+      "expected_tier": "LOW",
+      "routing_source": "llm_pass1",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["web_search", "research_gather"]},
+        "delegate_to": {"accepted_values": ["research_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "After Fix A: 'latest news' removed from _news_kw. Live-data signal beats 'summarise' verb (Fix E). Must NOT return intent=news_brief."
+    },
+    {
+      "id": "ROUTE-NEGATION-GUARD",
+      "pass": 1,
+      "source": "routing-fixes-jun18 Fix B",
+      "description": "Negation guard — 'you didn't ask Gemini' must not route to Gemini",
+      "input_text": "you didn't ask Gemini about that, you used local Ollama",
+      "expected_intent": "query",
+      "expected_delegate_to": "research_agent",
+      "expected_tier": "LOW",
+      "routing_source": "llm_pass1",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["query"]},
+        "delegate_to": {"accepted_values": ["research_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "_NEGATION_RE fires before _XPROV_RE. preferred_provider must NOT be 'gemini'."
+    },
+    {
+      "id": "ROUTE-MORNING-NEWS",
+      "pass": 1,
+      "source": "News-Harness / morning brief pattern",
+      "description": "Morning news — routes to news_brief (not web_search)",
+      "input_text": "what's in the news this morning",
+      "expected_intent": "news_brief",
+      "expected_delegate_to": "research_agent",
+      "expected_tier": "LOW",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["news_brief"]},
+        "delegate_to": {"accepted_values": ["research_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "After Fix A: bare 'news this morning' still in _news_kw. Generic brief, no topic. Must be news_brief."
+    },
+    {
+      "id": "ROUTE-CALENDAR-CREATE",
+      "pass": 1,
+      "source": "CalDAV routing / director-fact-capture",
+      "description": "Create calendar event — MID tier",
+      "input_text": "create an event for a team meeting tomorrow at 10am",
+      "expected_intent": "create_event",
+      "expected_delegate_to": "business_agent",
+      "expected_tier": "MID",
+      "routing_source": "quick_classify",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["create_event"]},
+        "delegate_to": {"accepted_values": ["business_agent"]},
+        "tier": {"accepted_values": ["MID"]}
+      },
+      "notes": "Calendar fast-path in _quick_classify. Always routes to business_agent, never CEO LLM path."
+    },
+    {
+      "id": "ROUTE-QUERY-CONVERSATIONAL",
+      "pass": 1,
+      "source": "routing-fixes-jun18 Fix D / conversational guard",
+      "description": "General knowledge query — local Ollama",
+      "input_text": "what is the capital of France",
+      "expected_intent": "query",
+      "expected_delegate_to": "research_agent",
+      "expected_tier": "LOW",
+      "routing_source": "llm_pass1",
+      "expected_json_schema": {
+        "intent": {"accepted_values": ["query"]},
+        "delegate_to": {"accepted_values": ["research_agent"]},
+        "tier": {"accepted_values": ["LOW"]}
+      },
+      "notes": "After Fix D: conversational guard returns None (not intent=query directly), falls through to PASS 1 LLM. preferred_provider should be local."
+    },
+    {
+      "id": "PASS3A-EMAIL-LIST",
+      "pass": "3a",
+      "source": "NC-Mail T-M1",
+      "description": "PASS 3a: Email list — specialist must produce correct operation and account fields",
+      "input_text": "list my unread business emails",
+      "delegation": {
+        "intent": "fetch_email",
+        "delegate_to": "business_agent",
+        "tier": "LOW",
+        "target": "business"
+      },
+      "expected_json_schema": {
+        "operation": {
+          "accepted_values": ["list_unread", "fetch_unread", "fetch_unread_personal"],
+          "tolerance": "contains",
+          "note": "Must NOT be fetch_unread_personal for business account"
+        },
+        "account": {"accepted_values": ["business"]}
+      },
+      "notes": "Specialist must output operation and account. account=business inferred from input. No databaseId needed for list."
+    },
+    {
+      "id": "PASS3A-EMAIL-FETCH-BY-ID",
+      "pass": "3a",
+      "source": "NC-Mail T-M3",
+      "description": "PASS 3a: Fetch specific email — databaseId must be preserved",
+      "input_text": "fetch email 3256",
+      "delegation": {
+        "intent": "fetch_message",
+        "delegate_to": "business_agent",
+        "tier": "LOW",
+        "target": "3256"
+      },
+      "expected_json_schema": {
+        "operation": {
+          "accepted_values": ["fetch_message", "fetch_message_personal"],
+          "tolerance": "contains"
+        },
+        "databaseId": {
+          "type": "integer_or_string",
+          "value": "3256",
+          "tolerance": "contains"
+        }
+      },
+      "notes": "databaseId 3256 must appear in payload. from_addr optional but acceptable."
+    },
+    {
+      "id": "PASS3A-EMAIL-SEND",
+      "pass": "3a",
+      "source": "NC-Mail T-M7",
+      "description": "PASS 3a: Send email — to/subject/body all required",
+      "input_text": "send email to test@digiant.co.nz subject Test body Hello",
+      "delegation": {
+        "intent": "send_email",
+        "delegate_to": "business_agent",
+        "tier": "MID",
+        "target": "test@digiant.co.nz"
+      },
+      "expected_json_schema": {
+        "operation": {"accepted_values": ["send", "send_personal", "nc_send"]},
+        "to": {"tolerance": "contains", "value": "test@digiant.co.nz"},
+        "subject": {"tolerance": "contains", "value": "Test"},
+        "body": {"tolerance": "contains", "value": "Hello"}
+      },
+      "notes": "All three fields (to/subject/body) extracted by _quick_classify deterministically. Specialist must preserve them."
+    },
+    {
+      "id": "PASS3A-CALENDAR-CREATE",
+      "pass": "3a",
+      "source": "CalDAV routing",
+      "description": "PASS 3a: Create calendar event — ISO datetime fields required",
+      "input_text": "create an event for a team meeting tomorrow at 10am",
+      "delegation": {
+        "intent": "create_event",
+        "delegate_to": "business_agent",
+        "tier": "MID"
+      },
+      "expected_json_schema": {
+        "operation": {"accepted_values": ["caldav_create_event"]},
+        "summary": {"tolerance": "contains", "value": "team meeting"},
+        "start": {"pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$"},
+        "end": {"pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$"},
+        "calendar": {"accepted_values": ["personal"]}
+      },
+      "notes": "start/end must be ISO 8601 YYYY-MM-DDTHH:MM:SS. 'tomorrow at 10am' relative date must be resolved to absolute. calendar=personal is default."
+    },
+    {
+      "id": "PASS3A-NOTE-CREATE",
+      "pass": "3a",
+      "source": "NC-Notes T3",
+      "description": "PASS 3a: Create note — title field required",
+      "input_text": "create a note titled NC-Notes test",
+      "delegation": {
+        "intent": "create_note",
+        "delegate_to": "business_agent",
+        "tier": "MID"
+      },
+      "expected_json_schema": {
+        "operation": {
+          "accepted_values": ["notes_create", "create_note"],
+          "tolerance": "contains"
+        },
+        "title": {"tolerance": "contains", "value": "NC-Notes test"}
+      },
+      "notes": "Title must propagate from input to payload. content optional."
+    },
+    {
+      "id": "PASS4-SUCCESS-NC-TASKS",
+      "pass": 4,
+      "source": "Routing fix 2026-06-18 / PASS 4 incident",
+      "description": "PASS 4: Successful list_nc_tasks — result_for_translator must mirror specialist success",
+      "input_text": "show me my nextcloud tasks",
+      "intent": "list_nc_tasks",
+      "tier": "LOW",
+      "specialist_inbound_result": {
+        "success": true,
+        "outcome": "Retrieved 4 Nextcloud tasks.",
+        "detail": {
+          "tasks": [
+            {"id": "1", "title": "Review invoices", "status": "needs-action"},
+            {"id": "2", "title": "Update portfolio", "status": "needs-action"},
+            {"id": "3", "title": "Call accountant", "status": "needs-action"},
+            {"id": "4", "title": "Buy groceries", "status": "needs-action"}
+          ]
+        },
+        "error": null
+      },
+      "expected_json_schema": {
+        "approved": {"accepted_values": [true]},
+        "result_for_translator": {
+          "success": {"accepted_values": [true]},
+          "outcome": {"tolerance": "non_empty"}
+        }
+      },
+      "notes": "This is the exact regression case. PASS 4 LLM truncation caused success:false default to fire. Fixed 2026-06-18: defaults now use specialist_inbound_result. result_for_translator.success must be true when specialist.success is true."
+    },
+    {
+      "id": "PASS4-SUCCESS-EMAIL-LIST",
+      "pass": 4,
+      "source": "NC-Mail T-M1",
+      "description": "PASS 4: Successful email list — LOW tier gate skips check 1",
+      "input_text": "list my unread business emails",
+      "intent": "fetch_email",
+      "tier": "LOW",
+      "specialist_inbound_result": {
+        "success": true,
+        "outcome": "Found 3 unread business emails.",
+        "detail": {
+          "emails": [
+            {"databaseId": 3270, "from": "supplier@example.com", "subject": "Invoice #1234"},
+            {"databaseId": 3271, "from": "client@example.com", "subject": "Meeting request"},
+            {"databaseId": 3272, "from": "newsletter@example.com", "subject": "Weekly digest"}
+          ]
+        },
+        "error": null
+      },
+      "expected_json_schema": {
+        "approved": {"accepted_values": [true]},
+        "memory_action": {"accepted_values": ["none", "store"]},
+        "result_for_translator": {
+          "success": {"accepted_values": [true]},
+          "outcome": {"tolerance": "non_empty"}
+        }
+      },
+      "notes": "LOW tier gate: approved must be true unless governance concern. TIER GATE in prompt skips intent-match check."
+    },
+    {
+      "id": "PASS4-FAILURE-PROPAGATION",
+      "pass": 4,
+      "source": "PASS 4 iron rule",
+      "description": "PASS 4: Failed specialist — success must propagate as false (never fabricate success)",
+      "input_text": "delete the file /Notes/old.md",
+      "intent": "delete_file",
+      "tier": "HIGH",
+      "specialist_inbound_result": {
+        "success": false,
+        "outcome": "File delete failed: resource not found.",
+        "detail": {"path": "/Notes/old.md", "http_status": 404},
+        "error": "HTTP 404 Not Found"
+      },
+      "expected_json_schema": {
+        "approved": {"accepted_values": [true]},
+        "result_for_translator": {
+          "success": {"accepted_values": [false]},
+          "error": {"tolerance": "non_empty"}
+        }
+      },
+      "notes": "IRON RULE: If specialist.success=false, result_for_translator.success must be false. Never fabricate success."
+    },
+    {
+      "id": "PASS4-MEMORY-STORE",
+      "pass": 4,
+      "source": "PASS 4 memory decision path",
+      "description": "PASS 4: Research result — should trigger memory_action=store",
+      "input_text": "search the web for NZ residential power prices",
+      "intent": "web_search",
+      "tier": "LOW",
+      "specialist_inbound_result": {
+        "success": true,
+        "outcome": "Found current NZ power pricing: average 29c/kWh for residential. Meridian and Contact are the largest retailers.",
+        "detail": {
+          "sources": ["https://www.energywise.govt.nz/", "https://www.ea.govt.nz/"],
+          "query": "NZ residential power prices 2026"
+        },
+        "error": null
+      },
+      "expected_json_schema": {
+        "approved": {"accepted_values": [true]},
+        "memory_action": {"accepted_values": ["store", "update"]},
+        "result_for_translator": {
+          "success": {"accepted_values": [true]},
+          "outcome": {"tolerance": "non_empty"}
+        }
+      },
+      "notes": "Web search results with factual content should trigger memory_action=store or update. memory_payload must include collection and lesson."
+    },
+    {
+      "id": "PASS4-SCHEMA-VALIDITY",
+      "pass": 4,
+      "source": "JSON schema validity test",
+      "description": "PASS 4: Structural test — all required top-level keys must be present",
+      "input_text": "list my nextcloud files",
+      "intent": "list_files",
+      "tier": "LOW",
+      "specialist_inbound_result": {
+        "success": true,
+        "outcome": "Listed 12 files in /.",
+        "detail": {"files": ["/Notes/", "/Photos/", "/Documents/"]},
+        "error": null
+      },
+      "expected_json_schema": {
+        "approved": {"required": true},
+        "feedback": {"required": true, "nullable": true},
+        "memory_action": {"required": true, "accepted_values": ["none", "store", "update", "flag_gap"]},
+        "memory_payload": {"required": true, "nullable": true},
+        "result_for_translator": {
+          "required": true,
+          "fields": {
+            "success": {"required": true},
+            "outcome": {"required": true},
+            "detail": {"required": true},
+            "error": {"required": true, "nullable": true},
+            "next_action": {"required": true, "nullable": true}
+          }
+        }
+      },
+      "notes": "Primary schema validity test. All 5 top-level keys required. result_for_translator must have all 5 sub-fields. This case directly tests whether json.loads succeeds on first attempt (json_repair_rate metric)."
+    }
+  ]
+}
