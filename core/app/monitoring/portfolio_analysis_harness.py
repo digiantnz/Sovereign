@@ -27,7 +27,7 @@ import httpx
 from monitoring.research_harness import (
     _gather_browser,
     _gather_finance,
-    _gather_grok,
+    _gather_groq_news_synthesis,
     _gather_technicals,
     _no_td,
     _classify_domain_scope,
@@ -466,6 +466,152 @@ def _calculate_concentration_flags(specs: list, portfolio_targets: dict) -> list
 
 # ── Category resolution ────────────────────────────────────────────────────────
 
+# Director-agreed staged exit plan (2026-07-08) for specific pre-redesign
+# holdings — consulted by _evaluate_signals()/run_portfolio_watcher_scan() when
+# building a SWAP_CANDIDATE's suggested swap size, which must reflect this
+# agreed plan rather than a generic full-rebalance-to-target calculation.
+# Keyed by exact statement holding name (not ticker/slug, to match AssetSpec
+# construction directly in _resolve_retirement_from_statements()).
+_STAGED_EXIT_PLAN: dict[str, dict] = {
+    "Global X Artificial Intelligence & Technology ETF": {
+        "disposition": "full_exit",
+        "note": "Agreed full exit (may already be done manually in Sharesies).",
+    },
+    "Rocket Lab USA Inc": {
+        "disposition": "staged_25pct",
+        "note": "Agreed staged exit — 25% per swap, not a full rebalance to target.",
+    },
+    "Milford Aggressive Fund": {
+        "disposition": "staged_25pct",
+        "note": "Agreed staged exit — 25% per swap, not a full rebalance to target.",
+    },
+    "Infratil": {
+        "disposition": "staged_25pct",
+        "note": "Agreed staged exit — 25% per swap, not a full rebalance to target.",
+    },
+}
+
+
+async def _resolve_retirement_from_statements(qdrant) -> dict:
+    """retirement-fund.md replacement (2026-07-08) — builds AssetSpecs from
+    ingested Sharesies statements + the target_allocation record instead of
+    parsing a Nextcloud ledger file. Mirrors resolve_category()'s "ok" return
+    contract exactly so every existing consumer (deep analysis, weekly watcher,
+    concentration flags) works unchanged.
+
+    Holdings not matched to any target_allocation entry (legacy/pre-redesign
+    positions still held) get specs with no asset_group/target — they still
+    get scanned for RSI/MACD signals, just never fire DRIFT_ALERT/SWAP_CANDIDATE
+    since there's no band to compare against. extra["locked"]=True on every
+    spec — KiwiSaver, no cash exit, only internal swaps (see _evaluate_signals()).
+    """
+    from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+    from config import cfg as _cfg
+
+    points, _ = await qdrant.archive_client.scroll(
+        collection_name="semantic",
+        scroll_filter=Filter(must=[
+            FieldCondition(key="domain", match=MatchValue(value="portfolio")),
+            FieldCondition(key="subject", match=MatchValue(value="retirement")),
+        ]),
+        limit=100, with_payload=True,
+    )
+    statements = [p.payload for p in points if p.payload.get("document_type")]
+    target_point = next(
+        (p.payload for p in points if (p.payload.get("_key") or "").endswith(":target_allocation")),
+        None,
+    )
+    if not statements:
+        return {
+            "status": "not_configured",
+            "message": "No Sharesies statements ingested yet — run /portfolio ingest first.",
+        }
+
+    # Dedupe by period_end — an annual and a quarterly statement can share the
+    # same date (KiwiSaver year-end); prefer annual, it's the richer breakdown.
+    by_period: dict[str, dict] = {}
+    for s in statements:
+        pe = s.get("period_end")
+        if pe not in by_period or s.get("document_type") == "annual":
+            by_period[pe] = s
+    ordered = sorted(by_period.values(), key=lambda s: s["period_end"])
+    latest = ordered[-1]
+    prior  = ordered[-2] if len(ordered) >= 2 else None
+    prior_by_name = {h["name"]: h for h in (prior.get("holdings", []) if prior else [])}
+
+    target_by_name: dict[str, dict] = {}
+    if target_point:
+        for h in target_point.get("holdings", []):
+            target_by_name[h["name"]] = h
+        for h in target_point.get("planned", []):
+            target_by_name[h["name"]] = h
+
+    specs: list[AssetSpec] = []
+    portfolio_targets: dict = {}
+    for h in latest.get("holdings", []):
+        name   = h["name"]
+        ticker = _cfg.portfolio_tickers.get(name)
+        target = target_by_name.get(name)
+        raw_slug = ticker or name
+        slug = re.sub(r"[^a-z0-9]+", "_", raw_slug.lower()).strip("_")
+
+        prior_h     = prior_by_name.get(name)
+        prior_value = prior_h["value_nzd"] if prior_h else None
+
+        asset_type = "fund" if ticker is None else ((target or {}).get("type") or "equity")
+        extra = {"locked": True, "ticker": ticker}
+        if prior_value is not None:
+            extra["prior_value_nzd"] = prior_value
+        staged = _STAGED_EXIT_PLAN.get(name)
+        if staged:
+            extra["staged_exit"] = staged
+
+        if target and target.get("slug"):
+            extra["asset_group"] = target["slug"]
+            portfolio_targets[target["slug"]] = {
+                "target_weight_pct":        target.get("target_pct") or 0,
+                "rebalance_band_lower_pct": target.get("rebalance_band_lower_pct") or 0,
+                "rebalance_band_upper_pct": target.get("rebalance_band_upper_pct") or 100,
+            }
+        elif staged:
+            # Staged-exit position with no real target-allocation entry — a
+            # near-zero synthetic target/band so it keeps surfacing every scan
+            # until it's actually wound down, rather than falling through the
+            # cracks just because the redesign didn't give it a target %.
+            extra["asset_group"] = slug
+            portfolio_targets[slug] = {
+                "target_weight_pct": 0, "rebalance_band_lower_pct": 0,
+                "rebalance_band_upper_pct": 0.01,
+            }
+
+        specs.append(AssetSpec(
+            slug=slug, display_name=name, asset_type=asset_type,
+            balance=0.0, value_nzd=h["value_nzd"], cost_basis_nzd=0.0,
+            weight_pct=h.get("allocation_pct") or 0.0,
+            extra=extra,
+        ))
+
+    total_value = sum(s.value_nzd for s in specs)
+
+    subject_context = None
+    try:
+        from cognition.subjects import get_subject
+        subject_context = await get_subject(qdrant, "retirement")
+    except Exception as exc:
+        logger.warning("_resolve_retirement_from_statements: subject context fetch failed: %s", exc)
+
+    return {
+        "status":               "ok",
+        "specs":                specs,
+        "total_value_nzd":      total_value,
+        # Cost basis not available from statements — see portfolio_statement_ingest.py.
+        "total_cost_basis_nzd": 0.0,
+        "portfolio_targets":    portfolio_targets,
+        "watchlist":            [],
+        "subject_context":      subject_context,
+    }
+
+
 async def resolve_category(nanobot, slug: str, qdrant, sov_wallet_url: str) -> dict:
     """Resolve a category slug → list[AssetSpec] with live prices injected.
 
@@ -475,6 +621,13 @@ async def resolve_category(nanobot, slug: str, qdrant, sov_wallet_url: str) -> d
       {"status": "empty", "message": "..."}
       {"status": "pending", "message": "..."}
     """
+    if slug == "retirement-fund":
+        # retirement-fund.md archived 2026-07-08 (Director-directed portfolio
+        # redesign) — canonical data now comes from Sharesies statement ingestion
+        # (semantic:portfolio:sharesies:* in Qdrant), not a Nextcloud ledger file.
+        # See monitoring/portfolio_statement_ingest.py.
+        return await _resolve_retirement_from_statements(qdrant)
+
     content = await _fetch_ledger(nanobot, slug)
     if content is None:
         return {
@@ -863,15 +1016,16 @@ async def _gather_one(nanobot, cog, spec: AssetSpec) -> dict:
             "td":             td,
         }
 
+    _grok_source_label = "groq_news_synthesis"
     if atype == "fund":
         provider = spec.extra.get("provider", "")
         browser_query = f"{provider} {spec.display_name} performance {date.today().year}"
-        grok_query = f"Market context and outlook for {spec.display_name} ({spec.extra.get('asset_group', 'managed fund')}) for a NZ investor"
         finance_url = None  # no ticker for managed funds
 
-        browser_coro = _gather_browser(nanobot, browser_query)
-        grok_coro    = _gather_grok(cog, grok_query)
-        browser_res, grok_res = await asyncio.gather(browser_coro, grok_coro, return_exceptions=True)
+        browser_res = await _gather_browser(nanobot, browser_query)
+        # Grok dropped (deprecated live search) — groq synthesis grounded in the
+        # real browser_res content just fetched, same fix as the crypto path.
+        grok_res = await _gather_groq_news_synthesis(cog, spec.display_name, browser_res[0])
         finance_res = ("", None)
 
     elif atype == "property":
@@ -881,16 +1035,11 @@ async def _gather_one(nanobot, cog, spec: AssetSpec) -> dict:
             f"{suburb} {city} property market {date.today().year}",
             f"{suburb} {city} comparable sales {date.today().year}",
         ]
-        grok_query = f"NZ property market conditions and outlook for {city} in {date.today().year}"
 
         browser_coros   = [_gather_browser(nanobot, q) for q in browser_queries]
-        grok_coro       = _gather_grok(cog, grok_query)
-        browser_results, grok_res = await asyncio.gather(
-            asyncio.gather(*browser_coros, return_exceptions=True),
-            grok_coro,
-            return_exceptions=True,
-        )
-        browser_res = _merge_browser_results(browser_results if not isinstance(browser_results, Exception) else [])
+        browser_results = await asyncio.gather(*browser_coros, return_exceptions=True)
+        browser_res     = _merge_browser_results(browser_results)
+        grok_res = await _gather_groq_news_synthesis(cog, f"{suburb} {city} property market", browser_res[0])
         finance_res = ("", None)
 
     else:  # crypto
@@ -903,13 +1052,22 @@ async def _gather_one(nanobot, cog, spec: AssetSpec) -> dict:
 
         browser_coro  = _gather_browser(nanobot, browser_query)
         finance_coro  = _gather_finance(nanobot, finance_url) if finance_url else _null_gather()
-        grok_coro     = _gather_grok(cog, spec.display_name)
-        browser_res, finance_res, grok_res, td = await asyncio.gather(
-            browser_coro, finance_coro, grok_coro, _gather_technicals(spec.slug),
+        browser_res, finance_res, td = await asyncio.gather(
+            browser_coro, finance_coro, _gather_technicals(spec.slug),
             return_exceptions=True,
         )
         if isinstance(td, Exception):
             td = _no_td(spec.slug)
+        # Grok's live web search was deprecated by xAI (2026-06-30) — asking it
+        # directly for "market sentiment" answers from stale training knowledge
+        # (observed citing the ETH PoS merge as an upcoming catalyst; it happened
+        # in 2022). Synthesise via Groq over the real browser_res content instead —
+        # free, content_synthesis-routed, actually grounded in what was just fetched.
+        _browser_text_for_synth = (
+            browser_res[0] if not isinstance(browser_res, Exception) and isinstance(browser_res, tuple) else ""
+        )
+        grok_res = await _gather_groq_news_synthesis(cog, spec.display_name, _browser_text_for_synth)
+        _grok_source_label = "groq_news_synthesis"
 
     browser_text = browser_res[0] if not isinstance(browser_res, Exception) and isinstance(browser_res, tuple) else ""
     browser_err  = browser_res[1] if not isinstance(browser_res, Exception) and isinstance(browser_res, tuple) else (str(browser_res) if isinstance(browser_res, Exception) else "")
@@ -926,7 +1084,7 @@ async def _gather_one(nanobot, cog, spec: AssetSpec) -> dict:
     if browser_text: sources_ok.append("browser")
     elif browser_err: sources_failed.append(f"browser: {browser_err}")
     if finance_text: sources_ok.append("yahoo_finance")
-    if grok_text:    sources_ok.append("grok")
+    if grok_text:    sources_ok.append(_grok_source_label)
     if td.data_available: sources_ok.append("technicals")
 
     sections = []
@@ -1120,9 +1278,18 @@ def _extract_json_verdict(raw: str) -> dict:
 
 
 async def _synthesise_security(cog, spec: AssetSpec, gather_result: dict,
-                               concentration_flags: list | None = None) -> dict:
+                               concentration_flags: list | None = None,
+                               qdrant=None) -> dict:
     """Per-security synthesis. Crypto assets use the 6-agent security_analysis_engine;
     fund and property assets use the existing single-call path.
+
+    qdrant: optional — enables per-asset Subject context lookup via the canonical
+    find_relevant_subjects() triage (embed + Qdrant vector search, no hardcoded
+    ticker map — same mechanism PASS 1 routing/email/RSS scoring already use),
+    injected into security_analysis_engine() as additive background (mirrors the
+    existing portfolio-level Subject injection in _synthesise_overall()). Works for
+    any asset with a semantically close Subject, not just crypto_btc/crypto_eth —
+    no code change needed if a crypto_sol or similar Subject is created later.
     """
     from adapters.inference_queue import InferenceQueue
 
@@ -1191,6 +1358,17 @@ async def _synthesise_security(cog, spec: AssetSpec, gather_result: dict,
             finance=gather_result.get("finance_text", ""),
             grok=gather_result.get("grok_text", ""),
         )
+        subject_context = None
+        if qdrant is not None:
+            try:
+                from cognition.subjects import find_relevant_subjects
+                ticker = spec.extra.get("ticker") or spec.slug
+                query_text = f"{spec.display_name} ({ticker}) cryptocurrency market direction analysis"
+                hits = await find_relevant_subjects(qdrant, query_text, threshold=0.72, limit=1)
+                if hits:
+                    subject_context = hits[0]
+            except Exception as exc:
+                logger.warning("_synthesise_security: subject triage failed for %r: %s", spec.slug, exc)
         try:
             eng = await security_analysis_engine(
                 cog=cog,
@@ -1200,6 +1378,7 @@ async def _synthesise_security(cog, spec: AssetSpec, gather_result: dict,
                 asset_spec=spec,
                 td=gather_result.get("td"),
                 concentration_flags=concentration_flags or [],
+                subject_context=subject_context,
             )
         except Exception as exc:
             logger.error("portfolio_harness: security_analysis_engine failed for %s: %s", spec.slug, exc)
@@ -2546,7 +2725,7 @@ async def _run_analysis_task(cog, nanobot, qdrant, category: str, slug: str, sov
         for spec in specs:
             synth = await _synthesise_security(
                 cog, spec, gather_by_slug.get(spec.slug, {}),
-                concentration_flags=concentration_flags,
+                concentration_flags=concentration_flags, qdrant=qdrant,
             )
             per_security[spec.slug] = synth
 
@@ -2572,10 +2751,10 @@ async def _run_analysis_task(cog, nanobot, qdrant, category: str, slug: str, sov
         # Cognition Engine hand-off — Phase 11 (2026-07-03). The portfolio
         # publishes unconditionally, every run — it doesn't pre-check whether
         # something looks gap-worthy itself; that decision is the Cognition
-        # Engine's, made inside observe_for_subject() (cognition/campaigns.py),
+        # Engine's, made inside observe_for_subject() (cognition/thoughts.py),
         # not duplicated here. This harness stays ignorant of what a "gap" is.
         if subject_context and subject_context.get("subject"):
-            from cognition.campaigns import observe_for_subject
+            from cognition.thoughts import observe_for_subject
             observation = (
                 f"{overall.get('executive_summary', '')} "
                 f"Key risk: {overall.get('key_risk', '')} "
@@ -2736,11 +2915,29 @@ def _evaluate_signals(spec: AssetSpec, technicals, portfolio_targets: dict) -> l
     """Deterministic signal evaluation for the weekly watcher. No LLM.
 
     Returns list of fired signal dicts. Empty list = clean week for this asset.
-    Five signal types: STRONG_BUY, BUY, SELL_ALERT, CAUTION, DRIFT_ALERT.
+    RSI/MACD-driven (STRONG_BUY, BUY, CAUTION, and the overbought half of
+    SELL_ALERT/SWAP_CANDIDATE) need live technicals and are skipped without
+    them. DRIFT_ALERT and the allocation-band half of SELL_ALERT/SWAP_CANDIDATE
+    are allocation-only and always evaluated — a managed fund with no exchange
+    ticker (e.g. Milford Aggressive) still has a weight to compare against its
+    target band, and previously fell through a blanket "no technicals -> no
+    signals at all" early return that silently muted every allocation signal
+    for every untickered holding. Fixed 2026-07-08 alongside the SWAP_CANDIDATE
+    rework below.
+
+    spec.extra["locked"] (KiwiSaver — no cash exit, only internal swaps between
+    holdings) fires SWAP_CANDIDATE where a freely-tradeable asset (crypto)
+    fires SELL_ALERT — same underlying conditions, different vocabulary because
+    the available action is genuinely different. A spec.extra["staged_exit"]
+    entry (Director-agreed wind-down plan, 2026-07-08 — see _STAGED_EXIT_PLAN)
+    overrides the normal overweight/overbought gate entirely: these positions
+    fire SWAP_CANDIDATE every scan while any balance remains, since the
+    Director has already decided they should be trimmed — the watcher's job
+    here is to keep surfacing it until done, not to re-litigate market timing.
     """
     signals: list[dict] = []
-    if not technicals or not technicals.data_available:
-        return signals
+    locked = bool((spec.extra or {}).get("locked"))
+    staged = (spec.extra or {}).get("staged_exit")
 
     group = _get_asset_group(spec, portfolio_targets)
     group_targets = portfolio_targets.get(group) or {}
@@ -2748,46 +2945,84 @@ def _evaluate_signals(spec: AssetSpec, technicals, portfolio_targets: dict) -> l
     band_lower = float(group_targets.get("rebalance_band_lower_pct", 0) or 0)
     target_pct = float(group_targets.get("target_weight_pct", 0) or 0)
 
-    # STRONG_BUY — monthly RSI < 30 (historically rare)
-    if technicals.monthly_rsi is not None and technicals.monthly_rsi < 30:
-        signals.append({
-            "name": "STRONG_BUY",
-            "description": f"Monthly RSI {technicals.monthly_rsi:.1f} — historically rare strong buy signal",
-            "severity": "high",
-        })
-    elif (technicals.weekly_rsi is not None and technicals.weekly_rsi < 35
-          and technicals.macd_signal_type == "bullish_crossover"):
-        # BUY — weekly RSI oversold + bullish MACD crossover
-        signals.append({
-            "name": "BUY",
-            "description": f"Weekly RSI {technicals.weekly_rsi:.1f} oversold with bullish MACD crossover",
-            "severity": "medium",
-        })
+    have_technicals = bool(technicals and technicals.data_available)
 
-    # SELL_ALERT — weekly RSI > 75 while position is overweight
-    if (technicals.weekly_rsi is not None and technicals.weekly_rsi > 75
-            and spec.weight_pct > band_upper and band_upper < 100):
+    if have_technicals:
+        # STRONG_BUY — monthly RSI < 30 (historically rare)
+        if technicals.monthly_rsi is not None and technicals.monthly_rsi < 30:
+            signals.append({
+                "name": "STRONG_BUY",
+                "description": f"Monthly RSI {technicals.monthly_rsi:.1f} — historically rare strong buy signal",
+                "severity": "high",
+            })
+        elif (technicals.weekly_rsi is not None and technicals.weekly_rsi < 35
+              and technicals.macd_signal_type == "bullish_crossover"):
+            # BUY — weekly RSI oversold + bullish MACD crossover
+            signals.append({
+                "name": "BUY",
+                "description": f"Weekly RSI {technicals.weekly_rsi:.1f} oversold with bullish MACD crossover",
+                "severity": "medium",
+            })
+
+        # CAUTION — bearish MACD crossover on a significant position (>10% weight)
+        if technicals.macd_signal_type == "bearish_crossover" and spec.weight_pct > 10:
+            signals.append({
+                "name": "CAUTION",
+                "description": (
+                    f"Bearish MACD crossover on {spec.display_name} "
+                    f"({spec.weight_pct:.1f}% of portfolio)"
+                ),
+                "severity": "low",
+            })
+
+    if locked and staged and spec.value_nzd > 0:
+        # Director-agreed wind-down — fires unconditionally, see docstring.
         signals.append({
-            "name": "SELL_ALERT",
+            "name": "SWAP_CANDIDATE",
             "description": (
-                f"Weekly RSI {technicals.weekly_rsi:.1f} overbought while {spec.display_name} "
-                f"is overweight ({spec.weight_pct:.1f}% vs {band_upper:.0f}% upper band)"
+                f"{spec.display_name} — staged exit in progress "
+                f"({staged['disposition'].replace('_', ' ')}): {staged['note']}"
             ),
             "severity": "medium",
         })
+    else:
+        overweight = band_upper < 100 and spec.weight_pct > band_upper
+        overbought = have_technicals and technicals.weekly_rsi is not None and technicals.weekly_rsi > 75
+        prior_value = (spec.extra or {}).get("prior_value_nzd")
+        concentration_drift = bool(
+            prior_value and prior_value > 0 and spec.value_nzd > prior_value * 1.5
+        )
 
-    # CAUTION — bearish MACD crossover on a significant position (>10% weight)
-    if technicals.macd_signal_type == "bearish_crossover" and spec.weight_pct > 10:
-        signals.append({
-            "name": "CAUTION",
-            "description": (
-                f"Bearish MACD crossover on {spec.display_name} "
-                f"({spec.weight_pct:.1f}% of portfolio)"
-            ),
-            "severity": "low",
-        })
+        if locked:
+            # SWAP_CANDIDATE — overweight AND (overbought OR grown sharply since
+            # the prior statement). KiwiSaver: swap internally, no cash exit.
+            if overweight and (overbought or concentration_drift):
+                reasons = []
+                if overbought:
+                    reasons.append(f"RSI {technicals.weekly_rsi:.1f} overbought")
+                if concentration_drift:
+                    growth_pct = (spec.value_nzd / prior_value - 1) * 100
+                    reasons.append(f"grown {growth_pct:.0f}% since last statement")
+                signals.append({
+                    "name": "SWAP_CANDIDATE",
+                    "description": (
+                        f"{spec.display_name} at {spec.weight_pct:.1f}% of portfolio "
+                        f"(target {target_pct:.0f}%) — {', '.join(reasons)}"
+                    ),
+                    "severity": "medium",
+                })
+        elif overweight and overbought:
+            # SELL_ALERT — unchanged, freely-tradeable assets only (crypto).
+            signals.append({
+                "name": "SELL_ALERT",
+                "description": (
+                    f"Weekly RSI {technicals.weekly_rsi:.1f} overbought while {spec.display_name} "
+                    f"is overweight ({spec.weight_pct:.1f}% vs {band_upper:.0f}% upper band)"
+                ),
+                "severity": "medium",
+            })
 
-    # DRIFT_ALERT — weight >5% outside target band
+    # DRIFT_ALERT — weight >5pp outside target band (allocation-only).
     if target_pct and (spec.weight_pct > band_upper + 5 or spec.weight_pct < band_lower - 5):
         signals.append({
             "name": "DRIFT_ALERT",
@@ -2801,8 +3036,162 @@ def _evaluate_signals(spec: AssetSpec, technicals, portfolio_targets: dict) -> l
     return signals
 
 
-async def run_portfolio_watcher_scan(cog, nanobot, qdrant, sov_wallet_url: str) -> dict:
-    """Weekly deterministic RSI/MACD signal scan across all active crypto assets.
+def _evaluate_contribution_drift(specs: list) -> list[dict]:
+    """Portfolio-level check, once per retirement scan (not per-asset like
+    _evaluate_signals() above) — flags holdings outside the redesigned target
+    allocation (and not already on the staged-exit plan either) whose value
+    grew since the prior statement, as a proxy for "new contributions may
+    still be flowing to the old strategy, not the new one."
+
+    Real data limitation, not glossed over: Sharesies statements never break
+    down contributions per holding, only a portfolio-wide total (see
+    monitoring/portfolio_statement_ingest.py) — this infers from value growth,
+    which conflates genuine new contributions with plain market movement.
+    It's the honest signal available given what the statements actually
+    contain, not a precise contribution tracker.
+    """
+    drifted: list[dict] = []
+    for s in specs:
+        if (s.extra or {}).get("asset_group") is not None:
+            continue  # matched to a real target, or already on the staged-exit plan
+        prior = (s.extra or {}).get("prior_value_nzd")
+        if prior and prior > 0 and s.value_nzd > prior:
+            growth_pct = (s.value_nzd / prior - 1) * 100
+            drifted.append({
+                "name": "CONTRIBUTION_DRIFT",
+                "asset": s.slug,
+                "display_name": s.display_name,
+                "description": (
+                    f"{s.display_name} grew {growth_pct:.1f}% since last statement "
+                    f"but isn't in the new target allocation — check whether "
+                    f"contributions are still flowing to it"
+                ),
+                "severity": "low",
+            })
+    return drifted
+
+
+def _evaluate_ratio_signal(technicals) -> list[dict]:
+    """Deterministic ETH/BTC relative-value rotation check — separate from
+    _evaluate_signals()'s per-asset USD-based signals above. Rex holds both
+    ETH and BTC; this reads the ETH-BTC cross pair itself so a rotation
+    (not buy/sell) opportunity can be flagged on its own schedule, feeding
+    the crypto_revenue Subject's rotation-timing thesis (2026-07-07).
+
+    RSI here is read on the ratio, not either asset's own USD price: low RSI
+    means ETH is cheap relative to BTC (rotation candidate: BTC -> ETH),
+    high RSI means ETH is expensive relative to BTC (rotation candidate:
+    ETH -> BTC).
+    """
+    signals: list[dict] = []
+    if not technicals or not technicals.data_available:
+        return signals
+
+    if technicals.monthly_rsi is not None and technicals.monthly_rsi < 30:
+        signals.append({
+            "name": "ROTATE_INTO_ETH",
+            "description": f"Monthly ETH/BTC RSI {technicals.monthly_rsi:.1f} — ETH historically cheap vs BTC",
+            "severity": "high",
+        })
+    elif technicals.monthly_rsi is not None and technicals.monthly_rsi > 70:
+        signals.append({
+            "name": "ROTATE_INTO_BTC",
+            "description": f"Monthly ETH/BTC RSI {technicals.monthly_rsi:.1f} — ETH historically expensive vs BTC",
+            "severity": "high",
+        })
+    elif technicals.weekly_rsi is not None and technicals.weekly_rsi < 35:
+        signals.append({
+            "name": "ROTATE_INTO_ETH",
+            "description": f"Weekly ETH/BTC RSI {technicals.weekly_rsi:.1f} oversold — ETH cheap vs BTC",
+            "severity": "medium",
+        })
+    elif technicals.weekly_rsi is not None and technicals.weekly_rsi > 65:
+        signals.append({
+            "name": "ROTATE_INTO_BTC",
+            "description": f"Weekly ETH/BTC RSI {technicals.weekly_rsi:.1f} overbought — ETH expensive vs BTC",
+            "severity": "medium",
+        })
+
+    if technicals.macd_signal_type == "bullish_crossover":
+        signals.append({
+            "name": "MOMENTUM_TO_ETH",
+            "description": "Bullish MACD crossover on ETH/BTC — ETH gaining momentum vs BTC",
+            "severity": "low",
+        })
+    elif technicals.macd_signal_type == "bearish_crossover":
+        signals.append({
+            "name": "MOMENTUM_TO_BTC",
+            "description": "Bearish MACD crossover on ETH/BTC — BTC gaining momentum vs ETH",
+            "severity": "low",
+        })
+
+    return signals
+
+
+def _most_underweight_target(specs: list, portfolio_targets: dict, exclude_slug: str) -> str | None:
+    """Which real target-allocation holding is furthest below its own target
+    weight right now — the swap destination suggested in a SWAP_CANDIDATE
+    message. Excludes the firing holding itself and any synthetic staged-exit
+    "target" (target_weight_pct 0 — those aren't rebalancing destinations)."""
+    by_slug = {s.extra.get("asset_group"): s for s in specs if s.extra.get("asset_group")}
+    best_slug, best_gap = None, 0.0
+    for slug, targets in portfolio_targets.items():
+        if slug == exclude_slug or not targets.get("target_weight_pct"):
+            continue
+        spec = by_slug.get(slug)
+        current = spec.weight_pct if spec else 0.0
+        gap = targets["target_weight_pct"] - current  # positive = underweight
+        if gap > best_gap:
+            best_gap, best_slug = gap, slug
+    if best_slug is None:
+        return None
+    spec = by_slug.get(best_slug)
+    return spec.display_name if spec else best_slug
+
+
+def _format_swap_candidate_message(spec, portfolio_targets: dict, specs: list, total_value_nzd: float) -> str:
+    """Director-specified Option A/B format for a locked (KiwiSaver) swap
+    signal — a staged-exit position (spec.extra['staged_exit']) uses the
+    Director-agreed wind-down amount instead of a generic full-rebalance
+    calculation (2026-07-08 — Rex must not recompute a "correct" swap size
+    for these, the Director already decided it)."""
+    group = spec.extra.get("asset_group")
+    target_pct = float((portfolio_targets.get(group) or {}).get("target_weight_pct", 0) or 0)
+    destination = _most_underweight_target(specs, portfolio_targets, group) or "the most underweight target holding"
+
+    staged = spec.extra.get("staged_exit")
+    if staged:
+        header = (
+            f"🔄 SWAP_CANDIDATE — {spec.display_name} at {spec.weight_pct:.1f}% of portfolio "
+            f"(staged exit — {staged['disposition'].replace('_', ' ')})"
+        )
+    else:
+        header = (
+            f"🔄 SWAP_CANDIDATE — {spec.display_name} at {spec.weight_pct:.1f}% of portfolio "
+            f"(target: {target_pct:.0f}%)"
+        )
+    lines = [header]
+    if staged:
+        if staged["disposition"] == "full_exit":
+            lines.append(f"Option A: Full exit (agreed plan) — move ${spec.value_nzd:,.0f} → {destination}")
+        else:
+            trim_nzd = spec.value_nzd * 0.25
+            lines.append(f"Option A: Trim 25% (agreed staged plan) — move ${trim_nzd:,.0f} → {destination}")
+        lines.append("Option B: Custom amount — you choose the size and destination")
+        lines.append(f"({staged['note']})")
+    else:
+        excess_pct  = max(0.0, spec.weight_pct - target_pct)
+        excess_nzd  = excess_pct / 100.0 * total_value_nzd
+        partial_nzd = excess_nzd * 0.25
+        lines.append(f"Option A: Swap to target band — move ${excess_nzd:,.0f} → {destination}")
+        lines.append(f"Option B: Partial swap 25% of overweight — move ${partial_nzd:,.0f} → you choose destination")
+    return "\n".join(lines)
+
+
+async def run_portfolio_watcher_scan(cog, nanobot, qdrant, sov_wallet_url: str,
+                                      category: str = "crypto") -> dict:
+    """Weekly deterministic RSI/MACD signal scan across all active assets in
+    one category ("crypto" default, or "retirement" — Director, 2026-07-08).
 
     No LLM unless a signal fires. On signal: immediate Telegram alert + single-asset
     6-agent engine at LOW priority + auto-save to Notes. Clean week: episodic log only.
@@ -2810,17 +3199,73 @@ async def run_portfolio_watcher_scan(cog, nanobot, qdrant, sov_wallet_url: str) 
     today_str = date.today().isoformat()
     _sov_wallet_url = sov_wallet_url or "http://sov-wallet:3001"
 
-    resolve = await resolve_category(nanobot, "crypto", qdrant, _sov_wallet_url)
+    resolve = await resolve_category(nanobot, _resolve_slug(category), qdrant, _sov_wallet_url)
     if resolve["status"] != "ok":
         logger.warning("portfolio_watcher: resolve_category failed: %s", resolve.get("message"))
-        return {"status": "error", "message": resolve.get("message", "Could not resolve crypto portfolio")}
+        return {"status": "error", "message": resolve.get("message", f"Could not resolve {category} portfolio")}
 
     specs             = resolve["specs"]
     portfolio_targets = resolve.get("portfolio_targets", {})
+    total_value_nzd   = resolve.get("total_value_nzd", 0.0)
 
     _SKIP_GROUPS = {"stablecoin", "disposal", "utility", "closed", "eth_derivative"}
     signals_fired: list[dict] = []
     assets_scanned = 0
+
+    # ETH/BTC rotation check — crypto only, not tied to any single asset spec.
+    if category == "crypto":
+        try:
+            ratio_td = await _gather_technicals("eth_btc_ratio")
+        except Exception as exc:
+            logger.warning("portfolio_watcher: eth_btc_ratio technicals fetch failed: %s", exc)
+            ratio_td = _no_td("eth_btc_ratio")
+
+        ratio_signals = _evaluate_ratio_signal(ratio_td)
+
+        try:
+            await qdrant.store(
+                collection="episodic",
+                content=(
+                    f"Weekly watcher scan — ETH/BTC ratio on {today_str}: "
+                    f"RSI weekly={ratio_td.weekly_rsi}, monthly={ratio_td.monthly_rsi}, "
+                    f"MACD={ratio_td.macd_signal_type}, signals={[s['name'] for s in ratio_signals]}"
+                ),
+                metadata={
+                    "type":          "episodic",
+                    "event_type":    "weekly_watcher_scan",
+                    "asset":         "eth_btc_ratio",
+                    "weekly_rsi":    ratio_td.weekly_rsi,
+                    "monthly_rsi":   ratio_td.monthly_rsi,
+                    "macd_signal":   ratio_td.macd_signal_type,
+                    "signals_fired": [s["name"] for s in ratio_signals],
+                    "ts":            datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as exc:
+            logger.warning("portfolio_watcher: eth_btc_ratio episodic log failed: %s", exc)
+
+        if ratio_signals:
+            rsi_w_str = f"{ratio_td.weekly_rsi:.1f}" if ratio_td.weekly_rsi is not None else "N/A"
+            rsi_m_str = f"{ratio_td.monthly_rsi:.1f}" if ratio_td.monthly_rsi is not None else "N/A"
+            signal_descriptions = "\n".join(f"• {s['description']}" for s in ratio_signals)
+            await _notify_telegram(
+                f"⚡ ROTATION SIGNAL: ETH/BTC ratio — {' + '.join(s['name'] for s in ratio_signals)}\n"
+                f"RSI weekly: {rsi_w_str} | RSI monthly: {rsi_m_str}\n"
+                f"MACD: {ratio_td.macd_signal_type or 'N/A'}\n"
+                f"{signal_descriptions}"
+            )
+            signals_fired.append({"asset": "eth_btc_ratio", "signals": [s["name"] for s in ratio_signals]})
+
+    # Contribution-drift check — retirement only, portfolio-level (not per-asset).
+    if category == "retirement":
+        drift_signals = _evaluate_contribution_drift(specs)
+        if drift_signals:
+            descriptions = "\n".join(f"• {s['description']}" for s in drift_signals)
+            await _notify_telegram(f"📉 CONTRIBUTION_DRIFT\n{descriptions}")
+            signals_fired.append({
+                "asset": "contribution_drift",
+                "signals": [s["name"] for s in drift_signals],
+            })
 
     for spec in specs:
         if spec.extra.get("asset_group") in _SKIP_GROUPS:
@@ -2869,31 +3314,42 @@ async def run_portfolio_watcher_scan(cog, nanobot, qdrant, sov_wallet_url: str) 
         signal_names       = " + ".join(s["name"] for s in asset_signals)
         signal_descriptions = "\n".join(f"• {s['description']}" for s in asset_signals)
 
-        group = _get_asset_group(spec, portfolio_targets)
-        gt    = portfolio_targets.get(group) or {}
-        tgt   = float(gt.get("target_weight_pct", 0) or 0)
-        b_lo  = float(gt.get("rebalance_band_lower_pct", 0) or 0)
-        b_hi  = float(gt.get("rebalance_band_upper_pct", 100) or 100)
+        if any(s["name"] == "SWAP_CANDIDATE" for s in asset_signals):
+            # KiwiSaver — Option A/B swap framing (Director, 2026-07-08), not the
+            # generic RSI/target-band message below (which still applies as-is
+            # to crypto's SELL_ALERT and any other co-fired signal descriptions).
+            other = [s for s in asset_signals if s["name"] != "SWAP_CANDIDATE"]
+            msg = _format_swap_candidate_message(spec, portfolio_targets, specs, total_value_nzd)
+            if other:
+                msg += "\n\n" + "\n".join(f"• {s['description']}" for s in other)
+            msg += "\n\nRunning full analysis… (~10 min)"
+            await _notify_telegram(msg)
+        else:
+            group = _get_asset_group(spec, portfolio_targets)
+            gt    = portfolio_targets.get(group) or {}
+            tgt   = float(gt.get("target_weight_pct", 0) or 0)
+            b_lo  = float(gt.get("rebalance_band_lower_pct", 0) or 0)
+            b_hi  = float(gt.get("rebalance_band_upper_pct", 100) or 100)
 
-        rsi_w_str = f"{td.weekly_rsi:.1f}"  if td.weekly_rsi  is not None else "N/A"
-        rsi_m_str = f"{td.monthly_rsi:.1f}" if td.monthly_rsi is not None else "N/A"
+            rsi_w_str = f"{td.weekly_rsi:.1f}"  if td.weekly_rsi  is not None else "N/A"
+            rsi_m_str = f"{td.monthly_rsi:.1f}" if td.monthly_rsi is not None else "N/A"
 
-        await _notify_telegram(
-            f"⚡ SIGNAL: {spec.display_name} — {signal_names}\n"
-            f"RSI weekly: {rsi_w_str} | RSI monthly: {rsi_m_str}\n"
-            f"MACD: {td.macd_signal_type or 'N/A'}\n"
-            f"Weight: {spec.weight_pct:.1f}% vs target {tgt:.0f}% "
-            f"(band {b_lo:.0f}–{b_hi:.0f}%)\n"
-            f"{signal_descriptions}\n\n"
-            f"Running full analysis… (~10 min)"
-        )
+            await _notify_telegram(
+                f"⚡ SIGNAL: {spec.display_name} — {signal_names}\n"
+                f"RSI weekly: {rsi_w_str} | RSI monthly: {rsi_m_str}\n"
+                f"MACD: {td.macd_signal_type or 'N/A'}\n"
+                f"Weight: {spec.weight_pct:.1f}% vs target {tgt:.0f}% "
+                f"(band {b_lo:.0f}–{b_hi:.0f}%)\n"
+                f"{signal_descriptions}\n\n"
+                f"Running full analysis… (~10 min)"
+            )
 
         # Gather + run single-asset 6-agent engine at LOW priority
         try:
             concentration_flags = _calculate_concentration_flags(specs, portfolio_targets)
             gather_result       = await _gather_one(nanobot, cog, spec)
             synth               = await _synthesise_security(
-                cog, spec, gather_result, concentration_flags=concentration_flags,
+                cog, spec, gather_result, concentration_flags=concentration_flags, qdrant=qdrant,
             )
 
             verdict_lines = [
@@ -2914,9 +3370,15 @@ async def run_portfolio_watcher_scan(cog, nanobot, qdrant, sov_wallet_url: str) 
                     "category": "Portfolio",
                 })
                 nb_r = nb.get("result") if nb.get("result") is not None else nb
-                if isinstance(nb_r, dict) and nb_r.get("status") == "ok":
+                # Success is read from nb's own top-level "status", not nb_r's — for
+                # legacy flat python3_exec responses, adapters/nanobot.py's _forward()
+                # strips "status" out of the inner result dict (treated as an envelope
+                # meta field) before it ever reaches here, so nb_r.get("status") is
+                # always None even on a real success. Found 2026-07-12: this made every
+                # note save log as a false "failed" despite ids incrementing correctly.
+                if nb.get("status") == "ok":
                     logger.info("portfolio_watcher: signal note saved for %s (id=%s)",
-                                spec.slug, nb_r.get("id"))
+                                spec.slug, nb_r.get("id") if isinstance(nb_r, dict) else None)
                 else:
                     logger.warning("portfolio_watcher: note save failed for %s: %s", spec.slug, nb_r)
             except Exception as exc:
