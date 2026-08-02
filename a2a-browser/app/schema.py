@@ -82,6 +82,11 @@ class FetchRequest(BaseModel):
     extract: str = "text"   # "text" | "html"
 
 
+class WorldMonitorRequest(BaseModel):
+    domain: str
+    params: dict = {}
+
+
 class FetchResponse(BaseModel):
     url: str
     title: str

@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from time import monotonic
 from typing import Optional
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -23,6 +24,7 @@ from schema import (
     FetchRequest, FetchResponse,
     QualityMetrics, QueryIntelligence, SearchRequest, SearchResponse,
     SearchResult, SovereignSynthesis, StructuredEntities, TestModeMetrics,
+    WorldMonitorRequest,
 )
 from search.router import SearchRouter
 
@@ -322,3 +324,41 @@ async def fetch(req: FetchRequest, _: None = Depends(security.verify_secret)):
         content_length=len(content),
         fetch_sha256=sha,
     )
+
+
+# ── WorldMonitor ──────────────────────────────────────────────────────────────
+# Loopback JSON RPC proxy to WorldMonitor (node04 127.0.0.1:3000). Stays dumb —
+# fetch, pass through raw JSON, no interpretation of degraded/stale/computedAt/
+# advisoryProvenance. The nanobot-01 worldmonitor skill owns that policy layer.
+
+_WM_ROUTES = {
+    "risk-scores":   "/api/intelligence/v1/get-risk-scores",
+    "macro-signals": "/api/economic/v1/get-macro-signals",
+}
+_WM_TIMEOUT_S = 12.0
+
+
+@app.post("/worldmonitor")
+async def worldmonitor(req: WorldMonitorRequest, _: None = Depends(security.verify_secret)):
+    upstream_path = _WM_ROUTES.get(req.domain)
+    if upstream_path is None:
+        raise HTTPException(status_code=400, detail=f"unknown worldmonitor domain: {req.domain}")
+
+    url = f"{config.WORLDMONITOR_URL}{upstream_path}"
+    headers = {"X-WorldMonitor-Key": config.WORLDMONITOR_API_KEY}
+
+    try:
+        async with httpx.AsyncClient(timeout=_WM_TIMEOUT_S) as client:
+            # Upstream RPC is GET with query params, not POST-with-body — confirmed
+            # against the live ANPI contract (get- prefix reads GET-shaped, but was
+            # verified rather than assumed from naming).
+            r = await client.get(url, params=req.params, headers=headers)
+        r.raise_for_status()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="worldmonitor upstream timeout")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"worldmonitor upstream HTTP {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"worldmonitor upstream error: {e}")
+
+    return {"domain": req.domain, **r.json()}

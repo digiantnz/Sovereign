@@ -9,6 +9,7 @@ sources, Grok added nothing but risk of fabricated "current" items.
 """
 
 import asyncio
+import json
 import logging
 import string
 from datetime import datetime, timezone
@@ -114,6 +115,59 @@ async def _fetch_browser(nanobot, topics: list[str], source_tag: str = "browser"
         return items, None
     except Exception as exc:
         logger.warning("news_harness: browser source (%s) failed: %s", source_tag, exc)
+        return [], str(exc)
+
+
+async def _fetch_worldmonitor_risk(nanobot, qdrant) -> tuple[list[dict], str | None]:
+    """WorldMonitor geopolitical risk scores — third grounded source into the
+    Subject-bound search, source_tag="worldmonitor_risk". Own Subject deferred
+    until a live healthy payload is reviewed (see plan D1) — this only feeds
+    the existing news-brief pipeline for now.
+
+    Only contributes items when the skill reports `assertable: True` — a
+    suppressed (stale-by-age) or non-assertable (degraded/stale-flagged) pull
+    returns [] here, which the caller's list-concatenation already tolerates
+    for free, same as any other source returning nothing.
+    """
+    try:
+        nb = await nanobot.run("worldmonitor", "get_risk_scores", {})
+        result = nb.get("result") if nb.get("result") is not None else nb
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            err = result.get("error") if isinstance(result, dict) else "malformed response"
+            return [], str(err)
+
+        from monitoring.worldmonitor_memory import record_pull
+        asyncio.create_task(record_pull(qdrant, "risk-scores", result))
+
+        if not result.get("assertable"):
+            logger.info(
+                "news_harness: worldmonitor risk-scores not assertable (%s) — excluded from grounded input",
+                result.get("gate_reason"),
+            )
+            return [], None
+
+        items = []
+        rows = result.get("strategic_risks") or result.get("cii_scores") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # Schema not fully confirmed live (no healthy payload observed yet) —
+            # try recognisable identity/narrative fields defensively, fall back
+            # to a compact dump rather than assuming exact key names.
+            name = row.get("region") or row.get("country") or row.get("territory") or row.get("name") or ""
+            summary = row.get("assessment") or row.get("summary") or row.get("narrative")
+            if not summary:
+                summary = json.dumps({k: v for k, v in row.items() if k != "advisoryProvenance"})[:300]
+            if name:
+                items.append({
+                    "title": f"Risk score: {name}",
+                    "summary": str(summary)[:300],
+                    "source": "worldmonitor_risk",
+                })
+        logger.info("news_harness: worldmonitor risk-scores returned %d items", len(items))
+        return items, None
+    except Exception as exc:
+        logger.warning("news_harness: worldmonitor risk source failed: %s", exc)
         return [], str(exc)
 
 
@@ -252,20 +306,23 @@ async def run_news_brief(cog, nanobot, qdrant, user_input: str = "") -> dict:
     except Exception as exc:
         logger.warning("news_harness: subject keyword fetch failed: %s", exc)
 
-    # ── 2. Parallel fetch — RSS, default-topic browser search, and (if any
-    #      high-level Subjects have search_keywords) a second Subject-bound
-    #      browser search. Grok dropped (see module docstring).
+    # ── 2. Parallel fetch — RSS, default-topic browser search, WorldMonitor
+    #      risk-scores (third grounded source, D1), and (if any high-level
+    #      Subjects have search_keywords) a second Subject-bound browser
+    #      search. Grok dropped (see module docstring).
     tasks = [
         asyncio.create_task(_fetch_rss(nanobot)),
         asyncio.create_task(_fetch_browser(nanobot, topics)),
+        asyncio.create_task(_fetch_worldmonitor_risk(nanobot, qdrant)),
     ]
     if subject_keywords:
         tasks.append(asyncio.create_task(_fetch_browser(nanobot, subject_keywords, source_tag="browser_subjects")))
 
     results = await asyncio.gather(*tasks)
-    rss_items,     rss_err     = results[0]
-    browser_items, browser_err = results[1]
-    subject_items,  subject_err = results[2] if len(results) > 2 else ([], None)
+    rss_items,          rss_err          = results[0]
+    browser_items,      browser_err      = results[1]
+    worldmonitor_items, worldmonitor_err = results[2]
+    subject_items,      subject_err      = results[3] if len(results) > 3 else ([], None)
 
     sources_ok     = []
     sources_failed = []
@@ -280,13 +337,18 @@ async def run_news_brief(cog, nanobot, qdrant, user_input: str = "") -> dict:
     else:
         sources_failed.append(f"browser: {browser_err}")
 
+    if worldmonitor_err is None:
+        sources_ok.append("worldmonitor_risk")
+    else:
+        sources_failed.append(f"worldmonitor_risk: {worldmonitor_err}")
+
     if subject_keywords:
         if subject_err is None:
             sources_ok.append("browser_subjects")
         else:
             sources_failed.append(f"browser_subjects: {subject_err}")
 
-    all_items = rss_items + browser_items + subject_items
+    all_items = rss_items + browser_items + worldmonitor_items + subject_items
 
     if not all_items:
         asyncio.create_task(_write_episodic(qdrant, sources_ok, sources_failed, 0, 0))

@@ -12,6 +12,10 @@ SEARXNG_URL = os.environ.get("SEARXNG_URL", "")   # e.g. http://searxng:8080
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
 BING_API_KEY = os.environ.get("BING_API_KEY", "")
 
+# WorldMonitor (node04 loopback — see /worldmonitor route)
+WORLDMONITOR_URL = os.environ.get("WORLDMONITOR_URL", "http://127.0.0.1:3000")
+WORLDMONITOR_API_KEY = os.environ.get("WM_API_KEY", "")
+
 # Rate limiting (requests per minute per backend)
 RATE_LIMIT = int(os.environ.get("A2A_RATE_LIMIT", "10"))
 
