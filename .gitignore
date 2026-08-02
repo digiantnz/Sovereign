@@ -37,3 +37,6 @@ nanobot-01/workspace/HEARTBEAT.md
 
 # Wallet browser profile (Chromium runtime state)
 wallet/profile/
+
+# Claude Code local session/tool state (settings, agent worktrees)
+.claude/
