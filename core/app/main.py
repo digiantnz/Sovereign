@@ -646,6 +646,7 @@ async def lifespan(app: FastAPI):
     app.state.exec.set_guardian(guardian)
     # Inject app.state so collect_all() can surface soul_checksum in metrics
     app.state.exec.app_state = app.state
+    await app.state.exec.nanobot.start()
 
     # ── Step 2b: Sign governance snapshot on startup
     if signer:
@@ -777,6 +778,7 @@ async def lifespan(app: FastAPI):
     _si_observe_task.cancel()
     _structural_loop_task.cancel()
     await inference_queue.stop()
+    await app.state.exec.nanobot.stop()
     # Promote eligible working_memory entries to RAID sovereign collections before shutdown.
     # Entries not promoted here are lost on container exit (known acceptable risk —
     # see docs/as-built.md; mitigated by 64GB RAM upgrade enabling periodic background flush).

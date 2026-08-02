@@ -275,16 +275,31 @@ class InferenceQueue:
             if not job.future.done():
                 job.future.set_result(result)
         except asyncio.TimeoutError:
+            # Diagnostic snapshot — the queue is single-worker, so nothing else
+            # can be *executing* through it concurrently; a timeout here means
+            # either the call was genuinely slow or Ollama itself was doing
+            # something else (model reload/swap, a call that bypassed this
+            # queue). running_models() gives ground truth from Ollama's own
+            # /api/ps rather than guessing — cheap (10s cap, already timed out
+            # anyway) and turns "mysterious" into "diagnosable" next time.
+            depth = self.queue_depth()
+            try:
+                running = await self._ollama.running_models()
+            except Exception:
+                running = None
             logger.warning(
-                "InferenceQueue: job=%s timed out after %.0fs (priority=%s)",
+                "InferenceQueue: job=%s timed out after %.0fs (priority=%s) "
+                "queue_depth=%d ollama_running=%s",
                 job.job_id, job.timeout,
                 self._LABELS.get(job.priority, str(job.priority)),
+                depth, running,
             )
             if self._ledger:
                 self._ledger.append(
                     "inference_timeout", "inference_queue",
                     {"job_id": job.job_id, "priority": job.priority,
-                     "timeout_s": job.timeout, "waited_s": wait_s},
+                     "timeout_s": job.timeout, "waited_s": wait_s,
+                     "queue_depth_at_timeout": depth, "ollama_running_at_timeout": running},
                 )
             if not job.future.done():
                 job.future.set_result(self._timeout_result(job))

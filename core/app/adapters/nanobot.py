@@ -22,6 +22,7 @@ REST API: POST http://nanobot-01:8080/run
   Backward-compat fields also present: {run_id, action, status, path}
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -31,6 +32,8 @@ from typing import Any
 import httpx
 import yaml
 from sovereign_a2a import A2AMessage, A2AErrorCodes, A2AResponse
+
+from adapters.nanobot_queue import NanobotQueue, concurrency_for_skill
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,8 @@ _agent_card_cache: dict[str, dict] = {}
 
 TASK_TIMEOUT = 65.0  # seconds — personal inbox IMAP sync can take 55s+; must exceed nanobot subprocess timeout
 HEALTH_TIMEOUT = 5.0
+_SLOW_CALL_THRESHOLD_S = 10.0  # above this, log even with no concurrent siblings — diagnostic only
+_QUEUE_TIMEOUT_GRACE_S = 10.0  # NanobotQueue wall-clock backstop margin over http_timeout
 
 _SKILLS_DIR = os.environ.get("SKILLS_DIR", "/home/sovereign/skills")
 
@@ -246,6 +251,12 @@ class NanobotAdapter:
     def __init__(self, ledger=None):
         self._ledger = ledger
         self._credential_proxy = None
+        # Per-skill dispatch queues, created lazily on first _forward() call
+        # for that skill name (see _get_queue) rather than eagerly enumerated
+        # here — the set of skills actually invoked varies per boot, and
+        # hardcoding the full skill list here would duplicate what
+        # SKILL_CONCURRENCY_OVERRIDES already tracks in nanobot_queue.py.
+        self._queues: dict[str, NanobotQueue] = {}
 
     def set_credential_proxy(self, proxy) -> None:
         self._credential_proxy = proxy
@@ -262,6 +273,37 @@ class NanobotAdapter:
         if not url:
             raise ValueError(f"Unknown nanobot node: {node!r}. Registered: {list(NANOBOT_NODES)}")
         return url.rstrip("/")
+
+    async def _get_queue(self, skill: str) -> NanobotQueue:
+        q = self._queues.get(skill)
+        if q is not None:
+            return q
+        q = NanobotQueue(skill, concurrency_for_skill(skill), ledger=self._ledger)
+        # Reserve the dict slot BEFORE awaiting start() — the check above and
+        # this write happen in the same synchronous stretch of code with no
+        # intervening await, so two "concurrent" first-callers for the same
+        # skill (e.g. the portfolio harness's asyncio.gather burst) cannot
+        # both construct+register a separate queue for it.
+        self._queues[skill] = q
+        await q.start()
+        return q
+
+    async def start(self) -> None:
+        """Lifecycle symmetry with InferenceQueue.start(); no-op today.
+
+        Per-skill NanobotQueue instances are created lazily (see
+        _get_queue), so there is nothing to start yet at boot.
+        """
+        logger.info("NanobotAdapter: ready (per-skill dispatch queues created lazily on first use)")
+
+    async def stop(self) -> None:
+        """Drain and stop every per-skill queue created this session."""
+        for skill, q in list(self._queues.items()):
+            try:
+                await q.stop()
+            except Exception as exc:
+                logger.warning("NanobotAdapter.stop(): queue[%s] failed to stop cleanly: %s", skill, exc)
+        logger.info("NanobotAdapter: %d per-skill queue(s) stopped", len(self._queues))
 
     async def health(self, node: str = "nanobot-01") -> dict:
         """Check nanobot node health. LOW-tier read — no governance gating needed."""
@@ -491,6 +533,8 @@ class NanobotAdapter:
 
         request_id = context.get("request_id") or str(uuid.uuid4())[:8]
 
+        job_queue = await self._get_queue(skill)
+
         # Build A2A 3.0 request — agents never construct raw dicts
         a2a_request = A2AMessage.request(
             method=f"{skill}/{action}",
@@ -505,9 +549,20 @@ class NanobotAdapter:
             },
         )
 
-        try:
+        async def _do_post():
             async with httpx.AsyncClient(timeout=http_timeout) as client:
-                r = await client.post(f"{base_url}/run", json=a2a_request, headers=_auth_headers())
+                return await client.post(f"{base_url}/run", json=a2a_request, headers=_auth_headers())
+
+        try:
+            # Queue timeout gets a small grace margin over http_timeout so
+            # that, in the normal case, httpx's own per-phase timeout fires
+            # first (existing except httpx.TimeoutException below) — this
+            # queue-level wait_for is a wall-clock backstop for the case
+            # where httpx's per-phase budgets (connect/read/write/pool, each
+            # independently capped at http_timeout) stack past a single
+            # http_timeout in total.
+            r = await job_queue.submit(_do_post, timeout=http_timeout + _QUEUE_TIMEOUT_GRACE_S,
+                                        priority=NanobotQueue.NORMAL)
 
             elapsed = round(time.monotonic() - t0, 2)
 
@@ -623,6 +678,18 @@ class NanobotAdapter:
                 "path": path, "elapsed_s": round(time.monotonic() - t0, 2),
                 "_trust": "untrusted_external",
             }
+        except asyncio.TimeoutError:
+            # Raised by NanobotQueue.submit() when the job's own wall-clock
+            # budget (http_timeout + grace) expires after being dequeued —
+            # a backstop distinct from httpx's own per-phase timeout above.
+            return {
+                "status": "error", "success": False,
+                "node": node, "skill": skill, "action": action,
+                "error": f"nanobot queue timed out after {http_timeout + _QUEUE_TIMEOUT_GRACE_S:.0f}s (skill={skill})",
+                "error_code": A2AErrorCodes.TIMEOUT,
+                "path": path, "elapsed_s": round(time.monotonic() - t0, 2),
+                "_trust": "untrusted_external",
+            }
         except Exception as e:
             logger.exception("NanobotAdapter._forward: unexpected error dispatching to %s", node)
             return {
@@ -633,3 +700,12 @@ class NanobotAdapter:
                 "path": path, "elapsed_s": round(time.monotonic() - t0, 2),
                 "_trust": "untrusted_external",
             }
+        finally:
+            elapsed = round(time.monotonic() - t0, 2)
+            if elapsed > _SLOW_CALL_THRESHOLD_S:
+                logger.warning(
+                    "NanobotAdapter: %s/%s took %.1fs — NanobotQueue[%s] "
+                    "queue_depth=%d active_workers=%d/%d",
+                    skill, action, elapsed, skill,
+                    job_queue.queue_depth(), job_queue.active_count(), job_queue.concurrency,
+                )
