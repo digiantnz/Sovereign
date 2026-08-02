@@ -1200,6 +1200,7 @@ class TaskScheduler:
             if r.get("status") != "ok":
                 return (
                     res.get("error") or res.get("raw_error") or res.get("note")
+                    or res.get("message") or res.get("director_message")
                     or r.get("error", "no detail")
                 )
 
@@ -1271,7 +1272,7 @@ class TaskScheduler:
         # Build summary for notification + episodic
         summary_parts = [f"*Scheduled task: {title}*", ""]
         for r in step_results:
-            status_icon = "✅" if r.get("status") in ("ok", "partial") else "❌"
+            status_icon = "✅" if r.get("status") in ("ok", "partial", "running") else "❌"
             content = _format_step_content(r)
             summary_parts.append(f"{status_icon} *{r['description']}*")
             summary_parts.append(content)

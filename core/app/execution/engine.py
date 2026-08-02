@@ -7002,11 +7002,18 @@ class ExecutionEngine:
                 run_portfolio_analysis, run_portfolio_analysis_save, run_portfolio_analysis_clear,
             )
             if operation == "gather":
-                _pa_cat = (delegation or {}).get("category") or (delegation or {}).get("target") or prompt or ""
+                # category/last_day_guard come via `action` when dispatched by the task
+                # scheduler (_execute_task merges step params into `action`, not
+                # `delegation`) — `delegation` is only populated on NL-routed calls.
+                # Check both; scheduler calls always have delegation=None.
+                _pa_cat = (
+                    (delegation or {}).get("category") or action.get("category")
+                    or (delegation or {}).get("target") or prompt or ""
+                )
                 _pa_url = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
                 # Last-day-of-month guard — set by the monthly task scheduler step.
                 # Fires on days 28-31 (cron 0 20 28-31 * *); guard skips if not the actual last day.
-                if (delegation or {}).get("last_day_guard"):
+                if (delegation or {}).get("last_day_guard") or action.get("last_day_guard"):
                     import calendar as _cal
                     from datetime import date as _date_cls
                     _today = _date_cls.today()
