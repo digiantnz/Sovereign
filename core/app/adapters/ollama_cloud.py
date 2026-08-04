@@ -102,12 +102,3 @@ class OllamaCloudAdapter:
             logger.warning("OllamaCloudAdapter.list_models error: %s", exc)
             return {"status": "error", "error": str(exc)}
 
-    async def health_check(self) -> dict:
-        try:
-            result = await self.chat(
-                [{"role": "user", "content": "Say 'ok' and nothing else."}],
-                model=DEFAULT_MODEL,
-            )
-            return {"status": "ok", "response": result.get("response", ""), "model": DEFAULT_MODEL}
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}

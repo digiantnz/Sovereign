@@ -106,9 +106,3 @@ class OpenRouterAdapter:
             logger.warning("OpenRouterAdapter.list_models error: %s", exc)
             return {"status": "error", "error": str(exc)}
 
-    async def health_check(self) -> dict:
-        try:
-            result = await self.generate("Say 'ok'", model=DEFAULT_MODEL, system="Reply with one word only.")
-            return {"status": "ok", "response": result.get("response", ""), "model": result.get("model")}
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}

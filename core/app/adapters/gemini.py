@@ -140,9 +140,3 @@ class GeminiAdapter:
             logger.warning("GeminiAdapter.generate_with_image error: %s", exc)
             return {"status": "error", "error": str(exc), "_trust": "untrusted_external"}
 
-    async def health_check(self) -> dict:
-        try:
-            result = await self.generate("Say 'ok'", model=DEFAULT_MODEL, system="Reply with one word only.")
-            return {"status": "ok", "response": result.get("response", ""), "model": DEFAULT_MODEL}
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}
