@@ -112,39 +112,6 @@ class WalletAdapter:
         except Exception:
             return None
 
-    def build_proposal(
-        self,
-        proposal_id: str,
-        amount_eth: float,
-        to_address: str,
-        description: str,
-        gas_usd: float,
-    ) -> "tuple[str, str]":
-        """Sign a transaction proposal. Returns (formatted_message, sig_prefix)."""
-        canonical = {
-            "proposal_id": proposal_id,
-            "action": f"Send {amount_eth} ETH to {to_address}",
-            "description": description,
-            "gas_estimate_usd": gas_usd,
-            "proposed_at": datetime.datetime.utcnow().isoformat() + "Z",
-        }
-        sig = self._signer.sign_dict(canonical)
-        sig_prefix = sig[:8]
-        self._ledger.append("wallet_proposal", "wallet", {
-            "canonical_payload": canonical,
-            "sig": sig,
-            "sig_prefix": sig_prefix,
-        })
-        msg = (
-            f"Rex: {proposal_id}\n"
-            f"Action: Send {amount_eth} ETH to {to_address}\n"
-            f"  ({description})\n"
-            f"Gas estimate: ~${gas_usd:.2f}\n"
-            f"Signature: rex_sig:{sig_prefix}...\n"
-            f"Verify: /verify {sig_prefix}"
-        )
-        return msg, sig_prefix
-
     def verify_sig(self, prefix: str) -> dict:
         """Scan audit ledger for wallet event matching sig prefix, verify it."""
         ledger_path = self._ledger.path

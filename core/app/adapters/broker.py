@@ -41,15 +41,6 @@ class BrokerAdapter:
             r.raise_for_status()
             return r.json()
 
-    async def get_gpu_stats(self) -> dict:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(
-                f"{BROKER_URL}/system/gpu",
-                headers={"X-Trust-Level": "low"},
-            )
-            r.raise_for_status()
-            return r.json()
-
     async def restart(self, container: str) -> dict:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -60,16 +51,6 @@ class BrokerAdapter:
             return {"status": "restarted", "container": container}
 
     # ── Read-only examination endpoints ──────────────────────────────────
-
-    async def get_containers_full(self) -> dict:
-        """Full docker ps -a with all fields including networks and mounts."""
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(
-                f"{BROKER_URL}/system/containers",
-                headers={"X-Trust-Level": "low"},
-            )
-            r.raise_for_status()
-            return r.json()
 
     async def inspect_container(self, container: str) -> dict:
         """docker inspect for a named container."""
@@ -136,13 +117,6 @@ class BrokerAdapter:
         """List all Docker networks with subnets and attached containers."""
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(f"{BROKER_URL}/system/networks", headers={"X-Trust-Level": "low"})
-            r.raise_for_status()
-            return r.json()
-
-    async def inspect_network(self, name: str) -> dict:
-        """Inspect a Docker network by name."""
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{BROKER_URL}/system/network/{name}", headers={"X-Trust-Level": "low"})
             r.raise_for_status()
             return r.json()
 
