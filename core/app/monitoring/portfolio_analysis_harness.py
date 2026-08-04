@@ -39,20 +39,32 @@ from monitoring.research_harness import (
 logger = logging.getLogger(__name__)
 
 
-async def _notify_telegram(message: str) -> None:
+async def _notify_telegram(message: str, raise_on_failure: bool = False) -> None:
+    """Send a Telegram message. Swallows failures by default (existing callers rely on
+
+    this never raising). Pass raise_on_failure=True for callers that need to know a
+    send genuinely failed — e.g. the daily alt-season trigger's notify-then-persist
+    ordering, where persisting a "fired" flag after a failed send would silently
+    swallow the signal.
+    """
     token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("OPENCLAW_TELEGRAM_ADMIN_CHAT_ID", "")
     if not token or not chat_id:
         logger.warning("PortfolioHarness: Telegram credentials missing — skipping notification")
+        if raise_on_failure:
+            raise RuntimeError("Telegram credentials missing")
         return
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
+            resp = await client.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
             )
+            resp.raise_for_status()
     except Exception as e:
         logger.warning("PortfolioHarness: Telegram notification failed: %s", e)
+        if raise_on_failure:
+            raise
 
 _SYNTHESIS_TIMEOUT = 180.0
 _CHECKPOINT_FLAG   = "_portfolio_analysis_checkpoint"

@@ -1769,6 +1769,97 @@ class TaskScheduler:
             logger.warning("TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result)
             return False
 
+    async def seed_daily_technicals_task(self) -> bool:
+        """Seed the daily technicals + BTC.D alt-season watcher at startup. Idempotent.
+        Creates a pending_approval task for Director activation.
+
+        Sequential Yahoo fetch (bounded concurrency=6, post-ReadTimeout-storm fix) +
+        per-asset shadow-compare + completeness-reminder scans observed to regularly run
+        several minutes end-to-end (measured live: 383s) — same class of problem as the
+        Weekly Portfolio Technical Scan (sequential multi-asset work exceeding the global
+        default timeout), so this task gets the same execution_timeout_s override.
+
+        Returns True if written, False if already present or write failed.
+        """
+        _TASK_TITLE = "Daily Technicals Capture"
+        # 19:10 UTC = 07:10 NZST daily — deliberately offset 10 min from the Daily
+        # Validator Monitor's identical "07:00 NZST daily" slot (cron "0 19 * * *").
+        # The idempotency check below matches on title-words OR cron — an exact cron
+        # collision with an unrelated existing task silently skips seeding this task
+        # entirely regardless of title (found live: this seed call no-op'd against the
+        # pre-existing validator task on first deploy). Fixed here by offsetting the
+        # cron, not by touching the shared OR-based check (used by 5+ other seed
+        # functions — a broader fix than this session's scope).
+        _TASK_CRON  = "10 19 * * *"
+
+        try:
+            _words = [w for w in _TASK_TITLE.lower().split() if len(w) >= 5]
+            prosp_all, _ = await self.qdrant.archive_client.scroll(
+                collection_name=PROSPECTIVE,
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="status", match=MatchAny(any=["active", "pending_approval"])),
+                ]),
+                limit=300,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in prosp_all:
+                pp = pt.payload or {}
+                pt_title = pp.get("title", "").lower()
+                pt_cron  = (pp.get("schedule") or {}).get("cron", "")
+                if all(w in pt_title for w in _words) or pt_cron == _TASK_CRON:
+                    logger.info(
+                        "TaskScheduler: daily technicals task already exists "
+                        "(task_id=%s status=%s) — skipping seed",
+                        str(pp.get("task_id", ""))[:8], pp.get("status", ""),
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("seed_daily_technicals_task: idempotency check failed: %s", exc)
+
+        task_def = {
+            "title": _TASK_TITLE,
+            "schedule": {
+                "type": "cron",
+                "cron": _TASK_CRON,
+            },
+            "steps": [
+                {
+                    "intent": "daily_technicals_capture",
+                    "params": {},
+                    "description": (
+                        "Daily-resolution price history capture (Yahoo Finance) for all "
+                        "wired assets + BTC.D dominance (CoinGecko) + alt-season trigger "
+                        "evaluation + shadow-compare against the weekly path + completeness "
+                        "reminder check. No LLM calls. Sends its own Telegram on an "
+                        "ALT_SEASON_SIGNAL fire; otherwise silent."
+                    ),
+                }
+            ],
+            "notify_when": "never",   # harness sends its own Telegram on signal; clean day = silence
+            "stop_condition": "Director cancels",
+            "status": "pending_approval",
+            "execution_timeout_s": 900,
+        }
+
+        result = await self.store_task(task_def, human_confirmed=True)
+        if result.get("status") in ("ok", "partial", "pending_approval"):
+            logger.info(
+                "TaskScheduler: seeded '%s' task_id=%s — pending Director approval",
+                _TASK_TITLE, result.get("task_id", "?"),
+            )
+            await self._notify_director(
+                f"📈 <b>Daily Technicals Capture</b> task created.\n"
+                f"Schedule: daily at 7:00 AM NZST.\n"
+                f"Daily price history + BTC.D alt-season watcher — silent unless a "
+                f"dominance threshold crosses.\n"
+                f"Reply <b>approve daily technicals</b> to activate."
+            )
+            return True
+        else:
+            logger.warning("TaskScheduler: failed to seed '%s': %s", _TASK_TITLE, result)
+            return False
+
     async def seed_subject_decay_task(self) -> bool:
         """Seed the daily Subject confidence-decay check at startup. Idempotent.
         Creates a pending_approval task for Director activation.

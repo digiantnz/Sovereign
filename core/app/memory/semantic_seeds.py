@@ -836,29 +836,11 @@ def build_provider_seeds() -> list[dict]:
                 "queue_position":      4,
             },
         },
-        {
-            "seed_id": "provider_seed_v1_alpha_vantage",
-            "key":     "semantic:provider:alpha_vantage",
-            "title":   "Alpha Vantage — financial data API (not an LLM)",
-            "content": (
-                "Alpha Vantage is a financial data API providing structured market data. "
-                "This is NOT an LLM — it returns deterministic structured financial data. "
-                "Preferred for: securities_price, securities_fundamentals, securities_technicals, "
-                "commodities_price, economic_indicators. "
-                "Strengths: deterministic, structured_financial_data, real-time quotes. "
-                "Returns use_external=False — the research harness handles the actual API call. "
-                "Eligible classifications: PUBLIC, WORKSPACE_INTERNAL. "
-                "Used by research_harness.py for financial data gathering tasks."
-            ),
-            "domain": "provider",
-            "extra_meta": {
-                "provider_name":       "alpha_vantage",
-                "preferred_for":       ["securities_price", "securities_fundamentals", "securities_technicals", "commodities_price", "economic_indicators"],
-                "strengths":           ["deterministic", "structured_financial_data"],
-                "is_llm":              False,
-                "free_tier":           True,
-            },
-        },
+        # provider_seed_v1_alpha_vantage removed 2026-08-03 — AlphaVantageAdapter confirmed
+        # dead code (zero live call sites) and deleted. The live semantic:provider:alpha_vantage
+        # Qdrant point is kept, marked status:"inactive" (SDO #8 — deprecate, don't delete);
+        # removing this seed definition just prevents a future fresh-Qdrant boot from
+        # re-seeding it as "enabled".
         {
             "seed_id": "provider_seed_v1_mistral_api",
             "key":     "semantic:provider:mistral_api",

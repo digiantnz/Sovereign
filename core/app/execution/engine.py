@@ -121,6 +121,7 @@ INTENT_ACTION_MAP = {
     "portfolio_analysis_save":  {"domain": "portfolio_analysis", "operation": "save"},
     "portfolio_analysis_clear": {"domain": "portfolio_analysis", "operation": "clear"},
     "portfolio_watcher_scan":   {"domain": "portfolio_watcher",  "operation": "scan"},
+    "daily_technicals_capture": {"domain": "technicals_daily",   "operation": "capture"},
     "read_feed":          {"domain": "feeds",   "operation": "read",   "name": "rss-digest"},
     "news_brief":         {"domain": "news",    "operation": "brief"},
     "score_rss_by_subject": {"domain": "cognition", "operation": "score_rss"},
@@ -340,6 +341,7 @@ INTENT_TIER_MAP = {
     "validator_alerts":      "LOW",
     "portfolio_analysis": "LOW", "portfolio_analysis_save": "MID", "portfolio_analysis_clear": "LOW",
     "portfolio_watcher_scan": "LOW",
+    "daily_technicals_capture": "LOW",
     "restart_container": "MID", "recreate_container": "MID", "write_file": "MID", "send_email": "MID", "create_event": "MID",
     "create_task": "MID", "complete_task": "MID", "create_folder": "MID",
     "delete_file": "HIGH", "delete_email": "HIGH", "delete_task": "HIGH",
@@ -7050,6 +7052,10 @@ class ExecutionEngine:
                 "signals_fired": (_crypto.get("signals_fired", []) + _retirement.get("signals_fired", [])),
                 "assets_scanned": (_crypto.get("assets_scanned", 0) + _retirement.get("assets_scanned", 0)),
             }
+
+        if domain == "technicals_daily":
+            from monitoring.technicals_daily_harness import run_daily_technicals_capture
+            return await run_daily_technicals_capture(self.qdrant)
 
         if domain == "tax":
             from tax_harness.harness import TaxIngestHarness

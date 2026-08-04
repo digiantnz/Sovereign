@@ -218,6 +218,13 @@ class GovernanceEngine:
             # Weekly watcher — deterministic scan; no LLM unless signal fires
             if operation == 'scan' and rules.get('browser_search', False):
                 return rules
+        elif domain == 'technicals_daily':
+            # Daily technicals + BTC.D alt-season watcher — deterministic price/dominance
+            # capture and memory writes, no LLM, no browser/nanobot (direct httpx to
+            # Yahoo/CoinGecko, same pattern as research_harness.py). Scheduler-only,
+            # no Director-NL trigger — see the daily_technicals_capture intent.
+            if operation == 'capture' and rules.get('memory_write', False):
+                return rules
         elif domain == 'nanobot':
             # Delegated execution via nanobot sidecar — MID tier for run, LOW for health
             if operation == 'health' and rules.get('docker_read', False):

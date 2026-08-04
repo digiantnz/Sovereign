@@ -446,6 +446,24 @@ async def lifespan(app: FastAPI):
         "value": "https://api.coingecko.com/api/v3/simple/price",
         "metadata": {"provider": "coingecko", "status": "active", "auth": "none"},
     })
+    # CoinGecko /global — BTC dominance % for the daily alt-season watcher
+    _static_facts.append({
+        "seed_id": "backfill_v1_coingecko_global",
+        "key": "semantic:provider:coingecko:global",
+        "title": "CoinGecko global market data endpoint (BTC dominance)",
+        "content": (
+            "CoinGecko global market data endpoint: https://api.coingecko.com/api/v3/global. "
+            "Used for BTC dominance % (market_cap_percentage.btc) by the daily alt-season watcher. "
+            "Free public API, no key required for this endpoint (confirmed live, no auth header "
+            "needed). COINGECKO_API_KEY attached when present for a higher rate limit only. "
+            "Failure degrades to a gap marker for that day — never blocks the rest of the daily "
+            "capture pass. Status: active."
+        ),
+        "domain": "provider.coingecko",
+        "label": "coingecko_global",
+        "value": "https://api.coingecko.com/api/v3/global",
+        "metadata": {"provider": "coingecko", "status": "active", "auth": "none"},
+    })
     # Director news preferences — used by news_harness to weight synthesis
     _static_facts.append({
         "seed_id": "static_v1_news_preferences",
@@ -726,6 +744,7 @@ async def lifespan(app: FastAPI):
     await task_scheduler.seed_monthly_portfolio_task()
     await task_scheduler.seed_weekly_watcher_task()
     await task_scheduler.seed_daily_validator_task()
+    await task_scheduler.seed_daily_technicals_task()
     await task_scheduler.seed_personal_mailbox_scan_task()
     await task_scheduler.seed_subject_decay_task()
 

@@ -668,6 +668,25 @@ async def _query_technical_trend(qdrant, slug: str, limit: int = 4) -> str:
         return ""
 
 
+def _parse_bars(data: dict) -> tuple[list[float], list[dict]]:
+    """Extract (closes, bar_dicts) from Yahoo v8 chart response."""
+    result = (data.get("chart") or {}).get("result") or []
+    if not result:
+        return [], []
+    r = result[0]
+    quote = (r.get("indicators") or {}).get("quote") or [{}]
+    q = quote[0]
+    closes  = q.get("close",  []) or []
+    volumes = q.get("volume", []) or []
+    closes  = [c for c in closes  if c is not None]
+    bars = [
+        {"close": c, "volume": v or 0}
+        for c, v in zip(closes, volumes)
+        if c is not None
+    ]
+    return closes, bars
+
+
 async def _gather_technicals(slug: str) -> "TechnicalData":
     """Fetch weekly + monthly OHLCV from Yahoo Finance; calculate RSI/MACD/MAs.
 
@@ -682,25 +701,6 @@ async def _gather_technicals(slug: str) -> "TechnicalData":
 
     base = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     headers = {"User-Agent": "Mozilla/5.0"}
-
-    def _parse_bars(data: dict) -> tuple[list[float], list[dict]]:
-        """Extract (closes, bar_dicts) from Yahoo v8 chart response."""
-        result = (data.get("chart") or {}).get("result") or []
-        if not result:
-            return [], []
-        r = result[0]
-        timestamps = r.get("timestamp", [])
-        quote = (r.get("indicators") or {}).get("quote") or [{}]
-        q = quote[0]
-        closes  = q.get("close",  []) or []
-        volumes = q.get("volume", []) or []
-        closes  = [c for c in closes  if c is not None]
-        bars = [
-            {"close": c, "volume": v or 0}
-            for c, v in zip(closes, volumes)
-            if c is not None
-        ]
-        return closes, bars
 
     try:
         async with _httpx.AsyncClient(timeout=20.0, headers=headers) as client:

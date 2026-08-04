@@ -117,6 +117,11 @@ _DEFAULTS: dict = {
         "api_limit_max": 50,
         "memory_collection_preview_max": 50,
     },
+    "dominance": {
+        "alert_high": 60.0,
+        "alert_low": 55.0,
+        "rearm": 60.0,
+    },
     "gateway": {
         "history_max_turns": 10,
         "chunk_debounce_s": 1.5,

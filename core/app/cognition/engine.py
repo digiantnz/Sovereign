@@ -2003,20 +2003,14 @@ class CognitionEngine:
     #   "use openrouter/ask openrouter"           → openrouter (if eligible)
     #   "use claude/ask claude/via claude"        → claude (if eligible)
     #
-    # Step 3 — task_type specialist match:
-    #   alpha_vantage task_types → returns use_external=False, provider="alpha_vantage"
-    #   (actual alpha_vantage call happens via execution engine research harness;
-    #    the provider tag is for audit logging only — do NOT add alpha_vantage to
-    #    the LLM dispatch dict in specialist_reason/specialist_outbound/route_cognition)
-    #
-    # Step 4 — Default preference by task_type:
+    # Step 3 — Default preference by task_type:
     #   web_aware_query / news_gather → grok (web-grounded)
     #   llm_generate / llm_chat       → grok (default) when complexity ≥ 0.50
     #   else → local
     #
-    # Step 5 — Complexity fallback (score ≥ 0.50, after operational penalty) → grok
+    # Step 4 — Complexity fallback (score ≥ 0.50, after operational penalty) → grok
     #
-    # Step 6 — Default → Ollama local
+    # Step 5 — Default → Ollama local
     #
     # Provider eligibility gate: enabled=True AND task_type in task_types
     # AND DCL tier in eligible_classifications.  Falls back to complexity scorer
@@ -2119,7 +2113,6 @@ class CognitionEngine:
         "groq_inference": "core.app.adapters.groq_inference",
         "ollama_cloud": "core.app.adapters.ollama_cloud",
         "openrouter":   "core.app.adapters.openrouter",
-        "alpha_vantage": "core.app.adapters.alpha_vantage",
         "local":        "local",
     }
 
@@ -2259,15 +2252,6 @@ class CognitionEngine:
                 if explicit_provider and explicit_provider in eligible:
                     chosen = explicit_provider
                     reason = "explicit_override"
-                    # alpha_vantage is a data API, not an LLM — tag for audit but keep local
-                    if chosen == "alpha_vantage":
-                        return _d({
-                            "use_external": False, "provider": "alpha_vantage",
-                            "adapter": self._PROVIDER_ADAPTERS.get("alpha_vantage", ""),
-                            "score": round(score, 3), "penalised_score": round(penalised, 3),
-                            "explicit": True, "force_local": False,
-                            "reason": "alpha_vantage_data_api",
-                        })
                     return _d({
                         "use_external": True, "provider": chosen,
                         "adapter": self._PROVIDER_ADAPTERS.get(chosen, ""),
@@ -2277,8 +2261,6 @@ class CognitionEngine:
                     })
 
                 # Task-type preferred LLM provider (e.g. grok for news_gather/web_aware_query).
-                # Checked BEFORE alpha_vantage so grok wins for "news" queries even if
-                # alpha_vantage also supports news_gather.
                 preferred = self._TASK_TYPE_PREFERRED.get(task_type)
                 if preferred and preferred in eligible:
                     chosen = preferred
@@ -2291,23 +2273,11 @@ class CognitionEngine:
                         "reason": reason,
                     })
 
-                # Specialist data provider: alpha_vantage matches financial task_types
-                # (securities_price, fundamentals, technicals, commodities, economic_indicators).
-                # Returns use_external=False — execution engine research harness handles it.
-                if "alpha_vantage" in eligible:
-                    return _d({
-                        "use_external": False, "provider": "alpha_vantage",
-                        "adapter": self._PROVIDER_ADAPTERS.get("alpha_vantage", ""),
-                        "score": round(score, 3), "penalised_score": round(penalised, 3),
-                        "explicit": False, "force_local": False,
-                        "reason": "alpha_vantage_data_api",
-                    })
-
                 # Unconditional free-first routing for task_types that bypass the complexity gate.
                 # general_lookup: PUBLIC conversational queries — always prefer external over local
                 # regardless of complexity score so simple factual queries don't stay local.
                 if task_type in self._FREE_FIRST_TASK_TYPES:
-                    llm_eligible = {k: v for k, v in eligible.items() if k != "alpha_vantage"}
+                    llm_eligible = eligible
                     if llm_eligible:
                         for pref in self._PROVIDER_QUEUE:
                             if pref in llm_eligible:
@@ -2321,8 +2291,7 @@ class CognitionEngine:
 
                 # Complexity-triggered selection among remaining eligible LLM providers
                 if penalised >= self._COMPLEXITY_THRESHOLD:
-                    # Remove alpha_vantage (data API) from LLM candidates
-                    llm_eligible = {k: v for k, v in eligible.items() if k != "alpha_vantage"}
+                    llm_eligible = eligible
                     if llm_eligible:
                         # Free-first: groq_inference → gemini → openrouter → ollama_cloud → grok (paid last)
                         for pref in self._PROVIDER_QUEUE:
