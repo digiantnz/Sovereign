@@ -25,8 +25,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from sovereign_a2a import A2AMessage
-
 
 # ── History entry ────────────────────────────────────────────────────────────
 
@@ -114,10 +112,7 @@ class InternalMessage:
     """Universal agent-to-agent message envelope for the cognitive loop.
 
     Construction: InternalMessage.create(director_input, session_id, tier)
-    Passing between agents: msg.for_pass(pass_num, from_agent, to_agent, mode)
     Appending history: msg.append_pass(pass_num, from_agent, duration_ms, success)
-    Nanobot slice: msg.nanobot_request_slice()
-    Translator slice: msg.translator_slice()
     """
     envelope: Envelope = field(default_factory=Envelope)
     context:  MessageContext = field(default_factory=MessageContext)
@@ -152,37 +147,6 @@ class InternalMessage:
         return cls(envelope=env, context=ctx)
 
     # ── Pass boundary helpers ─────────────────────────────────────────────────
-
-    def for_pass(
-        self,
-        pass_num: int,
-        from_agent: str,
-        to_agent: str,
-        mode: str = "outbound",
-    ) -> "InternalMessage":
-        """Return a copy of this message updated for the next pass.
-
-        payload is preserved; history is not modified here (call append_pass separately).
-        """
-        new_env = Envelope(
-            message_id=self.envelope.message_id,
-            request_id=self.envelope.request_id,
-            session_id=self.envelope.session_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            pass_num=pass_num,
-            mode=mode,
-            from_agent=from_agent,
-            to_agent=to_agent,
-            tier=self.envelope.tier,
-            timeout_ms=self.envelope.timeout_ms,
-        )
-        return InternalMessage(
-            envelope=new_env,
-            context=self.context,      # preserved unchanged
-            payload=dict(self.payload),
-            history=list(self.history),
-            result=self.result,
-        )
 
     def append_pass(
         self,
@@ -268,59 +232,6 @@ class InternalMessage:
         """Derived deterministically from intent + domain at PASS 1 for PASS 4 audit."""
         self.context.query_type = query_type
         return self
-
-    # ── Boundary slices ──────────────────────────────────────────────────────
-
-    def nanobot_request_slice(self) -> dict:
-        """A2A 3.0 request slice sent to nanobot — envelope never crosses this boundary.
-
-        Raw Director input never crosses this boundary (hashed at PASS 1).
-        Specialist's full payload is included — nanobot executes it verbatim.
-        Returns a fully-formed A2A 3.0 request dict via A2AMessage.request().
-        """
-        retry = (
-            "correct_payload"
-            if self.context.security_clearance == "conditional"
-            else "none"
-        )
-        return A2AMessage.request(
-            method=f"{self.context.skill}/{self.context.operation}",
-            params={
-                "skill":     self.context.skill,
-                "operation": self.context.operation,
-                "payload":   self.payload,
-            },
-            id=self.envelope.request_id,
-            metadata={
-                "context_hints": {
-                    "tier":            self.envelope.tier,
-                    "retry_strategy":  retry,
-                    "timeout_ms":      self.envelope.timeout_ms,
-                }
-            },
-        )
-
-    def merge_nanobot_hints(self, hints: dict) -> "InternalMessage":
-        """Store context_hints from a nanobot response into result.
-
-        Available to specialist_inbound() via result["_nanobot_context_hints"].
-        Stripped before translator_slice() — translator only sees result_for_translator.
-        Returns self.
-        """
-        if self.result is None:
-            self.result = {}
-        self.result["_nanobot_context_hints"] = hints
-        return self
-
-    def translator_slice(self) -> dict | None:
-        """Slice sent to translator — result_for_translator from orchestrator PASS 4 only.
-
-        Full envelope never crosses this boundary (fabrication firewall).
-        Returns None if result is not yet set.
-        """
-        if not self.result:
-            return None
-        return self.result.get("result_for_translator")
 
     # ── Validation ───────────────────────────────────────────────────────────
 
