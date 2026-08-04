@@ -8808,7 +8808,6 @@ class ExecutionEngine:
                 skill_summary = getattr(getattr(self, "app_state", None), "skill_summary", None) or {}
                 if not skill_summary:
                     skill_summary = getattr(getattr(self, "_app_state", None), "skill_summary", None) or {}
-                total_ops = 0
                 result_skills = []
                 for specialist, names in skill_summary.items():
                     for name in names:

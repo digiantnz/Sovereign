@@ -20,7 +20,6 @@ QDRANT_URL         = os.environ.get("QDRANT_URL", "http://qdrant-archive:6333")
 # QDRANT_WM_URL points to the working_memory qdrant container (tmpfs).
 QDRANT_WM_URL      = os.environ.get("QDRANT_WM_URL", "http://qdrant:6333")
 WEBDAV_URL         = os.environ.get("WEBDAV_URL", "http://nextcloud:80/remote.php/dav/")
-TELEGRAM_URL       = "https://api.telegram.org"
 GROK_URL           = "https://api.x.ai/v1"
 GEMINI_URL         = "https://generativelanguage.googleapis.com"
 GROQ_URL           = "https://api.groq.com"

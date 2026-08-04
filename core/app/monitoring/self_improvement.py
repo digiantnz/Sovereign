@@ -79,12 +79,6 @@ BASELINE_METRIC_NAMES = [
 # Others contribute only to the soft external_unreachable_count baseline metric.
 _CRITICAL_EXTERNAL_SERVICES = frozenset({"a2a_browser"})
 
-MONITORED_REPOS = [
-    # ClawSec injection patterns repo — check for new releases
-    ("digiantnz/Sovereign", "sovereign-core"),
-]
-
-
 # ── Telegram notification ─────────────────────────────────────────────────────
 
 async def _notify_director(message: str) -> None:

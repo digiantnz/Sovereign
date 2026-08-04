@@ -23,7 +23,6 @@ class TaxIngestHarness:
         self.cog     = cog
         self.nanobot = nanobot
         self.qdrant  = qdrant
-        self._semantic_cache: dict = {}
 
     async def run(self) -> dict:
         """Execute the full ingest cycle.

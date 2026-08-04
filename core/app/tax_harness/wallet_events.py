@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 async def handle_wallet_event(
     event: dict,
     qdrant,
-    semantic_cache: dict | None = None,
 ) -> "TaxEvent | None":
     """Record an incoming wallet event as a tax:crypto event.
 
