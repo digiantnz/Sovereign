@@ -41,6 +41,3 @@ wallet/profile/
 # Claude Code local session/tool state (settings, agent worktrees)
 .claude/
 
-# Stale checkout copy of governance.json — RAID (/home/sovereign/governance/governance.json)
-# is the sole source of truth, bind-mounted over this path at runtime. Never re-track.
-core/app/governance/governance.json
