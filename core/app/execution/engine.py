@@ -2962,52 +2962,6 @@ class ExecutionEngine:
         return await self._dispatch(action, prompt, payload=payload,
                                     security_confirmed=security_confirmed)
 
-    async def _safe_translate(self, user_input: str, result: dict, tier: str = "LOW") -> str:
-        """Always returns a Director-facing string. Never surfaces raw technical output."""
-        # Deterministic error guard — never pass error results to the LLM translator.
-        # The LLM may hallucinate success when given an error dict; this is an invariant:
-        # Sovereign must never claim success without a confirmed 2xx HTTP response.
-        _is_failure = (
-            result.get("error")
-            or result.get("status") in ("error", "unconfigured", "partial")
-            or result.get("success") is False
-        )
-        if _is_failure:
-            http_status = result.get("http_status")
-            err_detail  = result.get("error") or result.get("message") or "unknown error"
-            if http_status:
-                return f"That operation failed — upstream returned HTTP {http_status}: {err_detail}"
-            return f"That operation failed: {err_detail}"
-
-        try:
-            msg = await self.cog.ceo_translate(user_input, result, tier=tier)
-            if msg and msg.strip():
-                return msg.strip()
-        except Exception:
-            pass
-        # Shape-aware hard fallback — never expose raw error internals or technical fields
-        if result.get("error"):
-            return "I wasn't able to complete that. Please try again or rephrase your request."
-        if "items" in result:
-            items = result["items"]
-            path = result.get("path", "/")
-            names = ", ".join(i.get("name", "") for i in items[:8] if i.get("name"))
-            suffix = f" (and {len(items)-8} more)" if len(items) > 8 else ""
-            return f"Here's what I found at {path}: {names}{suffix}."
-        if "content" in result:
-            return f"Here are the contents of {result.get('path', 'that file')}:\n\n{result['content'][:3000]}"
-        if "messages" in result:
-            msgs = result["messages"]
-            return f"You have {len(msgs)} unread message(s)." if msgs else "No unread messages."
-        if "containers" in result:
-            return "\n".join(
-                f"{c.get('name',['?'])[0].lstrip('/') if isinstance(c.get('name'),list) else c.get('name','?')}: {c.get('status','')}"
-                for c in result["containers"]
-            )
-        if result.get("status") == "ok":
-            return "Done."
-        return "I wasn't able to complete that. Please try again."
-
     # ── Telegram attachment upload (/attachment endpoint) ─────────────────
     async def handle_attachment(self, filename: str, content_b64: str,
                                 mime_type: str, size: int, source: str) -> dict:

@@ -424,16 +424,6 @@ _COMPONENTS: list[dict] = [
         ),
         "location": "execution/adapters/wallet.py",
     },
-    {
-        "name": "adapter-whisper",
-        "component_type": "adapter",
-        "title": "Adapter: WhisperAdapter — transcription via a2a-whisper",
-        "content": (
-            f"WhisperAdapter: client to a2a-whisper on node04 (172.16.201.4:8003). "
-            "faster-whisper-server; no local GPU contention — Whisper runs on node04 (Quadro P4000)."
-        ),
-        "location": "execution/adapters/whisper.py",
-    },
 
     # ── Harnesses (3) ─────────────────────────────────────────────────────────
     {

@@ -887,77 +887,6 @@ class CognitionEngine:
         return result
 
     # ── Pass 2: Specialist Reasoning ──────────────────────────────────────
-    async def specialist_reason(self, agent_name: str, delegation: dict, user_input: str) -> dict:
-        from skills.loader import SkillLoader
-        _log = __import__("logging").getLogger(__name__)
-        persona = self.load_persona(agent_name)
-        try:
-            loader = SkillLoader(agent_name, ledger=self.ledger)
-            persona = loader.inject_into_persona(persona)
-            if loader.skills:
-                _log.debug("SkillLoader: injected %s into %s persona",
-                           loader.get_skill_names(), agent_name)
-        except Exception as e:
-            _log.warning("SkillLoader: failed for %s: %s", agent_name, e)
-
-        prompt = prompts.specialist(
-            agent_persona=persona,
-            delegation=delegation,
-            user_input=user_input,
-        )
-
-        # ── PASS 2 routing: external for complex/explicit requests ──────────
-        # PASS 1/3/4 always stay local; PASS 2 is the only externally-routed pass.
-        # Governance (PASS 3) and classification (PASS 1) must remain deterministic.
-        decision = self._routing_decision(prompt, user_input=user_input)
-
-        if decision["use_external"]:
-            _log.info(
-                "specialist_reason[%s]: routing to %s (reason=%s score=%.3f→%.3f)",
-                agent_name, decision["provider"], decision["reason"],
-                decision["score"], decision["penalised_score"],
-            )
-            try:
-                _ask_fn = {
-                    "claude":       self.ask_claude,
-                    "grok":         self.ask_grok,
-                    "gemini":       self.ask_gemini,
-                    "groq_inference": self.ask_groq_inf,
-                    "ollama_cloud": self.ask_ollama_cloud,
-                    "openrouter":   self.ask_openrouter,
-                }.get(decision["provider"], self.ask_grok)
-                raw = await _ask_fn(prompt, agent=agent_name)
-
-                response_text = raw.get("response", "")
-                # External providers return freeform text; may wrap JSON in ```json...```
-                # Strip markdown code fences first, then extract the outermost {...} block.
-                stripped = _re_fab.sub(r"```(?:json)?\s*", "", response_text).replace("```", "")
-                m = _re_fab.search(r"\{.*\}", stripped, _re_fab.DOTALL)
-                if m:
-                    try:
-                        result = json.loads(m.group())
-                        result["_routed_external"] = True
-                        result["_provider"]        = decision["provider"]
-                        result["_complexity_score"] = decision["score"]
-                        result["_routing_reason"]  = decision["reason"]
-                        return result
-                    except json.JSONDecodeError:
-                        pass
-                _log.warning("specialist_reason[%s]: external response had no parseable JSON, falling back to local",
-                             agent_name)
-            except Exception as exc:
-                _log.warning("specialist_reason[%s]: external call failed (%s), falling back to local",
-                             agent_name, exc)
-
-        # Local path (default, or fallback from failed external)
-        result = await self.call_llm_json(prompt)
-        result["_routed_external"]  = False
-        result["_provider"]         = "ollama"
-        result["_routing_reason"]   = decision["reason"]
-        result["_complexity_score"] = decision["score"]
-        result["_intended_provider"] = decision["provider"] if decision["use_external"] else "ollama"
-        return result
-
     # ── Pass 3 outbound: Specialist selects skill and builds payload ──────
     async def specialist_outbound(self, agent_name: str, delegation: dict, user_input: str,
                                   context_window=None, sovereign_context: str = "") -> dict:
@@ -1755,59 +1684,6 @@ class CognitionEngine:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
 
-    # ── External cognition — Gemini Vision ───────────────────────────────
-    async def ask_gemini_vision(
-        self,
-        image_b64: str,
-        mime_type:  str,
-        prompt:     str,
-        sensitivity: str = "WORKSPACE_INTERNAL",
-        agent:      str  = "sovereign-core",
-    ) -> dict:
-        """DCL-gated Gemini vision call. Classifies the text prompt; image bytes are not classified.
-
-        Blocks if sensitivity > WORKSPACE_INTERNAL (PRIVATE/SECRET).
-        Returns {response, _trust} or {error, message, _trust}.
-        """
-        from adapters.gemini import GeminiUnavailableError
-        logger.info("ask_gemini_vision[%s]: calling provider, prompt_chars=%d", agent, len(prompt))
-        dcl_result = self.dcl.prepare(prompt, agent=agent, provider="gemini")
-        if dcl_result.blocked:
-            logger.warning("ask_gemini_vision[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
-            if self.ledger:
-                self.dcl.log_call(dcl_result, self.ledger)
-            return {
-                "error": "DCL_BLOCKED", "sensitivity": dcl_result.tier,
-                "message": "Content classified SECRET — not transmitted to external provider.",
-                "_trust": "untrusted_external",
-            }
-        try:
-            raw = await self.gemini.generate_with_image(
-                prompt=dcl_result.content,
-                image_b64=image_b64,
-                mime_type=mime_type,
-            )
-            if self.ledger:
-                self.dcl.log_call(dcl_result, self.ledger,
-                                  output_tokens=raw.get("output_tokens", 0))
-            if raw.get("status") == "error" or not raw.get("response"):
-                raise ValueError(raw.get("error", "empty response from Gemini vision"))
-            logger.info("ask_gemini_vision[%s]: ok in=%d out=%d", agent,
-                        raw.get("input_tokens", 0), raw.get("output_tokens", 0))
-            return {"response": raw["response"], "_trust": "untrusted_external"}
-        except GeminiUnavailableError as exc:
-            logger.warning("ask_gemini_vision[%s]: unavailable: %s", agent, exc)
-            if self.ledger:
-                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(exc))
-            return {"error": "GEMINI_UNAVAILABLE", "message": str(exc), "_trust": "untrusted_external"}
-        except Exception as exc:
-            if "429" in str(exc) or "rate limit" in str(exc).lower():
-                self.mark_provider_rate_limited("gemini")
-            logger.warning("ask_gemini_vision[%s]: error: %s", agent, exc)
-            if self.ledger:
-                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(exc))
-            return {"error": str(exc), "_trust": "untrusted_external"}
-
     # ── External cognition — Groq Inference ──────────────────────────────
     async def ask_groq_inf(
         self,
@@ -1854,46 +1730,6 @@ class CognitionEngine:
             if self.ledger:
                 self.dcl.log_call(dcl_result, self.ledger, provider_error=str(e))
             return {"error": str(e), "_trust": "untrusted_external"}
-
-    # ── External cognition — Groq structured (Instructor) ────────────────
-    async def ask_groq_inf_structured(
-        self,
-        prompt: str,
-        response_model: type,
-        agent: str = "sovereign-core",
-        system: str = "You are a helpful assistant. Return only valid JSON.",
-        model: str | None = None,
-    ) -> dict | None:
-        """DCL-gated Groq call using Instructor for structured JSON output.
-
-        Returns model_dump() dict on success, None on DCL block or error.
-        Use for passes that need validated structured output from Groq —
-        Instructor retries with validation-error context, unlike the plain generate path.
-        """
-        dcl_result = self.dcl.prepare(prompt, agent=agent, provider="groq_inference")
-        if dcl_result.blocked:
-            logger.warning("ask_groq_inf_structured[%s]: DCL_BLOCKED tier=%s", agent, dcl_result.tier)
-            if self.ledger:
-                self.dcl.log_call(dcl_result, self.ledger)
-            return None
-        try:
-            result = await self.groq_inf.generate_structured(
-                prompt=dcl_result.content,
-                response_model=response_model,
-                system=system,
-                model=model,
-            )
-            if self.ledger:
-                self.dcl.log_call(dcl_result, self.ledger)
-            logger.info("ask_groq_inf_structured[%s]: ok model=%s", agent, model or "default")
-            return result.model_dump() if hasattr(result, "model_dump") else dict(result)
-        except Exception as exc:
-            if "429" in str(exc) or "rate limit" in str(exc).lower():
-                self.mark_provider_rate_limited("groq_inference")
-            logger.warning("ask_groq_inf_structured[%s]: error: %s", agent, exc)
-            if self.ledger:
-                self.dcl.log_call(dcl_result, self.ledger, provider_error=str(exc))
-            return None
 
     # ── External cognition — Ollama Cloud ────────────────────────────────
     async def ask_ollama_cloud(

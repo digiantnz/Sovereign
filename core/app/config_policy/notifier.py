@@ -39,19 +39,6 @@ Usage (async — call after a successful confirmed write):
         tier="MID",
         ledger=ledger,
     )
-
-For future adapters that write governance.json, personas, or security pattern files,
-use the async config_write() helper which gates the write, runs the write, and notifies:
-
-    result = await config_write(
-        path="/home/sovereign/personas/research_agent.md",
-        content=new_content,
-        proposed_by=agent,
-        reason=reason,
-        tier="MID",
-        ledger=ledger,
-        confirmed=True,
-    )
 """
 
 import logging
@@ -100,19 +87,6 @@ _SCOPE: list[tuple[str, str, object]] = [
         lambda p: p.startswith("/home/sovereign/skills/"),
     ),
 ]
-
-
-def is_in_scope(path: str) -> bool:
-    """Return True if path falls under the config change notification policy."""
-    return any(fn(path) for _, _, fn in _SCOPE)
-
-
-def get_policy_tier(path: str) -> Optional[str]:
-    """Return the policy tier for a path, or None if not in scope."""
-    for _, tier, fn in _SCOPE:
-        if fn(path):
-            return tier
-    return None
 
 
 def _get_scope_entry(path: str) -> Optional[tuple[str, str]]:
@@ -182,102 +156,6 @@ async def notify_config_change(
             ledger.append("config_change_notification", "post_write", data)
         except Exception as e:
             logger.warning("ConfigChangeNotifier: audit write failed: %s", e)
-
-
-# ── Future-proof config write helper ─────────────────────────────────────────
-
-async def config_write(
-    path: str,
-    content: str,
-    proposed_by: str,
-    reason: str,
-    tier: str,
-    ledger=None,
-    confirmed: bool = False,
-    narrative: Optional[str] = None,
-    technical: Optional[dict] = None,
-) -> dict:
-    """Gate, write, and notify for in-scope config file writes.
-
-    Intended for future adapters that need to write governance.json, persona files,
-    or security pattern files. The current write adapters (WebDAV) write to Nextcloud,
-    not to RAID paths — this helper is for direct RAID file writes only.
-
-    Args:
-        path:        Absolute RAID path to write.
-        content:     File content to write.
-        proposed_by: Agent proposing the change.
-        reason:      Reason for the change.
-        tier:        Governance tier (determines confirmation requirement).
-        ledger:      AuditLedger instance.
-        confirmed:   True only when Director has explicitly confirmed (gateway sets this).
-        narrative:   Plain English summary; auto-generated from path + reason if not provided.
-        technical:   Optional technical metadata for audit log.
-
-    Returns:
-        {"status": "ok", "path": path}
-        or {"requires_confirmation": True, "tier": tier, "path": path}
-        or {"error": "..."}
-    """
-    entry = _get_scope_entry(path)
-    if not entry:
-        # Not in scope — write without notification
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                f.write(content)
-            return {"status": "ok", "path": path}
-        except OSError as e:
-            return {"error": str(e)}
-
-    label, policy_tier = entry
-
-    # Confirmation gate — HIGH tier (soul, checksums) requires double confirmation.
-    # The execution engine enforces this via governance before _dispatch is called,
-    # but config_write enforces it independently for direct callers.
-    if not confirmed:
-        double = policy_tier == "HIGH" or tier == "HIGH"
-        resp: dict = {
-            "path": path,
-            "label": label,
-            "tier": tier,
-            "policy_tier": policy_tier,
-            "warning": (
-                f"Modifying '{label}' requires Director confirmation before writing. "
-                f"Resubmit with confirmed=True."
-            ),
-        }
-        if double:
-            resp["requires_double_confirmation"] = True
-        else:
-            resp["requires_confirmation"] = True
-        return resp
-
-    # Write the file
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            f.write(content)
-    except OSError as e:
-        return {"error": f"Write failed: {e}"}
-
-    # Build narrative if not provided
-    if not narrative:
-        filename = path.split("/")[-1]
-        narrative = f"{label} file '{filename}' was updated by {proposed_by}. Reason: {reason}"
-
-    # Post-write notification
-    await notify_config_change(
-        path=path,
-        narrative=narrative,
-        proposed_by=proposed_by,
-        reason=reason,
-        tier=tier,
-        ledger=ledger,
-        technical=technical,
-    )
-
-    return {"status": "ok", "path": path}
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────

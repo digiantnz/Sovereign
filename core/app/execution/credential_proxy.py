@@ -120,17 +120,6 @@ class CredentialProxy:
         self._audit("credential_token_redeemed", {"services": entry["services"]})
         return entry["credentials"]
 
-    def cleanup_expired(self) -> int:
-        """Remove expired tokens. Call from a periodic maintenance task."""
-        now = time.monotonic()
-        with self._lock:
-            expired = [t for t, e in self._tokens.items() if now > e["expires_at"]]
-            for t in expired:
-                del self._tokens[t]
-        if expired:
-            logger.debug("CredentialProxy: cleaned up %d expired tokens", len(expired))
-        return len(expired)
-
     def _audit(self, event_type: str, data: dict) -> None:
         if self._ledger:
             try:

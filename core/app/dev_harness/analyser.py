@@ -303,69 +303,6 @@ def _run_subprocess(
         return "", msg
 
 
-def run_local_analysis(scan_root: str, semgrep_config: str = "broker/semgrep-rules.yaml") -> AnalysisResult:
-    """
-    Run all three local analysis tools against scan_root.
-    Returns an AnalysisResult with findings and finalised gate decision.
-
-    semgrep_config: path to the semgrep ruleset, relative to the repo root
-    or absolute.  Defaults to the local custom ruleset (no internet required).
-
-    TEST USE ONLY — production invocations must go via broker command dispatch.
-    This function must never be called from engine.py domain handlers.
-    Direct subprocess execution bypasses commands-policy.yaml validation entirely.
-    """
-    assert os.getenv("SOVEREIGN_ENV") != "production", (
-        "run_local_analysis() called in production context — "
-        "use broker command dispatch (harness.py Phase 1 path)"
-    )
-    session_id = str(uuid.uuid4())
-    result     = AnalysisResult(
-        session_id = session_id,
-        trigger    = "direct",
-        scan_root  = scan_root,
-    )
-
-    # ── pylint ────────────────────────────────────────────────────────────
-    pylint_out, pylint_err = _run_subprocess(
-        ["python3", "-m", "pylint", "--output-format=json", scan_root],
-        timeout_s=120, label="pylint",
-    )
-    if pylint_err:
-        result.tool_errors.append(f"pylint: {pylint_err}")
-    else:
-        pylint_findings = parse_pylint_output(pylint_out, scan_root)
-        result.findings.extend(pylint_findings)
-        result.local_count += len(pylint_findings)
-
-    # ── semgrep ───────────────────────────────────────────────────────────
-    semgrep_out, semgrep_err = _run_subprocess(
-        ["semgrep", "--config", semgrep_config, "--json", scan_root],
-        timeout_s=120, label="semgrep",
-    )
-    if semgrep_err:
-        result.tool_errors.append(f"semgrep: {semgrep_err}")
-    else:
-        semgrep_findings = parse_semgrep_output(semgrep_out, scan_root)
-        result.findings.extend(semgrep_findings)
-        result.local_count += len(semgrep_findings)
-
-    # ── boundary scanner ──────────────────────────────────────────────────
-    boundary_out, boundary_err = _run_subprocess(
-        ["python3", str(_BOUNDARY_SCANNER), scan_root],
-        timeout_s=60, label="boundary_scanner",
-    )
-    if boundary_err:
-        result.tool_errors.append(f"boundary_scanner: {boundary_err}")
-    else:
-        boundary_findings = parse_boundary_output(boundary_out)
-        result.findings.extend(boundary_findings)
-        result.local_count += len(boundary_findings)
-
-    result.finalise()
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

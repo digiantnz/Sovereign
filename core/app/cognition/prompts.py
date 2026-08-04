@@ -716,59 +716,6 @@ NEVER write phrases like "Urgency does not apply here", "This is an informationa
 Respond with ONLY the translated message text and nothing else."""
 
 
-def memory_decision(ceo_persona: str, user_input: str, execution_result: dict) -> str:
-    return f"""{ceo_persona}
-
----
-TASK — PASS 4: MEMORY GOVERNANCE
-
-Request: {json.dumps(user_input)}
-
-Execution result:
-{json.dumps(execution_result, indent=2)}
-
-IRON RULE — MEMORY INTEGRITY:
-- execution_confirmed is authoritative. If execution_confirmed=false, the action did NOT complete successfully.
-- If execution_confirmed=false OR status="error" OR "error" key is present → do NOT set outcome="positive". Set outcome="negative" or store=false.
-- Never store a memory that claims an action completed when execution_confirmed=false.
-- Only set outcome="positive" when execution_confirmed=true is explicitly present in the result above.
-
-Decide if this interaction warrants storing a memory.
-Store only if it demonstrates novelty, corrective value, or a recurring pattern.
-Do NOT store routine successful operations (e.g. listing containers, reading email).
-
-COLLECTION CLASSIFICATION RULES:
-- semantic: durable facts, system knowledge, config truths, domain definitions
-- episodic: timestamped events with outcomes and lessons; include outcome field
-- prospective: future tasks or intentions with a scheduled date; MUST include next_due (YYYY-MM-DD)
-- procedural: repeatable multi-step workflows with triggers/preconditions (requires human confirmation — set store=true and collection=procedural, Director will be asked to confirm)
-- associative: a cross-memory link between two specific stored items (include item_a_id, item_b_id, link_type)
-- relational: concept overlap/divergence insight (MUST include concept_a, concept_b, shared array, diverges array, insight string)
-- meta: domain confidence maps, known gaps, system knowledge boundaries
-- working_memory: ephemeral session reasoning, in-progress context (default)
-
-WRITE PERMISSION RULES (enforce these):
-- sovereign-core only: semantic, associative, relational, meta
-- specialist-allowed: episodic, prospective
-- procedural: sovereign-core + requires human_confirmed=true
-
-Respond with ONLY this JSON (include only fields relevant to the chosen collection):
-
-{{
-  "store": false,
-  "collection": "working_memory|semantic|episodic|prospective|associative|relational|meta|procedural",
-  "type": "<same as collection>",
-  "lesson": "<concise content to store, empty if store=false>",
-  "outcome": "positive|negative|neutral",
-  "next_due": "<YYYY-MM-DD if prospective, else omit>",
-  "concept_a": "<first concept if relational, else omit>",
-  "concept_b": "<second concept if relational, else omit>",
-  "shared": ["<shared aspect if relational, else omit>"],
-  "diverges": ["<diverging aspect if relational, else omit>"],
-  "insight": "<one-sentence synthesis if relational, else omit>"
-}}"""
-
-
 def specialist_outbound(agent_persona: str, delegation: dict, user_input: str,
                         routing_history: str = "", context_window=None,
                         sovereign_context: str = "",
@@ -1170,7 +1117,7 @@ def translate_from_orchestrator(translator_persona: str, result_for_translator: 
     """PASS 5: Translator receives ONLY result_for_translator — nothing else.
 
     This is the new restricted-input translator prompt. The old translate_for_director()
-    is kept for error paths and _safe_translate() backward compat.
+    is kept for error paths.
     """
     success = result_for_translator.get("success", True)
     has_error = bool(result_for_translator.get("error"))
