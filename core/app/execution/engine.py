@@ -3101,12 +3101,32 @@ class ExecutionEngine:
             scan = self.scanner.scan(user_input)
             if scan.flagged:
                 try:
-                    sec = await self.cog.security_evaluate(scan, user_input)
-                except Exception:
-                    sec = {"block": False, "risk_level": "medium",
-                           "risk_categories": scan.categories,
-                           "reasoning_summary": "Security LLM evaluation failed — proceeding with caution",
-                           "required_mitigation": ""}
+                    sec = await asyncio.wait_for(
+                        self.cog.security_evaluate(scan, user_input),
+                        timeout=_cfg.timeouts.pass_s,
+                    )
+                except Exception as _sec_exc:
+                    logger.warning(
+                        "security_evaluate failed (inbound scanner), retrying once: %s", _sec_exc
+                    )
+                    try:
+                        sec = await asyncio.wait_for(
+                            self.cog.security_evaluate(scan, user_input),
+                            timeout=_cfg.timeouts.pass_s,
+                        )
+                    except Exception as _sec_exc2:
+                        logger.error(
+                            "SECURITY_EVALUATOR_FAILED_CLOSED gate=inbound_scanner error=%s — denying (fail-closed)",
+                            _sec_exc2,
+                        )
+                        sec = {"block": True, "risk_level": "high",
+                               "risk_categories": scan.categories,
+                               "reasoning_summary": (
+                                   "The security evaluator is currently unavailable, so this request "
+                                   "is being denied by default until it recovers. This is not a "
+                                   "judgement that your message was flagged as malicious."
+                               ),
+                               "required_mitigation": "", "_evaluator_failed": True}
                 if sec.get("block"):
                     if self.ledger:
                         try:
@@ -3114,6 +3134,7 @@ class ExecutionEngine:
                                 "categories": scan.categories,
                                 "risk_level": sec.get("risk_level", "high"),
                                 "input_preview": user_input[:200],
+                                "evaluator_failed": sec.get("_evaluator_failed", False),
                             })
                         except Exception:
                             pass
@@ -3437,20 +3458,37 @@ class ExecutionEngine:
         self._set_pass("P2", intent=intent, tier=tier, agent=agent)
         if tier == "HIGH" and not _scanner_evaluated and not security_confirmed and not confirmed:
             _t_p2 = _time_mod.monotonic()
+            # Build a minimal scan result for the security agent
+            class _HighTierScan:
+                flagged = True
+                categories = ["high_tier_action"]
+                matched_phrases = [intent]
             try:
-                # Build a minimal scan result for the security agent
-                class _HighTierScan:
-                    flagged = True
-                    categories = ["high_tier_action"]
-                    matched_phrases = [intent]
                 sec2 = await _asyncio.wait_for(
                     self.cog.security_evaluate(_HighTierScan(), user_input),
                     timeout=_PASS_TIMEOUT,
                 )
-            except Exception:
-                sec2 = {"block": False, "risk_level": "low", "risk_categories": [],
-                        "reasoning_summary": "Security PASS 2 unavailable — proceeding",
-                        "required_mitigation": ""}
+            except Exception as _sec2_exc:
+                logger.warning(
+                    "security_evaluate failed (PASS 2 HIGH-tier), retrying once: %s", _sec2_exc
+                )
+                try:
+                    sec2 = await _asyncio.wait_for(
+                        self.cog.security_evaluate(_HighTierScan(), user_input),
+                        timeout=_PASS_TIMEOUT,
+                    )
+                except Exception as _sec2_exc2:
+                    logger.error(
+                        "SECURITY_EVALUATOR_FAILED_CLOSED gate=pass2_high_tier error=%s — denying (fail-closed)",
+                        _sec2_exc2,
+                    )
+                    sec2 = {"block": True, "risk_level": "high", "risk_categories": ["evaluator_unavailable"],
+                            "reasoning_summary": (
+                                "The security evaluator is currently unavailable, so this HIGH-tier "
+                                "action is being denied by default until it recovers. This is not a "
+                                "judgement that the action itself was malicious."
+                            ),
+                            "required_mitigation": "", "_evaluator_failed": True}
             _p2_dur = (_time_mod.monotonic() - _t_p2) * 1000
             self._log_pass(2, "security_agent", user_input, sec2,
                            _p2_dur / 1000)
@@ -3470,6 +3508,7 @@ class ExecutionEngine:
                             "intent": intent, "tier": tier,
                             "risk_level": sec2.get("risk_level", "high"),
                             "reasoning": sec2.get("reasoning_summary", ""),
+                            "evaluator_failed": sec2.get("_evaluator_failed", False),
                         })
                     except Exception:
                         pass
