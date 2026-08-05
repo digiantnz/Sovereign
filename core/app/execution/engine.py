@@ -2480,6 +2480,63 @@ class ExecutionEngine:
         self._mip_listed_this_session = False
         # Live cognitive loop state — read by /cognitive/state endpoint for dashboard
         self._loop_state: dict = {"active": False, "pass": None, "intent": None, "tier": None, "agent": None}
+        # SEC-024/SEC-051/052/053 fix: server-side provenance for confirmed-continuation.
+        # security_confirmed / a truthy pending_delegation must never be trusted verbatim
+        # from the client — only a token minted by this process (see _mint_confirm_token /
+        # _verify_confirm_token below), bound to the exact delegation content, proves a
+        # gate actually fired and was legitimately answered. In-process, TTL-bound,
+        # single-use (mirrors CredentialProxy's issue/redeem shape) — lost on restart,
+        # same accepted tradeoff as working_memory checkpoints (core/app/CLAUDE.md's
+        # Harness Pattern crash note): an in-flight confirmation across a restart fails
+        # closed (gates re-run) rather than silently succeeding.
+        self._pending_confirmations: dict = {}
+        self._CONFIRM_TOKEN_TTL_S = 1200  # 20 minutes
+
+    def _fingerprint_delegation(self, d: dict) -> str:
+        import hashlib as _hashlib
+        d2 = {k: v for k, v in (d or {}).items() if k != "_confirm_token"}
+        blob = json.dumps(d2, sort_keys=True, default=str)
+        return _hashlib.sha256(blob.encode()).hexdigest()
+
+    def _mint_confirm_token(self, pending_delegation: dict) -> None:
+        """Mutates pending_delegation in place, adding a server-verifiable _confirm_token."""
+        import secrets as _secrets
+        import time as _time_mint
+        fp = self._fingerprint_delegation(pending_delegation)
+        token = _secrets.token_urlsafe(24)
+        self._pending_confirmations[token] = {
+            "expires_at": _time_mint.monotonic() + self._CONFIRM_TOKEN_TTL_S,
+            "fingerprint": fp,
+        }
+        pending_delegation["_confirm_token"] = token
+
+    def _verify_confirm_token(self, pending_delegation) -> bool:
+        """Single-use: pops the token on every read, valid or not."""
+        import time as _time_verify
+        if not pending_delegation:
+            return False
+        token = pending_delegation.get("_confirm_token")
+        if not token:
+            return False
+        entry = self._pending_confirmations.pop(token, None)
+        if not entry:
+            return False
+        if _time_verify.monotonic() > entry["expires_at"]:
+            return False
+        return self._fingerprint_delegation(pending_delegation) == entry["fingerprint"]
+
+    def _confirm_and_return(self, resp: dict) -> dict:
+        """Wrap any requires_confirmation / requires_double_confirmation /
+        requires_security_confirmation response dict — mints a server-verifiable
+        _confirm_token into its pending_delegation before returning, so the
+        eventual confirmed-continuation turn can prove provenance (SEC-024/
+        051/052/053 fix). No-op passthrough if there's no pending_delegation.
+        Every direct-return confirmation site in this class must route its
+        return value through this — see the fix's as-built entry for the full
+        list of call sites this covers."""
+        if resp.get("pending_delegation") is not None:
+            self._mint_confirm_token(resp["pending_delegation"])
+        return resp
 
     # ── Universal item index (working_memory, zero-vector, session-scoped) ────
     #
@@ -2958,7 +3015,11 @@ class ExecutionEngine:
             if rules.get("requires_confirmation"):
                 return {"requires_confirmation": True, "action": action, "tier": tier}
 
-        security_confirmed = payload.get("security_confirmed", False)
+        # SEC-024/051/052/053 fix: /query has no pending_delegation/token mechanism
+        # at all — there is no server-side state a client-supplied security_confirmed
+        # could ever legitimately verify against on this endpoint, so it's never
+        # trusted here (CLAUDE.md's own Test Governance examples never rely on it).
+        security_confirmed = False
         return await self._dispatch(action, prompt, payload=payload,
                                     security_confirmed=security_confirmed)
 
@@ -3027,6 +3088,11 @@ class ExecutionEngine:
         # instance, producing latency_ms values off by 30-130x. Threaded explicitly
         # as a parameter to every /command harness method below instead.
         _req_t0 = _time_mod0.monotonic()
+        # SEC-024/SEC-051/052/053 fix: security_confirmed is never trusted from the
+        # client — recompute from server-side token verification. This local now
+        # flows unchanged through every existing security_confirmed=... call site
+        # below (inbound scanner, GuardrailEngine via _dispatch/_dispatch_inner).
+        security_confirmed = self._verify_confirm_token(pending_delegation)
         # PROSPECTIVE + HEALTH SESSION-START CHECK — fires on first message of a new session
         # (no prior context, no pending delegation = fresh session)
         # NOTE: Do NOT pass due_items through ceo_translate — the LLM fabricates briefing
@@ -3096,8 +3162,10 @@ class ExecutionEngine:
             except Exception as _hb_e:
                 logger.warning("session-start health_brief lookup failed: %s", _hb_e)
 
-        # SECURITY LAYER — pre-LLM inbound scan (skip if already security-confirmed)
-        if not security_confirmed and self.scanner and not pending_delegation:
+        # SECURITY LAYER — pre-LLM inbound scan (skip only on verified provenance —
+        # SEC-024 fix: a merely-truthy pending_delegation is no longer sufficient on
+        # its own; security_confirmed above is now server-token-derived)
+        if not security_confirmed and self.scanner:
             scan = self.scanner.scan(user_input)
             if scan.flagged:
                 try:
@@ -3159,6 +3227,21 @@ class ExecutionEngine:
         _u_lower = user_input.lower()
         if any(w in _u_lower for w in ("skill", "clawhub", "openclaw")):
             _TOTAL_TIMEOUT = max(_TOTAL_TIMEOUT, _cfg.cognitive_loop.skills_domain_min_total_timeout_s)
+
+        # ── GuardrailEngine confirmed-continuation (SEC-053 promotion-bug fix) ───
+        # Resumes a "confirm" verdict from _dispatch_inner's guardrail check
+        # (marker shape set at its "pending_delegation" construction below).
+        # security_confirmed is already server-token-verified above — this only
+        # re-dispatches the exact original action once provenance checks out.
+        if pending_delegation and pending_delegation.get("_guardrail_pending_action") and security_confirmed:
+            return await self._dispatch(
+                pending_delegation["_guardrail_pending_action"],
+                pending_delegation.get("_guardrail_prompt"),
+                delegation=pending_delegation.get("_guardrail_delegation") or {},
+                specialist=pending_delegation.get("_guardrail_specialist"),
+                payload={"confirmed": confirmed},
+                security_confirmed=True,
+            )
 
         # ── Harness command fast-path (/install, /skills, /selfimprove, etc.) ───
         # Explicit /commands bypass all NL routing — deterministic entry point.
@@ -3430,7 +3513,7 @@ class ExecutionEngine:
         if not confirmed:
             if rules.get("requires_double_confirmation"):
                 self._clear_pass()
-                return {
+                return self._confirm_and_return({
                     "requires_double_confirmation": True,
                     # _original_request preserved so specialist_outbound on confirmed
                     # continuation gets the real request ("delete X"), not "yes".
@@ -3439,17 +3522,17 @@ class ExecutionEngine:
                     "summary": user_input,
                     "confidence": round(confidence, 3),
                     "gaps": gaps,
-                }
+                })
             if rules.get("requires_confirmation"):
                 self._clear_pass()
-                return {
+                return self._confirm_and_return({
                     "requires_confirmation": True,
                     "pending_delegation": {**delegation, "intent": intent,
                                            "_original_request": user_input},
                     "summary": user_input,
                     "confidence": round(confidence, 3),
                     "gaps": gaps,
-                }
+                })
 
         # PASS 2 — Conditional security (tier=HIGH only; scanner path already evaluated above)
         # The pre-LLM scanner fires before PASS 1 (injection detection).
@@ -3741,7 +3824,7 @@ class ExecutionEngine:
                                                    payload={"confirmed": confirmed},
                                                    security_confirmed=security_confirmed)
                 if exec_result.get("requires_confirmation"):
-                    return {
+                    return self._confirm_and_return({
                         "status": "ok", "intent": intent, "tier": tier, "agent": agent,
                         "confidence": round(confidence, 3), "gaps": gaps,
                         "requires_confirmation": True,
@@ -3751,7 +3834,7 @@ class ExecutionEngine:
                             "intent": "research_save",
                         },
                         "director_message": exec_result.get("director_message", "Research complete. Save to Nextcloud Notes?"),
-                    }
+                    })
                 if exec_result.get("status") == "stale_checkpoint":
                     # Stale checkpoint: surface the director_message directly, no confirmation gate
                     return {
@@ -3907,14 +3990,20 @@ class ExecutionEngine:
             execution_result = {"status": "error",
                                 "error": f"dispatch returned None for domain={action.get('domain')!r} op={action.get('operation')!r}"}
 
-        # Early exit for governance confirmation gates — translator generates the prompt
-        if execution_result.get("requires_confirmation") or execution_result.get("requires_double_confirmation"):
+        # Early exit for governance/guardrail confirmation gates — translator generates
+        # the prompt. requires_security_confirmation added (SEC-053 promotion-bug fix) —
+        # previously only requires_confirmation/requires_double_confirmation short-
+        # circuited here, so GuardrailEngine's "confirm" verdict fell through and was
+        # never surfaced to the Director.
+        if (execution_result.get("requires_confirmation")
+                or execution_result.get("requires_double_confirmation")
+                or execution_result.get("requires_security_confirmation")):
             _confirm_ctx = {
                 "success": True,   # Not a failure — a confirmation gate
                 "outcome": "confirmation_required",
                 "detail": {
                     "action": execution_result.get("action", intent),
-                    "summary": execution_result.get("summary", ""),
+                    "summary": execution_result.get("summary") or execution_result.get("reason", ""),
                     "review_decision": (execution_result.get("review_result") or {}).get("decision", ""),
                     "escalated": bool(execution_result.get("escalation_notice")),
                     "please_confirm": "Reply yes to proceed or no to cancel.",
@@ -3931,9 +4020,15 @@ class ExecutionEngine:
                 "confidence": round(confidence, 3), "gaps": gaps, "director_message": _dm,
             }
             for _gw_key in ("requires_confirmation", "requires_double_confirmation",
+                            "requires_security_confirmation",
                             "pending_delegation", "summary", "escalation_notice"):
                 if execution_result.get(_gw_key) is not None:
                     result_dict[_gw_key] = execution_result[_gw_key]
+            # SEC-024/051/052/053 fix: mint the server-verifiable token into the
+            # delegation the client will echo back on the confirmed turn.
+            if result_dict.get("pending_delegation") is not None:
+                result_dict["pending_delegation"] = dict(result_dict["pending_delegation"])
+                self._mint_confirm_token(result_dict["pending_delegation"])
             if morning_briefing:
                 result_dict["morning_briefing"] = morning_briefing
             self._clear_pass()
@@ -4647,11 +4742,20 @@ class ExecutionEngine:
             "_envelope": _msg.envelope.to_dict(),
             "_history": [r.to_dict() for r in _msg.history],
         }
-        # Promote gateway-critical fields to top level — gateway reads top-level only
+        # Promote gateway-critical fields to top level — gateway reads top-level only.
+        # requires_security_confirmation added (SEC-053 promotion-bug fix, see the
+        # other early-exit block above for the full explanation).
         for _gw_key in ("requires_confirmation", "requires_double_confirmation",
+                        "requires_security_confirmation",
                         "pending_delegation", "summary", "escalation_notice"):
             if execution_result.get(_gw_key) is not None:
                 result_dict[_gw_key] = execution_result[_gw_key]
+        # SEC-024/051/052/053 fix: mint the server-verifiable token here too — this
+        # is the main 5-pass flow's own ending, a separate chokepoint from the
+        # early-exit block above.
+        if result_dict.get("pending_delegation") is not None:
+            result_dict["pending_delegation"] = dict(result_dict["pending_delegation"])
+            self._mint_confirm_token(result_dict["pending_delegation"])
         if morning_briefing:
             result_dict["morning_briefing"] = morning_briefing
         self._clear_pass()
@@ -4915,7 +5019,7 @@ class ExecutionEngine:
                 + f"\n\nInstall?"
             )
 
-            return {
+            return self._confirm_and_return({
                 "requires_confirmation": True,
                 "summary": summary,
                 "pending_delegation": {
@@ -4924,7 +5028,7 @@ class ExecutionEngine:
                     "_harness_cmd": "install",
                     "_pending_install": selected,
                 },
-            }
+            })
 
         # ── Phase B: confirmed — scan → review → install ────────────────────
         selected = delegation.get("_pending_install")
@@ -5121,11 +5225,11 @@ class ExecutionEngine:
         psbt = psbt_b64 or delegation.get("psbt_b64", "")
         if not confirmed:
             preview = f" PSBT prefix: {psbt[:40]}..." if psbt else " No PSBT provided inline — Rex will use the latest pending PSBT."
-            return {
+            return self._confirm_and_return({
                 "requires_double_confirmation": True,
                 "pending_delegation": {"_harness_cmd": "sign_btc", "psbt_b64": psbt},
                 "summary": f"Sign BTC PSBT with Rex's key (1-of-3 multisig).{preview}\n\nThis is HIGH tier — confirm to proceed.",
-            }
+            })
         action = {**INTENT_ACTION_MAP.get("wallet_sign_btc_psbt", {"domain": "wallet", "operation": "sign", "name": "wallet_sign_btc_psbt"}), "psbt_b64": psbt}
         result = await self._dispatch_inner(action, delegation={"intent": "wallet_sign_btc_psbt"}, payload={})
         _rft = {
@@ -5804,7 +5908,19 @@ class ExecutionEngine:
                     "requires_security_confirmation": True,
                     "rules": grail.matched_rules,
                     "reason": grail.reason,
-                    "pending_action": action,
+                    # SEC-053 promotion-bug fix: was "pending_action" — never promoted
+                    # to the top-level API response anywhere (checked all 3 result-
+                    # assembly points), so this confirm verdict never reached the
+                    # Director. "pending_delegation" is the field name the existing
+                    # promotion whitelists + gateway already expect; the marker key
+                    # lets handle_chat's confirmed-continuation short-circuit above
+                    # recognise and resume this specific gate.
+                    "pending_delegation": {
+                        "_guardrail_pending_action": action,
+                        "_guardrail_prompt": prompt,
+                        "_guardrail_delegation": delegation,
+                        "_guardrail_specialist": specialist,
+                    },
                 }
 
 
@@ -7787,7 +7903,7 @@ class ExecutionEngine:
                                 f"Escalation reasons: "
                                 f"{'; '.join(_h_review.get('escalation_reasons', []))}."
                             )
-                        return _h_resp
+                        return self._confirm_and_return(_h_resp)
                     # confirmed=True — execute install
                     _h_dl = (delegation or {}).get("_pending_load") or {}
                     _h_install_result = await lifecycle.load(
@@ -7979,7 +8095,7 @@ class ExecutionEngine:
                         raw_url=pending.get("raw_url"),
                     )
 
-                return resp
+                return self._confirm_and_return(resp)
 
             return {"error": f"Unknown skills operation: {op}"}
 
