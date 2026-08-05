@@ -169,7 +169,7 @@ app.post('/check', _requireInternalToken, async (req, res) => {
 
 // ── Safe Transaction Service proxies ──────────────────────────────────────────
 
-app.get('/safe/nonce', async (req, res) => {
+app.get('/safe/nonce', _requireInternalToken, async (req, res) => {
   const safe = req.query.safe;
   if (!safe) return res.status(400).json({ error: 'safe param required' });
   try {
@@ -182,7 +182,7 @@ app.get('/safe/nonce', async (req, res) => {
   }
 });
 
-app.post('/safe/propose', async (req, res) => {
+app.post('/safe/propose', _requireInternalToken, async (req, res) => {
   const body = req.body;
   if (!body.safe) return res.status(400).json({ error: 'safe field required' });
   try {
@@ -199,7 +199,7 @@ app.post('/safe/propose', async (req, res) => {
   }
 });
 
-app.get('/safe/pending', async (req, res) => {
+app.get('/safe/pending', _requireInternalToken, async (req, res) => {
   const safe = req.query.safe;
   if (!safe) return res.status(400).json({ error: 'safe param required' });
   try {

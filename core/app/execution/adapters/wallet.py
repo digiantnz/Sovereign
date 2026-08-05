@@ -267,6 +267,13 @@ class WalletControlAdapter:
     _SOV_WALLET_API = os.environ.get("SOV_WALLET_URL", "http://sov-wallet:3001")
     _SAFE_ADDRESS   = os.environ.get("SAFE_ADDRESS", "")
     _CHAIN_ID       = int(os.environ.get("CHAIN_ID", "1"))
+    # Fix 2 (SEC register, Access-Control Remediation Batch): /safe/* on sov-wallet
+    # was unauthenticated. Same env var + header the existing wallet_watchlist
+    # domain (execution/engine.py) already uses for /watchlist and /check.
+    _WT_HEADERS = {
+        "Content-Type": "application/json",
+        "X-Wallet-Token": os.environ.get("WALLET_INTERNAL_TOKEN", ""),
+    }
 
     def __init__(self, ledger=None):
         self._ledger = ledger
@@ -375,6 +382,7 @@ class WalletControlAdapter:
                 nr = await client.get(
                     f"{self._SOV_WALLET_API}/safe/nonce",
                     params={"safe": self._SAFE_ADDRESS},
+                    headers=self._WT_HEADERS,
                 )
                 nr.raise_for_status()
                 nonce = nr.json()["nonce"]
@@ -446,6 +454,7 @@ class WalletControlAdapter:
                         "signature":                eth_sig,
                         "origin":                   f"Sovereign AI — {purpose}",
                     },
+                    headers=self._WT_HEADERS,
                 )
                 submit.raise_for_status()
 
@@ -585,6 +594,7 @@ class WalletControlAdapter:
                 r = await client.get(
                     f"{self._SOV_WALLET_API}/safe/pending",
                     params={"safe": self._SAFE_ADDRESS},
+                    headers=self._WT_HEADERS,
                 )
                 r.raise_for_status()
                 data = r.json()
