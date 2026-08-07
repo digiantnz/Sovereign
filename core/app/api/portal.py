@@ -8,6 +8,7 @@ No writes to any sovereign collection. No secrets in scope.
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -247,6 +248,23 @@ def _audit(request: Request, event: str, stage: str = "portal") -> None:
         pass
 
 
+def _check_portal_write_token(request: Request):
+    """Gates save_config / save_config_fields only (SEC-137/SEC-138, Fix 3 of the
+    Access-Control Remediation Batch). Mirrors wallet-api.js's _requireInternalToken
+    shape (static shared secret, header comparison, 503-vs-401) — see
+    secrets/portal.env's PORTAL_WRITE_TOKEN. sovereign-core is the only consumer;
+    unlike the wallet token no second container needs to verify this one.
+    Returns a JSONResponse to short-circuit the caller on failure, else None.
+    """
+    expected = os.environ.get("PORTAL_WRITE_TOKEN", "")
+    if not expected:
+        return JSONResponse({"error": "PORTAL_WRITE_TOKEN not set"}, status_code=503)
+    supplied = request.headers.get("x-portal-token", "")
+    if not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return None
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @router.get("/skills")
@@ -450,6 +468,9 @@ async def save_config(request: Request, body: dict = Body(...)):
     sovereign-core restart — the config singleton is loaded once at startup.
     Tier: MID (modifies system runtime configuration).
     """
+    _denied = _check_portal_write_token(request)
+    if _denied:
+        return _denied
     _audit(request, "portal_write", "config")
     content = body.get("content", "")
     if not isinstance(content, str) or not content.strip():
@@ -687,6 +708,9 @@ async def get_config_fields(request: Request):
 @router.post("/config/fields")
 async def save_config_fields(request: Request, body: dict = Body(...)):
     """Apply structured field changes to sovereign-config.yaml while preserving comments."""
+    _denied = _check_portal_write_token(request)
+    if _denied:
+        return _denied
     changes = body.get("changes", [])
     if not changes:
         return JSONResponse({"error": "No changes provided"}, status_code=400)
